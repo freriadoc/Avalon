@@ -29,6 +29,7 @@ static inline bool ggml_type_is_exl3(ggml_type) { return false; }
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <climits>
 #include <cmath>
@@ -1630,6 +1631,40 @@ static int moe_cache_find_pool(
     return -1;
 }
 
+#if defined(GGML_USE_HIP)
+// amdgpu driver counters for the device: /sys/bus/pci/devices/<bus id>/mem_info_vram_{total,used}.
+// On ROCm, hipMemGetInfo can report noticeably less free VRAM than these counters.
+static bool moe_cache_sysfs_free(int physical, size_t & free_out, size_t & total_out) {
+    char bus[32] = {};
+    if (cudaDeviceGetPCIBusId(bus, sizeof(bus), physical) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    std::string id(bus);
+    for (char & c : id) {
+        c = (char) tolower((unsigned char) c);
+    }
+    const std::string base = "/sys/bus/pci/devices/" + id + "/mem_info_vram_";
+    const auto read_u64 = [](const std::string & path, unsigned long long & v) {
+        FILE * f = fopen(path.c_str(), "r");
+        if (!f) {
+            return false;
+        }
+        const bool ok = fscanf(f, "%llu", &v) == 1;
+        fclose(f);
+        return ok;
+    };
+    unsigned long long total = 0;
+    unsigned long long used  = 0;
+    if (!read_u64(base + "total", total) || !read_u64(base + "used", used) || used > total) {
+        return false;
+    }
+    free_out  = (size_t) (total - used);
+    total_out = (size_t) total;
+    return true;
+}
+#endif
+
 static bool moe_cache_prepare_budget(
         moe_cache_session & session, moe_cache_device & device) {
     if (device.budget_ready) {
@@ -1645,6 +1680,26 @@ static bool moe_cache_prepare_budget(
         device.dead.store(true);
         return false;
     }
+
+#if defined(GGML_USE_HIP)
+    // GGML_CUDA_MOE_CACHE_FREE_SOURCE=sysfs sizes the cache from the driver counters
+    // instead of hipMemGetInfo; falls back to the HIP figure if they cannot be read
+    {
+        const char * source = getenv("GGML_CUDA_MOE_CACHE_FREE_SOURCE");
+        if (source && strcmp(source, "sysfs") == 0) {
+            size_t sysfs_free  = 0;
+            size_t sysfs_total = 0;
+            if (moe_cache_sysfs_free(device.physical, sysfs_free, sysfs_total)) {
+                MOE_CACHE_LOG("[moe-cache] CUDA%d free source=sysfs: hip=%zu MiB sysfs=%zu MiB (total %zu MiB)\n",
+                        device.physical, free_memory >> 20, sysfs_free >> 20, sysfs_total >> 20);
+                free_memory = sysfs_free;
+            } else {
+                MOE_CACHE_LOG("[moe-cache] CUDA%d free source=sysfs unavailable, using hip=%zu MiB\n",
+                        device.physical, free_memory >> 20);
+            }
+        }
+    }
+#endif
 
     size_t reserve_bytes = 0;
     const size_t available = moe_cache_budget_claim(
