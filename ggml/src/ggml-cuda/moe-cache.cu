@@ -31,6 +31,7 @@ static inline bool ggml_type_is_exl3(ggml_type) { return false; }
 #include <atomic>
 #include <cctype>
 #include <cerrno>
+#include <chrono>
 #include <climits>
 #include <cmath>
 #include <condition_variable>
@@ -132,7 +133,17 @@ struct moe_cache_pool {
     std::unordered_map<moe_cache_key, int, moe_cache_key_hash> map;
     int lru_head = -1;
     int lru_tail = -1;
+
+    // Tail of the slab that can be lent to the scheduler's expert prefetch during
+    // prefill. While lent, its slots are free, outside the free list, the LRU and the
+    // map, so nothing in the cache can reach them.
+    int zone_begin = INT_MAX;   // >= n_slots when the pool has no zone
+    bool zone_lent = false;
 };
+
+static inline bool moe_cache_pool_has_zone(const moe_cache_pool & pool) {
+    return pool.zone_begin < pool.n_slots;
+}
 
 struct moe_cache_shape {
     size_t expert_size = 0;
@@ -258,6 +269,7 @@ struct moe_cache_device {
     std::thread worker;
 
     cudaStream_t compute_stream = nullptr;
+    cudaStream_t zone_stream = nullptr;   // device-to-device moves when lending
     char * h_input = nullptr;
     char * d_input = nullptr;
     size_t h_input_cap = 0;
@@ -271,6 +283,13 @@ struct moe_cache_device {
 
     // hits and misses count tensor-expert probes; fusion counters count row pairs.
     long long hits = 0;
+    long long zone_lends = 0;
+    long long zone_restores = 0;
+    long long zone_moves = 0;
+    long long zone_evictions = 0;
+    long long zone_checked = 0;
+    long long zone_check_failed = 0;
+    double zone_lend_ms = 0.0;
     long long misses = 0;
     long long inserts = 0;
     long long fills = 0;
@@ -304,6 +323,7 @@ struct moe_cache_device {
 
 struct moe_cache_session {
     moe_cache_config config;
+    size_t lend_bytes = 0;   // size of one prefetch zone, set by the scheduler
     std::vector<std::unique_ptr<moe_cache_device>> devices;
     std::unordered_map<int, int> layer_devices;
     std::unordered_map<const void *, int> tensor_devices;
@@ -1811,6 +1831,9 @@ static bool moe_cache_allocate_pool(
     return true;
 }
 
+static size_t moe_cache_zone_bytes(const moe_cache_session & session);
+static void moe_cache_setup_zone(moe_cache_device & device, size_t zone_bytes);
+
 static void moe_cache_build_pending(
         moe_cache_session & session, moe_cache_device & device) {
     if (!moe_cache_prepare_budget(session, device)) {
@@ -1888,6 +1911,8 @@ static void moe_cache_build_pending(
             minimum_remaining -= minimum;
         }
     }
+
+    moe_cache_setup_zone(device, moe_cache_zone_bytes(session));
 }
 
 static int moe_cache_discover_pool(
@@ -1972,6 +1997,21 @@ static void moe_cache_log_stats(moe_cache_device & device) {
             device.full_fused_rows, device.full_fused_nodes,
             device.dedicated_down_mmv_dispatches,
             device.contention_bypasses);
+
+    size_t zone_slots = 0;
+    int zone_pools = 0;
+    for (const auto & pool_ptr : device.pools) {
+        if (moe_cache_pool_has_zone(*pool_ptr)) {
+            zone_slots += (size_t)(pool_ptr->n_slots - pool_ptr->zone_begin);
+            zone_pools++;
+        }
+    }
+    if (zone_pools) {
+        MOE_CACHE_LOG("[moe-cache] CUDA%d zone: pools=%d slots=%zu lends=%lld restores=%lld moved=%lld evicted=%lld last-lend=%.2f ms checked=%lld failed=%lld\n",
+                device.physical, zone_pools, zone_slots, device.zone_lends,
+                device.zone_restores, device.zone_moves, device.zone_evictions,
+                device.zone_lend_ms, device.zone_checked, device.zone_check_failed);
+    }
 }
 
 static void moe_cache_log_configuration(moe_cache_session & session) {
@@ -2231,6 +2271,10 @@ static void moe_cache_free_device(moe_cache_device & device) {
     if (device.compute_stream) {
         cudaStreamDestroy(device.compute_stream);
         device.compute_stream = nullptr;
+    }
+    if (device.zone_stream) {
+        cudaStreamDestroy(device.zone_stream);
+        device.zone_stream = nullptr;
     }
     device.pools.clear();
     device.allocated_bytes = 0;
@@ -4433,6 +4477,15 @@ static size_t moe_cache_trim_session(
 
     std::unique_lock<std::mutex> dispatch_lock(selected->dispatch_mu);
     std::unique_lock<std::mutex> lock(session.mu);
+    for (const auto & pool_ptr : selected->pools) {
+        if (pool_ptr->zone_lent) {
+            // the prefetch is using part of a slab: freeing it now would pull the
+            // memory from under the running prefill
+            MOE_CACHE_LOG("[moe-cache] CUDA%d trim refused: a zone is lent to the prefetch\n",
+                    selected->physical);
+            return 0;
+        }
+    }
     selected->dead.store(true);
     moe_cache_cancel_queue_locked(*selected, nullptr, 0, true);
     session.cv.notify_all();
@@ -4476,6 +4529,336 @@ extern "C" size_t ggml_moe_cache_trim(int device) {
     return freed;
 }
 
+// ---------------------------------------------------------------------------
+// Lending the tail of the largest pools to the scheduler's expert prefetch.
+//
+// During prefill the cache is bypassed (batches above the row limit), so its memory
+// idles while the prefetch needs two slots of the size of the largest offloaded
+// expert tensor. Instead of allocating them next to the cache, the prefetch borrows
+// a zone at the tail of each of the two largest pools for the duration of the
+// prefill and gives it back before generation resumes.
+// ---------------------------------------------------------------------------
+
+// Size of one zone: set by the scheduler, or GGML_CUDA_MOE_CACHE_ZONE_MB for testing.
+static size_t moe_cache_zone_bytes(const moe_cache_session & session) {
+    if (session.lend_bytes) {
+        return session.lend_bytes;
+    }
+    static const size_t env_bytes = [] () -> size_t {
+        const char * text = getenv("GGML_CUDA_MOE_CACHE_ZONE_MB");
+        const long long value = text && text[0] ? atoll(text) : 0;
+        return value > 0 ? (size_t)value << 20 : 0;
+    }();
+    return env_bytes;
+}
+
+// Mark the tail of the first two eligible pools (pools are created by decreasing
+// weight) as lendable. Nothing else changes: until lent, the zone is ordinary cache.
+static void moe_cache_setup_zone(moe_cache_device & device, size_t zone_bytes) {
+    if (!zone_bytes) {
+        return;
+    }
+    int equipped = 0;
+    for (auto & pool_ptr : device.pools) {
+        moe_cache_pool & pool = *pool_ptr;
+        if (equipped >= 2) {
+            break;
+        }
+        if (moe_cache_pool_has_zone(pool)) {
+            equipped++;
+            continue;
+        }
+        if (!pool.slab || !pool.expert_size || ggml_type_is_exl3((ggml_type)pool.wtype)) {
+            continue;
+        }
+        const size_t zone_slots = (zone_bytes + pool.expert_size - 1) / pool.expert_size;
+        if (!zone_slots || zone_slots > (size_t)pool.n_slots / 4) {
+            continue;
+        }
+        pool.zone_begin = pool.n_slots - (int)zone_slots;
+        equipped++;
+        MOE_CACHE_LOG("[moe-cache] CUDA%d zone: type=%s slots=%zu of %d (%zu MiB) at slot %d\n",
+                device.physical, ggml_type_name((ggml_type)pool.wtype), zone_slots,
+                pool.n_slots, (zone_slots * pool.expert_size) >> 20, pool.zone_begin);
+    }
+}
+
+// GGML_CUDA_MOE_CACHE_VERIFY=N: after a lend, read one moved entry out of N back and
+// compare it with the weights in host memory.
+static long long moe_cache_verify_period() {
+    static const long long period = [] () -> long long {
+        const char * text = getenv("GGML_CUDA_MOE_CACHE_VERIFY");
+        const long long value = text && text[0] ? atoll(text) : 0;
+        return value > 0 ? value : 0;
+    }();
+    return period;
+}
+
+static void moe_cache_zone_check(moe_cache_device & device, moe_cache_pool & pool, int index) {
+    const moe_cache_slot & slot = pool.slots[index];
+    if (slot.state != moe_cache_slot_state::valid || !slot.key.tensor) {
+        return;
+    }
+    std::vector<char> host_copy;
+    try {
+        host_copy.resize(pool.expert_size);
+    } catch (...) {
+        return;
+    }
+    if (cudaMemcpy(host_copy.data(), pool.slab + (size_t)index * pool.expert_size,
+                pool.expert_size, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return;
+    }
+    const char * source =
+        (const char *)slot.key.tensor + (size_t)slot.key.expert * pool.expert_size;
+    device.zone_checked++;
+    if (memcmp(host_copy.data(), source, pool.expert_size) != 0) {
+        device.zone_check_failed++;
+        MOE_CACHE_LOG("[moe-cache] CUDA%d ZONE CHECK FAILED slot=%d expert=%d\n",
+                device.physical, index, slot.key.expert);
+    }
+}
+
+// Empty the zone of one pool. Preconditions (caller holds session.mu): no fill queued
+// or in flight, no reader, zone not lent. Every slot is therefore either free or valid
+// and linked in the LRU. Copies are issued on device.zone_stream and waited for by the
+// caller. The destinations of the moved entries are appended to 'moved'.
+static void moe_cache_zone_evacuate(
+        moe_cache_device & device, moe_cache_pool & pool, std::vector<int> & moved) {
+    const int b = pool.zone_begin;
+    const int zone_slots = pool.n_slots - b;
+
+    // 1. free list: slots outside the zone become holes, slots inside leave with it
+    std::vector<int> holes;
+    holes.reserve(pool.free_slots.size() + (size_t)zone_slots);
+    const size_t free_total = pool.free_slots.size();
+    for (int index : pool.free_slots) {
+        if (index < b) {
+            holes.push_back(index);
+        }
+    }
+    pool.free_slots.clear();
+
+    // 2. evict the coldest entries, from the LRU head, until the pool has as many free
+    //    slots as the zone has slots
+    int to_evict = zone_slots > (int)free_total ? zone_slots - (int)free_total : 0;
+    while (to_evict > 0 && pool.lru_head >= 0) {
+        const int index = pool.lru_head;
+        moe_cache_slot_reset(pool, index, false);   // unlinks the head, erases the key
+        if (index < b) {
+            holes.push_back(index);
+        }
+        device.zone_evictions++;
+        to_evict--;
+    }
+
+    // 3. move the zone entries that survived into the holes, keeping their LRU place
+    for (int source = b; source < pool.n_slots; source++) {
+        moe_cache_slot & src = pool.slots[source];
+        if (src.state != moe_cache_slot_state::valid) {
+            continue;
+        }
+        GGML_ASSERT(!holes.empty() && "zone evacuation: not enough holes");
+        const int destination = holes.back();
+        holes.pop_back();
+
+        cudaMemcpyAsync(pool.slab + (size_t)destination * pool.expert_size,
+                pool.slab + (size_t)source * pool.expert_size,
+                pool.expert_size, cudaMemcpyDeviceToDevice, device.zone_stream);
+
+        moe_cache_slot & dst = pool.slots[destination];
+        dst.key = src.key;
+        dst.generation++;
+        dst.readers = 0;
+        dst.state = moe_cache_slot_state::valid;
+        dst.prev = src.prev;
+        dst.next = src.next;
+        if (dst.prev >= 0) {
+            pool.slots[dst.prev].next = destination;
+        } else {
+            pool.lru_head = destination;
+        }
+        if (dst.next >= 0) {
+            pool.slots[dst.next].prev = destination;
+        } else {
+            pool.lru_tail = destination;
+        }
+        auto it = pool.map.find(dst.key);
+        GGML_ASSERT(it != pool.map.end() && it->second == source);
+        it->second = destination;
+
+        src.key = {};
+        src.generation++;
+        src.readers = 0;
+        src.state = moe_cache_slot_state::free;
+        src.prev = -1;
+        src.next = -1;
+        moved.push_back(destination);
+        device.zone_moves++;
+    }
+
+    // 4. what is left are free slots outside the zone
+    pool.free_slots.swap(holes);
+}
+
+static moe_cache_device * moe_cache_device_for_backend(
+        moe_cache_session & session, void * backend_ptr) {
+    ggml_backend_t backend = (ggml_backend_t)backend_ptr;
+    if (!backend || !ggml_backend_is_cuda(backend)) {
+        return nullptr;
+    }
+    const int logical = ((ggml_backend_cuda_context *)backend->context)->device;
+    for (auto & device_ptr : session.devices) {
+        if (device_ptr->logical == logical) {
+            return device_ptr.get();
+        }
+    }
+    return nullptr;
+}
+
+static void moe_cache_set_lend_size(void * opaque, size_t bytes) {
+    moe_cache_session * session = (moe_cache_session *)opaque;
+    if (!session) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(session->mu);
+    if (session->lend_bytes == bytes) {
+        return;
+    }
+    session->lend_bytes = bytes;
+    // pools created before the size was known get their zone now (idempotent)
+    for (auto & device_ptr : session->devices) {
+        if (device_ptr->budget_ready && !device_ptr->dead.load()) {
+            moe_cache_setup_zone(*device_ptr, bytes);
+        }
+    }
+}
+
+// Lend n_zones zones of at least 'bytes' on the device of 'backend'. All or nothing:
+// returns n_zones and fills 'zones', or returns 0 and lends nothing.
+static int moe_cache_lend(void * opaque, void * backend, size_t bytes, void ** zones, int n_zones) {
+    moe_cache_session * session = (moe_cache_session *)opaque;
+    if (!session || !zones || n_zones <= 0 || n_zones > 2) {
+        return 0;
+    }
+    moe_cache_device * device = moe_cache_device_for_backend(*session, backend);
+    if (!device) {
+        return 0;
+    }
+
+    std::unique_lock<std::mutex> lock(session->mu);
+    if (device->dead.load() || !device->budget_ready) {
+        return 0;   // no pool yet (first prefill) or cache disabled after a trim
+    }
+    std::vector<moe_cache_pool *> chosen;
+    for (auto & pool_ptr : device->pools) {
+        moe_cache_pool & pool = *pool_ptr;
+        if (moe_cache_pool_has_zone(pool) && !pool.zone_lent &&
+                (size_t)(pool.n_slots - pool.zone_begin) * pool.expert_size >= bytes) {
+            chosen.push_back(&pool);
+            if ((int)chosen.size() == n_zones) {
+                break;
+            }
+        }
+    }
+    if ((int)chosen.size() < n_zones) {
+        return 0;
+    }
+
+    // let the fills already decided land; nobody enqueues while we wait, since
+    // admissions come from this very thread
+    session->idle_cv.wait(lock, [&] {
+        return device->queue.empty() && !device->inflight;
+    });
+    if (device->dead.load()) {
+        return 0;
+    }
+    for (moe_cache_pool * pool : chosen) {
+        for (const moe_cache_slot & slot : pool->slots) {
+            if (slot.readers > 0) {
+                MOE_CACHE_LOG("[moe-cache] CUDA%d lend refused: expert still being read\n",
+                        device->physical);
+                return 0;
+            }
+        }
+    }
+
+    ggml_cuda_set_device(device->logical);
+    if (!device->zone_stream &&
+            cudaStreamCreateWithFlags(&device->zone_stream, cudaStreamNonBlocking) != cudaSuccess) {
+        (void) cudaGetLastError();
+        device->zone_stream = nullptr;
+        return 0;
+    }
+
+    const auto t0 = std::chrono::steady_clock::now();
+    std::vector<int> moved[2];
+    for (size_t i = 0; i < chosen.size(); i++) {
+        moe_cache_zone_evacuate(*device, *chosen[i], moved[i]);
+    }
+    const cudaError_t error = cudaStreamSynchronize(device->zone_stream);
+    if (error != cudaSuccess) {
+        // the bookkeeping already points at the destinations: the copies must land
+        moe_cache_cuda_ok(*device, error, "zone evacuation", true);
+    }
+    for (size_t i = 0; i < chosen.size(); i++) {
+        moe_cache_pool & pool = *chosen[i];
+        pool.zone_lent = true;
+        zones[i] = pool.slab + (size_t)pool.zone_begin * pool.expert_size;
+    }
+    device->zone_lends++;
+    device->zone_lend_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+
+    const long long period = moe_cache_verify_period();
+    if (period) {
+        for (size_t i = 0; i < chosen.size(); i++) {
+            moe_cache_pool & pool = *chosen[i];
+            for (size_t m = 0; m < moved[i].size(); m += (size_t)period) {
+                moe_cache_zone_check(*device, pool, moved[i][m]);
+            }
+            for (const auto & kv : pool.map) {
+                if (kv.second >= pool.zone_begin) {
+                    device->zone_check_failed++;
+                    MOE_CACHE_LOG("[moe-cache] CUDA%d ZONE CHECK FAILED: map entry in lent zone\n",
+                            device->physical);
+                    break;
+                }
+            }
+        }
+    }
+    return n_zones;
+}
+
+// Give every lent zone of the device of 'backend' back to the cache.
+static void moe_cache_restore(void * opaque, void * backend) {
+    moe_cache_session * session = (moe_cache_session *)opaque;
+    if (!session) {
+        return;
+    }
+    moe_cache_device * device = moe_cache_device_for_backend(*session, backend);
+    if (!device) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(session->mu);
+    bool restored = false;
+    for (auto & pool_ptr : device->pools) {
+        moe_cache_pool & pool = *pool_ptr;
+        if (!pool.zone_lent) {
+            continue;
+        }
+        for (int index = pool.zone_begin; index < pool.n_slots; index++) {
+            pool.free_slots.push_back(index);   // already free, unlinked and unmapped
+        }
+        pool.zone_lent = false;
+        restored = true;
+    }
+    if (restored) {
+        device->zone_restores++;
+    }
+}
+
 void ggml_moe_cache_register(const void * owner) {
     if (ggml_moe_cache.owner && ggml_moe_cache.owner != owner) {
         return;
@@ -4495,6 +4878,9 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.end = moe_cache_end;
     ggml_moe_cache.fused_begin = moe_cache_fused_begin;
     ggml_moe_cache.invalidate = moe_cache_invalidate;
+    ggml_moe_cache.set_lend_size = moe_cache_set_lend_size;
+    ggml_moe_cache.lend = moe_cache_lend;
+    ggml_moe_cache.restore = moe_cache_restore;
 }
 
 #endif
