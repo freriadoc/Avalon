@@ -1052,6 +1052,11 @@ struct ggml_backend_sched {
     ggml_backend_event_t prefetch_free[GGML_SCHED_MAX_PREFETCH_SLOTS];
     bool prefetch_used[GGML_SCHED_MAX_PREFETCH_SLOTS];
     int prefetch_cur;
+    // Slot addresses. With an active MoE cache the slots are zones lent by the cache
+    // for the duration of a prefill graph; otherwise they are prefetch_slots buffers.
+    void * prefetch_slot_data[GGML_SCHED_MAX_PREFETCH_SLOTS];
+    bool prefetch_lent;
+    ggml_backend_t prefetch_lend_backend;
 
     int debug;
 
@@ -1881,15 +1886,38 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// Give the zones lent by the MoE cache back, once the kernels reading them are done.
+static void ggml_backend_sched_prefetch_restore(ggml_backend_sched_t sched) {
+    if (!sched->prefetch_lent) {
+        return;
+    }
+    for (int i = 0; i < sched->prefetch_n_slots; i++) {
+        if (sched->prefetch_used[i]) {
+            ggml_backend_event_synchronize(sched->prefetch_free[i]);
+            sched->prefetch_used[i] = false;
+        }
+        sched->prefetch_slot_data[i] = NULL;
+    }
+    if (sched->prefetch_backend) {
+        ggml_backend_synchronize(sched->prefetch_backend);
+    }
+    if (ggml_moe_cache.restore) {
+        ggml_moe_cache.restore(sched->moe_cache_session, sched->prefetch_lend_backend);
+    }
+    sched->prefetch_lent = false;
+}
+
 static void ggml_backend_sched_prefetch_disable(ggml_backend_sched_t sched, ggml_backend_t split_backend) {
     sched->prefetch_experts = false;
     if (sched->prefetch_backend) {
         ggml_backend_synchronize(split_backend);
         ggml_backend_synchronize(sched->prefetch_backend);
     }
+    ggml_backend_sched_prefetch_restore(sched);
     for (int i = 0; i < sched->prefetch_n_slots; i++) {
         ggml_backend_buffer_free(sched->prefetch_slots[i]);
         sched->prefetch_slots[i] = NULL;
+        sched->prefetch_slot_data[i] = NULL;
         sched->prefetch_used[i] = false;
     }
 }
@@ -1944,6 +1972,32 @@ static bool ggml_backend_sched_prefetch_init(ggml_backend_sched_t sched, ggml_ba
 
     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(split_backend);
     size = std::max(size, ggml_backend_sched_prefetch_max_size(sched, buft));
+
+    // With an active MoE cache, borrow the slots from it: its memory idles during
+    // prefill. Until the cache has created its pools (first prefill), there is nothing
+    // to borrow and this graph runs without prefetch; the prefetch stays enabled.
+    if (sched->moe_cache_session && ggml_moe_cache.lend && ggml_moe_cache.set_lend_size) {
+        if (sched->prefetch_lent) {
+            return true;
+        }
+        ggml_moe_cache.set_lend_size(sched->moe_cache_session, size);
+        if (sched->prefetch_n_slots > 2) {
+            sched->prefetch_n_slots = 2;   // the cache lends at most two zones
+            sched->prefetch_cur = 0;
+        }
+        void * zones[GGML_SCHED_MAX_PREFETCH_SLOTS] = {};
+        if (ggml_moe_cache.lend(sched->moe_cache_session, split_backend, size,
+                zones, sched->prefetch_n_slots) != sched->prefetch_n_slots) {
+            return false;
+        }
+        for (int i = 0; i < sched->prefetch_n_slots; i++) {
+            sched->prefetch_slot_data[i] = zones[i];
+        }
+        sched->prefetch_lent = true;
+        sched->prefetch_lend_backend = split_backend;
+        return true;
+    }
+
     for (int i = 0; i < sched->prefetch_n_slots; i++) {
         if (sched->prefetch_slots[i] == NULL || ggml_backend_buffer_get_size(sched->prefetch_slots[i]) < size) {
             // allocate before freeing so a failure leaves the old slot intact
@@ -1967,6 +2021,7 @@ static bool ggml_backend_sched_prefetch_init(ggml_backend_sched_t sched, ggml_ba
             // zero once so the row padding never holds garbage (NaN scales)
             ggml_backend_buffer_clear(new_buf, 0);
             sched->prefetch_slots[i] = new_buf;
+            sched->prefetch_slot_data[i] = ggml_backend_buffer_get_base(new_buf);
             sched->prefetch_used[i] = false;
         }
     }
@@ -1997,6 +2052,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
     } cache_scope(sched->moe_cache_session);
+
+    // Zones lent for the previous graph go back to the cache. A prefill graph borrows
+    // them again at its first prefetched split; between two prefill graphs that is
+    // almost free, since the cache did not touch them in between.
+    ggml_backend_sched_prefetch_restore(sched);
 
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
@@ -2063,8 +2123,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             prefetch_input_cpy    = input_cpy;
                             prefetch_saved_buffer = input_cpy->buffer;
                             prefetch_saved_data   = input_cpy->data;
-                            input_cpy->buffer = sched->prefetch_slots[slot];
-                            input_cpy->data   = ggml_backend_buffer_get_base(sched->prefetch_slots[slot]);
+                            // only the address changes: the tensor keeps its compute buffer,
+                            // which the HIP/CUDA paths only check for its type
+                            input_cpy->data   = sched->prefetch_slot_data[slot];
                             ggml_backend_tensor_set_async(sched->prefetch_backend, input_cpy, input->data, 0, ggml_nbytes(input));
                             {
                                 // re-zero the row padding: a previous, larger tensor may have
@@ -2392,6 +2453,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
     }
+    ggml_backend_sched_prefetch_restore(sched);
     if (sched->moe_cache_session && ggml_moe_cache.session_destroy) {
         ggml_moe_cache.session_destroy(sched->moe_cache_session);
         sched->moe_cache_session = NULL;
