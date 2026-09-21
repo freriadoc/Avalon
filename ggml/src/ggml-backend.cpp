@@ -1057,6 +1057,8 @@ struct ggml_backend_sched {
     void * prefetch_slot_data[GGML_SCHED_MAX_PREFETCH_SLOTS];
     bool prefetch_lent;
     ggml_backend_t prefetch_lend_backend;
+    // the MoE cache has been created from the first graph (see ggml_backend_sched_prime_moe_cache)
+    bool moe_cache_primed;
 
     int debug;
 
@@ -1974,9 +1976,11 @@ static bool ggml_backend_sched_prefetch_init(ggml_backend_sched_t sched, ggml_ba
     size = std::max(size, ggml_backend_sched_prefetch_max_size(sched, buft));
 
     // With an active MoE cache, borrow the slots from it: its memory idles during
-    // prefill. Until the cache has created its pools (first prefill), there is nothing
-    // to borrow and this graph runs without prefetch; the prefetch stays enabled.
-    if (sched->moe_cache_session && ggml_moe_cache.lend && ggml_moe_cache.set_lend_size) {
+    // prefill. The cache is created before the first graph runs (see
+    // ggml_backend_sched_prime_moe_cache); if it still cannot lend (dormant, disabled,
+    // pools too small for a zone), fall back to slots of our own below.
+    if (sched->moe_cache_session && ggml_moe_cache.lend && ggml_moe_cache.set_lend_size &&
+            !sched->prefetch_slots[0]) {
         if (sched->prefetch_lent) {
             return true;
         }
@@ -1987,15 +1991,14 @@ static bool ggml_backend_sched_prefetch_init(ggml_backend_sched_t sched, ggml_ba
         }
         void * zones[GGML_SCHED_MAX_PREFETCH_SLOTS] = {};
         if (ggml_moe_cache.lend(sched->moe_cache_session, split_backend, size,
-                zones, sched->prefetch_n_slots) != sched->prefetch_n_slots) {
-            return false;
+                zones, sched->prefetch_n_slots) == sched->prefetch_n_slots) {
+            for (int i = 0; i < sched->prefetch_n_slots; i++) {
+                sched->prefetch_slot_data[i] = zones[i];
+            }
+            sched->prefetch_lent = true;
+            sched->prefetch_lend_backend = split_backend;
+            return true;
         }
-        for (int i = 0; i < sched->prefetch_n_slots; i++) {
-            sched->prefetch_slot_data[i] = zones[i];
-        }
-        sched->prefetch_lent = true;
-        sched->prefetch_lend_backend = split_backend;
-        return true;
     }
 
     for (int i = 0; i < sched->prefetch_n_slots; i++) {
@@ -2536,10 +2539,68 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
     return true;
 }
 
+// Create the MoE cache before the first graph runs, instead of letting it appear on the
+// first generated token. The cache learns tensor shapes from the nodes it is asked to
+// serve; here it is shown every host-resident expert tensor of this graph as a one-token
+// node (begin, then end, no computation). Two passes: the cache builds its pools once it
+// has revisited every tensor it knows. The slot size is stated first, so the lendable
+// zones are laid out with the pools, and the prefetch can borrow from the first prefill.
+static void ggml_backend_sched_prime_moe_cache(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    if (sched->moe_cache_primed || !sched->moe_cache_session || !ggml_moe_cache.begin ||
+            !ggml_moe_cache.end || !ggml_moe_cache.session_enter || !ggml_moe_cache.session_leave) {
+        return;
+    }
+    sched->moe_cache_primed = true;
+
+    std::vector<const ggml_tensor *> experts;
+    size_t slot_bytes = 0;
+    ggml_backend_buffer_type_t gpu_buft = ggml_backend_get_default_buffer_type(sched->backends[0]);
+    for (int i = 0; i < graph->n_nodes; i++) {
+        const ggml_tensor * node = graph->nodes[i];
+        if (node->op != GGML_OP_MUL_MAT_ID) {
+            continue;
+        }
+        const ggml_tensor * w   = node->src[0];
+        const ggml_tensor * ids = node->src[2];
+        if (!w || !ids || !w->buffer || !w->data || !ggml_backend_buffer_is_host(w->buffer)) {
+            continue;
+        }
+        experts.push_back(node);
+        if (!ggml_backend_buft_is_host(gpu_buft)) {
+            slot_bytes = std::max(slot_bytes, ggml_backend_buft_get_alloc_size(gpu_buft, const_cast<ggml_tensor *>(w)));
+        }
+    }
+    if (experts.empty()) {
+        return;
+    }
+
+    if (sched->prefetch_experts && slot_bytes && ggml_moe_cache.set_lend_size) {
+        ggml_moe_cache.set_lend_size(sched->moe_cache_session, slot_bytes);
+    }
+
+    ggml_moe_cache.session_enter(sched->moe_cache_session);
+    for (int pass = 0; pass < 2; pass++) {
+        for (const ggml_tensor * node : experts) {
+            const ggml_tensor * w   = node->src[0];
+            const ggml_tensor * ids = node->src[2];
+            void * probe = ggml_moe_cache.begin(w->name, w->data, w->nb[2],
+                    w->ne[0], w->ne[1], w->type, w->ne[2],
+                    /*n_tokens =*/ 1, /*n_rows =*/ ids->ne[0]);
+            if (probe) {
+                ggml_moe_cache.end(probe);
+            }
+        }
+    }
+    ggml_moe_cache.session_leave(sched->moe_cache_session);
+}
+
 bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     GGML_ASSERT(sched);
     GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
     GGML_ASSERT(!sched->is_alloc);
+
+    // before split_graph, which redirects weight sources to their device copies
+    ggml_backend_sched_prime_moe_cache(sched, graph);
 
     sched->cur_copy = sched->next_copy;
     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
