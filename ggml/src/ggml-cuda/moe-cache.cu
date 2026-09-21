@@ -139,7 +139,28 @@ struct moe_cache_pool {
     // map, so nothing in the cache can reach them.
     int zone_begin = INT_MAX;   // >= n_slots when the pool has no zone
     bool zone_lent = false;
+
+    // Address translation. Logical slots 0..n1-1 live in the slab (region 1), slots
+    // n1..n_slots-1 in a region borrowed from the compute buffer (region 2). Kernels get
+    // one base and indices, so both regions are addressed from a virtual base: the
+    // lowest of the two, aligned so that every entry sits at base + k * expert_size.
+    // Without region 2: gpu_base = slab, offsets 0, extent = n_slots.
+    char * gpu_base = nullptr;
+    int n1 = 0;                 // slots in region 1
+    int64_t gpu_offset1 = 0;    // gpu index of logical slot 0
+    int64_t gpu_offset2 = 0;    // gpu index of logical slot n1
+    int64_t gpu_extent = 0;     // largest gpu index + 1, passed to kernels as a bound
 };
+
+static inline int32_t moe_cache_gpu_index(const moe_cache_pool & pool, int index) {
+    return index < pool.n1
+        ? (int32_t)(pool.gpu_offset1 + index)
+        : (int32_t)(pool.gpu_offset2 + (index - pool.n1));
+}
+
+static inline char * moe_cache_slot_ptr(const moe_cache_pool & pool, int index) {
+    return pool.gpu_base + (size_t)moe_cache_gpu_index(pool, index) * pool.expert_size;
+}
 
 static inline bool moe_cache_pool_has_zone(const moe_cache_pool & pool) {
     return pool.zone_begin < pool.n_slots;
@@ -1558,7 +1579,7 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
             if (job.pool >= 0 && job.pool < (int)device->pools.size()) {
                 pool = device->pools[job.pool].get();
                 if (pool->slab && job.slot >= 0 && job.slot < pool->n_slots) {
-                    destination = pool->slab + (size_t)job.slot * pool->expert_size;
+                    destination = moe_cache_slot_ptr(*pool, job.slot);
                 }
             }
         }
@@ -1790,6 +1811,11 @@ static bool moe_cache_allocate_pool(
         pool->wtype = shape.wtype;
         pool->slab = slab;
         pool->n_slots = (int)slot_count;
+        pool->gpu_base = slab;
+        pool->n1 = (int)slot_count;
+        pool->gpu_offset1 = 0;
+        pool->gpu_offset2 = 0;
+        pool->gpu_extent = (int64_t)slot_count;
         pool->covers_all_entries = (uint64_t)slot_count >= shape.n_entries;
         pool->slots.resize(slot_count);
         pool->free_slots.reserve(slot_count);
@@ -3181,13 +3207,14 @@ static int moe_cache_dispatch_internal(
     float * h_act = (float *)(device.h_input + ids_bytes);
     int32_t * d_ids = (int32_t *)device.d_input;
     float * d_act = (float *)(device.d_input + ids_bytes);
+    // kernels address entries as base + index * expert_size: hand them gpu indices
     for (int index = 0; index < n_hits; index++) {
-        h_ids[index] = slot_indices[index];
+        h_ids[index] = moe_cache_gpu_index(pool, slot_indices[index]);
         if (fused) {
-            h_ids[n_hits + index] = gate_slot_indices[index];
+            h_ids[n_hits + index] = moe_cache_gpu_index(*gate_pool, gate_slot_indices[index]);
         }
         if (full) {
-            h_ids[2 * n_hits + index] = down_slot_indices[index];
+            h_ids[2 * n_hits + index] = moe_cache_gpu_index(*down_pool, down_slot_indices[index]);
         }
         if (use_activation_map) {
             h_ids[(full ? 3 : fused ? 2 : 1) * n_hits + index] =
@@ -3216,7 +3243,7 @@ static int moe_cache_dispatch_internal(
     if (ok) {
         if (fused) {
             ggml_cuda_moe_cache_mmv_fused(
-                    pool.slab, gate_pool->slab, (ggml_type)wtype,
+                    pool.gpu_base, gate_pool->gpu_base, (ggml_type)wtype,
                     (const char *)device.d_act_q8,
                     d_ids, d_ids + n_hits,
                     use_activation_map ? d_ids + (full ? 3 : 2) * n_hits : nullptr,
@@ -3226,10 +3253,10 @@ static int moe_cache_dispatch_internal(
                     device.compute_stream);
         } else {
             (void)ggml_cuda_moe_cache_mmv(
-                    pool.slab, (ggml_type)wtype,
+                    pool.gpu_base, (ggml_type)wtype,
                     (const char *)device.d_act_q8, d_ids,
                     use_activation_map ? d_ids + n_hits : nullptr,
-                    device.d_out, n_in, n_out, pool.n_slots,
+                    device.d_out, n_in, n_out, pool.gpu_extent,
                     (int64_t)pool.expert_size, n_hits, activation_rows,
                     false, device.compute_stream);
         }
@@ -3249,10 +3276,10 @@ static int moe_cache_dispatch_internal(
         ggml_cuda_moe_cache_mmv_path::generic;
     if (ok && full) {
         down_mmv_path = ggml_cuda_moe_cache_mmv(
-                down_pool->slab, (ggml_type)down_pool->wtype,
+                down_pool->gpu_base, (ggml_type)down_pool->wtype,
                 (const char *)device.d_act_q8, d_ids + 2 * n_hits,
                 nullptr, device.d_out, n_out, node->n_out,
-                down_pool->n_slots, (int64_t)down_pool->expert_size,
+                down_pool->gpu_extent, (int64_t)down_pool->expert_size,
                 n_hits, n_hits, session.config.force_dedicated_down_mmv,
                 device.compute_stream);
         ok = moe_cache_cuda_ok(
@@ -4605,7 +4632,7 @@ static void moe_cache_zone_check(moe_cache_device & device, moe_cache_pool & poo
     } catch (...) {
         return;
     }
-    if (cudaMemcpy(host_copy.data(), pool.slab + (size_t)index * pool.expert_size,
+    if (cudaMemcpy(host_copy.data(), moe_cache_slot_ptr(pool, index),
                 pool.expert_size, cudaMemcpyDeviceToHost) != cudaSuccess) {
         (void) cudaGetLastError();
         return;
@@ -4663,8 +4690,8 @@ static void moe_cache_zone_evacuate(
         const int destination = holes.back();
         holes.pop_back();
 
-        cudaMemcpyAsync(pool.slab + (size_t)destination * pool.expert_size,
-                pool.slab + (size_t)source * pool.expert_size,
+        cudaMemcpyAsync(moe_cache_slot_ptr(pool, destination),
+                moe_cache_slot_ptr(pool, source),
                 pool.expert_size, cudaMemcpyDeviceToDevice, device.zone_stream);
 
         moe_cache_slot & dst = pool.slots[destination];
@@ -4805,7 +4832,7 @@ static int moe_cache_lend(void * opaque, void * backend, size_t bytes, void ** z
     for (size_t i = 0; i < chosen.size(); i++) {
         moe_cache_pool & pool = *chosen[i];
         pool.zone_lent = true;
-        zones[i] = pool.slab + (size_t)pool.zone_begin * pool.expert_size;
+        zones[i] = moe_cache_slot_ptr(pool, pool.zone_begin);   // region 1: contiguous
     }
     device->zone_lends++;
     device->zone_lend_ms = std::chrono::duration<double, std::milli>(
