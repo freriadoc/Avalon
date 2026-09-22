@@ -121,6 +121,14 @@ struct moe_cache_slot {
     moe_cache_slot_state state = moe_cache_slot_state::free;
 };
 
+// one contiguous piece of device memory holding logical slots [first, first + count)
+struct moe_cache_range {
+    char * base = nullptr;
+    int first = 0;
+    int count = 0;
+    int64_t gpu_offset = 0;   // gpu index of slot 'first'
+};
+
 struct moe_cache_pool {
     size_t expert_size = 0;
     int wtype = -1;
@@ -137,25 +145,27 @@ struct moe_cache_pool {
     // Tail of the slab that can be lent to the scheduler's expert prefetch during
     // prefill. While lent, its slots are free, outside the free list, the LRU and the
     // map, so nothing in the cache can reach them.
-    int zone_begin = INT_MAX;   // >= n_slots when the pool has no zone
+    int zone_begin = INT_MAX;   // lendable zone, inside range 0
+    int zone_end = 0;
     bool zone_lent = false;
 
-    // Address translation. Logical slots 0..n1-1 live in the slab (region 1), slots
-    // n1..n_slots-1 in a region borrowed from the compute buffer (region 2). Kernels get
-    // one base and indices, so both regions are addressed from a virtual base: the
-    // lowest of the two, aligned so that every entry sits at base + k * expert_size.
-    // Without region 2: gpu_base = slab, offsets 0, extent = n_slots.
+    // Address translation. Logical slots are spread over one or more ranges of device
+    // memory: range 0 is the slab, the others are borrowed (from the compute buffer).
+    // Kernels only take one base and an index, so every range is addressed from a
+    // virtual base, low enough and aligned so that each entry sits at
+    // gpu_base + k * expert_size.
+    std::vector<moe_cache_range> ranges;
     char * gpu_base = nullptr;
-    int n1 = 0;                 // slots in region 1
-    int64_t gpu_offset1 = 0;    // gpu index of logical slot 0
-    int64_t gpu_offset2 = 0;    // gpu index of logical slot n1
     int64_t gpu_extent = 0;     // largest gpu index + 1, passed to kernels as a bound
 };
 
 static inline int32_t moe_cache_gpu_index(const moe_cache_pool & pool, int index) {
-    return index < pool.n1
-        ? (int32_t)(pool.gpu_offset1 + index)
-        : (int32_t)(pool.gpu_offset2 + (index - pool.n1));
+    for (const moe_cache_range & r : pool.ranges) {
+        if (index >= r.first && index < r.first + r.count) {
+            return (int32_t)(r.gpu_offset + (index - r.first));
+        }
+    }
+    GGML_ABORT("moe-cache: slot %d outside every range", index);
 }
 
 static inline char * moe_cache_slot_ptr(const moe_cache_pool & pool, int index) {
@@ -163,7 +173,7 @@ static inline char * moe_cache_slot_ptr(const moe_cache_pool & pool, int index) 
 }
 
 static inline bool moe_cache_pool_has_zone(const moe_cache_pool & pool) {
-    return pool.zone_begin < pool.n_slots;
+    return pool.zone_begin < pool.zone_end;
 }
 
 struct moe_cache_shape {
@@ -291,6 +301,7 @@ struct moe_cache_device {
 
     cudaStream_t compute_stream = nullptr;
     cudaStream_t zone_stream = nullptr;   // device-to-device moves when lending
+    std::vector<char *> owned_regions;    // extra regions this device allocated itself (tests)
     char * h_input = nullptr;
     char * d_input = nullptr;
     size_t h_input_cap = 0;
@@ -1812,10 +1823,9 @@ static bool moe_cache_allocate_pool(
         pool->slab = slab;
         pool->n_slots = (int)slot_count;
         pool->gpu_base = slab;
-        pool->n1 = (int)slot_count;
-        pool->gpu_offset1 = 0;
-        pool->gpu_offset2 = 0;
         pool->gpu_extent = (int64_t)slot_count;
+        pool->zone_end = (int)slot_count;
+        pool->ranges.push_back({slab, 0, (int)slot_count, 0});
         pool->covers_all_entries = (uint64_t)slot_count >= shape.n_entries;
         pool->slots.resize(slot_count);
         pool->free_slots.reserve(slot_count);
@@ -1859,6 +1869,7 @@ static bool moe_cache_allocate_pool(
 
 static size_t moe_cache_zone_bytes(const moe_cache_session & session);
 static void moe_cache_setup_zone(moe_cache_device & device, size_t zone_bytes);
+static void moe_cache_attach_test_region(moe_cache_device & device);
 
 static void moe_cache_build_pending(
         moe_cache_session & session, moe_cache_device & device) {
@@ -1939,6 +1950,7 @@ static void moe_cache_build_pending(
     }
 
     moe_cache_setup_zone(device, moe_cache_zone_bytes(session));
+    moe_cache_attach_test_region(device);
 }
 
 static int moe_cache_discover_pool(
@@ -2028,7 +2040,7 @@ static void moe_cache_log_stats(moe_cache_device & device) {
     int zone_pools = 0;
     for (const auto & pool_ptr : device.pools) {
         if (moe_cache_pool_has_zone(*pool_ptr)) {
-            zone_slots += (size_t)(pool_ptr->n_slots - pool_ptr->zone_begin);
+            zone_slots += (size_t)(pool_ptr->zone_end - pool_ptr->zone_begin);
             zone_pools++;
         }
     }
@@ -2302,6 +2314,10 @@ static void moe_cache_free_device(moe_cache_device & device) {
         cudaStreamDestroy(device.zone_stream);
         device.zone_stream = nullptr;
     }
+    for (char * region : device.owned_regions) {
+        cudaFree(region);
+    }
+    device.owned_regions.clear();
     device.pools.clear();
     device.allocated_bytes = 0;
     device.d_input_cap = 0;
@@ -4615,16 +4631,126 @@ static void moe_cache_setup_zone(moe_cache_device & device, size_t zone_bytes) {
         if (!pool.slab || !pool.expert_size || ggml_type_is_exl3((ggml_type)pool.wtype)) {
             continue;
         }
+        const int region0 = pool.ranges.empty() ? 0 : pool.ranges[0].count;
         const size_t zone_slots = (zone_bytes + pool.expert_size - 1) / pool.expert_size;
-        if (!zone_slots || zone_slots > (size_t)pool.n_slots / 4) {
+        if (!zone_slots || zone_slots > (size_t)region0 / 4) {
             continue;
         }
-        pool.zone_begin = pool.n_slots - (int)zone_slots;
+        pool.zone_begin = region0 - (int)zone_slots;
+        pool.zone_end = region0;
         equipped++;
         MOE_CACHE_LOG("[moe-cache] CUDA%d zone: type=%s slots=%zu of %d (%zu MiB) at slot %d\n",
                 device.physical, ggml_type_name((ggml_type)pool.wtype), zone_slots,
-                pool.n_slots, (zone_slots * pool.expert_size) >> 20, pool.zone_begin);
+                region0, (zone_slots * pool.expert_size) >> 20, pool.zone_begin);
     }
+}
+
+
+// Give a pool a new range of device memory. The range is aligned so that every entry
+// sits at gpu_base + k * expert_size (losing less than one entry), lowering the virtual
+// base if the range sits below the slab. Returns the bytes actually taken.
+static size_t moe_cache_pool_attach_range(moe_cache_pool & pool, char * ptr, size_t bytes) {
+    const size_t es = pool.expert_size;
+    if (!es || bytes < es) {
+        return 0;
+    }
+    char * start = ptr;
+    if (start < pool.gpu_base) {
+        // the virtual base must stay below every range, on an entry boundary
+        const size_t below = (size_t)(pool.gpu_base - start);
+        const size_t steps = (below + es - 1) / es;
+        pool.gpu_base -= steps * es;
+        for (moe_cache_range & r : pool.ranges) {
+            r.gpu_offset += (int64_t)steps;
+        }
+        pool.gpu_extent += (int64_t)steps;
+    }
+    const size_t misalign = (size_t)(start - pool.gpu_base) % es;
+    if (misalign) {
+        start += es - misalign;
+    }
+    if (start >= ptr + bytes) {
+        return 0;
+    }
+    const int count = (int)((size_t)(ptr + bytes - start) / es);
+    if (count <= 0) {
+        return 0;
+    }
+    const int64_t offset = (int64_t)((size_t)(start - pool.gpu_base) / es);
+    if (offset + count > (int64_t)ggml_moe_cache_max_pool_slots(pool.wtype, es)) {
+        return 0;   // the kernels index entries as int32 from the virtual base
+    }
+
+    const int first = pool.n_slots;
+    try {
+        pool.slots.resize((size_t)first + count);
+        pool.ranges.push_back({start, first, count, offset});
+        pool.free_slots.reserve(pool.free_slots.size() + count);
+    } catch (...) {
+        pool.slots.resize((size_t)first);
+        return 0;
+    }
+    for (int i = first + count - 1; i >= first; i--) {
+        pool.free_slots.push_back(i);
+    }
+    pool.n_slots += count;
+    pool.gpu_extent = std::max(pool.gpu_extent, offset + count);
+    return (size_t)count * es;
+}
+
+// Share a region of device memory between the pools of a device, in proportion to what
+// each already holds, so that every expert type grows by the same fraction.
+static size_t moe_cache_region_attach(moe_cache_device & device, char * ptr, size_t bytes) {
+    size_t weight = 0;
+    for (const auto & pool_ptr : device.pools) {
+        if (!ggml_type_is_exl3((ggml_type)pool_ptr->wtype)) {
+            weight += (size_t)pool_ptr->n_slots * pool_ptr->expert_size;
+        }
+    }
+    if (!weight || !bytes) {
+        return 0;
+    }
+    size_t used = 0;
+    for (size_t i = 0; i < device.pools.size(); i++) {
+        moe_cache_pool & pool = *device.pools[i];
+        if (ggml_type_is_exl3((ggml_type)pool.wtype)) {
+            continue;
+        }
+        const size_t share = i + 1 == device.pools.size()
+            ? bytes - used
+            : (size_t)((double)bytes * ((double)((size_t)pool.n_slots * pool.expert_size) / (double)weight));
+        if (share < pool.expert_size || used + share > bytes) {
+            continue;
+        }
+        const size_t taken = moe_cache_pool_attach_range(pool, ptr + used, share);
+        MOE_CACHE_LOG("[moe-cache] CUDA%d region: type=%s +%zu MiB (%d slots), pool now %d slots, gpu extent %lld\n",
+                device.physical, ggml_type_name((ggml_type)pool.wtype), taken >> 20,
+                (int)(taken / pool.expert_size), pool.n_slots, (long long)pool.gpu_extent);
+        used += share;
+    }
+    return used;
+}
+
+// GGML_CUDA_MOE_CACHE_TEST_REGION_MB: allocate that much device memory and hand it to
+// the pools, to exercise multi-range addressing before the compute buffer lends its own.
+static void moe_cache_attach_test_region(moe_cache_device & device) {
+    static const size_t bytes = [] () -> size_t {
+        const char * text = getenv("GGML_CUDA_MOE_CACHE_TEST_REGION_MB");
+        const long long value = text && text[0] ? atoll(text) : 0;
+        return value > 0 ? (size_t)value << 20 : 0;
+    }();
+    if (!bytes || !device.owned_regions.empty()) {
+        return;
+    }
+    ggml_cuda_set_device(device.logical);
+    char * ptr = nullptr;
+    if (cudaMalloc((void **)&ptr, bytes) != cudaSuccess || !ptr) {
+        (void) cudaGetLastError();
+        MOE_CACHE_LOG("[moe-cache] CUDA%d test region of %zu MiB refused\n", device.physical, bytes >> 20);
+        return;
+    }
+    device.owned_regions.push_back(ptr);
+    moe_cache_region_attach(device, ptr, bytes);
 }
 
 // GGML_CUDA_MOE_CACHE_VERIFY=N: after a lend, read one moved entry out of N back and
@@ -4671,34 +4797,39 @@ static void moe_cache_zone_check(moe_cache_device & device, moe_cache_pool & poo
 static void moe_cache_zone_evacuate(
         moe_cache_device & device, moe_cache_pool & pool, std::vector<int> & moved) {
     const int b = pool.zone_begin;
-    const int zone_slots = pool.n_slots - b;
+    const int zone_slots = pool.zone_end - b;
+
+    const auto in_zone = [&](int index) { return index >= b && index < pool.zone_end; };
 
     // 1. free list: slots outside the zone become holes, slots inside leave with it
     std::vector<int> holes;
     holes.reserve(pool.free_slots.size() + (size_t)zone_slots);
-    const size_t free_total = pool.free_slots.size();
+    int free_in_zone = 0;
     for (int index : pool.free_slots) {
-        if (index < b) {
+        if (in_zone(index)) {
+            free_in_zone++;
+        } else {
             holes.push_back(index);
         }
     }
     pool.free_slots.clear();
 
-    // 2. evict the coldest entries, from the LRU head, until the pool has as many free
-    //    slots as the zone has slots
-    int to_evict = zone_slots > (int)free_total ? zone_slots - (int)free_total : 0;
-    while (to_evict > 0 && pool.lru_head >= 0) {
+    // 2. evict the coldest entries, from the LRU head, until every entry still in the
+    //    zone has a hole to move to
+    int occupied = zone_slots - free_in_zone;
+    while (occupied > (int)holes.size() && pool.lru_head >= 0) {
         const int index = pool.lru_head;
         moe_cache_slot_reset(pool, index, false);   // unlinks the head, erases the key
-        if (index < b) {
+        if (in_zone(index)) {
+            occupied--;
+        } else {
             holes.push_back(index);
         }
         device.zone_evictions++;
-        to_evict--;
     }
 
     // 3. move the zone entries that survived into the holes, keeping their LRU place
-    for (int source = b; source < pool.n_slots; source++) {
+    for (int source = b; source < pool.zone_end; source++) {
         moe_cache_slot & src = pool.slots[source];
         if (src.state != moe_cache_slot_state::valid) {
             continue;
@@ -4799,7 +4930,7 @@ static int moe_cache_lend(void * opaque, void * backend, size_t bytes, void ** z
     for (auto & pool_ptr : device->pools) {
         moe_cache_pool & pool = *pool_ptr;
         if (moe_cache_pool_has_zone(pool) && !pool.zone_lent &&
-                (size_t)(pool.n_slots - pool.zone_begin) * pool.expert_size >= bytes) {
+                (size_t)(pool.zone_end - pool.zone_begin) * pool.expert_size >= bytes) {
             chosen.push_back(&pool);
             if ((int)chosen.size() == n_zones) {
                 break;
@@ -4863,7 +4994,7 @@ static int moe_cache_lend(void * opaque, void * backend, size_t bytes, void ** z
                 moe_cache_zone_check(*device, pool, moved[i][m]);
             }
             for (const auto & kv : pool.map) {
-                if (kv.second >= pool.zone_begin) {
+                if (kv.second >= pool.zone_begin && kv.second < pool.zone_end) {
                     device->zone_check_failed++;
                     MOE_CACHE_LOG("[moe-cache] CUDA%d ZONE CHECK FAILED: map entry in lent zone\n",
                             device->physical);
@@ -4892,7 +5023,7 @@ static void moe_cache_restore(void * opaque, void * backend) {
         if (!pool.zone_lent) {
             continue;
         }
-        for (int index = pool.zone_begin; index < pool.n_slots; index++) {
+        for (int index = pool.zone_begin; index < pool.zone_end; index++) {
             pool.free_slots.push_back(index);   // already free, unlinked and unmapped
         }
         pool.zone_lent = false;
