@@ -144,6 +144,13 @@ struct ggml_moe_cache_api {
     void (*set_lend_size)(void * session, size_t bytes);
     int  (*lend)(void * session, void * backend, size_t bytes, void ** zones, int n_zones);
     void (*restore)(void * session, void * backend);
+
+    // Plain memory lending, for the compute buffer of a prefill graph: borrow returns a
+    // contiguous block of at least 'bytes' taken from the cache of this backend's device
+    // (evicting its coldest experts), or NULL if no pool can spare that much; give_back
+    // returns it. Called between graphs, never concurrently with plan/dispatch.
+    void * (*borrow)(void * session, void * backend, size_t bytes);
+    void (*give_back)(void * session, void * backend, void * ptr);
 };
 
 GGML_API struct ggml_moe_cache_api ggml_moe_cache;
