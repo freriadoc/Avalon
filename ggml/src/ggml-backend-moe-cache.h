@@ -151,6 +151,10 @@ struct ggml_moe_cache_api {
     // returns it. Called between graphs, never concurrently with plan/dispatch.
     void * (*borrow)(void * session, void * backend, size_t bytes);
     void (*give_back)(void * session, void * backend, void * ptr);
+
+    // Buffer type whose allocations come from this session's cache on that backend's
+    // device (falling back to a normal allocation), for the scheduler's compute buffers.
+    ggml_backend_buffer_type_t (*compute_buffer_type)(void * session, void * backend);
 };
 
 GGML_API struct ggml_moe_cache_api ggml_moe_cache;

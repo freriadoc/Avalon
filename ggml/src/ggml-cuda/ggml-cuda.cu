@@ -5,6 +5,7 @@
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/moe-cache.cuh"
+#include "../ggml-backend-moe-cache.h"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
@@ -743,13 +744,24 @@ struct ggml_backend_cuda_buffer_context {
     void * dev_ptr = nullptr;
     std::string name;
 
-    ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
-        device(device), dev_ptr(dev_ptr),
+    // false when the memory is not ours to free (borrowed from the MoE cache)
+    bool owned = true;
+
+    // set when the memory was borrowed from the MoE cache instead of allocated
+    void *      moe_cache_session = nullptr;
+    ggml_backend_t moe_cache_backend = nullptr;
+
+    ggml_backend_cuda_buffer_context(int device, void * dev_ptr, bool owned = true) :
+        device(device), dev_ptr(dev_ptr), owned(owned),
         name(GGML_CUDA_NAME + std::to_string(device)) {
     }
 
     ~ggml_backend_cuda_buffer_context() {
-        CUDA_CHECK(cudaFree(dev_ptr));
+        if (moe_cache_session && ggml_moe_cache.give_back) {
+            ggml_moe_cache.give_back(moe_cache_session, moe_cache_backend, dev_ptr);
+        } else if (owned) {
+            CUDA_CHECK(cudaFree(dev_ptr));
+        }
     }
 };
 
@@ -974,6 +986,76 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
     }
 
     return &ggml_backend_cuda_buffer_types[device];
+}
+
+// Compute buffers that borrow from the MoE cache.
+//
+// During a prefill the cache is bypassed, so its memory can host the compute buffer of
+// the graph instead of being idle; the memory goes back to the cache when the buffer is
+// freed. The buffer type keeps the name of the normal CUDA type, so every
+// ggml_backend_buft_is_cuda check still holds, and only allocation differs. If the cache
+// cannot lend, the normal allocation is used.
+struct ggml_backend_cuda_borrowed_buffer_type_context {
+    int device;
+    void * session;
+    ggml_backend_t backend;
+    std::string name;
+};
+
+static size_t ggml_backend_cuda_borrowed_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+    // the cache lends contiguous runs of one pool: ask ggml-alloc for chunks it can serve
+    static const size_t max_chunk = [] () -> size_t {
+        const char * text = getenv("GGML_SCHED_BORROW_CHUNK_MB");
+        const long long value = text && text[0] ? atoll(text) : 0;
+        return (value > 0 ? (size_t)value : 1024) << 20;
+    }();
+    return max_chunk;
+}
+
+static ggml_backend_buffer_t ggml_backend_cuda_borrowed_buffer_type_alloc_buffer(
+        ggml_backend_buffer_type_t buft, size_t size) {
+    ggml_backend_cuda_borrowed_buffer_type_context * ctx =
+        (ggml_backend_cuda_borrowed_buffer_type_context *)buft->context;
+
+    void * ptr = ggml_moe_cache.borrow ? ggml_moe_cache.borrow(ctx->session, ctx->backend, size) : nullptr;
+    if (!ptr) {
+        return ggml_backend_cuda_buffer_type_alloc_buffer(ggml_backend_cuda_buffer_type(ctx->device), size);
+    }
+
+    ggml_backend_cuda_buffer_context * buf_ctx =
+        new ggml_backend_cuda_buffer_context(ctx->device, ptr, /*owned =*/ false);
+    buf_ctx->moe_cache_session = ctx->session;
+    buf_ctx->moe_cache_backend = ctx->backend;
+    return ggml_backend_buffer_init(ggml_backend_cuda_buffer_type(ctx->device),
+            ggml_backend_cuda_buffer_interface, buf_ctx, size);
+}
+
+ggml_backend_buffer_type_t ggml_backend_cuda_borrowed_buffer_type(
+        int device, void * session, ggml_backend_t backend) {
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+
+    static std::vector<ggml_backend_buffer_type *> types;
+    for (ggml_backend_buffer_type * type : types) {
+        const auto * ctx = (const ggml_backend_cuda_borrowed_buffer_type_context *)type->context;
+        if (ctx->device == device && ctx->session == session && ctx->backend == backend) {
+            return type;
+        }
+    }
+
+    ggml_backend_buffer_type_i iface = ggml_backend_cuda_buffer_type_interface;
+    iface.alloc_buffer = ggml_backend_cuda_borrowed_buffer_type_alloc_buffer;
+    iface.get_max_size = ggml_backend_cuda_borrowed_buffer_type_get_max_size;
+
+    ggml_backend_buffer_type * type = new ggml_backend_buffer_type{
+        /* .iface   = */ iface,
+        /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), device),
+        /* .context = */ new ggml_backend_cuda_borrowed_buffer_type_context{
+            device, session, backend, GGML_CUDA_NAME + std::to_string(device)},
+    };
+    types.push_back(type);
+    return type;
 }
 
 // Communication context for multi-GPU AllReduce during tensor parallelism.

@@ -5128,6 +5128,20 @@ static void * moe_cache_borrow(void * opaque, void * backend, size_t bytes) {
     return moe_cache_slot_ptr(*chosen, begin);
 }
 
+// The buffer type the scheduler uses for its compute buffers when it wants them taken
+// from this session's cache.
+static ggml_backend_buffer_type_t moe_cache_compute_buffer_type(void * opaque, void * backend) {
+    moe_cache_session * session = (moe_cache_session *)opaque;
+    if (!session || !backend || !ggml_backend_is_cuda((ggml_backend_t)backend)) {
+        return nullptr;
+    }
+    moe_cache_device * device = moe_cache_device_for_backend(*session, backend);
+    if (!device) {
+        return nullptr;
+    }
+    return ggml_backend_cuda_borrowed_buffer_type(device->logical, opaque, (ggml_backend_t)backend);
+}
+
 // Give back memory obtained from moe_cache_borrow.
 static void moe_cache_give_back(void * opaque, void * backend, void * ptr) {
     moe_cache_session * session = (moe_cache_session *)opaque;
@@ -5218,6 +5232,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.restore = moe_cache_restore;
     ggml_moe_cache.borrow = moe_cache_borrow;
     ggml_moe_cache.give_back = moe_cache_give_back;
+    ggml_moe_cache.compute_buffer_type = moe_cache_compute_buffer_type;
 }
 
 #endif

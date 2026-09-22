@@ -2327,6 +2327,25 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     return GGML_STATUS_SUCCESS;
 }
 
+// GGML_SCHED_BORROW_COMPUTE=1: take the compute buffers from the MoE cache while it is
+// idle (during prefill) instead of allocating them next to it.
+static void ggml_backend_sched_use_borrowed_compute(ggml_backend_sched_t sched) {
+    static const bool enabled = [] {
+        const char * text = getenv("GGML_SCHED_BORROW_COMPUTE");
+        return text && text[0] && text[0] != '0';
+    }();
+    if (!enabled || !sched->moe_cache_session || !ggml_moe_cache.compute_buffer_type) {
+        return;
+    }
+    for (int b = 0; b < sched->n_backends; b++) {
+        ggml_backend_buffer_type_t buft =
+            ggml_moe_cache.compute_buffer_type(sched->moe_cache_session, sched->backends[b]);
+        if (buft && ggml_backend_supports_buft(sched->backends[b], buft)) {
+            sched->bufts[b] = buft;
+        }
+    }
+}
+
 ggml_backend_sched_t ggml_backend_sched_new(
         ggml_backend_t * backends,
         ggml_backend_buffer_type_t * bufts,
@@ -2399,6 +2418,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
         sched->moe_cache_session = ggml_moe_cache.session_create(cache_backends, n_backends, nullptr);
     }
 
+    ggml_backend_sched_use_borrowed_compute(sched);
+
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
     sched->op_offload = op_offload;
 
@@ -2452,6 +2473,12 @@ void ggml_backend_sched_set_moe_cache(
     }
     sched->moe_cache_session = ggml_moe_cache.session_create(
             cache_backends, sched->n_backends, &config);
+
+    // the session changed: the compute buffer types point at it, and the allocator holds
+    // them, so both are rebuilt here (this runs before any graph is reserved)
+    ggml_backend_sched_use_borrowed_compute(sched);
+    ggml_gallocr_free(sched->galloc);
+    sched->galloc = ggml_gallocr_new_n(sched->bufts, sched->n_backends);
 }
 
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
@@ -2524,11 +2551,17 @@ void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
     ggml_gallocr_reserve_n_size(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, sizes);
 }
 
+static void ggml_backend_sched_prime_moe_cache(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+
 bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph) {
     GGML_ASSERT(sched);
     GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
 
     ggml_backend_sched_synchronize(sched);
+
+    // the cache must exist before the compute buffers are allocated: with
+    // GGML_SCHED_BORROW_COMPUTE they are taken from it
+    ggml_backend_sched_prime_moe_cache(sched, measure_graph);
 
     ggml_backend_sched_split_graph(sched, measure_graph);
 

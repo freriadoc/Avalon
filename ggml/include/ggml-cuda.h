@@ -27,6 +27,9 @@ GGML_BACKEND_API bool ggml_backend_is_cuda(ggml_backend_t backend);
 // device buffer
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device);
 
+// Compute buffers taken from the MoE cache of this device while it is idle (prefill).
+GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_borrowed_buffer_type(int device, void * session, ggml_backend_t backend);
+
 // conduct allreduce operation between devices
 GGML_BACKEND_API bool ggml_backend_cuda_allreduce_tensor(ggml_backend_t * backends, struct ggml_tensor ** tensors, size_t n_backends);
 
