@@ -2433,23 +2433,40 @@ static void moe_cache_session_leave(void * opaque) {
     }
 }
 
+
+// GGML_CUDA_MOE_CACHE_TRACE_BEGIN=1: log the source line of each begin() refusal
+// (first 400). Diagnostic only; line numbers refer to this file before the macro.
+static void moe_cache_trace_refusal(int line, const char * name, int64_t n_tokens, int64_t n_rows) {
+    static const bool enabled = [] {
+        const char * text = getenv("GGML_CUDA_MOE_CACHE_TRACE_BEGIN");
+        return text && text[0] && text[0] != '0';
+    }();
+    static std::atomic<int> logged{0};
+    if (!enabled || logged.fetch_add(1) >= 400) {
+        return;
+    }
+    MOE_CACHE_LOG("[moe-cache] begin refused at line %d: %s tokens=%lld rows=%lld\n",
+            line, name ? name : "(null)", (long long)n_tokens, (long long)n_rows);
+}
+#define MOE_CACHE_REFUSE(line) do { moe_cache_trace_refusal((line), name, n_tokens, n_rows); return nullptr; } while (0)
+
 static void * moe_cache_begin(
         const char * name, const void * host_base, size_t expert_size,
         int64_t n_in, int64_t n_out, int wtype, int64_t n_expert,
         int64_t n_tokens, int64_t n_rows) {
     if (g_session_suppressed > 0 || g_session_stack.empty()) {
-        return nullptr;
+        MOE_CACHE_REFUSE(2440);
     }
     moe_cache_session * session = g_session_stack.back().active;
     if (!session || session->stopping || session->dormant) {
-        return nullptr;
+        MOE_CACHE_REFUSE(2444);
     }
     // Expert-parallel mode owns discovery and admission through the complete
     // up/gate/down path. Letting the single-device fallback see these nodes would
     // allocate a pool after the first tensor is revisited, before all layer shapes
     // have been counted, and permanently strand most of that device's capacity.
     if (session->config.expert_parallel && session->devices.size() >= 2) {
-        return nullptr;
+        MOE_CACHE_REFUSE(2451);
     }
     moe_cache_log_configuration(*session);
     if (!name || !host_base ||
@@ -2458,10 +2475,10 @@ static void * moe_cache_begin(
             session->config.min_expert_explicit, session->config.min_expert_bytes) ||
         n_in <= 0 || n_out <= 0 || n_expert <= 0 ||
         !moe_cache_type_supported((ggml_type)wtype)) {
-        return nullptr;
+        MOE_CACHE_REFUSE(2460);
     }
     if (n_rows < n_tokens || n_rows % n_tokens != 0) {
-        return nullptr;
+        MOE_CACHE_REFUSE(2463);
     }
     if (n_tokens > session->config.max_batch) {
         bool expected = false;
@@ -2469,7 +2486,7 @@ static void * moe_cache_begin(
             MOE_CACHE_LOG("[moe-cache] bypassing %lld-token node above max-batch=%d; prompt batches normally use the CPU path, while larger decode or speculative batches will not use the cache\n",
                     (long long)n_tokens, session->config.max_batch);
         }
-        return nullptr;
+        MOE_CACHE_REFUSE(2471);
     }
     if (n_rows > moe_cache_node_rows_max) {
         bool expected = false;
@@ -2477,7 +2494,7 @@ static void * moe_cache_begin(
             MOE_CACHE_LOG("[moe-cache] bypassing %lld-row node above row limit=%d; the stock CPU path remains active\n",
                     (long long)n_rows, moe_cache_node_rows_max);
         }
-        return nullptr;
+        MOE_CACHE_REFUSE(2479);
     }
 
     const size_t row_size = ggml_row_size((ggml_type)wtype, n_in);
@@ -2485,13 +2502,13 @@ static void * moe_cache_begin(
         expert_size != (size_t)n_out * row_size ||
         (uint64_t)n_expert > SIZE_MAX / expert_size ||
         expert_size > SIZE_MAX / moe_cache_pool_slots_min) {
-        return nullptr;
+        MOE_CACHE_REFUSE(2487);
     }
     const size_t tensor_size = (size_t)n_expert * expert_size;
     moe_cache_scratch scratch_requirements;
     if (!moe_cache_scratch_requirements(
             n_in, n_out, scratch_requirements)) {
-        return nullptr;
+        MOE_CACHE_REFUSE(2493);
     }
     int layer = -1;
     const bool has_layer = moe_cache_layer_number(name, layer);
@@ -2504,7 +2521,7 @@ static void * moe_cache_begin(
     {
         std::unique_lock<std::mutex> lock(session->mu);
         if (session->stopping) {
-            return nullptr;
+            MOE_CACHE_REFUSE(2506);
         }
 
         int budget_devices = 0;
@@ -2545,11 +2562,11 @@ static void * moe_cache_begin(
             for (const auto & device_ptr : session->devices) {
                 moe_cache_trim_session(*session, device_ptr->physical);
             }
-            return nullptr;
+            MOE_CACHE_REFUSE(2547);
         }
         if (session->config.automatic &&
             eligible_devices < session->config.min_devices) {
-            return nullptr;
+            MOE_CACHE_REFUSE(2551);
         }
 
         auto route_weight = [&](moe_cache_device & candidate) -> size_t {
@@ -2579,7 +2596,7 @@ static void * moe_cache_begin(
                     return device_ptr.get();
                 }
             }
-            return nullptr;
+            MOE_CACHE_REFUSE(2581);
         };
 
         auto tensor_route = session->tensor_devices.find(host_base);
@@ -2620,7 +2637,7 @@ static void * moe_cache_begin(
             }
         }
         if (!selected && total_weight == 0) {
-            return nullptr;
+            MOE_CACHE_REFUSE(2622);
         }
 
         if (!selected && has_layer && !tensor_override) {
@@ -2646,7 +2663,7 @@ static void * moe_cache_begin(
                 try {
                     session->layer_devices.emplace(layer, selected->physical);
                 } catch (...) {
-                    return nullptr;
+                    MOE_CACHE_REFUSE(2648);
                 }
             }
         }
@@ -2671,7 +2688,7 @@ static void * moe_cache_begin(
                 }
             }
             if (!selected) {
-                return nullptr;
+                MOE_CACHE_REFUSE(2673);
             }
             try {
                 if (tensor_override) {
@@ -2680,7 +2697,7 @@ static void * moe_cache_begin(
                     session->layer_devices.emplace(layer, selected->physical);
                 }
             } catch (...) {
-                return nullptr;
+                MOE_CACHE_REFUSE(2682);
             }
         }
 
@@ -2688,7 +2705,7 @@ static void * moe_cache_begin(
                 selected->scratch_reserve, &scratch_requirements);
         if (selected_scratch >= selected->budget_limit ||
             minimum_pool > selected->budget_limit - selected_scratch) {
-            return nullptr;
+            MOE_CACHE_REFUSE(2690);
         }
         selected->scratch_reserve.input = std::max(
                 selected->scratch_reserve.input, scratch_requirements.input);
@@ -2702,18 +2719,18 @@ static void * moe_cache_begin(
                     *session, *selected, host_base, tensor_size, expert_size, wtype, n_expert);
         } catch (...) {
             MOE_CACHE_LOG("[moe-cache] disabled one node after host allocation failure\n");
-            return nullptr;
+            MOE_CACHE_REFUSE(2704);
         }
         if (pool_index < 0 || pool_index >= (int)selected->pools.size() ||
             !selected->pools[pool_index]->slab) {
-            return nullptr;
+            MOE_CACHE_REFUSE(2708);
         }
         pool = selected->pools[pool_index].get();
         moe_cache_session::active_source * source = nullptr;
         try {
             source = &session->active_sources[host_base];
         } catch (...) {
-            return nullptr;
+            MOE_CACHE_REFUSE(2715);
         }
         source->bytes = std::max(source->bytes, tensor_size);
         source->references++;
@@ -2734,7 +2751,7 @@ static void * moe_cache_begin(
         }
         session->active_nodes--;
         session->idle_cv.notify_all();
-        return nullptr;
+        MOE_CACHE_REFUSE(2736);
     }
     if (!dispatch_lock.owns_lock()) {
         device.contention_bypasses++;
@@ -2747,7 +2764,7 @@ static void * moe_cache_begin(
         }
         session->active_nodes--;
         session->idle_cv.notify_all();
-        return nullptr;
+        MOE_CACHE_REFUSE(2749);
     }
 
     std::unique_ptr<moe_cache_node> node(new (std::nothrow) moe_cache_node());
@@ -2759,7 +2776,7 @@ static void * moe_cache_begin(
         }
         session->active_nodes--;
         session->idle_cv.notify_all();
-        return nullptr;
+        MOE_CACHE_REFUSE(2761);
     }
     node->session = session;
     node->device = &device;
