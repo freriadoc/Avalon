@@ -833,6 +833,18 @@ void llama_context::sched_reserve() {
         if (!gf) {
             throw std::runtime_error("failed to allocate compute pp buffers");
         }
+
+        // A single-sequence ubatch can build a larger graph than a multi-sequence one:
+        // some models only take their sparse-selection path when every token belongs to
+        // one sequence (qwen4exp QSA: its per-cell score and mask tensors grow with n_kv).
+        // Reserve that case too, so the compute buffer never has to grow during a long
+        // prompt; the allocator keeps the largest of the reservations.
+        if (n_seqs > 1 && model.arch != LLM_ARCH_MINIMAX_01) {
+            gf = graph_reserve(n_tokens, 1, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
+            if (!gf) {
+                throw std::runtime_error("failed to allocate compute pp buffers (single sequence)");
+            }
+        }
     }
 
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -1001,6 +1013,10 @@ bool llama_context::memory_update(bool optimize) {
         const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
 
         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_max, mctx.get());
+        if (gf && n_seqs > 1 && model.arch != LLM_ARCH_MINIMAX_01) {
+            // same single-sequence worst case as at context creation
+            gf = graph_reserve(n_tokens, 1, std::min(n_outputs_max, n_tokens), mctx.get());
+        }
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to reserve graph after the memory update\n", __func__);
         }
