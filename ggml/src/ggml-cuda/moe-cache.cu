@@ -4612,8 +4612,9 @@ static size_t moe_cache_zone_bytes(const moe_cache_session & session) {
     return env_bytes;
 }
 
-// Mark the tail of the first two eligible pools (pools are created by decreasing
-// weight) as lendable. Nothing else changes: until lent, the zone is ordinary cache.
+// Mark the tail of the first two eligible pools as lendable: one prefetch slot each,
+// so that a prefill evicts a little of every expert type rather than a lot of one.
+// Nothing else changes: until lent, the zone is ordinary cache.
 static void moe_cache_setup_zone(moe_cache_device & device, size_t zone_bytes) {
     if (!zone_bytes) {
         return;
@@ -4633,8 +4634,8 @@ static void moe_cache_setup_zone(moe_cache_device & device, size_t zone_bytes) {
         }
         const int region0 = pool.ranges.empty() ? 0 : pool.ranges[0].count;
         const size_t zone_slots = (zone_bytes + pool.expert_size - 1) / pool.expert_size;
-        if (!zone_slots || zone_slots > (size_t)region0 / 4) {
-            continue;
+        if (!zone_slots || zone_slots > (size_t)region0 / 2) {
+            continue;   // at most half of a pool, so the cache keeps a working set
         }
         pool.zone_begin = region0 - (int)zone_slots;
         pool.zone_end = region0;
@@ -4642,6 +4643,10 @@ static void moe_cache_setup_zone(moe_cache_device & device, size_t zone_bytes) {
         MOE_CACHE_LOG("[moe-cache] CUDA%d zone: type=%s slots=%zu of %d (%zu MiB) at slot %d\n",
                 device.physical, ggml_type_name((ggml_type)pool.wtype), zone_slots,
                 region0, (zone_slots * pool.expert_size) >> 20, pool.zone_begin);
+    }
+    if (equipped < 2) {
+        MOE_CACHE_LOG("[moe-cache] CUDA%d zone: only %d of 2 prefetch slots reserved, "
+                "the prefetch will not borrow\n", device.physical, equipped);
     }
 }
 
