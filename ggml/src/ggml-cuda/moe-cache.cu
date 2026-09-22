@@ -5029,16 +5029,32 @@ static int moe_cache_lend(void * opaque, void * backend, size_t bytes, void ** z
 // taken from the tail of range 0, under the prefetch zone, and given back later.
 // ---------------------------------------------------------------------------
 
-// how much of a pool may be lent out at once, prefetch zone included
-static constexpr int moe_cache_lend_percent = 80;
+// How much of a pool may be lent out at once, prefetch zone included. The cache is
+// bypassed while the memory is lent (it is lent for a prefill), so this floor only has
+// to keep the pool usable for the single-token nodes of the last layer.
+static constexpr int moe_cache_lend_percent = 95;
 
-static bool moe_cache_pool_can_lend(const moe_cache_pool & pool, int slots) {
+// How far a pool may be lent beyond the least-lent one that could also take the block.
+static constexpr double moe_cache_lend_fairness = 0.20;
+
+// lowest entry currently lent, or the start of the prefetch zone
+static int moe_cache_pool_lend_low(const moe_cache_pool & pool) {
+    const int region0 = pool.ranges.empty() ? 0 : pool.ranges[0].count;
+    if (pool.lent_low < region0) {
+        return pool.lent_low;
+    }
+    return pool.zone_begin < region0 ? pool.zone_begin : region0;
+}
+
+// entries this pool could still lend
+static int moe_cache_pool_lendable(const moe_cache_pool & pool) {
     if (pool.ranges.empty() || !pool.expert_size || ggml_type_is_exl3((ggml_type)pool.wtype)) {
-        return false;
+        return 0;
     }
     const int region0 = pool.ranges[0].count;
-    const int low = pool.lent_low < region0 ? pool.lent_low : (pool.zone_begin < region0 ? pool.zone_begin : region0);
-    return low - slots >= region0 - (int)((int64_t)region0 * moe_cache_lend_percent / 100);
+    const int floor = region0 - (int)((int64_t)region0 * moe_cache_lend_percent / 100);
+    const int low = moe_cache_pool_lend_low(pool);
+    return low > floor ? low - floor : 0;
 }
 
 // Borrow 'bytes' of contiguous device memory from the cache of this backend's device.
@@ -5057,22 +5073,43 @@ static void * moe_cache_borrow(void * opaque, void * backend, size_t bytes) {
         return nullptr;
     }
 
-    moe_cache_pool * chosen = nullptr;
-    int slots = 0;
+    // Like a waiter seating a party: the smallest table that fits, so that the large
+    // pools stay free for the large blocks (a tensor bigger than the chunk limit gets a
+    // chunk of its own: the QSA scores are 2 GiB). But never seat a party at a table
+    // already much more crowded than another that would do, so that no expert type ends
+    // up carrying the whole loan.
+    struct candidate { moe_cache_pool * pool; int slots; int64_t room; double lent_after; };
+    std::vector<candidate> candidates;
+    double least_lent = 1.0;
     for (auto & pool_ptr : device->pools) {
         moe_cache_pool & pool = *pool_ptr;
         const int want = (int)((bytes + pool.expert_size - 1) / pool.expert_size);
-        if (!moe_cache_pool_can_lend(pool, want)) {
+        const int room = moe_cache_pool_lendable(pool);
+        if (room < want) {
             continue;
         }
-        // prefer the pool that keeps the largest share of itself
-        if (!chosen || (int64_t)pool.n_slots * pool.expert_size >
-                (int64_t)chosen->n_slots * chosen->expert_size) {
-            chosen = &pool;
-            slots = want;
+        const int region0 = pool.ranges[0].count;
+        const double lent_after = region0 > 0
+            ? (double)(region0 - (moe_cache_pool_lend_low(pool) - want)) / (double)region0 : 1.0;
+        candidates.push_back({&pool, want, (int64_t)room * pool.expert_size, lent_after});
+        least_lent = std::min(least_lent, lent_after);
+    }
+    moe_cache_pool * chosen = nullptr;
+    int slots = 0;
+    int64_t smallest_room = 0;
+    for (const candidate & c : candidates) {
+        if (c.lent_after > least_lent + moe_cache_lend_fairness) {
+            continue;
+        }
+        if (!chosen || c.room < smallest_room) {
+            chosen = c.pool;
+            slots = c.slots;
+            smallest_room = c.room;
         }
     }
     if (!chosen) {
+        MOE_CACHE_LOG("[moe-cache] CUDA%d borrow: no pool can lend %zu MiB in one piece\n",
+                device->physical, bytes >> 20);
         return nullptr;
     }
 
@@ -5098,9 +5135,7 @@ static void * moe_cache_borrow(void * opaque, void * backend, size_t bytes) {
         return nullptr;
     }
 
-    const int region0 = chosen->ranges[0].count;
-    const int low = chosen->lent_low < region0
-        ? chosen->lent_low : (chosen->zone_begin < region0 ? chosen->zone_begin : region0);
+    const int low = moe_cache_pool_lend_low(*chosen);
     const int begin = low - slots;
 
     const auto t0 = std::chrono::steady_clock::now();
@@ -5115,9 +5150,10 @@ static void * moe_cache_borrow(void * opaque, void * backend, size_t bytes) {
     device->zone_lends++;
     device->zone_lend_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - t0).count();
-    MOE_CACHE_LOG("[moe-cache] CUDA%d borrow: %zu MiB from the %s pool (%d entries at %d), %.2f ms\n",
-            device->physical, bytes >> 20, ggml_type_name((ggml_type)chosen->wtype),
-            slots, begin, device->zone_lend_ms);
+    MOE_CACHE_LOG("[moe-cache] CUDA%d borrow: %zu MiB from the %s pool (%d entries at %d, %d%% of it lent), %.2f ms\n",
+            device->physical, bytes >> 20, ggml_type_name((ggml_type)chosen->wtype), slots, begin,
+            (int)(100 * (chosen->ranges[0].count - begin) / chosen->ranges[0].count),
+            device->zone_lend_ms);
 
     const long long period = moe_cache_verify_period();
     if (period) {
