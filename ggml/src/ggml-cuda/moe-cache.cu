@@ -5091,7 +5091,7 @@ static void * moe_cache_borrow(void * opaque, void * backend, size_t bytes) {
         const int region0 = pool.ranges[0].count;
         const double lent_after = region0 > 0
             ? (double)(region0 - (moe_cache_pool_lend_low(pool) - want)) / (double)region0 : 1.0;
-        candidates.push_back({&pool, want, (int64_t)room * pool.expert_size, lent_after});
+        candidates.push_back({&pool, want, static_cast<int64_t>((int64_t)room * (int64_t)pool.expert_size), lent_after});
         least_lent = std::min(least_lent, lent_after);
     }
     moe_cache_pool * chosen = nullptr;
