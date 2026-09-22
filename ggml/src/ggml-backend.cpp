@@ -1979,8 +1979,7 @@ static bool ggml_backend_sched_prefetch_init(ggml_backend_sched_t sched, ggml_ba
     // prefill. The cache is created before the first graph runs (see
     // ggml_backend_sched_prime_moe_cache); if it still cannot lend (dormant, disabled,
     // pools too small for a zone), fall back to slots of our own below.
-    if (sched->moe_cache_session && ggml_moe_cache.lend && ggml_moe_cache.set_lend_size &&
-            !sched->prefetch_slots[0]) {
+    if (sched->moe_cache_session && ggml_moe_cache.lend && ggml_moe_cache.set_lend_size) {
         if (sched->prefetch_lent) {
             return true;
         }
@@ -1999,6 +1998,9 @@ static bool ggml_backend_sched_prefetch_init(ggml_backend_sched_t sched, ggml_ba
             sched->prefetch_lend_backend = split_backend;
             return true;
         }
+        // no zone to borrow: run this graph without prefetch, keep it enabled; slots of our
+        // own would be sized into the cache's reserve and never let it lend again
+        return false;
     }
 
     for (int i = 0; i < sched->prefetch_n_slots; i++) {
@@ -2554,12 +2556,14 @@ static void ggml_backend_sched_prime_moe_cache(ggml_backend_sched_t sched, struc
 
     std::vector<const ggml_tensor *> experts;
     size_t slot_bytes = 0;
+    int n_mmid = 0;
     ggml_backend_buffer_type_t gpu_buft = ggml_backend_get_default_buffer_type(sched->backends[0]);
     for (int i = 0; i < graph->n_nodes; i++) {
         const ggml_tensor * node = graph->nodes[i];
         if (node->op != GGML_OP_MUL_MAT_ID) {
             continue;
         }
+        n_mmid++;
         const ggml_tensor * w   = node->src[0];
         const ggml_tensor * ids = node->src[2];
         if (!w || !ids || !w->buffer || !w->data || !ggml_backend_buffer_is_host(w->buffer)) {
@@ -2570,6 +2574,8 @@ static void ggml_backend_sched_prime_moe_cache(ggml_backend_sched_t sched, struc
             slot_bytes = std::max(slot_bytes, ggml_backend_buft_get_alloc_size(gpu_buft, const_cast<ggml_tensor *>(w)));
         }
     }
+    GGML_LOG_INFO("%s: graph with %d nodes: %d MUL_MAT_ID, %zu with host weights, slot %zu MiB\n",
+            __func__, graph->n_nodes, n_mmid, experts.size(), slot_bytes >> 20);
     if (experts.empty()) {
         return;
     }
@@ -2578,6 +2584,7 @@ static void ggml_backend_sched_prime_moe_cache(ggml_backend_sched_t sched, struc
         ggml_moe_cache.set_lend_size(sched->moe_cache_session, slot_bytes);
     }
 
+    int accepted[2] = {0, 0};
     ggml_moe_cache.session_enter(sched->moe_cache_session);
     for (int pass = 0; pass < 2; pass++) {
         for (const ggml_tensor * node : experts) {
@@ -2587,11 +2594,16 @@ static void ggml_backend_sched_prime_moe_cache(ggml_backend_sched_t sched, struc
                     w->ne[0], w->ne[1], w->type, w->ne[2],
                     /*n_tokens =*/ 1, /*n_rows =*/ ids->ne[0]);
             if (probe) {
+                accepted[pass]++;
                 ggml_moe_cache.end(probe);
             }
         }
     }
     ggml_moe_cache.session_leave(sched->moe_cache_session);
+    GGML_LOG_INFO("%s: MoE cache probed with %zu tensors, accepted %d then %d (first: %s, %s, rows %lld)\n",
+            __func__, experts.size(), accepted[0], accepted[1],
+            experts[0]->src[0]->name, ggml_type_name(experts[0]->src[0]->type),
+            (long long)experts[0]->src[2]->ne[0]);
 }
 
 bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
