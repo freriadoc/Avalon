@@ -2590,9 +2590,12 @@ static void ggml_backend_sched_prime_moe_cache(ggml_backend_sched_t sched, struc
         for (const ggml_tensor * node : experts) {
             const ggml_tensor * w   = node->src[0];
             const ggml_tensor * ids = node->src[2];
+            // one token routed to one expert: the warmup graph routes every token to
+            // all experts (ids->ne[0] == n_expert), which the cache would reject as a
+            // batch above its row limit
             void * probe = ggml_moe_cache.begin(w->name, w->data, w->nb[2],
                     w->ne[0], w->ne[1], w->type, w->ne[2],
-                    /*n_tokens =*/ 1, /*n_rows =*/ ids->ne[0]);
+                    /*n_tokens =*/ 1, /*n_rows =*/ 1);
             if (probe) {
                 accepted[pass]++;
                 ggml_moe_cache.end(probe);
