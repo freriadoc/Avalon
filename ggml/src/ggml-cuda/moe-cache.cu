@@ -5035,7 +5035,10 @@ static int moe_cache_lend(void * opaque, void * backend, size_t bytes, void ** z
 static constexpr int moe_cache_lend_percent = 95;
 
 // How far a pool may be lent beyond the least-lent one that could also take the block.
-static constexpr double moe_cache_lend_fairness = 0.20;
+// Measured over the real chunk list at two cache sizes: at 5 or 10 points the early
+// choices leave later blocks unplaceable, at 30 one pool gets drained; 15 gives the
+// smallest spread with no refusal.
+static constexpr double moe_cache_lend_fairness = 0.15;
 
 // lowest entry currently lent, or the start of the prefetch zone
 static int moe_cache_pool_lend_low(const moe_cache_pool & pool) {

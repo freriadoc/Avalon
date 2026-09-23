@@ -1008,7 +1008,10 @@ static size_t ggml_backend_cuda_borrowed_buffer_type_get_max_size(ggml_backend_b
     static const size_t max_chunk = [] () -> size_t {
         const char * text = getenv("GGML_SCHED_BORROW_CHUNK_MB");
         const long long value = text && text[0] ? atoll(text) : 0;
-        return (value > 0 ? (size_t)value : 1024) << 20;
+        // 512 MiB: with 1 GiB chunks and a slightly smaller cache, a quarter of the chunk
+        // orders left a block no pool could serve, allocated on top of the cache instead;
+        // 512 MiB places them all and keeps 9 chunks for 7.6 GiB (ggml-alloc allows 16)
+        return (value > 0 ? (size_t)value : 512) << 20;
     }();
     return max_chunk;
 }
