@@ -1,5 +1,6 @@
 #include "ggml-alloc.h"
 #include "ggml-backend-impl.h"
+#include "ggml-backend-moe-cache.h"
 #include "ggml.h"
 #include "ggml-impl.h"
 
@@ -425,6 +426,15 @@ static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, cons
     struct vbuffer * buf = (struct vbuffer *)calloc(1, sizeof(struct vbuffer));
     if (buf == NULL) {
         return NULL;
+    }
+
+    if (ggml_moe_cache.plan_borrows) {
+        // the whole list is known before the first chunk: let a borrowing type seat it at once
+        size_t sizes[GGML_VBUFFER_MAX_CHUNKS];
+        for (int n = 0; n < talloc->n_chunks; n++) {
+            sizes[n] = talloc->chunks[n]->max_size;
+        }
+        ggml_moe_cache.plan_borrows(buft, sizes, talloc->n_chunks);
     }
 
     for (int n = 0; n < talloc->n_chunks; n++) {

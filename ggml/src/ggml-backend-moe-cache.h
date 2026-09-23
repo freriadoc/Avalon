@@ -155,6 +155,10 @@ struct ggml_moe_cache_api {
     // Buffer type whose allocations come from this session's cache on that backend's
     // device (falling back to a normal allocation), for the scheduler's compute buffers.
     ggml_backend_buffer_type_t (*compute_buffer_type)(void * session, void * backend);
+
+    // ggml-alloc announces every chunk it is about to allocate from 'buft', before the
+    // first one, so that the provider can seat them all at once. Other types are ignored.
+    void (*plan_borrows)(ggml_backend_buffer_type_t buft, const size_t * sizes, int n_sizes);
 };
 
 GGML_API struct ggml_moe_cache_api ggml_moe_cache;

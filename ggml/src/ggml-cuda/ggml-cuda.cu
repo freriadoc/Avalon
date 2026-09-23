@@ -1061,6 +1061,17 @@ ggml_backend_buffer_type_t ggml_backend_cuda_borrowed_buffer_type(
     return type;
 }
 
+bool ggml_backend_cuda_borrowed_buffer_type_source(
+        ggml_backend_buffer_type_t buft, void ** session, ggml_backend_t * backend) {
+    if (!buft || buft->iface.alloc_buffer != ggml_backend_cuda_borrowed_buffer_type_alloc_buffer) {
+        return false;
+    }
+    const auto * ctx = (const ggml_backend_cuda_borrowed_buffer_type_context *)buft->context;
+    *session = ctx->session;
+    *backend = ctx->backend;
+    return true;
+}
+
 // Communication context for multi-GPU AllReduce during tensor parallelism.
 //
 // Created once per meta backend instance.  Resources for the selected mode
