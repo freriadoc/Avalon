@@ -1076,11 +1076,16 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
         }
     }
 
+    // a failed reservation leaves the assignments of its graph without a buffer
+    for (int i = 0; i < galloc->n_buffers; i++) {
+        if (galloc->buffers[i] == NULL) {
+            return false;
+        }
+    }
+
     // reset buffers
     for (int i = 0; i < galloc->n_buffers; i++) {
-        if (galloc->buffers[i] != NULL) {
-            ggml_vbuffer_reset(galloc->buffers[i]);
-        }
+        ggml_vbuffer_reset(galloc->buffers[i]);
     }
 
     // allocate the graph tensors from the previous assignments

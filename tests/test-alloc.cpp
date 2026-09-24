@@ -16,6 +16,7 @@ uint8_t * const alloc_base = (uint8_t *) 16;
 struct dummy_backend_context {
     size_t max_buffer_size = 64;
     size_t alignment       = 8;
+    size_t fail_above      = SIZE_MAX;  // buffers larger than this fail to allocate
 
     ggml_backend_buffer_i              buffer_interface;
     ggml_backend_device                device;
@@ -42,6 +43,9 @@ static const char * dummy_backend_buffer_type_get_name(ggml_backend_buffer_type_
 
 static ggml_backend_buffer_t dummy_backend_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     dummy_backend_context * ctx    = (dummy_backend_context *) buft->context;
+    if (size > ctx->fail_above) {
+        return nullptr;
+    }
     ggml_backend_buffer_t & buffer = ctx->buffers.emplace_back();
     buffer                         = ggml_backend_buffer_init(buft, ctx->buffer_interface, ctx, size);
     return buffer;
@@ -1099,6 +1103,46 @@ static void test_buft_get_alloc_size_n_does_not_allocate() {
     GGML_ASSERT(x[1]->data == nullptr);
 }
 
+// a graph that needs a larger buffer than the device can give: the scheduler must report
+// the failure (not crash on the missing buffer), and a graph that fits must work again
+static ggml_tensor * build_chain(test_context_with_graph & c, size_t size_bytes) {
+    ggml_tensor * x = make_input_with_size(c.ctx, size_bytes);
+    ggml_tensor * y = ggml_scale(c.ctx, x, 2.0f);
+    ggml_tensor * z = ggml_scale(c.ctx, y, 2.0f);
+    ggml_set_output(z);
+    ggml_build_forward_expand(c.graph, z);
+    return z;
+}
+
+static void test_sched_realloc_failure() {
+    dummy_backend backend = dummy_backend_init(SIZE_MAX);
+    backend.context->fail_above = 256;
+
+    ggml_backend_t             backend_ptr = &backend.context->backend;
+    ggml_backend_buffer_type_t buft        = &backend.buffer_type;
+    ggml_backend_sched_ptr     sched(ggml_backend_sched_new(&backend_ptr, &buft, 1, 8, false, true));
+
+    {
+        auto c = make_context();
+        build_chain(c, 32);
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), c.graph));
+        check_all_allocated(c.graph);
+    }
+    ggml_backend_sched_reset(sched.get());
+    {
+        auto c = make_context();
+        build_chain(c, 1024);
+        GGML_ASSERT(!ggml_backend_sched_alloc_graph(sched.get(), c.graph));
+    }
+    ggml_backend_sched_reset(sched.get());
+    {
+        auto c = make_context();
+        build_chain(c, 32);
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), c.graph));
+        check_all_allocated(c.graph);
+    }
+}
+
 static void run(const char * name, void (*f)()) {
     printf("%s ", name);
     fflush(stdout);
@@ -1139,5 +1183,6 @@ int main() {
     run("test_buft_get_alloc_size_n_custom_override", test_buft_get_alloc_size_n_custom_override);
     run("test_buft_get_alloc_size_n_custom_override_ctx_size", test_buft_get_alloc_size_n_custom_override_ctx_size);
     run("test_buft_get_alloc_size_n_does_not_allocate", test_buft_get_alloc_size_n_does_not_allocate);
+    run("test_sched_realloc_failure", test_sched_realloc_failure);
     return 0;
 }
