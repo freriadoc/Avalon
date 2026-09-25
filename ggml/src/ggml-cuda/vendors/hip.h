@@ -5,6 +5,7 @@
 #include <hipblas/hipblas.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_bf16.h>
+#include "hip-runtime.h"
 
 #ifdef GGML_USE_NCCL
 #include <rccl/rccl.h>
@@ -91,8 +92,11 @@
 #define cudaMallocHost(ptr, size) hipHostMalloc(ptr, size, hipHostMallocDefault)
 #define cudaMallocManaged hipMallocManaged
 #define cudaMemAdvise hipMemAdvise
-#define cudaMemcpy hipMemcpy
-#define cudaMemcpyAsync hipMemcpyAsync
+// Pageable host -> device copies go through a pinned ring (ggml_hip_copy[_async], 8 x 16 MiB by
+// default, GGML_HIP_COPY_RING=0 for direct copies): ROCm never locks mmap pages and the pinned
+// memory is bounded (see hip-runtime.h).
+#define cudaMemcpy ggml_hip_copy
+#define cudaMemcpyAsync ggml_hip_copy_async
 #define cudaMemcpyPeerAsync hipMemcpyPeerAsync
 #define cudaMemcpy2DAsync hipMemcpy2DAsync
 #define cudaMemcpyDeviceToDevice hipMemcpyDeviceToDevice
