@@ -220,6 +220,20 @@ static int ggml_cuda_parse_id(char devName[]) {
 }
 #endif // defined(GGML_USE_HIP)
 
+#if defined(GGML_USE_HIP)
+// ROCm gives a process 4 hardware queues per device by default and maps further streams onto
+// them round-robin: two streams on one queue run one after the other. With a second context
+// (an MTP sidecar), the expert prefetch stream landed on the queue of the target's compute
+// stream and the uploads stopped overlapping the compute (45% -> 5% of the copy time under a
+// kernel, prefill -20%). One process drives up to 8 streams at once (target compute and
+// prefetch, draft compute, MoE cache fills and zone moves, VBR transcodes, null stream,
+// auxiliaries): 8 queues give each its own. Set at library load, before the HIP runtime reads
+// its settings on its first call; an explicit GPU_MAX_HW_QUEUES is kept.
+__attribute__((constructor)) static void ggml_hip_set_hw_queues() {
+    setenv("GPU_MAX_HW_QUEUES", "8", /*overwrite =*/ 0);
+}
+#endif
+
 static ggml_cuda_device_info ggml_cuda_init() {
     ggml_cuda_device_info info = {};
 
