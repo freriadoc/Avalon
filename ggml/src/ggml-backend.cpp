@@ -999,6 +999,9 @@ struct ggml_backend_sched {
 
     ggml_backend_t backends[GGML_SCHED_MAX_BACKENDS];
     ggml_backend_buffer_type_t bufts[GGML_SCHED_MAX_BACKENDS];
+    // the buffer types given at creation; bufts replaces them with borrowed ones while a
+    // MoE cache session lends the compute buffers
+    ggml_backend_buffer_type_t bufts_plain[GGML_SCHED_MAX_BACKENDS];
     ggml_gallocr_t galloc;
 
     // hash map of the nodes in the graph
@@ -2334,6 +2337,10 @@ static void ggml_backend_sched_use_borrowed_compute(ggml_backend_sched_t sched) 
         const char * text = getenv("GGML_SCHED_BORROW_COMPUTE");
         return text && text[0] && text[0] != '0';
     }();
+    // a borrowed type points at the session: without one, back to the plain types
+    for (int b = 0; b < sched->n_backends; b++) {
+        sched->bufts[b] = sched->bufts_plain[b];
+    }
     if (!enabled || !sched->moe_cache_session || !ggml_moe_cache.compute_buffer_type) {
         return;
     }
@@ -2401,6 +2408,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
     for (int b = 0; b < n_backends; b++) {
         sched->backends[b] = backends[b];
         sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
+        sched->bufts_plain[b] = sched->bufts[b];
         GGML_ASSERT(ggml_backend_supports_buft(backends[b], sched->bufts[b]));
 
         if (sched->n_copies > 1) {
@@ -2446,12 +2454,23 @@ void ggml_backend_sched_set_moe_cache(
         return;
     }
 
+    // the session changes: the compute buffer types may point at it and the allocator holds
+    // them, so both are rebuilt on every path below; buffers borrowed from the old session
+    // go back to it before it is destroyed (this runs before any graph is reserved)
+    ggml_gallocr_free(sched->galloc);
+    sched->galloc = NULL;
     if (sched->moe_cache_session && ggml_moe_cache.session_destroy) {
         ggml_moe_cache.session_destroy(sched->moe_cache_session);
     }
     sched->moe_cache_session = nullptr;
+
+    auto rebuild_bufts = [sched]() {
+        ggml_backend_sched_use_borrowed_compute(sched);
+        sched->galloc = ggml_gallocr_new_n(sched->bufts, sched->n_backends);
+    };
     if (mode == GGML_MOE_CACHE_MODE_OFF ||
         !ggml_moe_cache.query_config || !ggml_moe_cache.session_create) {
+        rebuild_bufts();
         return;
     }
 
@@ -2459,6 +2478,7 @@ void ggml_backend_sched_set_moe_cache(
     const int automatic = mode == GGML_MOE_CACHE_MODE_UNSPECIFIED ? -1 :
         mode == GGML_MOE_CACHE_MODE_AUTO ? 1 : 0;
     if (!ggml_moe_cache.query_config(automatic, budget_mib, &config)) {
+        rebuild_bufts();
         return;
     }
     if (mode != GGML_MOE_CACHE_MODE_UNSPECIFIED) {
@@ -2473,12 +2493,7 @@ void ggml_backend_sched_set_moe_cache(
     }
     sched->moe_cache_session = ggml_moe_cache.session_create(
             cache_backends, sched->n_backends, &config);
-
-    // the session changed: the compute buffer types point at it, and the allocator holds
-    // them, so both are rebuilt here (this runs before any graph is reserved)
-    ggml_backend_sched_use_borrowed_compute(sched);
-    ggml_gallocr_free(sched->galloc);
-    sched->galloc = ggml_gallocr_new_n(sched->bufts, sched->n_backends);
+    rebuild_bufts();
 }
 
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
@@ -2486,6 +2501,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         return;
     }
     ggml_backend_sched_prefetch_restore(sched);
+    // the compute buffers may be borrowed from the cache: give them back while the
+    // session still exists
+    ggml_gallocr_free(sched->galloc);
+    sched->galloc = NULL;
     if (sched->moe_cache_session && ggml_moe_cache.session_destroy) {
         ggml_moe_cache.session_destroy(sched->moe_cache_session);
         sched->moe_cache_session = NULL;
@@ -2505,7 +2524,6 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         }
         ggml_backend_free(sched->prefetch_backend);
     }
-    ggml_gallocr_free(sched->galloc);
     ggml_free(sched->ctx);
     ggml_hash_set_free(&sched->hash_set);
     for (int i = 0; i < sched->splits_capacity; i++) {
