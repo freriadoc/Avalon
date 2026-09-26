@@ -389,6 +389,7 @@ struct moe_cache_session {
     bool lent_in_last_graph = false;
     bool lent_since_evictions = false;
     size_t lend_bytes = 0;   // size of one prefetch zone, set by the scheduler
+    int lend_zones = 2;      // prefetch slots the scheduler wants, one zone per pool
     std::vector<std::unique_ptr<moe_cache_device>> devices;
     std::unordered_map<int, int> layer_devices;
     std::unordered_map<const void *, int> tensor_devices;
@@ -1924,7 +1925,7 @@ static bool moe_cache_allocate_pool(
 }
 
 static size_t moe_cache_zone_bytes(const moe_cache_session & session);
-static void moe_cache_setup_zone(moe_cache_device & device, size_t zone_bytes);
+static void moe_cache_setup_zone(moe_cache_device & device, size_t zone_bytes, int n_zones);
 static void moe_cache_attach_test_region(moe_cache_device & device);
 
 static void moe_cache_build_pending(
@@ -2005,7 +2006,7 @@ static void moe_cache_build_pending(
         }
     }
 
-    moe_cache_setup_zone(device, moe_cache_zone_bytes(session));
+    moe_cache_setup_zone(device, moe_cache_zone_bytes(session), session.lend_zones);
     moe_cache_attach_test_region(device);
 }
 
@@ -4745,17 +4746,17 @@ static size_t moe_cache_zone_bytes(const moe_cache_session & session) {
     return env_bytes;
 }
 
-// Mark the tail of the first two eligible pools as lendable: one prefetch slot each,
+// Mark the tail of the first n_zones eligible pools as lendable: one prefetch slot each,
 // so that a prefill evicts a little of every expert type rather than a lot of one.
 // Nothing else changes: until lent, the zone is ordinary cache.
-static void moe_cache_setup_zone(moe_cache_device & device, size_t zone_bytes) {
-    if (!zone_bytes) {
+static void moe_cache_setup_zone(moe_cache_device & device, size_t zone_bytes, int n_zones) {
+    if (!zone_bytes || n_zones <= 0) {
         return;
     }
     int equipped = 0;
     for (auto & pool_ptr : device.pools) {
         moe_cache_pool & pool = *pool_ptr;
-        if (equipped >= 2) {
+        if (equipped >= n_zones) {
             break;
         }
         if (moe_cache_pool_has_zone(pool)) {
@@ -4777,9 +4778,10 @@ static void moe_cache_setup_zone(moe_cache_device & device, size_t zone_bytes) {
                 device.physical, ggml_type_name((ggml_type)pool.wtype), zone_slots,
                 region0, (zone_slots * pool.expert_size) >> 20, pool.zone_begin);
     }
-    if (equipped < 2) {
-        MOE_CACHE_LOG("[moe-cache] CUDA%d zone: only %d of 2 prefetch slots reserved, "
-                "the prefetch will not borrow\n", device.physical, equipped);
+    if (equipped < n_zones) {
+        MOE_CACHE_LOG("[moe-cache] CUDA%d zone: only %d of %d prefetch slots reserved%s\n",
+                device.physical, equipped, n_zones,
+                equipped < 2 ? ", the prefetch will not borrow" : "");
     }
 }
 
@@ -5034,29 +5036,31 @@ static moe_cache_device * moe_cache_device_for_backend(
     return nullptr;
 }
 
-static void moe_cache_set_lend_size(void * opaque, size_t bytes) {
+static void moe_cache_set_lend_size(void * opaque, size_t bytes, int n_zones) {
     moe_cache_session * session = (moe_cache_session *)opaque;
     if (!session) {
         return;
     }
     std::lock_guard<std::mutex> lock(session->mu);
-    if (session->lend_bytes == bytes) {
+    if (session->lend_bytes == bytes && session->lend_zones == n_zones) {
         return;
     }
     session->lend_bytes = bytes;
+    session->lend_zones = n_zones;
     // pools created before the size was known get their zone now (idempotent)
     for (auto & device_ptr : session->devices) {
         if (device_ptr->budget_ready && !device_ptr->dead.load()) {
-            moe_cache_setup_zone(*device_ptr, bytes);
+            moe_cache_setup_zone(*device_ptr, bytes, n_zones);
         }
     }
 }
 
-// Lend n_zones zones of at least 'bytes' on the device of 'backend'. All or nothing:
-// returns n_zones and fills 'zones', or returns 0 and lends nothing.
+// Lend up to n_zones zones of at least 'bytes' on the device of 'backend', one per pool.
+// Returns the number lent and fills 'zones', or 0 and lends nothing when fewer than two
+// zones are available (the prefetch needs two slots to overlap copies and compute).
 static int moe_cache_lend(void * opaque, void * backend, size_t bytes, void ** zones, int n_zones) {
     moe_cache_session * session = (moe_cache_session *)opaque;
-    if (!session || !zones || n_zones <= 0 || n_zones > 2) {
+    if (!session || !zones || n_zones <= 0) {
         return 0;
     }
     moe_cache_device * device = moe_cache_device_for_backend(*session, backend);
@@ -5081,7 +5085,7 @@ static int moe_cache_lend(void * opaque, void * backend, size_t bytes, void ** z
             }
         }
     }
-    if ((int)chosen.size() < n_zones) {
+    if (chosen.size() < 2) {
         return 0;
     }
 
@@ -5112,7 +5116,7 @@ static int moe_cache_lend(void * opaque, void * backend, size_t bytes, void ** z
     }
 
     const auto t0 = std::chrono::steady_clock::now();
-    std::vector<int> moved[2];
+    std::vector<std::vector<int>> moved(chosen.size());
     for (size_t i = 0; i < chosen.size(); i++) {
         moe_cache_evacuate(*device, *chosen[i], chosen[i]->zone_begin, chosen[i]->zone_end, moved[i]);
     }
@@ -5147,7 +5151,7 @@ static int moe_cache_lend(void * opaque, void * backend, size_t bytes, void ** z
             }
         }
     }
-    return n_zones;
+    return (int)chosen.size();
 }
 
 

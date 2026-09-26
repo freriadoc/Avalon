@@ -343,6 +343,23 @@ int main() {
         printf("\nE. burst 2 served against the plan of burst 1: %d refused (online rule fallback)\n", refused);
     }
 
+    // F. pools of 26 Sept. (reserve 2304), three prefetch slots: one 450 MiB zone per pool
+    {
+        printf("\nF. 26 Sept. pools, zones on 2 then 3 pools\n");
+        for (int n_zones = 2; n_zones <= 3; n_zones++) {
+            std::vector<pool_t> pools = {
+                {"iq4_nl", 900 * KiB, 6491, 6491 - 513, {}, INT_MAX},
+                {"iq2_s",  512 * KiB, 9706, 9706 - 900, {}, INT_MAX},
+                {"iq3_s",  687 * KiB, 3278, n_zones == 3 ? 3278 - 671 : INT_MAX, {}, INT_MAX},
+            };
+            int r = serve(pools, BURST1, true);
+            for (pool_t & p : pools) give_back_all(p);
+            r += serve(pools, BURST2, true);
+            printf("  %d zones: refused %d, loads", n_zones, r); print_loads(pools);
+            if (r) { printf("  ERROR: the plan refused a block\n"); errors++; }
+        }
+    }
+
     printf("\nerrors=%d\n", errors);
     return errors != 0;
 }

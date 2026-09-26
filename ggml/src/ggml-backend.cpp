@@ -1986,14 +1986,15 @@ static bool ggml_backend_sched_prefetch_init(ggml_backend_sched_t sched, ggml_ba
         if (sched->prefetch_lent) {
             return true;
         }
-        ggml_moe_cache.set_lend_size(sched->moe_cache_session, size);
-        if (sched->prefetch_n_slots > 2) {
-            sched->prefetch_n_slots = 2;   // the cache lends at most two zones
-            sched->prefetch_cur = 0;
-        }
+        ggml_moe_cache.set_lend_size(sched->moe_cache_session, size, sched->prefetch_n_slots);
         void * zones[GGML_SCHED_MAX_PREFETCH_SLOTS] = {};
-        if (ggml_moe_cache.lend(sched->moe_cache_session, split_backend, size,
-                zones, sched->prefetch_n_slots) == sched->prefetch_n_slots) {
+        const int n_lent = ggml_moe_cache.lend(sched->moe_cache_session, split_backend, size,
+                zones, sched->prefetch_n_slots);
+        if (n_lent > 0) {
+            if (n_lent < sched->prefetch_n_slots) {
+                sched->prefetch_n_slots = n_lent;   // one zone per pool: fewer pools than slots
+                sched->prefetch_cur = 0;
+            }
             for (int i = 0; i < sched->prefetch_n_slots; i++) {
                 sched->prefetch_slot_data[i] = zones[i];
             }
@@ -2632,7 +2633,7 @@ static void ggml_backend_sched_prime_moe_cache(ggml_backend_sched_t sched, struc
     }
 
     if (sched->prefetch_experts && slot_bytes && ggml_moe_cache.set_lend_size) {
-        ggml_moe_cache.set_lend_size(sched->moe_cache_session, slot_bytes);
+        ggml_moe_cache.set_lend_size(sched->moe_cache_session, slot_bytes, sched->prefetch_n_slots);
     }
 
     int accepted[2] = {0, 0};

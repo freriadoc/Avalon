@@ -135,13 +135,14 @@ struct ggml_moe_cache_api {
     void (*invalidate)(const void * base, size_t size);
 
     // Expert prefetch support. set_lend_size states the size of one prefetch slot (the
-    // largest offloaded expert tensor, padded); the provider keeps that much room at the
-    // tail of its largest pools. lend empties n_zones such zones on the device of
-    // 'backend' and returns n_zones with their addresses, or 0 without lending anything
-    // (for instance before the cache has created its pools). restore gives every lent
-    // zone of that device back. Both are called between graphs, never concurrently
-    // with plan/dispatch on the same session.
-    void (*set_lend_size)(void * session, size_t bytes);
+    // largest offloaded expert tensor, padded) and how many slots the prefetch wants; the
+    // provider keeps that much room at the tail of as many pools, one slot per pool. lend
+    // empties up to n_zones such zones on the device of 'backend' and returns how many it
+    // lent with their addresses (at least two), or 0 without lending anything (for
+    // instance before the cache has created its pools). restore gives every lent zone of
+    // that device back. Both are called between graphs, never concurrently with
+    // plan/dispatch on the same session.
+    void (*set_lend_size)(void * session, size_t bytes, int n_zones);
     int  (*lend)(void * session, void * backend, size_t bytes, void ** zones, int n_zones);
     void (*restore)(void * session, void * backend);
 
