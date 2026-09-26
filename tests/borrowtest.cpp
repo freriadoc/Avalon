@@ -455,5 +455,6 @@ int main(int argc, char ** argv) {
     while (!held.empty()) { give_back(pool, held.back()); held.pop_back(); }
     errors += check(pool, "final");
     printf("moves=%lld evictions=%lld errors=%d\n", dev.zone_moves, dev.zone_evictions, errors);
+    free(arena);
     return errors != 0;
 }

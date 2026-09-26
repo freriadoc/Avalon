@@ -438,5 +438,6 @@ int main(int argc, char ** argv) {
         errors += check(pool, "restored");
     }
     printf("moves=%lld evictions=%lld errors=%d\n", dev.zone_moves, dev.zone_evictions, errors);
+    free(arena);
     return errors != 0;
 }
