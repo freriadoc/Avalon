@@ -3,6 +3,7 @@
 #include "llama.h"
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #define LLAMA_MAX_SEQ 256
@@ -20,6 +21,12 @@ struct llama_cparams {
     int32_t  n_threads_batch; // number of threads to use for batch processing
 
     int32_t  nextn_layer_offset = 0;
+
+    enum llama_moe_cache_mode moe_cache_mode;
+    size_t moe_cache_budget_mib;
+    int32_t moe_cache_expert_parallel;
+    int32_t moe_cache_cpu_overlap;
+    std::string moe_cache_profile_path;
 
     float rope_freq_base;
     float rope_freq_scale;
