@@ -36,6 +36,7 @@
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
+#include "ggml-cuda/qwen4-hc.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
@@ -3673,6 +3674,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             fusion.shared_dst = shared;
             ggml_cuda_mul_mat_vec_q(*cuda_ctx, up->src[0], up->src[1], up->src[2], routed, &fusion);
             return 5;
+        }
+    }
+
+    if (node->op == GGML_OP_SCALE || node->op == GGML_OP_MUL_MAT) {
+        const int skip = ggml_cuda_try_fuse_qwen4_hc(*cuda_ctx, cgraph, i,
+            [](const ggml_cgraph * g, int idx, int count, const int * outs, int n_outs) {
+                return ggml_cuda_check_fusion_memory_ranges(g, idx, count, outs, n_outs);
+            });
+        if (skip > 0) {
+            return skip;
         }
     }
 

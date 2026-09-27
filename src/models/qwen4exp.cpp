@@ -329,6 +329,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
     cb(xn, "hc_norm", il);
 
+    // the scatter weights read the same normalized streams as the low-rank gate: build them here,
+    // next to it, rather than where the combine consumes them
+    if (inject) {
+        *inject = build_lora_mm(w_inject, xn);
+        cb(*inject, "hc_inject", il);
+        ggml_build_forward_expand(gf, *inject);
+    }
+
     ggml_tensor * lo = build_lora_mm(w_down, xn);
     lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
     ggml_tensor * gate = build_lora_mm(w_up, lo);
@@ -358,11 +366,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         mixed = ggml_scale(ctx0, mixed, 1.0f / (float) hc);
     }
     cb(mixed, "hc_mixed", il);
-
-    if (inject) {
-        *inject = build_lora_mm(w_inject, xn);
-        cb(*inject, "hc_inject", il);
-    }
 
     return mixed;
 }
