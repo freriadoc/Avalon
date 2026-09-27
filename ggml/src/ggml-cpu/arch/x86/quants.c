@@ -3407,15 +3407,10 @@ void ggml_vec_dot_iq3_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
     const __m256i mask1 = _mm256_loadu_si256((const __m256i*)k_mask1);
     const __m256i mask2 = _mm256_loadu_si256((const __m256i*)k_mask2);
 
-    const __m256i idx_shift = _mm256_set_epi32(1, 2, 3, 4, 5, 6, 7, 8);
-    const __m256i idx_mask  = _mm256_set1_epi32(256);
-
-    typedef union {
-        __m256i  vec[2];
-        uint32_t index[16];
-    } index_t;
-
-    index_t idx;
+    // grid entry of weight group k (4 weights) of a 32-weight block: 8 bits in qs, bit k of qh.
+    // The indices are built in scalar registers: going through a vector and a union costs a
+    // wide store read back by narrow loads, ~25 % of the kernel on Zen 2.
+#define IQ3S_GRID(qs, qh, k) iq3s_grid[(qs)[k] | ((((uint32_t) (qh)) << (8 - (k))) & 256)]
 
     __m256 accumf = _mm256_setzero_ps();
     for (int i = 0; i < nb; ++i) {
@@ -3429,25 +3424,15 @@ void ggml_vec_dot_iq3_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
         for (int ib32 = 0; ib32 < QK_K/32; ib32 += 2) {
             const __m256i q8_1 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
             const __m256i q8_2 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
-            const __m256i idx_l = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)qs)); qs += 16;
-            idx.vec[0] = _mm256_set1_epi32(qh[ib32+0]);
-            idx.vec[1] = _mm256_set1_epi32(qh[ib32+1]);
-            idx.vec[0] = _mm256_and_si256(_mm256_sllv_epi32(idx.vec[0], idx_shift), idx_mask);
-            idx.vec[1] = _mm256_and_si256(_mm256_sllv_epi32(idx.vec[1], idx_shift), idx_mask);
-            idx.vec[0] = _mm256_or_si256(idx.vec[0], _mm256_cvtepi16_epi32(_mm256_castsi256_si128(idx_l)));
-            idx.vec[1] = _mm256_or_si256(idx.vec[1], _mm256_cvtepi16_epi32(_mm256_extractf128_si256(idx_l, 1)));
-
-            // At leat on my CPU (Ryzen 7950X), using _mm256_i32gather_epi32 is slower than _mm256_set_epi32. Strange.
-            //const __m256i q2_1 = _mm256_i32gather_epi32((const int *)iq3s_grid, idx.vec[0], 4);
-            //const __m256i q2_2 = _mm256_i32gather_epi32((const int *)iq3s_grid, idx.vec[1], 4);
+            // _mm256_i32gather_epi32 is slower than _mm256_set_epi32 (Ryzen 7950X, and ~20 % on a 3800XT)
+            const uint32_t h0 = qh[ib32+0], h1 = qh[ib32+1];
             const __m256i q2_1 = _mm256_set_epi32(
-                    iq3s_grid[idx.index[7]], iq3s_grid[idx.index[6]], iq3s_grid[idx.index[5]], iq3s_grid[idx.index[4]],
-                    iq3s_grid[idx.index[3]], iq3s_grid[idx.index[2]], iq3s_grid[idx.index[1]], iq3s_grid[idx.index[0]]
-            );
+                    IQ3S_GRID(qs,   h0, 7), IQ3S_GRID(qs,   h0, 6), IQ3S_GRID(qs,   h0, 5), IQ3S_GRID(qs,   h0, 4),
+                    IQ3S_GRID(qs,   h0, 3), IQ3S_GRID(qs,   h0, 2), IQ3S_GRID(qs,   h0, 1), IQ3S_GRID(qs,   h0, 0));
             const __m256i q2_2 = _mm256_set_epi32(
-                    iq3s_grid[idx.index[15]], iq3s_grid[idx.index[14]], iq3s_grid[idx.index[13]], iq3s_grid[idx.index[12]],
-                    iq3s_grid[idx.index[11]], iq3s_grid[idx.index[10]], iq3s_grid[idx.index[ 9]], iq3s_grid[idx.index[ 8]]
-            );
+                    IQ3S_GRID(qs+8, h1, 7), IQ3S_GRID(qs+8, h1, 6), IQ3S_GRID(qs+8, h1, 5), IQ3S_GRID(qs+8, h1, 4),
+                    IQ3S_GRID(qs+8, h1, 3), IQ3S_GRID(qs+8, h1, 2), IQ3S_GRID(qs+8, h1, 1), IQ3S_GRID(qs+8, h1, 0));
+            qs += 16;
 
             __m256i aux256 = _mm256_set1_epi32(signs[0] | (signs[1] << 16));
             aux256 = _mm256_and_si256(_mm256_shuffle_epi8(aux256,mask1), mask2);
@@ -3476,6 +3461,7 @@ void ggml_vec_dot_iq3_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
     }
 
     *s = hsum_float_8(accumf);
+#undef IQ3S_GRID
 
 #elif defined(__AVX__)
    static const uint8_t k_mask1[32] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
