@@ -199,4 +199,33 @@ static void dot_v5(int n, float * s, const block_iq3_s * x, const block_q8_K * y
     *s = hsum_float_8(accumf);
 }
 
-#define VARIANTS { "v1-scal", dot_v1 }, { "v2-pair64", dot_v2 }, { "v3-store", dot_v3 }, { "v4-gather", dot_v4 }, { "v5-2blocks", dot_v5 }
+// V6: V1 with every grid index pinned to an integer register (see iq2sbench.cpp W5)
+static inline uint32_t iq3s_pin(uint32_t v) { __asm__("" : "+r"(v)); return v; }
+#define IQ3S_GP(qs, qh, k) iq3s_grid[iq3s_pin((qs)[k] | ((((uint32_t) (qh)) << (8 - (k))) & 256))]
+static void dot_v6(int n, float * s, const block_iq3_s * x, const block_q8_K * y) {
+    IQ3S_HEAD
+    for (int i = 0; i < nb; ++i) {
+        const float d = fp16_to_fp32(x[i].d) * y[i].d;
+        const uint8_t * qs = x[i].qs;
+        const uint8_t * qh = x[i].qh;
+        const uint16_t * signs = (const uint16_t *)x[i].signs;
+        const int8_t  * q8 = y[i].qs;
+        __m256i sumi1 = _mm256_setzero_si256();
+        __m256i sumi2 = _mm256_setzero_si256();
+        for (int ib32 = 0; ib32 < QK_K/32; ib32 += 2) {
+            const __m256i q8_1 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+            const __m256i q8_2 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+            const uint32_t h0 = qh[ib32+0], h1 = qh[ib32+1];
+            const __m256i q2_1 = _mm256_set_epi32(IQ3S_GP(qs, h0, 7), IQ3S_GP(qs, h0, 6), IQ3S_GP(qs, h0, 5), IQ3S_GP(qs, h0, 4),
+                                                  IQ3S_GP(qs, h0, 3), IQ3S_GP(qs, h0, 2), IQ3S_GP(qs, h0, 1), IQ3S_GP(qs, h0, 0));
+            const __m256i q2_2 = _mm256_set_epi32(IQ3S_GP(qs+8, h1, 7), IQ3S_GP(qs+8, h1, 6), IQ3S_GP(qs+8, h1, 5), IQ3S_GP(qs+8, h1, 4),
+                                                  IQ3S_GP(qs+8, h1, 3), IQ3S_GP(qs+8, h1, 2), IQ3S_GP(qs+8, h1, 1), IQ3S_GP(qs+8, h1, 0));
+            qs += 16;
+            IQ3S_TAIL
+        }
+        accumf = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1, sumi2)), accumf);
+    }
+    *s = hsum_float_8(accumf);
+}
+
+#define VARIANTS { "v1-scal", dot_v1 }, { "v2-pair64", dot_v2 }, { "v3-store", dot_v3 }, { "v4-gather", dot_v4 }, { "v5-2blocks", dot_v5 }, { "v6-pin", dot_v6 }

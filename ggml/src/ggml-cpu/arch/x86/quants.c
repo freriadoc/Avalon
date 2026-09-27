@@ -3072,6 +3072,15 @@ void ggml_vec_dot_iq2_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
 #endif
 }
 
+// keeps a value in an integer register: stops clang from building the IQ2_S grid indices in a
+// vector and extracting them one by one (see ggml_vec_dot_iq2_s_q8_K)
+static inline uint32_t ggml_iq2s_pin_index(uint32_t v) {
+#if defined(__GNUC__)
+    __asm__("" : "+r"(v));
+#endif
+    return v;
+}
+
 void ggml_vec_dot_iq2_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(n % QK_K == 0);
     assert(nrc == 1);
@@ -3103,6 +3112,11 @@ void ggml_vec_dot_iq2_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
     uint64_t aux64;
 
+    // Each grid index is pinned to an integer register and the block loop is unrolled: clang
+    // otherwise builds the indices in a vector and extracts them with vpextrw (2 uops each on
+    // Zen 2), ~11 % of the kernel; gcc already emits scalar indices and is unchanged.
+#define IQ2S_GRID(qs, h, k) iq2s_grid[ggml_iq2s_pin_index((qs)[k] | ((((uint32_t) (h)) << (8 - 2*(k))) & 0x300))]
+
     __m256 accumf = _mm256_setzero_ps();
     for (int i = 0; i < nb; ++i) {
         const float d = GGML_CPU_FP16_TO_FP32(x[i].d) * y[i].d;
@@ -3117,17 +3131,15 @@ void ggml_vec_dot_iq2_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
         __m256i sumi1 = _mm256_setzero_si256();
         __m256i sumi2 = _mm256_setzero_si256();
+#pragma GCC unroll 4
         for (int ib32 = 0; ib32 < QK_K/32; ib32 += 2) {
             const __m256i q8_1 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
             const __m256i q8_2 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
-            const __m256i q2_1 = _mm256_set_epi64x(iq2s_grid[qs[3] | ((qh[ib32+0] << 2) & 0x300)],
-                                                   iq2s_grid[qs[2] | ((qh[ib32+0] << 4) & 0x300)],
-                                                   iq2s_grid[qs[1] | ((qh[ib32+0] << 6) & 0x300)],
-                                                   iq2s_grid[qs[0] | ((qh[ib32+0] << 8) & 0x300)]);
-            const __m256i q2_2 = _mm256_set_epi64x(iq2s_grid[qs[7] | ((qh[ib32+1] << 2) & 0x300)],
-                                                   iq2s_grid[qs[6] | ((qh[ib32+1] << 4) & 0x300)],
-                                                   iq2s_grid[qs[5] | ((qh[ib32+1] << 6) & 0x300)],
-                                                   iq2s_grid[qs[4] | ((qh[ib32+1] << 8) & 0x300)]);
+            const uint32_t h0 = qh[ib32+0], h1 = qh[ib32+1];
+            const __m256i q2_1 = _mm256_set_epi64x(IQ2S_GRID(qs,   h0, 3), IQ2S_GRID(qs,   h0, 2),
+                                                   IQ2S_GRID(qs,   h0, 1), IQ2S_GRID(qs,   h0, 0));
+            const __m256i q2_2 = _mm256_set_epi64x(IQ2S_GRID(qs+4, h1, 3), IQ2S_GRID(qs+4, h1, 2),
+                                                   IQ2S_GRID(qs+4, h1, 1), IQ2S_GRID(qs+4, h1, 0));
             qs += 8;
 
             __m256i aux256 = _mm256_set1_epi32(signs[0] | ((uint32_t) signs[1] << 16));
@@ -3156,6 +3168,7 @@ void ggml_vec_dot_iq2_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
     }
 
     *s = 0.125f * hsum_float_8(accumf);
+#undef IQ2S_GRID
 
 #elif defined(__AVX__)
    static const uint8_t k_mask1[32] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
