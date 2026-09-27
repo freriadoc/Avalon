@@ -7,8 +7,12 @@
 #include <cstdlib>
 #include <cstring>
 
-// Pinned ring for pageable host -> device copies (GGML_HIP_COPY_RING=N,MIB, default 8,16;
-// GGML_HIP_COPY_RING=0 or GGML_CUDA_NO_PINNED: direct copies, as in upstream).
+// Pinned ring for pageable host -> device copies, off by default (direct copies, as in upstream);
+// GGML_HIP_COPY_RING=N,MIB enables it (8,16 was the measured best), GGML_CUDA_NO_PINNED keeps it off.
+// Off because one host thread both fills the ring and launches the kernels: a DMA held back by a
+// prefetch slot not yet released stalls the launches too (qwen4exp prefill on llama.cpp master:
+// ~865 t/s with the ring, ~940 direct), and past PCIe 3.0 the ring's three passes over RAM and a
+// Zen 2 CCD's write bandwidth (~25.6 GB/s) would cap the link.
 // The source is copied into the next of N pinned buffers of MIB MiB, whose DMA
 // is queued on the stream; a buffer is reused once the event of its previous DMA has completed,
 // so the call returns without waiting for the whole transfer and the source may change as soon
@@ -21,7 +25,7 @@
 // 2 GiB copy bench 13.8-14.0 GB/s against 14.1 direct; prefill 757 t/s against 761 direct at
 // 19k tokens, 518 against 513 at 81k; smaller rings lose 1 to 3 %.
 struct ggml_hip_copy_ring_config {
-    size_t n     = 8;
+    size_t n     = 0;
     size_t bytes = 16u << 20;
     bool   nt    = true;
     ggml_hip_copy_ring_config() {
