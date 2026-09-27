@@ -341,6 +341,7 @@ struct common_params_speculative_draft {
     llama_context * ctx_dft = nullptr;
 
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
+    int32_t n_ubatch     = 0;  // physical batch size of the draft context (0 - the target's)
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
@@ -590,6 +591,8 @@ struct common_params {
     bool ctx_shift         = false; // context shift on infinite text generation
     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
     bool kv_unified        = false; // enable unified KV cache
+    bool defer_reserve     = false; // see llama_context_params.defer_reserve; common_init_from_params
+                                    // then leaves the warmup to common_init_result::warmup()
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool verbose_prompt    = false; // print prompt tokens before generation
@@ -992,6 +995,9 @@ struct common_init_result {
 
     common_sampler * sampler(llama_seq_id seq_id);
     void reset_samplers();
+
+    // the empty decode common_init_from_params runs unless params.defer_reserve
+    void warmup(const common_params & params);
 
     std::vector<llama_adapter_lora_ptr> & lora();
 

@@ -1449,48 +1449,60 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         common_set_adapter_lora(lctx, params.lora_adapters);
     }
 
-    if (params.warmup) {
-        COM_TRC("%s", "warming up the model with an empty run - please wait ... (--no-warmup to disable)\n");
-
-        std::vector<llama_token> tmp;
-        llama_token bos = llama_vocab_bos(vocab);
-        llama_token eos = llama_vocab_eos(vocab);
-
-        // some models (e.g. T5) don't have a BOS token
-        if (bos != LLAMA_TOKEN_NULL) {
-            tmp.push_back(bos);
-        }
-        if (eos != LLAMA_TOKEN_NULL) {
-            tmp.push_back(eos);
-        }
-        if (tmp.empty()) {
-            tmp.push_back(0);
-        }
-
-        if (llama_model_has_encoder(model)) {
-            common_batch batch = common_batch_get_one(lctx, tmp);
-            llama_process(lctx, LLAMA_PROCESS_TYPE_ENCODE, batch.get());
-            llama_token decoder_start_token_id = llama_model_decoder_start_token(model);
-            if (decoder_start_token_id == LLAMA_TOKEN_NULL) {
-                decoder_start_token_id = bos;
-            }
-            tmp.clear();
-            tmp.push_back(decoder_start_token_id);
-        }
-        if (llama_model_has_decoder(model)) {
-            tmp.resize(std::min(tmp.size(), (size_t) params.n_batch));
-            common_batch batch = common_batch_get_one(lctx, tmp);
-            llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
-        }
-        llama_memory_clear(llama_get_memory(lctx), true);
-        llama_synchronize(lctx);
-        llama_perf_context_reset(lctx);
-
-        // reset samplers to reset RNG state after warmup to the seeded state
-        res->reset_samplers();
+    // with a deferred reserve the warmup would reserve now: the caller runs it later
+    if (params.warmup && !params.defer_reserve) {
+        res->warmup(params);
     }
 
     return res;
+}
+
+void common_init_result::warmup(const common_params & params) {
+    llama_context * lctx  = context();
+    llama_model   * model = this->model();
+    if (lctx == nullptr || model == nullptr) {
+        return;
+    }
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+
+    COM_TRC("%s", "warming up the model with an empty run - please wait ... (--no-warmup to disable)\n");
+
+    std::vector<llama_token> tmp;
+    llama_token bos = llama_vocab_bos(vocab);
+    llama_token eos = llama_vocab_eos(vocab);
+
+    // some models (e.g. T5) don't have a BOS token
+    if (bos != LLAMA_TOKEN_NULL) {
+        tmp.push_back(bos);
+    }
+    if (eos != LLAMA_TOKEN_NULL) {
+        tmp.push_back(eos);
+    }
+    if (tmp.empty()) {
+        tmp.push_back(0);
+    }
+
+    if (llama_model_has_encoder(model)) {
+        common_batch batch = common_batch_get_one(lctx, tmp);
+        llama_process(lctx, LLAMA_PROCESS_TYPE_ENCODE, batch.get());
+        llama_token decoder_start_token_id = llama_model_decoder_start_token(model);
+        if (decoder_start_token_id == LLAMA_TOKEN_NULL) {
+            decoder_start_token_id = bos;
+        }
+        tmp.clear();
+        tmp.push_back(decoder_start_token_id);
+    }
+    if (llama_model_has_decoder(model)) {
+        tmp.resize(std::min(tmp.size(), (size_t) params.n_batch));
+        common_batch batch = common_batch_get_one(lctx, tmp);
+        llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+    }
+    llama_memory_clear(llama_get_memory(lctx), true);
+    llama_synchronize(lctx);
+    llama_perf_context_reset(lctx);
+
+    // reset samplers to reset RNG state after warmup to the seeded state
+    reset_samplers();
 }
 
 common_init_result::~common_init_result() = default;
@@ -1695,6 +1707,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
+    cparams.defer_reserve     = params.defer_reserve;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

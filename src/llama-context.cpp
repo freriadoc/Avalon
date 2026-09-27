@@ -468,7 +468,13 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
-        sched_reserve();
+        // deferred: the first decode reserves (sched_need_reserve is still set); the flash
+        // attention check below needs an explicit choice, which auto FA only makes at reserve
+        if (!params.defer_reserve || cparams.auto_fa) {
+            sched_reserve();
+        } else {
+            LLAMA_LOG_INFO("%s: graph reserve deferred to the first decode\n", __func__);
+        }
 
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
@@ -3914,6 +3920,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.defer_reserve               =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,

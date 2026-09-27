@@ -1145,7 +1145,11 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
+        // the draft context is created after the target context: defer the target's graph
+        // reserve, which sizes the MoE cache on the free device memory, until it exists
+        params_base.defer_reserve = has_spec;
         llama_init = common_init_from_params(params_base);
+        params_base.defer_reserve = false;
 
         model_tgt = llama_init->model();
         ctx_tgt   = llama_init->context();
@@ -1204,6 +1208,11 @@ private:
             }
 
             load_progress_callback(1.0f, &load_progress_spec);
+
+            // deferred target reserve: the warmup's reserve sizes the MoE cache on what is left
+            if (params_base.warmup) {
+                llama_init->warmup(params_base);
+            }
         }
 
         if (has_mmproj) {

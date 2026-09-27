@@ -4308,6 +4308,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.devices = parse_device_list(value);
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-draft-ubatch-size", "-ubd", "--ubatch-size-draft"}, "N",
+        string_format("physical batch size of the draft context (default: %d, 0 = the target's -ub); "
+            "the draft compute buffer scales with it", params.speculative.draft.n_ubatch),
+        [](common_params & params, int value) {
+            params.speculative.draft.n_ubatch = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     GGML_ASSERT(params.speculative.draft.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"--spec-draft-ngl", "-ngld", "--gpu-layers-draft", "--n-gpu-layers-draft"}, "N",
