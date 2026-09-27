@@ -168,6 +168,11 @@ GGML_API void ggml_backend_sched_set_moe_cache(
         ggml_backend_sched_t sched, enum ggml_moe_cache_mode mode,
         size_t budget_mib, int expert_parallel, int cpu_overlap, const char * profile_path);
 
+// the cache session outlives a scheduler rebuilt by a new reserve: detach it from the old one
+// (lent zones and borrowed compute buffers go back to it first), attach it to the new one
+GGML_API void * ggml_backend_sched_detach_moe_cache(ggml_backend_sched_t sched);
+GGML_API void   ggml_backend_sched_attach_moe_cache(ggml_backend_sched_t sched, void * session);
+
 #ifdef __cplusplus
 }
 #endif

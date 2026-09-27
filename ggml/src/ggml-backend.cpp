@@ -2497,6 +2497,30 @@ void ggml_backend_sched_set_moe_cache(
     rebuild_bufts();
 }
 
+void * ggml_backend_sched_detach_moe_cache(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    ggml_backend_sched_prefetch_restore(sched);
+    // borrowed compute buffers go back to the session while it is still attached
+    ggml_gallocr_free(sched->galloc);
+    void * session = sched->moe_cache_session;
+    sched->moe_cache_session = nullptr;
+    ggml_backend_sched_use_borrowed_compute(sched);
+    sched->galloc = ggml_gallocr_new_n(sched->bufts, sched->n_backends);
+    return session;
+}
+
+void ggml_backend_sched_attach_moe_cache(ggml_backend_sched_t sched, void * session) {
+    GGML_ASSERT(sched);
+    ggml_gallocr_free(sched->galloc);
+    // the default session of a new scheduler gives way to the kept one
+    if (sched->moe_cache_session && ggml_moe_cache.session_destroy) {
+        ggml_moe_cache.session_destroy(sched->moe_cache_session);
+    }
+    sched->moe_cache_session = session;
+    ggml_backend_sched_use_borrowed_compute(sched);
+    sched->galloc = ggml_gallocr_new_n(sched->bufts, sched->n_backends);
+}
+
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
