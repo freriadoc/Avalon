@@ -93,10 +93,12 @@ static void dot_ref(int n, float * s, const block_iq3_s * x, const block_q8_K * 
 typedef void (*dot_fn)(int, float *, const block_iq3_s *, const block_q8_K *);
 
 int main(int argc, char ** argv) {
-    const int n = 2560, rows = 640, reps = argc > 1 ? atoi(argv[1]) : 200;
+    // argv[2] = number of distinct experts cycled through (default 1: the same expert, hot in the
+    // cache); e.g. 256 experts = 172 MiB, far beyond L3, as when the CPU computes cache misses
+    const int n = 2560, rows = 640, reps = argc > 1 ? atoi(argv[1]) : 200, n_exp = argc > 2 ? atoi(argv[2]) : 1;
     const int nb = n / QK_K;
     std::mt19937 rng(1);
-    std::vector<block_iq3_s> w((size_t) rows * nb);
+    std::vector<block_iq3_s> w((size_t) n_exp * rows * nb);
     for (auto & b : w) {
         uint8_t * p = (uint8_t *) &b;
         for (size_t k = 0; k < sizeof(b); ++k) p[k] = (uint8_t) rng();
@@ -111,7 +113,11 @@ int main(int argc, char ** argv) {
     std::vector<float> out_ref(rows);
     for (int r = 0; r < rows; ++r) dot_ref(n, &out_ref[r], &w[(size_t) r*nb], a.data());
     int errors = 0;
+    const char * only = argc > 3 ? argv[3] : nullptr;   // run only this variant (e.g. parallel instances)
     for (auto & f : fns) {
+        if (only && strcmp(f.name, only) != 0) {
+            continue;
+        }
         std::vector<float> out(rows);
         for (int r = 0; r < rows; ++r) f.fn(n, &out[r], &w[(size_t) r*nb], a.data());
         const bool same = memcmp(out.data(), out_ref.data(), rows*sizeof(float)) == 0;
@@ -119,7 +125,8 @@ int main(int argc, char ** argv) {
         float sink = 0;
         const auto t0 = std::chrono::steady_clock::now();
         for (int k = 0; k < reps; ++k) {
-            for (int r = 0; r < rows; ++r) { float v; f.fn(n, &v, &w[(size_t) r*nb], a.data()); sink += v; }
+            const block_iq3_s * we = &w[(size_t) (k % n_exp) * rows * nb];
+            for (int r = 0; r < rows; ++r) { float v; f.fn(n, &v, &we[(size_t) r*nb], a.data()); sink += v; }
         }
         const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / reps;
         printf("%-10s %s  %8.1f us per expert (640 rows, 1 thread)  %6.3f ns per lookup  [%g]\n", f.name, same ? "exact" : "DIFF ",
