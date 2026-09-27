@@ -1570,6 +1570,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
+            // draft() wrote its own cells from the verified frontier on (the drafted positions,
+            // with the draft's hidden rows): drop them before replaying the target rows there,
+            // or the draft attention reads both the stale and the replayed cell of a position
+            if (!chain_heads) {
+                auto * mem_dft = llama_get_memory(ctx_dft);
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    if (i_batch_beg[seq_id] >= 0) {
+                        llama_memory_seq_rm(mem_dft, seq_id, batch_in.tokens[i_batch_beg[seq_id]].pos[0], -1);
+                    }
+                }
+            }
+
             batch.clear();
 
             // pair each token with the tgt embedding shifted right by one position, and
