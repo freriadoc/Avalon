@@ -39,6 +39,29 @@
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+// DIAGNOSTIC (LLAMA_SPEC_TIMING=1): wall time of the speculative step phases, every 200 steps:
+// work inside yield_to_queue, the yield handoff around it, and the rest of the step
+struct spec_timing {
+    bool on = getenv("LLAMA_SPEC_TIMING") != nullptr;
+    int64_t work[3] = {}, yield[3] = {}, step = 0, t_last = 0; int n = 0;
+    void add(int k, int64_t t0, int64_t w0, int64_t w1) {
+        work[k] += w1 - w0; yield[k] += ggml_time_us() - t0 - (w1 - w0);
+    }
+    void step_start() {
+        const int64_t t = ggml_time_us();
+        if (t_last) { step += t - t_last; n++; }
+        t_last = t;
+        if (n && n % 200 == 0) {
+            const double f = 1e-3 / n;
+            SRV_INF("spec timing: %d steps, %.2f ms/step: draft %.2f (+%.2f yield), decode %.2f (+%.2f), process %.2f (+%.2f), rest %.2f\n",
+                    n, step*f, work[0]*f, yield[0]*f, work[1]*f, yield[1]*f, work[2]*f, yield[2]*f,
+                    (step - work[0]-work[1]-work[2]-yield[0]-yield[1]-yield[2])*f);
+        }
+    }
+};
+static spec_timing g_spec_timing;
+
+
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
             (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
@@ -3196,9 +3219,14 @@ private:
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
+            if (g_spec_timing.on) g_spec_timing.step_start();
+            const int64_t st0 = ggml_time_us(); int64_t sw0 = 0, sw1 = 0;
             queue_tasks.yield_to_queue([&]() {
+                sw0 = ggml_time_us();
                 common_speculative_draft(spec.get());
+                sw1 = ggml_time_us();
             });
+            if (g_spec_timing.on) g_spec_timing.add(0, st0, sw0, sw1);
         }
 
         // make checkpoints if needed
@@ -3884,12 +3912,16 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        const int64_t dt0 = ggml_time_us(); int64_t dw0 = 0, dw1 = 0;
         queue_tasks.yield_to_queue([&]() {
+            dw0 = ggml_time_us();
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
+            dw1 = ggml_time_us();
         });
+        if (g_spec_timing.on && batch.view.size() <= 8) g_spec_timing.add(1, dt0, dw0, dw1);
 
         if (ret != 0) {
             {
@@ -3949,9 +3981,13 @@ private:
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
             bool ok = true;
+            const int64_t st0 = ggml_time_us(); int64_t sw0 = 0, sw1 = 0;
             queue_tasks.yield_to_queue([&]() {
+                sw0 = ggml_time_us();
                 ok = common_speculative_process(spec.get(), batch.view);
+                sw1 = ggml_time_us();
             });
+            if (g_spec_timing.on && batch.view.size() <= 8) g_spec_timing.add(2, st0, sw0, sw1);
 
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");

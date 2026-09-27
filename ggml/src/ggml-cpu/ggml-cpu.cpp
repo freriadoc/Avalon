@@ -1,3 +1,4 @@
+#include <atomic>
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpu.h"
@@ -187,6 +188,24 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
     cplan.abort_callback_data = cpu_ctx->abort_callback_data;
     cplan.use_ref             = cpu_ctx->use_ref;
 
+    // DIAGNOSTIC (GGML_CPU_COMPUTE_STATS=1): cumulated wall time of the CPU splits that contain a
+    // MUL_MAT_ID (the host-resident experts), logged every 5000 such calls
+    static const bool stats = getenv("GGML_CPU_COMPUTE_STATS") && atoi(getenv("GGML_CPU_COMPUTE_STATS"));
+    if (stats) {
+        bool moe = false;
+        for (int i = 0; i < cgraph->n_nodes && !moe; i++) moe = cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID;
+        if (moe) {
+            static std::atomic<long long> calls{0}, ns{0};
+            const int64_t t0 = ggml_time_us();
+            const enum ggml_status st = ggml_graph_compute(cgraph, &cplan);
+            ns += (ggml_time_us() - t0) * 1000;
+            if (++calls % 5000 == 0) {
+                GGML_LOG_INFO("cpu compute stats: %lld moe splits, %.3f s, %.3f ms per split\n",
+                        calls.load(), ns.load() / 1e9, ns.load() / 1e6 / calls.load());
+            }
+            return st;
+        }
+    }
     return ggml_graph_compute(cgraph, &cplan);
 }
 

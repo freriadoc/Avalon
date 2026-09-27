@@ -3,6 +3,7 @@
 #include <hip/hip_runtime_api.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -143,22 +144,40 @@ inline hipError_t ggml_hip_copy_async(void * dst, const void * src, size_t size,
         return hipMemcpyAsync(dst, src, size, kind, stream);
     }
     const ggml_hip_copy_ring_config & cfg = ggml_hip_copy_ring_get_config();
+    // DIAGNOSTIC (GGML_HIP_COPY_STATS=1): host time waiting for a slot, copying, queueing
+    static const bool stats = std::getenv("GGML_HIP_COPY_STATS") != nullptr;
+    thread_local double st_wait = 0, st_copy = 0, st_queue = 0, st_bytes = 0, st_next = 4.0*(1ull << 30);
     for (size_t offset = 0; offset < size; offset += cfg.bytes) {
         const size_t bytes = std::min(cfg.bytes, size - offset);
         const size_t i = ring->next;
+        const auto t0 = std::chrono::steady_clock::now();
         // an event never recorded counts as complete
         hipError_t status = hipEventSynchronize(ring->ev[i]);
         if (status != hipSuccess) {
             return status;
         }
+        const auto t1 = std::chrono::steady_clock::now();
         if (cfg.nt) {
             ggml_hip_copy_nt(ring->buf[i], static_cast<const char *>(src) + offset, bytes);
         } else {
             std::memcpy(ring->buf[i], static_cast<const char *>(src) + offset, bytes);
         }
+        const auto t2 = std::chrono::steady_clock::now();
         status = hipMemcpyAsync(static_cast<char *>(dst) + offset, ring->buf[i], bytes, kind, stream);
         if (status == hipSuccess) {
             status = hipEventRecord(ring->ev[i], stream);
+        }
+        if (stats) {
+            const auto t3 = std::chrono::steady_clock::now();
+            st_wait  += std::chrono::duration<double>(t1 - t0).count();
+            st_copy  += std::chrono::duration<double>(t2 - t1).count();
+            st_queue += std::chrono::duration<double>(t3 - t2).count();
+            st_bytes += bytes;
+            if (st_bytes >= st_next) {
+                st_next += 4.0*(1ull << 30);
+                std::fprintf(stderr, "ring stats: %.1f GiB, wait %.3f s, copy %.3f s (%.2f GB/s), queue %.3f s\n",
+                        st_bytes / (1ull << 30), st_wait, st_copy, st_bytes / st_copy / 1e9, st_queue);
+            }
         }
         if (status != hipSuccess) {
             return status;

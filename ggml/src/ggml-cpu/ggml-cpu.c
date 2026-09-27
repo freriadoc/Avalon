@@ -1479,6 +1479,19 @@ UseGgmlGemm2:;
 
 #define MOE_CACHE_MAX_TOPK 64
 
+// DIAGNOSTIC (GGML_CPU_MOE_WAIT=1): thread 0 time in MoE cache ops, total vs waiting in collect
+static int64_t moe_wait_tot[2], moe_wait_col[2], moe_wait_n[2];
+static void moe_wait_report(int k, int64_t tot, int64_t col) {
+    static int on = -1;
+    if (on < 0) { on = getenv("GGML_CPU_MOE_WAIT") != NULL; }
+    if (!on) return;
+    moe_wait_tot[k] += tot; moe_wait_col[k] += col;
+    if (++moe_wait_n[k] % 20000 == 0) {
+        GGML_LOG_INFO("moe wait: %s %lld ops, total %.3f s, in collect %.3f s (%.0f %%)\n", k ? "fused" : "mmid",
+                (long long) moe_wait_n[k], moe_wait_tot[k]/1e6, moe_wait_col[k]/1e6, 100.0*moe_wait_col[k]/moe_wait_tot[k]);
+    }
+}
+
 struct mmid_row_mapping {
     int32_t i1;
     int32_t i2;
@@ -1604,6 +1617,7 @@ static void ggml_compute_forward_mul_mat_id_impl(
     const bool moe_cache_rows_fit =
         moe_cache_n_rows <= MOE_CACHE_MAX_TOPK;
     void *        moe_cache_node = NULL;
+    int64_t       moe_t0 = 0;
     int           moe_cache_n_hits = 0;
     int32_t       moe_cache_slot_idx[MOE_CACHE_MAX_TOPK];
     int32_t       moe_cache_compact[MOE_CACHE_MAX_TOPK];
@@ -1677,6 +1691,7 @@ static void ggml_compute_forward_mul_mat_id_impl(
 
         ggml_backend_buffer_t src0_buffer =
             src0->view_src ? src0->view_src->buffer : src0->buffer;
+        moe_t0 = ggml_time_us();
         if (allow_moe_cache &&
             ggml_moe_cache.begin && ggml_moe_cache.plan &&
             ggml_moe_cache.dispatch && ggml_moe_cache.collect && ggml_moe_cache.end &&
@@ -1828,7 +1843,10 @@ static void ggml_compute_forward_mul_mat_id_impl(
     }
 
     if (ith == 0 && moe_cache_node) {
-        if (!ggml_moe_cache.collect(moe_cache_node, moe_cache_n_hits, moe_cache_rows, ne0)) {
+        const int64_t moe_tc = ggml_time_us();
+        const int moe_ok = ggml_moe_cache.collect(moe_cache_node, moe_cache_n_hits, moe_cache_rows, ne0);
+        moe_wait_report(0, ggml_time_us() - moe_t0, ggml_time_us() - moe_tc);
+        if (!moe_ok) {
             // the GPU results are lost: recompute the skipped rows here
             const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
             const size_t row_size = ggml_row_size(vec_dot_type, ne10);
@@ -3437,6 +3455,33 @@ static void ggml_compute_forward_swiglu_masked(
     }
 }
 
+// DIAGNOSTIC (GGML_CPU_MOE_SHAPE=1): per ubatch size (1..8 tokens), fused MoE nodes: routed rows,
+// distinct experts, missed rows, distinct missed experts, CPU time before collect, collect wait
+static int64_t moe_shape[9][7];
+static void moe_shape_report(int n_tokens, const int32_t * ids, int n_rows, uint64_t miss_mask, int64_t t_cpu, int64_t t_col) {
+    static int on = -1;
+    if (on < 0) { on = getenv("GGML_CPU_MOE_SHAPE") != NULL; }
+    if (!on || n_tokens < 1 || n_tokens > 8) return;
+    int n_dist = 0, n_miss = 0, n_dmiss = 0;
+    for (int r = 0; r < n_rows; r++) {
+        const bool miss = (miss_mask >> r) & 1;
+        n_miss += miss;
+        bool seen = false, seen_miss = false;
+        for (int q = 0; q < r; q++) {
+            if (ids[q] == ids[r]) { seen = true; if ((miss_mask >> q) & 1) seen_miss = true; }
+        }
+        n_dist += !seen;
+        n_dmiss += miss && !seen_miss;
+    }
+    int64_t * a = moe_shape[n_tokens];
+    a[0]++; a[1] += n_rows; a[2] += n_dist; a[3] += n_miss; a[4] += n_dmiss; a[5] += t_cpu; a[6] += t_col;
+    if (a[0] % 10000 == 0) {
+        GGML_LOG_INFO("moe shape: %d tok, %lld nodes: rows %.2f, distinct %.2f, missed rows %.2f, missed distinct %.2f, cpu %.1f us, collect %.1f us per node\n",
+                n_tokens, (long long) a[0], (double) a[1]/a[0], (double) a[2]/a[0], (double) a[3]/a[0], (double) a[4]/a[0],
+                (double) a[5]/a[0], (double) a[6]/a[0]);
+    }
+}
+
 static int ggml_cpu_try_fuse_moe_cache(
         const struct ggml_cgraph * cgraph,
         int node_n,
@@ -3461,7 +3506,9 @@ static int ggml_cpu_try_fuse_moe_cache(
     const int n_tokens = (int)ids->ne[1];
     const int n_rows = n_ids*n_tokens;
 
+    static int64_t fused_t0;
     if (params->ith == 0) {
+        fused_t0 = ggml_time_us();
         memset(state, 0, sizeof(*state));
         struct ggml_moe_cache_tensor_desc up_desc = {
             up_weight->name,
@@ -3572,9 +3619,12 @@ static int ggml_cpu_try_fuse_moe_cache(
         }
     }
     if (params->ith == 0) {
+        const int64_t tc = ggml_time_us();
         state->collect_ok = ggml_moe_cache.collect(
                 state->node, state->n_hits, state->rows,
                 state->full ? down->ne[0] : glu->ne[0]);
+        moe_wait_report(1, ggml_time_us() - fused_t0, ggml_time_us() - tc);
+        moe_shape_report(n_tokens, state->ids, n_rows, miss_mask, tc - fused_t0, ggml_time_us() - tc);
         ggml_moe_cache.end(state->node);
         state->node = NULL;
     }

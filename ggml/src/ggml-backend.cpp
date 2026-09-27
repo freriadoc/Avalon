@@ -2073,9 +2073,28 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
+    // DIAGNOSTIC (GGML_SCHED_TRACE_INPUTS=N): log every input copy of graph number N
+    static const int trace_graph = getenv("GGML_SCHED_TRACE_INPUTS") ? atoi(getenv("GGML_SCHED_TRACE_INPUTS")) : -1;
+    static int trace_counter = 0;
+    const bool trace_on = trace_graph >= 0 && trace_counter++ == trace_graph;
+    struct trace_input_log {
+        bool on; int split; const char * dst; const ggml_tensor * t; const char * src; int64_t t0;
+        ~trace_input_log() {
+            if (on) {
+                GGML_LOG_INFO("trace input: split %3d %-6s <- %-6s %-40s %8zu B %s %6lld us\n", split, dst, src, t->name,
+                        ggml_nbytes(t), ggml_is_contiguous(t) ? "cont" : "NONCONT", (long long) (ggml_time_us() - t0));
+            }
+        }
+    };
+    // DIAGNOSTIC (GGML_SCHED_TIME=1): host time per backend in input copies/syncs and in compute
+    static const bool sched_time = getenv("GGML_SCHED_TIME") && atoi(getenv("GGML_SCHED_TIME"));
+    static int64_t st_in[GGML_SCHED_MAX_BACKENDS], st_cp[GGML_SCHED_MAX_BACKENDS], st_n[GGML_SCHED_MAX_BACKENDS], st_calls, st_total;
+    const int64_t st_t_graph = sched_time ? ggml_time_us() : 0;
+    int64_t st_t0 = 0;
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
+        if (sched_time) st_t0 = ggml_time_us();
         ggml_backend_t split_backend = sched->backends[split_backend_id];
         int split_prefetch_slot = -1;
         ggml_tensor * prefetch_input_cpy = NULL;
@@ -2097,6 +2116,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+            trace_input_log trace_log{trace_on, split_id, ggml_backend_name(split_backend), input,
+                ggml_backend_name(input_backend), trace_on ? ggml_time_us() : 0};
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
@@ -2274,8 +2295,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        if (trace_on && getenv("GGML_SCHED_TRACE_NODES")) {
+            for (int j = 0; j < split->graph.n_nodes; j++) {
+                const ggml_tensor * t = split->graph.nodes[j];
+                GGML_LOG_INFO("trace node: split %3d %-6s %-14s %-36s [%lld,%lld,%lld,%lld] %s\n", split_id,
+                        ggml_backend_name(split_backend), ggml_op_desc(t), t->name,
+                        (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+                        ggml_type_name(t->type));
+            }
+        }
+        int64_t st_t1 = 0;
+        if (sched_time) { st_t1 = ggml_time_us(); st_in[split_backend_id] += st_t1 - st_t0; }
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            if (sched_time) { st_cp[split_backend_id] += ggml_time_us() - st_t1; st_n[split_backend_id]++; }
             if (split_prefetch_slot != -1) {
                 // the kernels have captured the slot address at launch, safe to restore
                 ggml_backend_event_record(sched->prefetch_free[split_prefetch_slot], split_backend);
@@ -2326,6 +2359,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         prev_backend_id = split_backend_id;
+    }
+
+    if (sched_time) {
+        st_total += ggml_time_us() - st_t_graph;
+        static const int st_every = getenv("GGML_SCHED_TIME_EVERY") ? atoi(getenv("GGML_SCHED_TIME_EVERY")) : 250;
+        if (++st_calls % st_every == 0) {
+            for (int b = 0; b < sched->n_backends; b++) {
+                GGML_LOG_INFO("sched time: %d graphs, backend %s: %lld splits, inputs %.3f s, compute %.3f s (graphs total %.3f s)\n",
+                        (int) st_calls, ggml_backend_name(sched->backends[b]), (long long) st_n[b],
+                        st_in[b] / 1e6, st_cp[b] / 1e6, st_total / 1e6);
+            }
+        }
     }
 
     return GGML_STATUS_SUCCESS;
