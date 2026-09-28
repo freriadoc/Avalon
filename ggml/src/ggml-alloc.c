@@ -695,6 +695,18 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
         size_t size = ggml_backend_buft_get_alloc_size(buft, node);
         hn->buffer_id = buffer_id;
         hn->addr = ggml_dyn_tallocr_alloc(alloc, size, node);
+        // DIAGNOSTIC (GGML_ALLOC_TRACE_BIG=MiB): every tensor at least that large, as it is placed
+        {
+            static long trace_mib = -1;
+            if (trace_mib < 0) {
+                trace_mib = getenv("GGML_ALLOC_TRACE_BIG") ? atol(getenv("GGML_ALLOC_TRACE_BIG")) : 0;
+            }
+            if (trace_mib > 0 && size >= ((size_t) trace_mib << 20)) {
+                GGML_LOG_INFO("alloc big: %-40s %-12s %s [%lld,%lld,%lld,%lld] %.0f MiB\n", node->name, ggml_op_desc(node),
+                        ggml_type_name(node->type), (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2],
+                        (long long) node->ne[3], size / 1048576.0);
+            }
+        }
     }
 }
 
