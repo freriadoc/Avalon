@@ -4364,7 +4364,6 @@ static void * moe_cache_fused_begin(
     const float * hit_acts[moe_cache_node_rows_max];
     uint64_t mask = 0;
     int hits = 0;
-    bool full_ready = true;
     int inserts_left = session->config.inserts_per_plan;
     bool wake_worker = false;
     {
@@ -4435,14 +4434,12 @@ static void * moe_cache_fused_begin(
                         selected->pair_neither++;
                     }
                 }
-                if (down && (resident_up[index] < 0 ||
-                             resident_gate[index] < 0 ||
-                             resident_down[index] < 0)) {
-                    full_ready = false;
-                }
             }
 
-            for (int index = 0; index < n_ids && (!down || full_ready); index++) {
+            // A full node serves the rows whose three tensors are resident; the CPU computes
+            // the others whole (up, gate, swiglu and down), so the node costs one round trip
+            // to the GPU instead of two (up+gate, then down).
+            for (int index = 0; index < n_ids; index++) {
                 if (resident_up[index] < 0 || resident_gate[index] < 0 ||
                     (down && resident_down[index] < 0)) {
                     continue;
@@ -4467,8 +4464,12 @@ static void * moe_cache_fused_begin(
 
             // Preserve the unfused access order when all three tensors happen
             // to share one pool: pair rows first, then down rows.
-            if (down && full_ready) {
+            if (down) {
+                int hit = 0;
                 for (int index = 0; index < n_ids; index++) {
+                    if (!(mask & (UINT64_C(1) << index))) {
+                        continue;
+                    }
                     moe_cache_slot & down_slot =
                         down_pool->slots[resident_down[index]];
                     down_slot.readers++;
@@ -4476,12 +4477,15 @@ static void * moe_cache_fused_begin(
                     moe_cache_lru_push_back(*down_pool, resident_down[index]);
                     node->pins[node->n_pins++] = {
                         down_pool, resident_down[index]};
-                    down_slots[index] = resident_down[index];
+                    down_slots[hit++] = resident_down[index];
                     selected->hits++;
                 }
             }
 
-            for (int index = 0; index < n_ids && hits > 0 && !down; index++) {
+            // the rows the CPU computes: their lookups count toward admission (a node
+            // without a hit returns below, and its caller retries without down, which
+            // does them)
+            for (int index = 0; index < n_ids && hits > 0; index++) {
                 if (mask & (UINT64_C(1) << index)) {
                     continue;
                 }
@@ -4519,11 +4523,30 @@ static void * moe_cache_fused_begin(
                     selected->misses++;
                 }
 
+                int down_slot = -1;
+                if (down) {
+                    down_slot = moe_cache_lookup_or_queue_locked(
+                            *session, *selected, *down_pool, down_pool_index,
+                            down->data, expert, down->expert_size,
+                            inserts_left, wake_worker);
+                    if (down_slot >= 0) {
+                        down_pool->slots[down_slot].readers++;
+                        moe_cache_lru_remove(*down_pool, down_slot);
+                        moe_cache_lru_push_back(*down_pool, down_slot);
+                        selected->hits++;
+                    } else {
+                        selected->misses++;
+                    }
+                }
+
                 if (up_slot >= 0) {
                     pool->slots[up_slot].readers--;
                 }
                 if (gate_slot >= 0) {
                     pool->slots[gate_slot].readers--;
+                }
+                if (down_slot >= 0) {
+                    down_pool->slots[down_slot].readers--;
                 }
             }
             if (hits > 0) {
