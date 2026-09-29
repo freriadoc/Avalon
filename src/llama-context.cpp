@@ -516,6 +516,12 @@ llama_context::~llama_context() {
         }
     }
     ggml_opt_free(opt_ctx);
+
+    // the scheduler before the backends: 'backends' is declared after 'sched', so the members'
+    // destruction would free the backends first, and freeing the compute buffers borrowed from
+    // the MoE cache hands their backend back to the cache (use after free: an intermittent
+    // segfault at shutdown)
+    sched.reset();
 }
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
