@@ -68,6 +68,10 @@ GGML_API bool ggml_gallocr_reserve_n(
     const int * leaf_buffer_ids);
 
 // automatic reallocation if the topology changes when using a single buffer
+// while set, a (re)reservation also shrinks buffers borrowed from a cache (ggml_moe_cache.borrows)
+// when the graph needs less; set it only for graphs about to run, not for worst-case reservations
+GGML_API void ggml_gallocr_set_shrink(ggml_gallocr_t galloc, bool shrink);
+
 // returns false if using multiple buffers and a re-allocation is needed (call ggml_gallocr_reserve_n first to set the node buffers)
 GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph);
 

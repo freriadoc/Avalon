@@ -1878,7 +1878,11 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             ggml_backend_synchronize(sched->backends[i]);
         }
 
-        if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
+        // this graph runs next: a buffer borrowed from the cache may shrink to what it needs
+        ggml_gallocr_set_shrink(sched->galloc, true);
+        const bool reserved = ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
+        ggml_gallocr_set_shrink(sched->galloc, false);
+        if (!reserved) {
             GGML_LOG_ERROR("%s: failed to reserve graph buffers\n", __func__);
             return false;
         }

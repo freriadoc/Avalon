@@ -160,6 +160,10 @@ struct ggml_moe_cache_api {
     // ggml-alloc announces every chunk it is about to allocate from 'buft', before the
     // first one, so that the provider can seat them all at once. Other types are ignored.
     void (*plan_borrows)(ggml_backend_buffer_type_t buft, const size_t * sizes, int n_sizes);
+
+    // true if allocations of 'buft' are borrowed from a cache: ggml-alloc then also shrinks
+    // them when a graph needs less, so that the cache gets the memory back
+    bool (*borrows)(ggml_backend_buffer_type_t buft);
 };
 
 GGML_API struct ggml_moe_cache_api ggml_moe_cache;

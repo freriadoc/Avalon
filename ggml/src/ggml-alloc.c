@@ -503,6 +503,8 @@ struct ggml_gallocr {
 
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
+
+    bool shrink; // see ggml_gallocr_set_shrink
 };
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
@@ -935,6 +937,8 @@ static bool ggml_gallocr_reserve_n_impl(
 
         // even if there are no tensors allocated in this buffer, we still need to allocate it to initialize views
         bool realloc = galloc->buffers[i] == NULL;
+        // a buffer borrowed from a cache is returned as soon as a graph needs less of it
+        const bool shrink = galloc->shrink && !no_alloc && galloc->buffers[i] && ggml_moe_cache.borrows && ggml_moe_cache.borrows(galloc->bufts[i]);
         size_t new_size = 0;
         for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
             size_t cur_chunk_size = galloc->buffers[i] ? ggml_vbuffer_chunk_size(galloc->buffers[i], c) : 0;
@@ -943,6 +947,9 @@ static bool ggml_gallocr_reserve_n_impl(
             if (new_chunk_size > cur_chunk_size) {
                 realloc = true;
             }
+        }
+        if (shrink && !realloc && new_size < ggml_vbuffer_size(galloc->buffers[i])) {
+            realloc = true;
         }
         if (realloc) {
 #ifndef NDEBUG
@@ -983,6 +990,10 @@ void ggml_gallocr_reserve_n_size(
 
 bool ggml_gallocr_reserve_n(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids) {
     return ggml_gallocr_reserve_n_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, /*no_alloc =*/ false);
+}
+
+void ggml_gallocr_set_shrink(ggml_gallocr_t galloc, bool shrink) {
+    galloc->shrink = shrink;
 }
 
 bool ggml_gallocr_reserve(ggml_gallocr_t galloc, struct ggml_cgraph *graph) {

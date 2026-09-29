@@ -5237,6 +5237,12 @@ struct moe_cache_loan_search {
     }
 };
 
+static bool moe_cache_borrows(ggml_backend_buffer_type_t buft) {
+    void * opaque = nullptr;
+    ggml_backend_t backend = nullptr;
+    return ggml_backend_cuda_borrowed_buffer_type_source(buft, &opaque, &backend) && opaque;
+}
+
 static void moe_cache_plan_borrows(ggml_backend_buffer_type_t buft, const size_t * sizes, int n_sizes) {
     void * opaque = nullptr;
     ggml_backend_t backend = nullptr;
@@ -5537,6 +5543,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.give_back = moe_cache_give_back;
     ggml_moe_cache.compute_buffer_type = moe_cache_compute_buffer_type;
     ggml_moe_cache.plan_borrows = moe_cache_plan_borrows;
+    ggml_moe_cache.borrows = moe_cache_borrows;
 }
 
 #endif
