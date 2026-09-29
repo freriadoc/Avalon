@@ -1492,6 +1492,9 @@ static void moe_wait_report(int k, int64_t tot, int64_t col) {
     }
 }
 
+static int moe_count_distinct(const int32_t * ids, int n_rows, uint64_t mask);
+static void moe_miss_report(int type, int n_tokens, int n_dmiss, int64_t t_disp, int64_t t_cpu, int64_t t_col);
+
 struct mmid_row_mapping {
     int32_t i1;
     int32_t i2;
@@ -1618,6 +1621,9 @@ static void ggml_compute_forward_mul_mat_id_impl(
         moe_cache_n_rows <= MOE_CACHE_MAX_TOPK;
     void *        moe_cache_node = NULL;
     int64_t       moe_t0 = 0;
+    int64_t       moe_t_disp = 0;
+    int32_t       moe_miss_ids[MOE_CACHE_MAX_TOPK];
+    uint64_t      moe_miss_mask = 0;
     int           moe_cache_n_hits = 0;
     int32_t       moe_cache_slot_idx[MOE_CACHE_MAX_TOPK];
     int32_t       moe_cache_compact[MOE_CACHE_MAX_TOPK];
@@ -1745,6 +1751,10 @@ static void ggml_compute_forward_mul_mat_id_impl(
 
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
                 matrix_row_counts[i02] += 1;
+                if (logical_row < MOE_CACHE_MAX_TOPK) {
+                    moe_miss_ids[logical_row] = i02;
+                    moe_miss_mask |= UINT64_C(1) << logical_row;
+                }
             }
         }
 
@@ -1766,6 +1776,7 @@ static void ggml_compute_forward_mul_mat_id_impl(
             ggml_moe_cache.end(moe_cache_node);
             moe_cache_node = NULL;
         }
+        moe_t_disp = ggml_time_us();
     }
 
     // reset current_chunk
@@ -1846,6 +1857,8 @@ static void ggml_compute_forward_mul_mat_id_impl(
         const int64_t moe_tc = ggml_time_us();
         const int moe_ok = ggml_moe_cache.collect(moe_cache_node, moe_cache_n_hits, moe_cache_rows, ne0);
         moe_wait_report(0, ggml_time_us() - moe_t0, ggml_time_us() - moe_tc);
+        moe_miss_report(src0->type, (int) ids->ne[1], moe_count_distinct(moe_miss_ids, (int) moe_cache_n_rows, moe_miss_mask),
+                moe_t_disp - moe_t0, moe_tc - moe_t_disp, ggml_time_us() - moe_tc);
         if (!moe_ok) {
             // the GPU results are lost: recompute the skipped rows here
             const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
@@ -3482,6 +3495,37 @@ static void moe_shape_report(int n_tokens, const int32_t * ids, int n_rows, uint
     }
 }
 
+// DIAGNOSTIC (GGML_CPU_MOE_MISS=N): every N MoE cache nodes, per weight type and batch size
+// (1..8 tokens), thread 0, per node: distinct missed experts (computed here), time to plan and
+// dispatch the cached rows to the GPU, CPU time on the missed rows, collect (waiting for the
+// GPU's rows). A fused node reports its gate/up type (up+gate+swiglu), a plain one its own (down).
+static int64_t moe_miss[GGML_TYPE_COUNT][9][6];
+static int moe_count_distinct(const int32_t * ids, int n_rows, uint64_t mask) {
+    int n = 0;
+    for (int r = 0; r < n_rows; r++) {
+        if (!((mask >> r) & 1)) continue;
+        bool seen = false;
+        for (int q = 0; q < r; q++) {
+            seen |= ((mask >> q) & 1) && ids[q] == ids[r];
+        }
+        n += !seen;
+    }
+    return n;
+}
+static void moe_miss_report(int type, int n_tokens, int n_dmiss, int64_t t_disp, int64_t t_cpu, int64_t t_col) {
+    static int every = -1;
+    if (every < 0) { every = getenv("GGML_CPU_MOE_MISS") ? atoi(getenv("GGML_CPU_MOE_MISS")) : 0; }
+    if (every <= 0 || n_tokens < 1 || n_tokens > 8 || type < 0 || type >= GGML_TYPE_COUNT) return;
+    int64_t * a = moe_miss[type][n_tokens];
+    a[0]++; a[1] += n_dmiss; a[2] += t_disp; a[3] += t_cpu; a[4] += t_col; a[5] += n_dmiss > 0;
+    if (a[0] % every == 0) {
+        GGML_LOG_INFO("moe miss: %-6s %d tok, %lld nodes: missed experts %.2f (nodes with a miss %.0f %%), "
+                "dispatch %.1f us, cpu %.1f us, collect %.1f us per node\n",
+                ggml_type_name((enum ggml_type) type), n_tokens, (long long) a[0], (double) a[1]/a[0], 100.0*a[5]/a[0],
+                (double) a[2]/a[0], (double) a[3]/a[0], (double) a[4]/a[0]);
+    }
+}
+
 static int ggml_cpu_try_fuse_moe_cache(
         const struct ggml_cgraph * cgraph,
         int node_n,
@@ -3506,7 +3550,7 @@ static int ggml_cpu_try_fuse_moe_cache(
     const int n_tokens = (int)ids->ne[1];
     const int n_rows = n_ids*n_tokens;
 
-    static int64_t fused_t0;
+    static int64_t fused_t0, fused_t_disp;
     if (params->ith == 0) {
         fused_t0 = ggml_time_us();
         memset(state, 0, sizeof(*state));
@@ -3568,6 +3612,7 @@ static int ggml_cpu_try_fuse_moe_cache(
             state->full = 1;
         }
         state->skipped = fusion.skipped + state->full;
+        fused_t_disp = ggml_time_us();
         if (state->node) {
             struct ggml_tensor * output = state->full ? down : glu;
             for (int row = 0; row < n_rows; row++) {
@@ -3625,6 +3670,8 @@ static int ggml_cpu_try_fuse_moe_cache(
                 state->full ? down->ne[0] : glu->ne[0]);
         moe_wait_report(1, ggml_time_us() - fused_t0, ggml_time_us() - tc);
         moe_shape_report(n_tokens, state->ids, n_rows, miss_mask, tc - fused_t0, ggml_time_us() - tc);
+        moe_miss_report(gate_weight->type, n_tokens, moe_count_distinct(state->ids, n_rows, miss_mask),
+                fused_t_disp - fused_t0, tc - fused_t_disp, ggml_time_us() - tc);
         ggml_moe_cache.end(state->node);
         state->node = NULL;
     }
