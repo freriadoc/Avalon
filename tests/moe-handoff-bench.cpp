@@ -22,6 +22,7 @@
 #include <cstring>
 #include <thread>
 #include <vector>
+#include <unistd.h>
 
 #define CHECK(x) do { hipError_t e = (x); if (e != hipSuccess) { \
     fprintf(stderr, "%s:%d %s: %s\n", __FILE__, __LINE__, #x, hipGetErrorString(e)); exit(1); } } while (0)
@@ -47,6 +48,12 @@ __global__ void k_post(const float * res, float * acc, long long spin) {
     while (wall_clock64() - t0 < spin) {}
 }
 
+__global__ void k_write_flag(volatile uint32_t * flag, uint32_t value) {
+    __threadfence_system();
+    *flag = value;
+    __threadfence_system();
+}
+
 __global__ void k_wait_flag(const volatile uint32_t * flag, uint32_t value) {
     while (*flag < value) { __builtin_amdgcn_s_sleep(1); }
     __threadfence_system();
@@ -65,6 +72,9 @@ int main(int argc, char ** argv) {
     const double cpu_us  = argc > 1 ? atof(argv[1]) : 120.0;
     const double pre_us  = argc > 2 ? atof(argv[2]) : 20.0;
     const double post_us = argc > 3 ? atof(argv[3]) : 10.0;
+    // which parts run: "all", "stream" (V0-V2), or one graph variant "g1" / "g2" / "g3"
+    const char * only = argc > 4 ? argv[4] : "all";
+    setvbuf(stdout, nullptr, _IOLBF, 0);
 
     int dev = 0, rate = 0, can_wait = 0;
     CHECK(hipSetDevice(dev));
@@ -120,8 +130,9 @@ int main(int argc, char ** argv) {
         printf("%-44s %7.1f us per layer, overhead %6.1f us\n", name, per, per - gpu_layer - cpu_us);
     };
 
+    const bool run_stream = !strcmp(only, "all") || !strcmp(only, "stream");
     // V0: host-driven, as the scheduler: launch, copy down, synchronize, compute, copy up
-    {
+    if (run_stream) {
         double best = 1e30;
         for (int r = 0; r < REPS; r++) {
             CHECK(hipStreamSynchronize(s));
@@ -142,7 +153,7 @@ int main(int argc, char ** argv) {
     }
 
     // V1 / V2: the pass queued at once, a CPU thread answering the flags
-    for (int variant = 1; variant <= 2; variant++) {
+    for (int variant = 1; variant <= 2 && run_stream; variant++) {
         double best = 1e30;
         uint32_t base = 0;
         for (int r = 0; r < REPS; r++) {
@@ -183,6 +194,106 @@ int main(int argc, char ** argv) {
             base += LAYERS;
         }
         report(variant == 1 ? "V1 queued, stream write/wait value" : "V2 queued, polling kernel", best);
+    }
+
+    // Graphs: the pass captured once, replayed. Layer l waits for / writes the value l + 1; the host
+    // resets the flags before each replay.
+    //   G1 stream write value + stream wait value, G2 stream write value + polling kernel,
+    //   G3 a kernel writes flag A (mapped memory) + polling kernel.
+    uint32_t * h_flagA, * m_flagA;
+    CHECK(hipHostMalloc((void **) &h_flagA, 64, hipHostMallocMapped | hipHostMallocCoherent));
+    CHECK(hipHostGetDevicePointer((void **) &m_flagA, h_flagA, 0));
+
+    // GPU-only reference in a graph: the graph variants' overhead is measured against it
+    double gpu_graph_layer = 0.0;
+    {
+        hipGraph_t graph; hipGraphExec_t exec;
+        CHECK(hipStreamBeginCapture(s, hipStreamCaptureModeGlobal));
+        for (int l = 0; l < LAYERS; l++) {
+            k_pre<<<1, 256, 0, s>>>(d_act, pre_spin, l);
+            k_post<<<1, 256, 0, s>>>(d_res + l * RES_F, d_acc, post_spin);
+        }
+        CHECK(hipStreamEndCapture(s, &graph));
+        CHECK(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+        double best = 1e30;
+        for (int r = 0; r < REPS; r++) {
+            const double t0 = now_us();
+            CHECK(hipGraphLaunch(exec, s));
+            CHECK(hipStreamSynchronize(s));
+            best = std::min(best, now_us() - t0);
+        }
+        printf("GPU alone, graph: %.1f us per layer\n", best / LAYERS);
+        gpu_graph_layer = best / LAYERS;
+    }
+
+    for (int variant = 1; variant <= 3; variant++) {
+        const char gname[3] = {'g', (char) ('0' + variant), 0};
+        if (strcmp(only, "all") && strcmp(only, gname)) {
+            continue;
+        }
+        const char * name = variant == 1 ? "G1 graph, stream write + wait value"
+                          : variant == 2 ? "G2 graph, stream write + polling kernel"
+                          :                "G3 graph, flag kernel + polling kernel";
+        hipGraph_t graph; hipGraphExec_t exec;
+        CHECK(hipStreamBeginCapture(s, hipStreamCaptureModeGlobal));
+        bool ok = true;
+        for (int l = 0; l < LAYERS && ok; l++) {
+            const uint32_t want = l + 1;
+            k_pre<<<1, 256, 0, s>>>(d_act, pre_spin, l);
+            ok = ok && hipMemcpyAsync(h_act + l * ACT_F, d_act, ACT_F * sizeof(float), hipMemcpyDeviceToHost, s) == hipSuccess;
+            if (variant == 3) {
+                k_write_flag<<<1, 1, 0, s>>>(m_flagA, want);
+            } else {
+                ok = ok && hipStreamWriteValue32(s, sigA, want, 0) == hipSuccess;
+            }
+            if (variant == 1) {
+                ok = ok && hipStreamWaitValue32(s, sigB, want, hipStreamWaitValueGte, 0xFFFFFFFF) == hipSuccess;
+            } else {
+                k_wait_flag<<<1, 1, 0, s>>>(m_flagB, want);
+            }
+            k_post<<<1, 256, 0, s>>>(m_res + l * RES_F, d_acc, post_spin);
+        }
+        const hipError_t end = hipStreamEndCapture(s, &graph);
+        if (!ok || end != hipSuccess || hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0) != hipSuccess) {
+            printf("%-44s capture failed (%s)\n", name, hipGetErrorString(hipGetLastError()));
+            (void) hipGetLastError();
+            continue;
+        }
+        const uint32_t * flagA_host = variant == 3 ? h_flagA : sigA;
+        double best = 1e30;
+        for (int r = 0; r < REPS; r++) {
+            CHECK(hipStreamSynchronize(s));
+            __atomic_store_n(sigA, 0u, __ATOMIC_RELEASE);
+            __atomic_store_n(sigB, 0u, __ATOMIC_RELEASE);
+            __atomic_store_n(h_flagA, 0u, __ATOMIC_RELEASE);
+            __atomic_store_n(h_flagB, 0u, __ATOMIC_RELEASE);
+            std::atomic<bool> go{false};
+            std::thread worker([&] {
+                while (!go.load(std::memory_order_acquire)) {}
+                for (int l = 0; l < LAYERS; l++) {
+                    const uint32_t want = l + 1;
+                    while (__atomic_load_n(flagA_host, __ATOMIC_ACQUIRE) < want) {}
+                    cpu_spin(cpu_us);
+                    memcpy(h_res + l * RES_F, cpu_out.data(), RES_F * sizeof(float));
+                    __atomic_store_n(variant == 1 ? sigB : h_flagB, want, __ATOMIC_RELEASE);
+                }
+            });
+            const double t0 = now_us();
+            go.store(true, std::memory_order_release);
+            CHECK(hipGraphLaunch(exec, s));
+            while (hipStreamQuery(s) == hipErrorNotReady) {
+                if (now_us() - t0 > 3e6) {
+                    printf("%-44s hangs (replay %d does not finish in 3 s)\n", name, r);
+                    _exit(2);
+                }
+            }
+            const double t = now_us() - t0;
+            worker.join();
+            best = std::min(best, t);
+        }
+        const double per = best / LAYERS;
+        printf("%-44s %7.1f us per layer, overhead %6.1f us (against the graph reference)\n",
+               name, per, per - gpu_graph_layer - cpu_us);
     }
     return 0;
 }
