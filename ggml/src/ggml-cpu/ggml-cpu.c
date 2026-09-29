@@ -4505,6 +4505,7 @@ int ggml_cpu_has_sme2(void) {
 static void ggml_cpu_moe_experts(const struct ggml_tensor * gate_w, const struct ggml_tensor * up_w,
                                  const struct ggml_tensor * down_w, const float * act,
                                  const int32_t * experts, int n, float * out, int n_threads) {
+    const int64_t t_call = ggml_time_us();
     static _Thread_local void * mem = NULL;
     static _Thread_local size_t mem_size = 0;
     static _Thread_local uint8_t * work = NULL;
@@ -4552,10 +4553,24 @@ static void ggml_cpu_moe_experts(const struct ggml_tensor * gate_w, const struct
         return;
     }
     cplan.work_data = work;
+    static _Thread_local int64_t st_calls, st_rows, st_build, st_compute;
+    const int64_t t_built = ggml_time_us();
     ggml_graph_compute(gf, &cplan);
+    const int64_t t_done = ggml_time_us();
 
     memcpy(out, d->data, (size_t) n_embd * n * sizeof(float));
     ggml_free(ctx);
+
+    // DIAGNOSTIC (GGML_CPU_MOE_EXPERTS_STATS=1): graph build and compute time per call, compute by rows (1, 2, 3, 4+)
+    static _Thread_local int64_t st_by_n[5], st_cnt_n[5];
+    st_calls++; st_rows += n; st_build += t_built - t_call; st_compute += t_done - t_built;
+    st_by_n[n < 4 ? n : 4] += t_done - t_built; st_cnt_n[n < 4 ? n : 4]++;
+    if (getenv("GGML_CPU_MOE_EXPERTS_STATS") && st_calls % 20000 == 0) {
+        GGML_LOG_INFO("cpu experts: %lld calls, %.2f rows, build %.1f us, compute %.1f us per call; by rows: 1 %.1f, 2 %.1f, 3 %.1f, 4+ %.1f us\n",
+                (long long) st_calls, (double) st_rows / st_calls, (double) st_build / st_calls, (double) st_compute / st_calls,
+                st_cnt_n[1] ? (double) st_by_n[1] / st_cnt_n[1] : 0.0, st_cnt_n[2] ? (double) st_by_n[2] / st_cnt_n[2] : 0.0,
+                st_cnt_n[3] ? (double) st_by_n[3] / st_cnt_n[3] : 0.0, st_cnt_n[4] ? (double) st_by_n[4] / st_cnt_n[4] : 0.0);
+    }
 }
 
 void ggml_cpu_init(void) {

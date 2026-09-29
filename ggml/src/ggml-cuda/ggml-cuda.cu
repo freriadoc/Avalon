@@ -381,6 +381,19 @@ static ggml_cuda_device_info ggml_cuda_init() {
         }
 
 #endif  // defined(GGML_USE_HIP)
+
+        // When the GPU hosts the MoE blocks (GGML_MOE_GPU=1, see the scheduler), the host thread only
+        // waits for whole graphs while a host thread computes the missed experts: it sleeps instead
+        // of spinning on a core they need (their time per row 90 -> 76 us, generation +4.3 %). The
+        // host-driven path alternates short waits with CPU work, and sleeping costs it 3.8 %.
+        if (getenv("GGML_MOE_GPU") && atoi(getenv("GGML_MOE_GPU"))) {
+            CUDA_CHECK(cudaSetDevice(id));
+#if defined(GGML_USE_HIP)
+            CUDA_CHECK(hipSetDeviceFlags(hipDeviceScheduleBlockingSync));
+#else
+            CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync));
+#endif
+        }
     }
 
     if (ggml_cuda_highest_compiled_arch(GGML_CUDA_CC_TURING) >= GGML_CUDA_CC_TURING && !turing_devices_without_mma.empty()) {
