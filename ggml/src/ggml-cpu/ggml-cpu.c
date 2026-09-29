@@ -4504,7 +4504,8 @@ int ggml_cpu_has_sme2(void) {
 // cache session, so these MUL_MAT_ID go the plain CPU way.
 static void ggml_cpu_moe_experts(const struct ggml_tensor * gate_w, const struct ggml_tensor * up_w,
                                  const struct ggml_tensor * down_w, const float * act,
-                                 const int32_t * experts, int n, float * out, int n_threads) {
+                                 const int32_t * experts, int k, int n_tokens, float * out, int n_threads) {
+    const int n = k * n_tokens;
     const int64_t t_call = ggml_time_us();
     static _Thread_local void * mem = NULL;
     static _Thread_local size_t mem_size = 0;
@@ -4516,7 +4517,7 @@ static void ggml_cpu_moe_experts(const struct ggml_tensor * gate_w, const struct
     // tensors and graph metadata; data: the activations, the ids, the 3 intermediate [n_ff, n]
     // results and the output; each object aligned
     const size_t need = 16*ggml_tensor_overhead() + ggml_graph_overhead_custom(16, false) +
-        (size_t) n_embd * sizeof(float) + (size_t) n * sizeof(int32_t) +
+        (size_t) n_embd * n_tokens * sizeof(float) + (size_t) n * sizeof(int32_t) +
         (size_t) (3*n_ff + n_embd) * n * sizeof(float) + 16*GGML_MEM_ALIGN;
     if (mem_size < need) {
         free(mem);
@@ -4529,9 +4530,9 @@ static void ggml_cpu_moe_experts(const struct ggml_tensor * gate_w, const struct
     struct ggml_init_params params = { mem_size, mem, false };
     struct ggml_context * ctx = ggml_init(params);
 
-    struct ggml_tensor * a   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 1, 1);
-    struct ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n, 1);
-    memcpy(a->data, act, (size_t) n_embd * sizeof(float));
+    struct ggml_tensor * a   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 1, n_tokens);
+    struct ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, k, n_tokens);
+    memcpy(a->data, act, (size_t) n_embd * n_tokens * sizeof(float));
     memcpy(ids->data, experts, (size_t) n * sizeof(int32_t));
 
     struct ggml_tensor * g = ggml_mul_mat_id(ctx, (struct ggml_tensor *) gate_w, a, ids);

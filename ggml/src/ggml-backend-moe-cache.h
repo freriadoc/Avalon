@@ -165,13 +165,14 @@ struct ggml_moe_cache_api {
     // them when a graph needs less, so that the cache gets the memory back
     bool (*borrows)(ggml_backend_buffer_type_t buft);
 
-    // Whole experts computed on the CPU, registered by ggml-cpu: for the n experts 'experts'
-    // of one token with activations 'act' [n_embd], out[k*n_embd ...] = down(swiglu(gate, up))
-    // of expert experts[k]. For the MoE block the GPU hosts (the cache plans it and hands the
-    // missed experts to a host thread); never called from a graph compute thread.
+    // Whole experts computed on the CPU, registered by ggml-cpu: for n_tokens tokens with
+    // activations act [n_embd, n_tokens] and k experts each, experts [k, n_tokens],
+    // out[(t*k + i)*n_embd ...] = down(swiglu(gate, up)) of expert experts[t*k + i] on token t.
+    // An expert several tokens use is read once. For the MoE block the GPU hosts (the cache plans
+    // it and hands the missed experts to a host thread); never called from a graph compute thread.
     void (*cpu_experts)(const struct ggml_tensor * gate_w, const struct ggml_tensor * up_w,
                         const struct ggml_tensor * down_w, const float * act,
-                        const int32_t * experts, int n, float * out, int n_threads);
+                        const int32_t * experts, int k, int n_tokens, float * out, int n_threads);
 };
 
 GGML_API struct ggml_moe_cache_api ggml_moe_cache;

@@ -5623,6 +5623,13 @@ struct moe_hosted_state {
     moe_hosted_mailbox * h_mail = nullptr;
     moe_hosted_mailbox * m_mail = nullptr;
     uint32_t * d_seq = nullptr;
+    // quantized activations of the block and of its intermediate result: the block's own tensors
+    // cannot hold them, ggml-alloc may place down's output over gate's or up's once swiglu has read
+    // them. Sized once for the largest block (addresses captured in graphs).
+    char * d_q8_act = nullptr;
+    char * d_q8_mid = nullptr;
+    size_t q8_act_bytes = 0;
+    size_t q8_mid_bytes = 0;
     std::thread worker;
     std::atomic<bool> stop{false};
     int n_threads = 1;
@@ -5805,6 +5812,7 @@ static void moe_hosted_worker(moe_hosted_state * st) {
     std::vector<int32_t> cpu_rows(moe_hosted_rows_max);
     std::vector<int32_t> experts(moe_hosted_rows_max);
     std::vector<float> out;
+    std::vector<float> act;
     // DIAGNOSTIC (GGML_CUDA_MOE_HOSTED_STATS=N): every N layers, per layer: the GPU's time between the
     // CPU rows handed back and the next publication (merge + the next layer's GPU work; long gaps,
     // between graphs, left out), the plan, the CPU rows, the CPU rows per layer
@@ -5839,24 +5847,50 @@ static void moe_hosted_worker(moe_hosted_state * st) {
         __atomic_store_n(&layer->h_flags[0], seq, __ATOMIC_RELEASE);
         const int64_t t_plan = stats_every > 0 ? ggml_time_us() : 0;
 
-        // the CPU rows, token by token
-        for (int token = 0, k = 0; token < n_tokens; token++) {
-            int n = 0;
-            int first = k;
-            while (k < n_cpu && cpu_rows[k] / layer->n_used == token) {
-                experts[n++] = layer->h_ids[cpu_rows[k]];
-                k++;
+        // the CPU rows of all tokens that have some, in one call, k per token (the largest count; a
+        // token with fewer repeats one of its own, whose output is dropped): an expert several tokens
+        // miss is read once
+        if (n_cpu > 0) {
+            int per_token[moe_hosted_rows_max] = {0};
+            int k = 0;
+            for (int j = 0; j < n_cpu; j++) {
+                k = std::max(k, ++per_token[cpu_rows[j] / layer->n_used]);
             }
-            if (n == 0) {
-                continue;
+            int col[moe_hosted_rows_max];   // token -> column of the call
+            int m = 0;
+            for (int token = 0; token < n_tokens; token++) {
+                col[token] = per_token[token] > 0 ? m++ : -1;
             }
-            out.resize((size_t) n * layer->n_embd);
-            ggml_moe_cache.cpu_experts(layer->gate_w, layer->up_w, layer->down_w,
-                                       layer->h_act + (size_t) token * layer->n_embd, experts.data(), n, out.data(),
-                                       st->n_threads);
-            for (int j = 0; j < n; j++) {
-                memcpy(layer->h_res + (size_t) cpu_rows[first + j] * layer->n_embd,
-                       out.data() + (size_t) j * layer->n_embd, layer->n_embd * sizeof(float));
+            std::vector<int32_t> & ids = experts;
+            ids.assign((size_t) k * m, -1);
+            std::vector<int32_t> row_of((size_t) k * m, -1);
+            act.resize((size_t) m * layer->n_embd);
+            int fill[moe_hosted_rows_max] = {0};
+            for (int j = 0; j < n_cpu; j++) {
+                const int c = col[cpu_rows[j] / layer->n_used];
+                const int at = c * k + fill[c]++;
+                ids[at] = layer->h_ids[cpu_rows[j]];
+                row_of[at] = cpu_rows[j];
+            }
+            for (int token = 0; token < n_tokens; token++) {
+                const int c = col[token];
+                if (c < 0) {
+                    continue;
+                }
+                memcpy(act.data() + (size_t) c * layer->n_embd, layer->h_act + (size_t) token * layer->n_embd,
+                       layer->n_embd * sizeof(float));
+                for (int i = fill[c]; i < k; i++) {
+                    ids[c * k + i] = ids[c * k];
+                }
+            }
+            out.resize((size_t) k * m * layer->n_embd);
+            ggml_moe_cache.cpu_experts(layer->gate_w, layer->up_w, layer->down_w, act.data(), ids.data(), k, m,
+                                       out.data(), st->n_threads);
+            for (size_t at = 0; at < row_of.size(); at++) {
+                if (row_of[at] >= 0) {
+                    memcpy(layer->h_res + (size_t) row_of[at] * layer->n_embd,
+                           out.data() + at * layer->n_embd, layer->n_embd * sizeof(float));
+                }
             }
         }
         __atomic_store_n(&layer->h_flags[16], seq, __ATOMIC_RELEASE);
@@ -5924,6 +5958,8 @@ static void moe_hosted_shutdown(moe_cache_session * session) {
     }
     if (st->h_mail) cudaFreeHost(st->h_mail);
     if (st->d_seq) cudaFree(st->d_seq);
+    if (st->d_q8_act) cudaFree(st->d_q8_act);
+    if (st->d_q8_mid) cudaFree(st->d_q8_mid);
     // the pins of the last plan go with the pools the session is about to free
 }
 
@@ -5976,6 +6012,19 @@ static moe_hosted_layer * moe_hosted_register(moe_hosted_state & st, moe_cache_d
     if (!ok) {
         (void) cudaGetLastError();
         GGML_ABORT("MoE block hosted by the GPU: allocation failed");
+    }
+    {
+        const size_t act_bytes = (size_t) tokens * (GGML_PAD(layer->n_embd, MATRIX_ROW_PADDING) / QK8_1) * sizeof(block_q8_1);
+        const size_t mid_bytes = (size_t) rows * (GGML_PAD(layer->n_ff, MATRIX_ROW_PADDING) / QK8_1) * sizeof(block_q8_1);
+        if (!st.d_q8_act) {
+            if (cudaMalloc((void **) &st.d_q8_act, act_bytes) != cudaSuccess ||
+                cudaMalloc((void **) &st.d_q8_mid, mid_bytes) != cudaSuccess) {
+                GGML_ABORT("MoE block hosted by the GPU: allocation failed");
+            }
+            st.q8_act_bytes = act_bytes;
+            st.q8_mid_bytes = mid_bytes;
+        }
+        GGML_ASSERT(act_bytes <= st.q8_act_bytes && mid_bytes <= st.q8_mid_bytes);   // one shape per model
     }
     slot = (int) st.layers.size();
     st.slot_of[gate_w->data] = slot;
@@ -6048,12 +6097,10 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
     k_moe_hosted_publish<<<1, 1, 0, stream>>>(st->d_seq, layer->d_expect, st->m_mail, (uint32_t) slot, (uint32_t) n_tokens);
     k_moe_hosted_wait_plan<<<1, 64, 0, stream>>>(layer->d_expect, layer->m_flags, layer->m_plan, layer->d_plan, 3 * rows);
 
-    // resident rows: activations quantized into the gate result (free until now), up/gate/swiglu into
-    // the glu result, its quantization into the up result, down into the block's output
-    char * q8_act = (char *) gate->data;
-    char * q8_mid = (char *) up->data;
-    GGML_ASSERT((size_t) n_tokens * (padded_embd / QK8_1) * sizeof(block_q8_1) <= ggml_nbytes(gate));
-    GGML_ASSERT((size_t) rows * (padded_ff / QK8_1) * sizeof(block_q8_1) <= ggml_nbytes(up));
+    // resident rows: activations quantized, up/gate/swiglu into the glu result (alive until down has
+    // read it), its quantization, down into the block's output
+    char * q8_act = st->d_q8_act;
+    char * q8_mid = st->d_q8_mid;
     quantize_row_q8_1_cuda((const float *) act->data, nullptr, q8_act, wtype, n_embd, n_embd, n_tokens * n_embd,
                            n_tokens * n_embd, padded_embd, n_tokens, 1, 1, stream);
     ggml_cuda_moe_cache_mmv_fused(layer->base, layer->base, wtype, q8_act, layer->d_plan, layer->d_plan + rows,
