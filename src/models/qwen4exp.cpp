@@ -1184,26 +1184,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
-    ggml_tensor * moe_out =
-        build_moe_ffn(cur,
-            model.layers[il].ffn_gate_inp,
-            model.layers[il].ffn_up_exps,
-            model.layers[il].ffn_gate_exps,
-            model.layers[il].ffn_down_exps,
-            nullptr,
-            n_expert, n_expert_used,
-            LLM_FFN_SILU, true,
-            hparams.expert_weights_scale,
-            LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
-            nullptr, model.layers[il].ffn_gate_up_exps,
-            model.layers[il].ffn_up_exps_s,
-            model.layers[il].ffn_gate_exps_s,
-            model.layers[il].ffn_down_exps_s);
-    cb(moe_out, "ffn_moe_out", il);
-
-    // shared experts, as in the Qwen3Next reference
+    // shared experts, as in the Qwen3Next reference; built first but queued by build_moe_ffn right
+    // after the routed experts' down projection (moe_interleave): when the GPU hosts the MoE block
+    // (resident experts on the GPU, the others on the CPU), it computes the shared expert while the
+    // CPU works. Order only, same arithmetic.
+    ggml_tensor * ffn_shexp = nullptr;
     if (model.layers[il].ffn_up_shexp != nullptr) {
-        ggml_tensor * ffn_shexp =
+        ffn_shexp =
             build_ffn(cur,
                 model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
                 model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
@@ -1221,7 +1208,28 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
 
         ffn_shexp = ggml_mul(ctx0, ffn_shexp, shared_gate);
         cb(ffn_shexp, "ffn_shexp_gated", il);
+    }
 
+    moe_interleave = ffn_shexp;
+    ggml_tensor * moe_out =
+        build_moe_ffn(cur,
+            model.layers[il].ffn_gate_inp,
+            model.layers[il].ffn_up_exps,
+            model.layers[il].ffn_gate_exps,
+            model.layers[il].ffn_down_exps,
+            nullptr,
+            n_expert, n_expert_used,
+            LLM_FFN_SILU, true,
+            hparams.expert_weights_scale,
+            LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
+            nullptr, model.layers[il].ffn_gate_up_exps,
+            model.layers[il].ffn_up_exps_s,
+            model.layers[il].ffn_gate_exps_s,
+            model.layers[il].ffn_down_exps_s);
+    moe_interleave = nullptr;
+    cb(moe_out, "ffn_moe_out", il);
+
+    if (ffn_shexp) {
         cur = ggml_add(ctx0, moe_out, ffn_shexp);
         cb(cur, "ffn_out", il);
     } else {

@@ -2339,6 +2339,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(experts, "ffn_moe_down_biased", il);
     }
 
+    // a graph that does not depend on the routed experts (a shared expert) queued between their
+    // down projection and their weighting: see moe_interleave
+    if (moe_interleave) {
+        ggml_build_forward_expand(gf, experts);
+        ggml_build_forward_expand(gf, moe_interleave);
+    }
+
     if (!weight_before_ffn) {
         experts = ggml_mul(ctx0, experts, weights);
         cb(experts, "ffn_moe_weighted", il);

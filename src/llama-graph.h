@@ -1041,6 +1041,11 @@ struct llm_graph_context {
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
 
+    // Set by a model before build_moe_ffn: queued right after the routed experts' down projection,
+    // before their weighting. A MoE block hosted by the GPU (resident experts on the GPU, the others
+    // on the CPU) computes it while the CPU works. Order only.
+    ggml_tensor * moe_interleave = nullptr;
+
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
 
