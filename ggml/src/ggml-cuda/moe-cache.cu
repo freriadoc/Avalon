@@ -447,6 +447,7 @@ struct moe_cache_node {
     int n_pins = 0;
     bool planned = false;
     bool dispatched = false;
+    bool download_queued = false;   // the output download follows the kernels (dispatch)
     bool owns_active = true;
     bool composite = false;
     int n_result_rows = 0;
@@ -3189,6 +3190,8 @@ static int moe_cache_plan(
     return hits;
 }
 
+static bool moe_cache_collect_enqueue(moe_cache_node & node, int n_hits);
+
 static int moe_cache_dispatch_internal(
         void * opaque, int wtype, int64_t n_in, int64_t n_out, int n_hits,
         const int32_t * slot_indices, const float * const * act_rows,
@@ -3463,6 +3466,11 @@ static int moe_cache_dispatch_internal(
         device.dedicated_down_mmv_dispatches++;
     }
     node->dispatched = true;
+
+    // queue the output download right behind the kernels: it lands while the CPU computes
+    // the missed rows, and collect only waits for it (queued at collect time, it cost the
+    // copy's submission and transfer after the CPU was done: ~60 us per node, measured)
+    node->download_queued = moe_cache_collect_enqueue(*node, n_hits);
     return 1;
 }
 
@@ -3496,6 +3504,9 @@ static bool moe_cache_collect_preflight(
 }
 
 static bool moe_cache_collect_enqueue(moe_cache_node & node, int n_hits) {
+    if (node.download_queued) {
+        return true;
+    }
     moe_cache_session & session = *node.session;
     moe_cache_device & device = *node.device;
 
@@ -3526,6 +3537,7 @@ static bool moe_cache_collect_finish(moe_cache_node & node, bool ok) {
         cudaStreamSynchronize(device.compute_stream);
     }
     node.dispatched = false;
+    node.download_queued = false;
 
     {
         std::lock_guard<std::mutex> lock(session.mu);
