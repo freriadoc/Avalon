@@ -2104,6 +2104,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         ggml_tensor * prefetch_input_cpy = NULL;
         ggml_backend_buffer_t prefetch_saved_buffer = NULL;
         void * prefetch_saved_data = NULL;
+        const bool split_is_cpu =
+            ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
+        ggml_backend_t copies_backend = NULL;
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -2188,6 +2191,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
                 } else {
                     ggml_backend_synchronize(split_backend);
+                }
+
+                // an input a CPU split takes from a GPU is queued as an asynchronous copy into
+                // its host buffer; one synchronization after the inputs replaces a
+                // synchronization and a synchronous copy per input (a MoE layer takes two:
+                // generation +5 %, measured). Polling a counter the GPU writes behind the
+                // copies instead of synchronizing was measured too: no better (-1 to -3 %).
+                if (split_is_cpu && input_backend != split_backend &&
+                    input_backend->iface.get_tensor_async && ggml_backend_buffer_is_host(input_cpy->buffer) &&
+                    ggml_is_contiguous(input) && ggml_is_contiguous(input_cpy)) {
+                    ggml_backend_tensor_get_async(input_backend, input, input_cpy->data, 0, ggml_nbytes(input));
+                    copies_backend = input_backend;
+                    continue;
                 }
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
@@ -2297,6 +2313,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                 }
             }
+        }
+
+        if (copies_backend) {
+            ggml_backend_synchronize(copies_backend);
         }
 
         if (trace_on && getenv("GGML_SCHED_TRACE_NODES")) {
