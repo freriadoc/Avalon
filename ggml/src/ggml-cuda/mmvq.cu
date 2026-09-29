@@ -1742,6 +1742,50 @@ static void ggml_cuda_moe_cache_mmv_t(
     GGML_UNUSED(n_slots);
 }
 
+// Share of the threads that hold a block of a row of n_in values: the generic kernel gives a whole
+// thread block (nwarps warps) to one row, the dedicated MoE kernel one warp; a row of few blocks
+// (down: 640 values, 20 IQ4_NL blocks) leaves most of the generic block idle.
+template <ggml_type type>
+static bool ggml_cuda_moe_cache_dedicated_fills_better(int64_t n_in) {
+    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = get_vdr_mmvq(type);
+    const int device    = ggml_cuda_get_device();
+    const int warp_size = ggml_cuda_info().devices[device].warp_size;
+    const int nwarps    = calc_nwarps(type, 1, get_device_table_id(ggml_cuda_info().devices[device].cc));
+    const int64_t blocks = n_in / qk;
+    const auto fill = [blocks](int64_t per_iter) {
+        return (double) blocks / (double) (((blocks + per_iter - 1) / per_iter) * per_iter);
+    };
+    return fill(vdr * warp_size / qi) > fill(vdr * nwarps * warp_size / qi);
+}
+
+static bool ggml_cuda_moe_cache_prefer_dedicated(ggml_type type, int64_t n_in) {
+    switch (type) {
+#define MOE_CACHE_FILL_CASE(t) case t: return ggml_cuda_moe_cache_dedicated_fills_better<t>(n_in)
+        MOE_CACHE_FILL_CASE(GGML_TYPE_Q4_0);
+        MOE_CACHE_FILL_CASE(GGML_TYPE_Q4_1);
+        MOE_CACHE_FILL_CASE(GGML_TYPE_Q5_0);
+        MOE_CACHE_FILL_CASE(GGML_TYPE_Q5_1);
+        MOE_CACHE_FILL_CASE(GGML_TYPE_Q8_0);
+        MOE_CACHE_FILL_CASE(GGML_TYPE_Q2_K);
+        MOE_CACHE_FILL_CASE(GGML_TYPE_Q3_K);
+        MOE_CACHE_FILL_CASE(GGML_TYPE_Q4_K);
+        MOE_CACHE_FILL_CASE(GGML_TYPE_Q5_K);
+        MOE_CACHE_FILL_CASE(GGML_TYPE_Q6_K);
+        MOE_CACHE_FILL_CASE(GGML_TYPE_IQ2_XXS);
+        MOE_CACHE_FILL_CASE(GGML_TYPE_IQ2_XS);
+        MOE_CACHE_FILL_CASE(GGML_TYPE_IQ2_S);
+        MOE_CACHE_FILL_CASE(GGML_TYPE_IQ3_XXS);
+        MOE_CACHE_FILL_CASE(GGML_TYPE_IQ3_S);
+        MOE_CACHE_FILL_CASE(GGML_TYPE_IQ4_NL);
+        MOE_CACHE_FILL_CASE(GGML_TYPE_IQ4_XS);
+#undef MOE_CACHE_FILL_CASE
+        default:
+            return false;
+    }
+}
+
 ggml_cuda_moe_cache_mmv_path ggml_cuda_moe_cache_mmv(
     const void * pool, ggml_type type0, const char * act_q8,
     const int32_t * ids_dev, const int32_t * act_ids_dev,
@@ -1752,7 +1796,9 @@ ggml_cuda_moe_cache_mmv_path ggml_cuda_moe_cache_mmv(
     const int64_t ts0 = ggml_type_size(type0);
     GGML_ASSERT(slot_stride_bytes % ts0 == 0);
 
-    if (!act_ids_dev && !force_dedicated) {
+    // IQ4_NL down on RDNA3: 16 % of the generic block's threads hold a block, 62 % of the
+    // dedicated warp's; measured: collect 49 -> 34 us per node, generation +3 %
+    if (!act_ids_dev && !force_dedicated && !ggml_cuda_moe_cache_prefer_dedicated(type0, n_in)) {
         const int64_t ne10_padded = GGML_PAD(n_in, MATRIX_ROW_PADDING);
         const int64_t s01 = ggml_row_size(type0, n_in) / ts0;
         const int64_t s02 = slot_stride_bytes / ts0;
