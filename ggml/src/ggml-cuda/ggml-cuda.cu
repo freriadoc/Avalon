@@ -4577,6 +4577,23 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                // the CPU rows of a hosted MoE block, before a node (or a fusion starting here)
+                // reads the block's output
+                for (int k = i; k < std::min(i + 4, cgraph->n_nodes); k++) {
+                    ggml_cuda_moe_hosted_flush(*cuda_ctx, cgraph->nodes[k]);
+                }
+
+                // weights in host memory: the scheduler left a MoE block of the cache on the GPU
+                if (node->op == GGML_OP_MUL_MAT_ID && node->src[0]->buffer &&
+                        !ggml_backend_buft_is_cuda(node->src[0]->buffer->buft)) {
+                    const int covered = ggml_cuda_moe_hosted_block(*cuda_ctx, cgraph, i);
+                    if (covered <= 0) {
+                        GGML_ABORT("%s: MUL_MAT_ID with host weights outside a hosted MoE block (%s)", __func__, node->name);
+                    }
+                    i += covered;
+                    continue;
+                }
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
@@ -4616,6 +4633,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     try_launch_concurrent_event(node);
                }
             }
+            ggml_cuda_moe_hosted_flush(*cuda_ctx, nullptr);
         }
 
 #ifdef USE_CUDA_GRAPH

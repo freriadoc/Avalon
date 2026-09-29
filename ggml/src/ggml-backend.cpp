@@ -31,6 +31,7 @@ void ggml_moe_cache_unregister(const void * owner) {
 #include <string.h>
 #include <algorithm>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #ifdef __APPLE__
@@ -1034,6 +1035,9 @@ struct ggml_backend_sched {
 
     struct ggml_context * ctx;
     void * moe_cache_session;
+    // MUL_MAT_ID nodes of the MoE blocks left on the GPU with their weights in host memory
+    // (GGML_MOE_GPU=1), found again by every split_graph
+    std::unordered_set<const struct ggml_tensor *> * moe_hosted;
 
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
@@ -1150,7 +1154,20 @@ static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML
 #endif
 
 // returns the backend that should be used for the node based on the current locations
+static bool ggml_backend_sched_is_hosted_moe(ggml_backend_sched_t sched, const struct ggml_tensor * node);
+
 static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, struct ggml_tensor * tensor) {
+    // a MoE block the GPU hosts: on the first GPU backend (the cache's device)
+    if (ggml_backend_sched_is_hosted_moe(sched, tensor)) {
+        for (int b = 0; b < sched->n_backends - 1; b++) {
+            if (ggml_backend_dev_type(ggml_backend_get_device(sched->backends[b])) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+                ggml_backend_supports_op(sched->backends[b], tensor)) {
+                SET_CAUSE(tensor, "1.moe");
+                return b;
+            }
+        }
+    }
+
     // assign pre-allocated nodes to their backend
     int cur_backend_id = ggml_backend_sched_backend_from_buffer(sched, tensor, tensor);
     if (cur_backend_id != -1) {
@@ -1295,11 +1312,57 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
 }
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
+static bool ggml_backend_sched_is_hosted_moe(ggml_backend_sched_t sched, const struct ggml_tensor * node) {
+    return sched->moe_hosted && !sched->moe_hosted->empty() && sched->moe_hosted->count(node) > 0;
+}
+
+// GGML_MOE_GPU=1: with a MoE cache session, a MoE block gate / up / swiglu / down whose weights are
+// in host memory stays on the GPU for batches of up to 64 routed rows: the GPU computes the rows
+// the cache holds, a host thread the others (ggml_cuda_moe_hosted_block); no weight is copied.
+static void ggml_backend_sched_find_hosted_moe(ggml_backend_sched_t sched, const struct ggml_cgraph * graph) {
+    static const bool enabled = getenv("GGML_MOE_GPU") && atoi(getenv("GGML_MOE_GPU")) != 0;
+    if (sched->moe_hosted) {
+        sched->moe_hosted->clear();
+    }
+    if (!enabled || !sched->moe_cache_session || !ggml_moe_cache.cpu_experts) {
+        return;
+    }
+    if (!sched->moe_hosted) {
+        sched->moe_hosted = new std::unordered_set<const struct ggml_tensor *>();
+    }
+    const auto host_weights = [](const struct ggml_tensor * t) {
+        return t->op == GGML_OP_MUL_MAT_ID && t->src[0]->buffer && ggml_backend_buffer_is_host(t->src[0]->buffer) &&
+               t->src[0]->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+    };
+    for (int i = 0; i + 3 < graph->n_nodes; i++) {
+        const struct ggml_tensor * glu  = graph->nodes[i + 2];
+        const struct ggml_tensor * down = graph->nodes[i + 3];
+        if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || down->src[1] != glu) {
+            continue;
+        }
+        const struct ggml_tensor * gate = glu->src[0];
+        const struct ggml_tensor * up   = glu->src[1];
+        const struct ggml_tensor * ids  = down->src[2];
+        if (!((gate == graph->nodes[i] && up == graph->nodes[i + 1]) || (gate == graph->nodes[i + 1] && up == graph->nodes[i])) ||
+            !host_weights(gate) || !host_weights(up) || !host_weights(down) ||
+            gate->src[2] != ids || up->src[2] != ids || gate->src[1] != up->src[1] ||
+            ids->ne[0] * ids->ne[1] > 64) {
+            continue;
+        }
+        sched->moe_hosted->insert(gate);
+        sched->moe_hosted->insert(up);
+        sched->moe_hosted->insert(down);
+        i += 3;
+    }
+}
+
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     // reset splits
     sched->n_splits = 0;
     sched->n_graph_inputs = 0;
     sched->is_reset = false;
+
+    ggml_backend_sched_find_hosted_moe(sched, graph);
 
     struct ggml_init_params params = {
         /* .mem_size =   */ sched->context_buffer_size,
@@ -1563,7 +1626,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     }
                     // check if a weight is on a different and incompatible backend
                     // by starting a new split, the memory of the previously offloaded weights can be reused
-                    if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                    if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                            !(j == 0 && ggml_backend_sched_is_hosted_moe(sched, node))) {
                         int src_backend_id = tensor_backend_id(src);
                         if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
                             need_new_split = true;
@@ -1603,6 +1667,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 size_t src_id = hash_id(src);
                 const int src_backend_id = sched->hv_tensor_backend_ids[src_id];
                 GGML_ASSERT(src_backend_id != -1); // all inputs should be assigned by now
+
+                // the weights of a hosted MoE block stay where they are, the block reads them there
+                if (j == 0 && ggml_backend_sched_is_hosted_moe(sched, node)) {
+                    continue;
+                }
 
                 if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
                     // create a copy of the input in the split's backend
@@ -2634,6 +2703,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->context_buffer);
     free(sched->graph.nodes);
     free(sched->graph.leafs);
+    delete sched->moe_hosted;
     free(sched);
 }
 

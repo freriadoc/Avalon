@@ -4498,6 +4498,66 @@ int ggml_cpu_has_sme2(void) {
 #endif
 }
 
+// Whole experts of one token on the CPU for the MoE block the GPU hosts (ggml_moe_cache.cpu_experts):
+// a small graph gate / up / swiglu / down over the given experts only, on the model's weight
+// tensors, computed by this thread and n_threads - 1 others. The thread that calls it has no MoE
+// cache session, so these MUL_MAT_ID go the plain CPU way.
+static void ggml_cpu_moe_experts(const struct ggml_tensor * gate_w, const struct ggml_tensor * up_w,
+                                 const struct ggml_tensor * down_w, const float * act,
+                                 const int32_t * experts, int n, float * out, int n_threads) {
+    static _Thread_local void * mem = NULL;
+    static _Thread_local size_t mem_size = 0;
+    static _Thread_local uint8_t * work = NULL;
+    static _Thread_local size_t work_size = 0;
+
+    const int64_t n_embd = gate_w->ne[0];
+    const int64_t n_ff   = gate_w->ne[1];
+    // tensors and graph metadata; data: the activations, the ids, the 3 intermediate [n_ff, n]
+    // results and the output; each object aligned
+    const size_t need = 16*ggml_tensor_overhead() + ggml_graph_overhead_custom(16, false) +
+        (size_t) n_embd * sizeof(float) + (size_t) n * sizeof(int32_t) +
+        (size_t) (3*n_ff + n_embd) * n * sizeof(float) + 16*GGML_MEM_ALIGN;
+    if (mem_size < need) {
+        free(mem);
+        mem = malloc(need);
+        mem_size = mem ? need : 0;
+        if (!mem) {
+            return;
+        }
+    }
+    struct ggml_init_params params = { mem_size, mem, false };
+    struct ggml_context * ctx = ggml_init(params);
+
+    struct ggml_tensor * a   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 1, 1);
+    struct ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n, 1);
+    memcpy(a->data, act, (size_t) n_embd * sizeof(float));
+    memcpy(ids->data, experts, (size_t) n * sizeof(int32_t));
+
+    struct ggml_tensor * g = ggml_mul_mat_id(ctx, (struct ggml_tensor *) gate_w, a, ids);
+    struct ggml_tensor * u = ggml_mul_mat_id(ctx, (struct ggml_tensor *) up_w,   a, ids);
+    struct ggml_tensor * h = ggml_swiglu_split(ctx, g, u);
+    struct ggml_tensor * d = ggml_mul_mat_id(ctx, (struct ggml_tensor *) down_w, h, ids);
+
+    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx, 16, false);
+    ggml_build_forward_expand(gf, d);
+
+    struct ggml_cplan cplan = ggml_graph_plan(gf, n_threads, NULL);
+    if (cplan.work_size > work_size) {
+        free(work);
+        work = malloc(cplan.work_size);
+        work_size = work ? cplan.work_size : 0;
+    }
+    if (cplan.work_size > 0 && !work) {
+        ggml_free(ctx);
+        return;
+    }
+    cplan.work_data = work;
+    ggml_graph_compute(gf, &cplan);
+
+    memcpy(out, d->data, (size_t) n_embd * n * sizeof(float));
+    ggml_free(ctx);
+}
+
 void ggml_cpu_init(void) {
     // needed to initialize ggml_time
     {
@@ -4570,6 +4630,8 @@ void ggml_cpu_init(void) {
             const char * env = getenv("GGML_CPU_DISABLE_FUSION");
             ggml_cpu_disable_fusion = (env != NULL && atoi(env) == 1);
         }
+
+        ggml_moe_cache.cpu_experts = ggml_cpu_moe_experts;
 
         is_first_call = false;
     }
