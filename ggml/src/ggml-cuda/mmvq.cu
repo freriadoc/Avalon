@@ -580,6 +580,9 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
 }
 
 static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+    if (table_id == MMVQ_PARAMETERS_RDNA3_0 && ncols_dst == 1 && small_k) {
+        return nwarps;
+    }
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
             case 1:
@@ -1258,6 +1261,14 @@ static void mul_mat_vec_q_switch_ncols_dst(
 
         const bool is_nvidia_turing_plus  = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING;
         const bool is_nvidia_pascal_older = GGML_CUDA_CC_IS_NVIDIA(cc) && cc < GGML_CUDA_CC_VOLTA;
+
+        // RDNA3 widens simple types to 8 warps for one row; a short row (qwen4exp's shared expert
+        // down, K = 640 in Q8_0: 20 blocks for 64 per pass) leaves most of them idle. Giving the
+        // warps a row each (rows_per_block = nwarps) measured on the RX 7900 XT: that kernel
+        // ~110 GB/s before, generation +1.9 %, same log-probs.
+        if (table_id == MMVQ_PARAMETERS_RDNA3_0) {
+            return use;
+        }
 
         if (is_nvidia_turing_plus) {
             if (ncols_dst == 1 &&
