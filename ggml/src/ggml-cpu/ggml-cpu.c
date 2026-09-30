@@ -4631,6 +4631,16 @@ void ggml_cpu_init(void) {
                 setenv("KMP_BLOCKTIME", "200", 0); // 200ms
 #endif
             }
+
+#ifndef _WIN32
+            // one thread of a team per physical core: an unbound team shares cores with the runtime's
+            // own busy threads (the HIP runtime's event thread, the MoE cache's fill thread), and each
+            // barrier waits for the slowest (MoE experts on the CPU: 422 -> 416 us per layer)
+            if (!getenv("OMP_PLACES") && !getenv("OMP_PROC_BIND") && !getenv("KMP_AFFINITY")) {
+                setenv("OMP_PLACES", "cores", 0);
+                setenv("OMP_PROC_BIND", "spread", 0);
+            }
+#endif
 #endif
         }
 
