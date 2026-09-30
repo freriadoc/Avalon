@@ -1669,11 +1669,39 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                 fill_lock.lock();
             }
             if (error == cudaSuccess && stage && stage_capacity >= job.bytes) {
+                // DIAGNOSTIC (GGML_CUDA_MOE_FILL_STATS=1): per 2000 fills, time in the copy to the staging
+                // buffer, in the copy to the device and its wait (of which the call), between fills
+                static const bool ft = getenv("GGML_CUDA_MOE_FILL_STATS") != nullptr;
+                static int64_t f_n = 0, f_cpy = 0, f_dma = 0, f_idle = 0, f_last = 0;
+                const int64_t t0 = ft ? ggml_time_us() : 0;
                 memcpy(stage, job.source, job.bytes);
+                const int64_t t1 = ft ? ggml_time_us() : 0;
                 error = cudaMemcpyAsync(
                         destination, stage, job.bytes, cudaMemcpyHostToDevice, stream);
+                static int64_t f_call = 0;
+                const int64_t t1b = ft ? ggml_time_us() : 0;
                 if (error == cudaSuccess) {
-                    error = cudaStreamSynchronize(stream);
+                    // Poll, do not synchronize: with the MoE blocks hosted by the GPU (its host thread
+                    // polling the main stream), cudaStreamSynchronize put this thread to sleep for
+                    // ~1.2 ms per fill of ~60 us; the cache then warmed 8 times slower. A fill lasts
+                    // tens of microseconds, this thread has nothing else to do meanwhile.
+                    while ((error = cudaStreamQuery(stream)) == cudaErrorNotReady) {
+#if defined(__x86_64__)
+                        __builtin_ia32_pause();
+#endif
+                    }
+                }
+                if (ft) {
+                    const int64_t t2 = ggml_time_us();
+                    f_call += t1b - t1;
+                    f_cpy += t1 - t0; f_dma += t2 - t1;
+                    if (f_last > 0 && t0 - f_last < 5000) f_idle += t0 - f_last;
+                    f_last = t2;
+                    if (++f_n % 2000 == 0) {
+                        GGML_LOG_INFO("fill: %lld fills, per fill: memcpy %.1f us, copy+sync %.1f us (call %.1f), between fills %.1f us\n",
+                                (long long) f_n, (double) f_cpy / 2000, (double) f_dma / 2000, (double) f_call / 2000, (double) f_idle / 2000);
+                        f_cpy = f_dma = f_idle = f_call = 0;
+                    }
                 }
             } else if (error == cudaSuccess) {
                 error = cudaMemcpy(
@@ -4465,7 +4493,6 @@ static void * moe_cache_fused_begin(
                     }
                 }
             }
-
             // A full node serves the rows whose three tensors are resident; the CPU computes
             // the others whole (up, gate, swiglu and down), so the node costs one round trip
             // to the GPU instead of two (up+gate, then down).
@@ -5643,6 +5670,8 @@ struct moe_hosted_state {
     std::vector<int32_t> cpu_rows, experts;
     std::vector<float> out, act;
     int64_t st_n = 0, st_gap = 0, st_gaps = 0, st_plan = 0, st_cpu = 0, st_rows = 0, t_done = 0;
+    // CPU rows by what they have resident: up+gate (not down), down only, up or gate only, nothing
+    int64_t partial[4] = {0, 0, 0, 0};
 };
 
 static std::mutex g_hosted_mu;
@@ -5678,9 +5707,9 @@ static T * moe_hosted_device_ptr(T * host) {
 
 static __device__ __forceinline__ void moe_hosted_pause() {
 #if defined(GGML_USE_HIP)
-    __builtin_amdgcn_s_sleep(1);
+    __builtin_amdgcn_s_sleep(127);
 #else
-    __nanosleep(100);
+    __nanosleep(2000);
 #endif
 }
 
@@ -5765,7 +5794,11 @@ static int moe_hosted_plan(moe_hosted_state & st, moe_hosted_layer & layer, cons
                 pool = down_pool = nullptr;
             }
         }
-        int inserts_left = session.config.inserts_per_plan;
+        // an admission budget per pool, as the host-driven path had (a plan for the up/gate node, one
+        // for the down node): one shared budget admitted half as many experts, and a cold cache
+        // warmed twice as slowly
+        int inserts_gate_up = session.config.inserts_per_plan;
+        int inserts_down = session.config.inserts_per_plan;
         for (int row = 0; row < rows; row++) {
             out[row] = out[rows + row] = out[2 * rows + row] = -1;
             const int32_t expert = ids[row];
@@ -5795,12 +5828,14 @@ static int moe_hosted_plan(moe_hosted_state & st, moe_hosted_layer & layer, cons
                 continue;
             }
             cpu_rows[n_cpu++] = row;
+            // DIAGNOSTIC: what the CPU rows have resident (see GGML_CUDA_MOE_HOSTED_STATS)
+            st.partial[(slot[0] >= 0 && slot[1] >= 0) ? 0 : slot[2] >= 0 ? 1 : (slot[0] >= 0 || slot[1] >= 0) ? 2 : 3]++;
             const size_t sizes[3] = {ggml_nbytes(layer.up_w) / layer.up_w->ne[2], ggml_nbytes(layer.gate_w) / layer.gate_w->ne[2],
                                      ggml_nbytes(layer.down_w) / layer.down_w->ne[2]};
             const int indices[3] = {layer.pool_index, layer.pool_index, layer.down_pool_index};
             for (int k = 0; k < 3; k++) {
                 const int s = moe_cache_lookup_or_queue_locked(session, device, *pools[k], indices[k], base[k], expert,
-                                                               sizes[k], inserts_left, wake_worker);
+                                                               sizes[k], k == 2 ? inserts_down : inserts_gate_up, wake_worker);
                 if (s >= 0) {
                     device.hits++;
                 } else {
@@ -5903,9 +5938,17 @@ static void moe_hosted_serve_one(moe_hosted_state * st, uint32_t seq) {
         st->st_cpu += st->t_done - t_plan;
         st->st_rows += n_cpu;
         if (++st->st_n % stats_every == 0) {
-            GGML_LOG_INFO("moe hosted: %lld layers: GPU between layers %.1f us, plan %.1f us, CPU rows %.1f us (%.2f rows)\n",
+            const double n = (double) stats_every;
+            GGML_LOG_INFO("moe hosted: %lld layers: GPU between layers %.1f us, plan %.1f us, CPU rows %.1f us (%.2f rows); "
+                    "last %d layers, CPU rows with up+gate %.2f, down only %.2f, up or gate %.2f, nothing %.2f\n",
                     (long long) st->st_n, st->st_gaps ? (double) st->st_gap / st->st_gaps : 0.0,
-                    (double) st->st_plan / st->st_n, (double) st->st_cpu / st->st_n, (double) st->st_rows / st->st_n);
+                    (double) st->st_plan / st->st_n, (double) st->st_cpu / st->st_n, (double) st->st_rows / st->st_n,
+                    stats_every, st->partial[0] / n, st->partial[1] / n, st->partial[2] / n, st->partial[3] / n);
+            st->partial[0] = st->partial[1] = st->partial[2] = st->partial[3] = 0;
+            {
+                std::lock_guard<std::mutex> lock(st->session->mu);
+                moe_cache_log_stats(*st->device);
+            }
         }
     }
 }
