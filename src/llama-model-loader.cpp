@@ -1049,6 +1049,13 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
             {
                 op_tensor = ggml_scale(ctx, w, 1.0f);
             } break;
+        case GGML_OP_SET_ROWS:
+            {
+                // w holds the row indices (the d2t map of a cut draft head)
+                ggml_tensor * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, 2*w->ne[0], 1);
+                ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, w->ne[0], 1);
+                op_tensor = ggml_set_rows(ctx, a, b, w);
+            } break;
         default:
             GGML_ABORT("%s: missing test for op %s for tensor %s", __func__, ggml_op_name(op), w->name);
     }
