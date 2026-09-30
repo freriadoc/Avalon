@@ -381,19 +381,6 @@ static ggml_cuda_device_info ggml_cuda_init() {
         }
 
 #endif  // defined(GGML_USE_HIP)
-
-        // When the GPU hosts the MoE blocks (GGML_MOE_GPU=1, see the scheduler), the host thread only
-        // waits for whole graphs while a host thread computes the missed experts: it sleeps instead
-        // of spinning on a core they need (their time per row 90 -> 76 us, generation +4.3 %). The
-        // host-driven path alternates short waits with CPU work, and sleeping costs it 3.8 %.
-        if (getenv("GGML_MOE_GPU") && atoi(getenv("GGML_MOE_GPU"))) {
-            CUDA_CHECK(cudaSetDevice(id));
-#if defined(GGML_USE_HIP)
-            CUDA_CHECK(hipSetDeviceFlags(hipDeviceScheduleBlockingSync));
-#else
-            CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync));
-#endif
-        }
     }
 
     if (ggml_cuda_highest_compiled_arch(GGML_CUDA_CC_TURING) >= GGML_CUDA_CC_TURING && !turing_devices_without_mma.empty()) {
@@ -2762,7 +2749,10 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
-    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+    // a hosted MoE block may be waiting for this thread to compute its missed experts
+    if (!ggml_cuda_moe_hosted_wait((void *) cuda_ctx->stream(), nullptr)) {
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+    }
 
     GGML_UNUSED(backend);
 }
@@ -5971,7 +5961,9 @@ static void ggml_backend_cuda_device_event_free(ggml_backend_dev_t dev, ggml_bac
 
 static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
     GGML_UNUSED(dev);
-    CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
+    if (!ggml_cuda_moe_hosted_wait(nullptr, event->context)) {
+        CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
+    }
 }
 
 static const ggml_backend_device_i ggml_backend_cuda_device_interface = {

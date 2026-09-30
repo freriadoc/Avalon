@@ -30,4 +30,9 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, struct ggml_cgra
 // end of the graph). Called before every node the graph evaluation computes.
 struct ggml_tensor;
 void ggml_cuda_moe_hosted_flush(ggml_backend_cuda_context & ctx, const struct ggml_tensor * node);
+
+// Waits for the stream (or the event, if not null) like cudaStreamSynchronize / cudaEventSynchronize
+// while computing the missed experts of the hosted blocks the stream publishes meanwhile. Returns
+// false if no block is hosted: the caller synchronizes as usual.
+bool ggml_cuda_moe_hosted_wait(void * stream, void * event);   // cudaStream_t, cudaEvent_t
 #endif

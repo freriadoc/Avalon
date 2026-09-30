@@ -24,6 +24,11 @@ void ggml_cuda_moe_hosted_flush(ggml_backend_cuda_context & ctx, const ggml_tens
     (void) ctx; (void) node;
 }
 
+bool ggml_cuda_moe_hosted_wait(void * stream, void * event) {
+    (void) stream; (void) event;
+    return false;
+}
+
 #else
 
 #include "common.cuh"
@@ -5630,10 +5635,14 @@ struct moe_hosted_state {
     char * d_q8_mid = nullptr;
     size_t q8_act_bytes = 0;
     size_t q8_mid_bytes = 0;
-    std::thread worker;
-    std::atomic<bool> stop{false};
     int n_threads = 1;
     std::vector<moe_cache_pin> pins;                         // held by the last plan
+    // served by the thread that waits for the stream (ggml_cuda_moe_hosted_wait)
+    std::mutex serve_mu;
+    uint32_t last_seq = 0;
+    std::vector<int32_t> cpu_rows, experts;
+    std::vector<float> out, act;
+    int64_t st_n = 0, st_gap = 0, st_gaps = 0, st_plan = 0, st_cpu = 0, st_rows = 0, t_done = 0;
 };
 
 static std::mutex g_hosted_mu;
@@ -5807,103 +5816,132 @@ static int moe_hosted_plan(moe_hosted_state & st, moe_hosted_layer & layer, cons
     return n_cpu;
 }
 
-static void moe_hosted_worker(moe_hosted_state * st) {
-    uint32_t last = 0;
-    std::vector<int32_t> cpu_rows(moe_hosted_rows_max);
-    std::vector<int32_t> experts(moe_hosted_rows_max);
-    std::vector<float> out;
-    std::vector<float> act;
+// One publication of the stream: plan the layer, raise the plan flag, compute the missed rows on
+// the CPU (with this thread's OpenMP team, the one of the graph's other CPU work), raise the rows
+// flag. The cache is suspended meanwhile: the thread may be inside a session of the scheduler.
+static void moe_hosted_serve_one(moe_hosted_state * st, uint32_t seq) {
     // DIAGNOSTIC (GGML_CUDA_MOE_HOSTED_STATS=N): every N layers, per layer: the GPU's time between the
     // CPU rows handed back and the next publication (merge + the next layer's GPU work; long gaps,
     // between graphs, left out), the plan, the CPU rows, the CPU rows per layer
     static const int stats_every = getenv("GGML_CUDA_MOE_HOSTED_STATS") ? atoi(getenv("GGML_CUDA_MOE_HOSTED_STATS")) : 0;
-    int64_t st_n = 0, st_gap = 0, st_gaps = 0, st_plan = 0, st_cpu = 0, st_rows = 0, t_done = 0;
-    while (!st->stop.load(std::memory_order_relaxed)) {
+    const int64_t t_arrive = stats_every > 0 ? ggml_time_us() : 0;
+    if (stats_every > 0 && st->t_done > 0 && t_arrive - st->t_done < 2000) {
+        st->st_gap += t_arrive - st->t_done;
+        st->st_gaps++;
+    }
+    const uint32_t slot = __atomic_load_n(&st->h_mail->slot, __ATOMIC_RELAXED);
+    const int n_tokens = (int) __atomic_load_n(&st->h_mail->n_tokens, __ATOMIC_RELAXED);
+    moe_hosted_layer * layer;
+    {
+        std::lock_guard<std::mutex> lock(st->mu);
+        layer = slot < st->layers.size() ? st->layers[slot].get() : nullptr;
+    }
+    if (!layer) {
+        return;   // cannot happen: the stream publishes registered slots only
+    }
+    std::vector<int32_t> & cpu_rows = st->cpu_rows;
+    std::vector<int32_t> & ids = st->experts;
+    std::vector<float> & out = st->out;
+    std::vector<float> & act = st->act;
+    cpu_rows.resize(moe_hosted_rows_max);
+    const int rows = layer->n_used * n_tokens;
+    const int n_cpu = moe_hosted_plan(*st, *layer, layer->h_ids, rows, layer->h_plan, cpu_rows.data());
+    __atomic_store_n(&layer->h_flags[0], seq, __ATOMIC_RELEASE);
+    const int64_t t_plan = stats_every > 0 ? ggml_time_us() : 0;
+
+    // the CPU rows of all tokens that have some, in one call, k per token (the largest count; a
+    // token with fewer repeats one of its own, whose output is dropped): an expert several tokens
+    // miss is read once
+    if (n_cpu > 0) {
+        int per_token[moe_hosted_rows_max] = {0};
+        int k = 0;
+        for (int j = 0; j < n_cpu; j++) {
+            k = std::max(k, ++per_token[cpu_rows[j] / layer->n_used]);
+        }
+        int col[moe_hosted_rows_max];   // token -> column of the call
+        int m = 0;
+        for (int token = 0; token < n_tokens; token++) {
+            col[token] = per_token[token] > 0 ? m++ : -1;
+        }
+        ids.assign((size_t) k * m, -1);
+        std::vector<int32_t> row_of((size_t) k * m, -1);
+        act.resize((size_t) m * layer->n_embd);
+        int fill[moe_hosted_rows_max] = {0};
+        for (int j = 0; j < n_cpu; j++) {
+            const int c = col[cpu_rows[j] / layer->n_used];
+            const int at = c * k + fill[c]++;
+            ids[at] = layer->h_ids[cpu_rows[j]];
+            row_of[at] = cpu_rows[j];
+        }
+        for (int token = 0; token < n_tokens; token++) {
+            const int c = col[token];
+            if (c < 0) {
+                continue;
+            }
+            memcpy(act.data() + (size_t) c * layer->n_embd, layer->h_act + (size_t) token * layer->n_embd,
+                   layer->n_embd * sizeof(float));
+            for (int i = fill[c]; i < k; i++) {
+                ids[c * k + i] = ids[c * k];
+            }
+        }
+        out.resize((size_t) k * m * layer->n_embd);
+        g_session_suppressed++;
+        ggml_moe_cache.cpu_experts(layer->gate_w, layer->up_w, layer->down_w, act.data(), ids.data(), k, m,
+                                   out.data(), st->n_threads);
+        g_session_suppressed--;
+        for (size_t at = 0; at < row_of.size(); at++) {
+            if (row_of[at] >= 0) {
+                memcpy(layer->h_res + (size_t) row_of[at] * layer->n_embd,
+                       out.data() + at * layer->n_embd, layer->n_embd * sizeof(float));
+            }
+        }
+    }
+    __atomic_store_n(&layer->h_flags[16], seq, __ATOMIC_RELEASE);
+    if (stats_every > 0) {
+        st->t_done = ggml_time_us();
+        st->st_plan += t_plan - t_arrive;
+        st->st_cpu += st->t_done - t_plan;
+        st->st_rows += n_cpu;
+        if (++st->st_n % stats_every == 0) {
+            GGML_LOG_INFO("moe hosted: %lld layers: GPU between layers %.1f us, plan %.1f us, CPU rows %.1f us (%.2f rows)\n",
+                    (long long) st->st_n, st->st_gaps ? (double) st->st_gap / st->st_gaps : 0.0,
+                    (double) st->st_plan / st->st_n, (double) st->st_cpu / st->st_n, (double) st->st_rows / st->st_n);
+        }
+    }
+}
+
+// Wait for the stream (or the event) like cudaStreamSynchronize / cudaEventSynchronize, answering the
+// hosted MoE blocks it publishes meanwhile: the thread that waits for the GPU computes the missed
+// experts. Returns false when no block is hosted (the caller synchronizes as usual).
+bool ggml_cuda_moe_hosted_wait(void * stream_ptr, void * event_ptr) {
+    cudaStream_t stream = (cudaStream_t) stream_ptr;
+    cudaEvent_t event = (cudaEvent_t) event_ptr;
+    moe_hosted_state * st;
+    {
+        std::lock_guard<std::mutex> lock(g_hosted_mu);
+        if (g_hosted.empty()) {
+            return false;
+        }
+        st = g_hosted.begin()->second.get();
+    }
+    std::unique_lock<std::mutex> serving(st->serve_mu, std::try_to_lock);
+    for (;;) {
+        const cudaError_t done = event ? cudaEventQuery(event) : cudaStreamQuery(stream);
+        if (done != cudaErrorNotReady) {
+            CUDA_CHECK(done);
+            return true;
+        }
         const uint32_t seq = __atomic_load_n(&st->h_mail->seq, __ATOMIC_ACQUIRE);
-        if (seq == last) {
-#if defined(__x86_64__)
-            __builtin_ia32_pause();
-#endif
+        if (serving.owns_lock() && seq != st->last_seq) {
+            st->last_seq = seq;
+            moe_hosted_serve_one(st, seq);
             continue;
         }
-        last = seq;
-        const int64_t t_arrive = stats_every > 0 ? ggml_time_us() : 0;
-        if (stats_every > 0 && t_done > 0 && t_arrive - t_done < 2000) {
-            st_gap += t_arrive - t_done;
-            st_gaps++;
-        }
-        const uint32_t slot = __atomic_load_n(&st->h_mail->slot, __ATOMIC_RELAXED);
-        const int n_tokens = (int) __atomic_load_n(&st->h_mail->n_tokens, __ATOMIC_RELAXED);
-        moe_hosted_layer * layer;
-        {
-            std::lock_guard<std::mutex> lock(st->mu);
-            layer = slot < st->layers.size() ? st->layers[slot].get() : nullptr;
-        }
-        if (!layer) {
-            continue;   // cannot happen: the stream publishes registered slots only
-        }
-        const int rows = layer->n_used * n_tokens;
-        const int n_cpu = moe_hosted_plan(*st, *layer, layer->h_ids, rows, layer->h_plan, cpu_rows.data());
-        __atomic_store_n(&layer->h_flags[0], seq, __ATOMIC_RELEASE);
-        const int64_t t_plan = stats_every > 0 ? ggml_time_us() : 0;
-
-        // the CPU rows of all tokens that have some, in one call, k per token (the largest count; a
-        // token with fewer repeats one of its own, whose output is dropped): an expert several tokens
-        // miss is read once
-        if (n_cpu > 0) {
-            int per_token[moe_hosted_rows_max] = {0};
-            int k = 0;
-            for (int j = 0; j < n_cpu; j++) {
-                k = std::max(k, ++per_token[cpu_rows[j] / layer->n_used]);
-            }
-            int col[moe_hosted_rows_max];   // token -> column of the call
-            int m = 0;
-            for (int token = 0; token < n_tokens; token++) {
-                col[token] = per_token[token] > 0 ? m++ : -1;
-            }
-            std::vector<int32_t> & ids = experts;
-            ids.assign((size_t) k * m, -1);
-            std::vector<int32_t> row_of((size_t) k * m, -1);
-            act.resize((size_t) m * layer->n_embd);
-            int fill[moe_hosted_rows_max] = {0};
-            for (int j = 0; j < n_cpu; j++) {
-                const int c = col[cpu_rows[j] / layer->n_used];
-                const int at = c * k + fill[c]++;
-                ids[at] = layer->h_ids[cpu_rows[j]];
-                row_of[at] = cpu_rows[j];
-            }
-            for (int token = 0; token < n_tokens; token++) {
-                const int c = col[token];
-                if (c < 0) {
-                    continue;
-                }
-                memcpy(act.data() + (size_t) c * layer->n_embd, layer->h_act + (size_t) token * layer->n_embd,
-                       layer->n_embd * sizeof(float));
-                for (int i = fill[c]; i < k; i++) {
-                    ids[c * k + i] = ids[c * k];
-                }
-            }
-            out.resize((size_t) k * m * layer->n_embd);
-            ggml_moe_cache.cpu_experts(layer->gate_w, layer->up_w, layer->down_w, act.data(), ids.data(), k, m,
-                                       out.data(), st->n_threads);
-            for (size_t at = 0; at < row_of.size(); at++) {
-                if (row_of[at] >= 0) {
-                    memcpy(layer->h_res + (size_t) row_of[at] * layer->n_embd,
-                           out.data() + at * layer->n_embd, layer->n_embd * sizeof(float));
-                }
-            }
-        }
-        __atomic_store_n(&layer->h_flags[16], seq, __ATOMIC_RELEASE);
-        if (stats_every > 0) {
-            t_done = ggml_time_us();
-            st_plan += t_plan - t_arrive;
-            st_cpu += t_done - t_plan;
-            st_rows += n_cpu;
-            if (++st_n % stats_every == 0) {
-                GGML_LOG_INFO("moe hosted: %lld layers: GPU between layers %.1f us, plan %.1f us, CPU rows %.1f us (%.2f rows)\n",
-                        (long long) st_n, st_gaps ? (double) st_gap / st_gaps : 0.0, (double) st_plan / st_n,
-                        (double) st_cpu / st_n, (double) st_rows / st_n);
-            }
+#if defined(__x86_64__)
+        __builtin_ia32_pause();
+#endif
+        if (!serving.owns_lock()) {
+            serving.try_lock();
         }
     }
 }
@@ -5927,7 +5965,6 @@ static moe_hosted_state * moe_hosted_state_for(moe_cache_session & session, moe_
         (void) cudaGetLastError();
         return nullptr;
     }
-    st->worker = std::thread(moe_hosted_worker, st.get());
     entry = std::move(st);
     return entry.get();
 }
@@ -5942,10 +5979,6 @@ static void moe_hosted_shutdown(moe_cache_session * session) {
         }
         st = std::move(it->second);
         g_hosted.erase(it);
-    }
-    st->stop.store(true);
-    if (st->worker.joinable()) {
-        st->worker.join();
     }
     for (auto & layer : st->layers) {
         for (void * h : {(void *) layer->h_act, (void *) layer->h_ids, (void *) layer->h_plan, (void *) layer->h_res,
