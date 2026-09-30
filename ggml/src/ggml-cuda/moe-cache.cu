@@ -1681,10 +1681,14 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                 static int64_t f_call = 0;
                 const int64_t t1b = ft ? ggml_time_us() : 0;
                 if (error == cudaSuccess) {
-                    // Poll, do not synchronize: with the MoE blocks hosted by the GPU (its host thread
-                    // polling the main stream), cudaStreamSynchronize put this thread to sleep for
-                    // ~1.2 ms per fill of ~60 us; the cache then warmed 8 times slower. A fill lasts
-                    // tens of microseconds, this thread has nothing else to do meanwhile.
+                    // Poll, do not synchronize. ROCclr (7.2) gives a stream an SDMA engine of its own
+                    // at its first copy and takes it back only when the stream is synchronized; a
+                    // stream that finds both engines of the card taken falls back to ROCr's shared
+                    // copy path and queues behind their copies. The hosted MoE blocks and the MTP
+                    // draft poll their streams, which keep an engine each: a synchronized fill
+                    // stream lost its own at every fill and waited ~1.2 ms behind a copy of the main
+                    // stream (itself waiting on a kernel) for a fill of ~60 us. Polled, it keeps its
+                    // engine; a fill lasts tens of microseconds, this thread has nothing else to do.
                     while ((error = cudaStreamQuery(stream)) == cudaErrorNotReady) {
 #if defined(__x86_64__)
                         __builtin_ia32_pause();
@@ -5884,51 +5888,25 @@ static void moe_hosted_serve_one(moe_hosted_state * st, uint32_t seq) {
     __atomic_store_n(&layer->h_flags[0], seq, __ATOMIC_RELEASE);
     const int64_t t_plan = stats_every > 0 ? ggml_time_us() : 0;
 
-    // the CPU rows of all tokens that have some, in one call, k per token (the largest count; a
-    // token with fewer repeats one of its own, whose output is dropped): an expert several tokens
-    // miss is read once
+    // the CPU rows in one call, one column each (k = 1) with its token's activations: exactly the
+    // missed rows (a k-per-token layout padded the tokens with fewer misses: 8.1 rows computed for
+    // 5.9, CPU time +12 % per layer); MUL_MAT_ID groups the rows of an expert, which is read once
     if (n_cpu > 0) {
-        int per_token[moe_hosted_rows_max] = {0};
-        int k = 0;
+        ids.resize(n_cpu);
+        act.resize((size_t) n_cpu * layer->n_embd);
         for (int j = 0; j < n_cpu; j++) {
-            k = std::max(k, ++per_token[cpu_rows[j] / layer->n_used]);
-        }
-        int col[moe_hosted_rows_max];   // token -> column of the call
-        int m = 0;
-        for (int token = 0; token < n_tokens; token++) {
-            col[token] = per_token[token] > 0 ? m++ : -1;
-        }
-        ids.assign((size_t) k * m, -1);
-        std::vector<int32_t> row_of((size_t) k * m, -1);
-        act.resize((size_t) m * layer->n_embd);
-        int fill[moe_hosted_rows_max] = {0};
-        for (int j = 0; j < n_cpu; j++) {
-            const int c = col[cpu_rows[j] / layer->n_used];
-            const int at = c * k + fill[c]++;
-            ids[at] = layer->h_ids[cpu_rows[j]];
-            row_of[at] = cpu_rows[j];
-        }
-        for (int token = 0; token < n_tokens; token++) {
-            const int c = col[token];
-            if (c < 0) {
-                continue;
-            }
-            memcpy(act.data() + (size_t) c * layer->n_embd, layer->h_act + (size_t) token * layer->n_embd,
+            ids[j] = layer->h_ids[cpu_rows[j]];
+            memcpy(act.data() + (size_t) j * layer->n_embd, layer->h_act + (size_t) (cpu_rows[j] / layer->n_used) * layer->n_embd,
                    layer->n_embd * sizeof(float));
-            for (int i = fill[c]; i < k; i++) {
-                ids[c * k + i] = ids[c * k];
-            }
         }
-        out.resize((size_t) k * m * layer->n_embd);
+        out.resize((size_t) n_cpu * layer->n_embd);
         g_session_suppressed++;
-        ggml_moe_cache.cpu_experts(layer->gate_w, layer->up_w, layer->down_w, act.data(), ids.data(), k, m,
+        ggml_moe_cache.cpu_experts(layer->gate_w, layer->up_w, layer->down_w, act.data(), ids.data(), 1, n_cpu,
                                    out.data(), st->n_threads);
         g_session_suppressed--;
-        for (size_t at = 0; at < row_of.size(); at++) {
-            if (row_of[at] >= 0) {
-                memcpy(layer->h_res + (size_t) row_of[at] * layer->n_embd,
-                       out.data() + at * layer->n_embd, layer->n_embd * sizeof(float));
-            }
+        for (int j = 0; j < n_cpu; j++) {
+            memcpy(layer->h_res + (size_t) cpu_rows[j] * layer->n_embd, out.data() + (size_t) j * layer->n_embd,
+                   layer->n_embd * sizeof(float));
         }
     }
     __atomic_store_n(&layer->h_flags[16], seq, __ATOMIC_RELEASE);
