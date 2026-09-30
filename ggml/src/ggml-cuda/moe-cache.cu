@@ -5768,6 +5768,16 @@ static __global__ void k_moe_hosted_merge(const uint32_t * d_expect, const volat
     }
 }
 
+// Unpin the rows the GPU read for the last planned layer (session lock held).
+static void moe_hosted_unpin_locked(moe_hosted_state & st) {
+    for (const moe_cache_pin & pin : st.pins) {
+        if (pin.pool && pin.slot >= 0 && pin.slot < pin.pool->n_slots && pin.pool->slots[pin.slot].readers > 0) {
+            pin.pool->slots[pin.slot].readers--;
+        }
+    }
+    st.pins.clear();
+}
+
 // Plan a layer's rows under the session lock: resident rows (three tensors valid) are pinned and
 // touched, as moe_cache_fused_begin does; the others count toward admission. out: up, gate, down
 // gpu ids (-1 for a row the CPU computes). Returns the rows the CPU computes.
@@ -5779,12 +5789,7 @@ static int moe_hosted_plan(moe_hosted_state & st, moe_hosted_layer & layer, cons
     bool wake_worker = false;
     {
         std::lock_guard<std::mutex> lock(session.mu);
-        for (const moe_cache_pin & pin : st.pins) {
-            if (pin.pool && pin.slot >= 0 && pin.slot < pin.pool->n_slots && pin.pool->slots[pin.slot].readers > 0) {
-                pin.pool->slots[pin.slot].readers--;
-            }
-        }
-        st.pins.clear();
+        moe_hosted_unpin_locked(st);
 
         moe_cache_pool * pool = nullptr;
         moe_cache_pool * down_pool = nullptr;
@@ -5950,6 +5955,13 @@ bool ggml_cuda_moe_hosted_wait(void * stream_ptr, void * event_ptr) {
         const cudaError_t done = event ? cudaEventQuery(event) : cudaStreamQuery(stream);
         if (done != cudaErrorNotReady) {
             CUDA_CHECK(done);
+            if (!event) {
+                // the stream is done, the last hosted layer's rows too: unpin them (a plan unpins the
+                // previous layer's; left pinned after a graph, they made the cache refuse to lend its
+                // zones to the next prefill, which then ran without prefetch)
+                std::lock_guard<std::mutex> lock(st->session->mu);
+                moe_hosted_unpin_locked(*st);
+            }
             return true;
         }
         const uint32_t seq = __atomic_load_n(&st->h_mail->seq, __ATOMIC_ACQUIRE);
