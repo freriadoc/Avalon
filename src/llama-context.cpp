@@ -4181,6 +4181,10 @@ void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
     ctx->set_embeddings_nextn(value, masked);
 }
 
+int32_t llama_output_reserve(llama_context * ctx, int32_t n_outputs) {
+    return (int32_t) ctx->reserve_outputs(n_outputs);
+}
+
 void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {
     ctx->set_embeddings_layer_inp(lid, value);
 }

@@ -1477,6 +1477,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
+        // the target's output buffer at its final size now (nextn rows of a whole batch, the outputs of
+        // a verification: n_max drafted tokens + 1 per sequence), not grown at the first requests
+        llama_output_reserve(ctx_tgt, (int32_t) n_seq * (this->params.n_max + 1));
 
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;

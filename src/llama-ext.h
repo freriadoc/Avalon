@@ -95,6 +95,11 @@ LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_c
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
 LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
 
+// Allocate the output buffer now for up to n_outputs outputs of a batch, with the embeddings enabled
+// so far, so that a decode needing no more never reallocates it (freeing pinned host memory makes
+// the HIP runtime synchronize every stream of the device). Returns the outputs reserved, 0 on failure.
+LLAMA_API int32_t llama_output_reserve(struct llama_context * ctx, int32_t n_outputs);
+
 // Select which appended NextN block the DECODER_MTP graph runs (offset past
 // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
 // chain multiple trained NextN heads. Default 0 (first head).
