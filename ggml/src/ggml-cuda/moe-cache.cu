@@ -5603,7 +5603,7 @@ static void moe_cache_restore(void * opaque, void * backend) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// MoE block hosted by the GPU (GGML_MOE_GPU=1, generation batches).
+// MoE block hosted by the GPU (default, GGML_MOE_GPU=0 turns it off; generation batches).
 //
 // The scheduler leaves the MoE block gate / up / swiglu / down of a layer on the GPU with its
 // weights in host memory. Per layer the stream: copies the activations and the router's ids to
@@ -5644,6 +5644,8 @@ struct moe_hosted_layer {
     uint32_t * h_flags = nullptr;   // [0] plan ready, [16] CPU rows ready
     int32_t * m_plan = nullptr;
     float * m_res = nullptr;
+    float * m_act = nullptr;
+    int32_t * m_ids = nullptr;
     uint32_t * m_flags = nullptr;
     // device memory
     int32_t * d_plan = nullptr;
@@ -5716,6 +5718,21 @@ static __device__ __forceinline__ void moe_hosted_pause() {
 #else
     __nanosleep(2000);
 #endif
+}
+
+// the activations and the router's ids of the block to mapped host memory, written by the kernel
+// (a copy node of the graph would wait in a copy engine's queue for the previous layers, holding
+// back the cache's fills on that engine)
+static __global__ void k_moe_hosted_stage(const float * act, float * h_act, int64_t n_act,
+                                          const int32_t * ids, int64_t ids_nb1, int32_t * h_ids, int n_used, int n_tokens) {
+    for (int64_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n_act; i += (int64_t) gridDim.x * blockDim.x) {
+        h_act[i] = act[i];
+    }
+    const int n_ids = n_used * n_tokens;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_ids; i += gridDim.x * blockDim.x) {
+        const int t = i / n_used;
+        h_ids[i] = *(const int32_t *) ((const char *) ids + (int64_t) t * ids_nb1 + (int64_t) (i % n_used) * sizeof(int32_t));
+    }
 }
 
 static __global__ void k_moe_hosted_publish(uint32_t * d_seq, uint32_t * d_expect,
@@ -6063,7 +6080,8 @@ static moe_hosted_layer * moe_hosted_register(moe_hosted_state & st, moe_cache_d
               moe_hosted_host_alloc((void **) &layer->h_plan, 3 * rows * sizeof(int32_t)) &&
               moe_hosted_host_alloc((void **) &layer->h_res, (size_t) rows * layer->n_embd * sizeof(float)) &&
               moe_hosted_host_alloc((void **) &layer->h_flags, 128);
-    ok = ok && (layer->m_plan = moe_hosted_device_ptr(layer->h_plan)) && (layer->m_res = moe_hosted_device_ptr(layer->h_res)) &&
+    ok = ok && (layer->m_act = moe_hosted_device_ptr(layer->h_act)) && (layer->m_ids = moe_hosted_device_ptr(layer->h_ids)) &&
+         (layer->m_plan = moe_hosted_device_ptr(layer->h_plan)) && (layer->m_res = moe_hosted_device_ptr(layer->h_res)) &&
          (layer->m_flags = moe_hosted_device_ptr(layer->h_flags));
     ok = ok && cudaMalloc((void **) &layer->d_plan, 3 * rows * sizeof(int32_t)) == cudaSuccess &&
          cudaMalloc((void **) &layer->d_act_ids, rows * sizeof(int32_t)) == cudaSuccess &&
@@ -6157,10 +6175,8 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
     const int64_t padded_ff = GGML_PAD(n_ff, MATRIX_ROW_PADDING);
 
     // activations and ids to the host, then the mailbox
-    CUDA_CHECK(cudaMemcpyAsync(layer->h_act, act->data, (size_t) n_tokens * n_embd * sizeof(float),
-                               cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaMemcpy2DAsync(layer->h_ids, n_used * sizeof(int32_t), ids->data, ids->nb[1],
-                                 n_used * sizeof(int32_t), n_tokens, cudaMemcpyDeviceToHost, stream));
+    k_moe_hosted_stage<<<8, 256, 0, stream>>>((const float *) act->data, layer->m_act, (int64_t) n_tokens * n_embd,
+                                              (const int32_t *) ids->data, ids->nb[1], layer->m_ids, n_used, n_tokens);
     k_moe_hosted_publish<<<1, 1, 0, stream>>>(st->d_seq, layer->d_expect, st->m_mail, (uint32_t) slot, (uint32_t) n_tokens);
     k_moe_hosted_wait_plan<<<1, 64, 0, stream>>>(layer->d_expect, layer->m_flags, layer->m_plan, layer->d_plan, 3 * rows);
 

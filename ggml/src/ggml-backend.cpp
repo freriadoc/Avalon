@@ -1036,7 +1036,7 @@ struct ggml_backend_sched {
     struct ggml_context * ctx;
     void * moe_cache_session;
     // MUL_MAT_ID nodes of the MoE blocks left on the GPU with their weights in host memory
-    // (GGML_MOE_GPU=1), found again by every split_graph
+    // (unless GGML_MOE_GPU=0), found again by every split_graph
     std::unordered_set<const struct ggml_tensor *> * moe_hosted;
 
     ggml_backend_sched_eval_callback callback_eval;
@@ -1316,11 +1316,11 @@ static bool ggml_backend_sched_is_hosted_moe(ggml_backend_sched_t sched, const s
     return sched->moe_hosted && !sched->moe_hosted->empty() && sched->moe_hosted->count(node) > 0;
 }
 
-// GGML_MOE_GPU=1: with a MoE cache session, a MoE block gate / up / swiglu / down whose weights are
+// With a MoE cache session (GGML_MOE_GPU=0 turns it off), a MoE block gate / up / swiglu / down whose weights are
 // in host memory stays on the GPU for batches of up to 64 routed rows: the GPU computes the rows
 // the cache holds, a host thread the others (ggml_cuda_moe_hosted_block); no weight is copied.
 static void ggml_backend_sched_find_hosted_moe(ggml_backend_sched_t sched, const struct ggml_cgraph * graph) {
-    static const bool enabled = getenv("GGML_MOE_GPU") && atoi(getenv("GGML_MOE_GPU")) != 0;
+    static const bool enabled = !getenv("GGML_MOE_GPU") || atoi(getenv("GGML_MOE_GPU")) != 0;
     if (sched->moe_hosted) {
         sched->moe_hosted->clear();
     }
