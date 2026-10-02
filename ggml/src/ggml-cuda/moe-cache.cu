@@ -1248,6 +1248,7 @@ static bool moe_cache_type_supported(ggml_type type) {
         case GGML_TYPE_IQ2_S:
         case GGML_TYPE_IQ3_XXS:
         case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ3_K:
         case GGML_TYPE_IQ1_S:
         case GGML_TYPE_IQ1_M:
         case GGML_TYPE_IQ4_NL:

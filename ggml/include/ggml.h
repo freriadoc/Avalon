@@ -430,7 +430,8 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        GGML_TYPE_IQ3_K   = 43, // ik_llama.cpp's IQ3_K (type 138 there): the block and grid are the same
+        GGML_TYPE_COUNT   = 44,
     };
 
     // [TAG_GGML_PREC]

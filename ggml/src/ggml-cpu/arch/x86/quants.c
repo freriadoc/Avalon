@@ -3916,6 +3916,56 @@ void ggml_vec_dot_iq1_m_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 #endif
 }
 
+void ggml_vec_dot_iq3_k_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    assert(n % QK_K == 0);
+
+#if defined __AVX2__
+    const block_iq3_k * GGML_RESTRICT x = vx;
+    const block_q8_K  * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_K;
+
+    // iq3nl_values + 64: the two grids in one register (a lane per 16 weights: index | 8 selects the shifted grid)
+    static const uint8_t kvalues_iq3nl_u[16] = {1, 24, 41, 54, 65, 77, 92, 111, 5, 28, 45, 58, 69, 81, 96, 115};
+    const __m256i values = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *) kvalues_iq3nl_u));
+    const __m256i m1 = _mm256_set1_epi8(1);
+    const __m256i m3 = _mm256_set1_epi8(3);
+
+    float sumf = 0;
+    for (int ibl = 0; ibl < nb; ++ibl) {
+        const __m256i qh = _mm256_loadu_si256((const __m256i *) x[ibl].qh);
+        const uint16_t extra = x[ibl].extra;
+        int16_t ls[QK_K/16];
+        int32_t sum_ls_bsums = 0;
+        for (int ib = 0; ib < QK_K/16; ++ib) {
+            ls[ib] = (2*((x[ibl].scales_l[ib/2] >> 4*(ib%2)) & 0xf) + 1) * ((x[ibl].scales_h >> ib) & 1 ? -1 : 1);
+            sum_ls_bsums += ls[ib] * y[ibl].bsums[ib];
+        }
+        __m256i acc = _mm256_setzero_si256();
+        for (int ib32 = 0; ib32 < QK_K/32; ++ib32) {
+            const __m256i q2 = _mm256_and_si256(_mm256_srli_epi16(_mm256_loadu_si256((const __m256i *)(x[ibl].qs + 32*(ib32/4))), 2*(ib32%4)), m3);
+            const __m256i q1 = _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh, ib32), m1), 2);
+            const __m256i shift = MM256_SET_M128I(_mm_set1_epi8(((extra >> (2*ib32 + 1)) & 1) << 3), _mm_set1_epi8(((extra >> (2*ib32)) & 1) << 3));
+            const __m256i u = _mm256_shuffle_epi8(values, _mm256_or_si256(_mm256_or_si256(q2, q1), shift));
+            const __m256i q8 = _mm256_loadu_si256((const __m256i *)(y[ibl].qs + 32*ib32));
+            const __m256i p16 = _mm256_maddubs_epi16(u, q8);
+            const __m256i sc = MM256_SET_M128I(_mm_set1_epi16(ls[2*ib32 + 1]), _mm_set1_epi16(ls[2*ib32]));
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(p16, sc));
+        }
+        const int32_t sumi = hsum_i32_8(acc) - 64*sum_ls_bsums;
+        sumf += GGML_CPU_FP16_TO_FP32(x[ibl].d) * y[ibl].d * sumi;
+    }
+    *s = sumf;
+#else
+    ggml_vec_dot_iq3_k_q8_K_generic(n, s, bs, vx, bx, vy, by, nrc);
+#endif
+}
+
 void ggml_vec_dot_iq4_nl_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);
     UNUSED(nrc);

@@ -459,6 +459,19 @@ typedef struct {
 } block_iq4_xs;
 static_assert(sizeof(block_iq4_xs) == sizeof(ggml_half) + sizeof(uint16_t) + QK_K/64 + QK_K/2, "wrong iq4_xs block size/padding");
 
+// iq3_k (from ik_llama.cpp): 3.4375 bpw. Blocks of 16 weights on a non-linear grid of 8 values
+// (iq3nl_values; a bit of 'extra' per block selects the second, shifted grid), a 4-bit scale and a
+// sign per block, one fp16 per super-block of 256. The grid fits one SIMD register.
+typedef struct {
+    ggml_half d;
+    uint16_t extra;
+    uint16_t scales_h;
+    uint8_t scales_l[QK_K/32];
+    uint8_t qs[QK_K/4];
+    uint8_t qh[QK_K/8];
+} block_iq3_k;
+static_assert(sizeof(block_iq3_k) == sizeof(ggml_half) + 2*sizeof(uint16_t) + QK_K/32 + QK_K/4 + QK_K/8, "wrong iq3_k block size/padding");
+
 #endif // GGML_COMMON_DECL
 #endif // GGML_COMMON_DECL
 
@@ -1119,6 +1132,12 @@ GGML_TABLE_END()
 // TODO: fix name to kvalues_iq4_nl
 GGML_TABLE_BEGIN(int8_t, kvalues_iq4nl, 16)
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+GGML_TABLE_END()
+
+// iq3_k grids: the 8 values, then the same shifted (block 'extra' bit set)
+GGML_TABLE_BEGIN(int8_t, iq3nl_values, 16)
+    -63, -40, -23, -10, 1, 13, 28,  47,
+    -59, -36, -19,  -6, 5, 17, 32,  51,
 GGML_TABLE_END()
 
 // e2m1 values (doubled), shared by MXFP4 and NVFP4
