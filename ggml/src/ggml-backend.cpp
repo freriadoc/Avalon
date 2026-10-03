@@ -2176,6 +2176,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         const bool split_is_cpu =
             ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
         ggml_backend_t copies_backend = NULL;
+        bool user_inputs_queued = false;
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -2197,12 +2198,29 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
-                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                    ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
-                } else {
-                    ggml_backend_synchronize(split_backend);
+                if (!user_inputs_queued) {
+                    if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                        ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                    } else {
+                        ggml_backend_synchronize(split_backend);
+                    }
                 }
-                ggml_backend_tensor_copy(input, input_cpy);
+                // from host memory to a backend that copies asynchronously: queued, one synchronization
+                // after the split's inputs (a synchronous copy per input cost ~18 us on ROCm: 39 inputs,
+                // ~0.9 ms per generated token, while the GPU waited for the first hosted MoE layer's plan)
+                if (!split_is_cpu && split_backend->iface.set_tensor_async && input->buffer &&
+                    ggml_backend_buffer_is_host(input->buffer) && ggml_is_contiguous(input) &&
+                    input_cpy->buffer && ggml_backend_buffer_get_type(input_cpy->buffer) ==
+                        ggml_backend_get_default_buffer_type(split_backend)) {
+                    ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                    user_inputs_queued = true;
+                } else {
+                    if (user_inputs_queued) {
+                        ggml_backend_synchronize(split_backend);
+                        user_inputs_queued = false;
+                    }
+                    ggml_backend_tensor_copy(input, input_cpy);
+                }
             } else {
                 // with a large batch virtually every expert is used, so instead of waiting
                 // for the routing ids, upload the full tensor through the prefetch backend
@@ -2386,6 +2404,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         if (copies_backend) {
             ggml_backend_synchronize(copies_backend);
+        }
+        if (user_inputs_queued) {
+            ggml_backend_synchronize(split_backend);
         }
 
         if (trace_on && getenv("GGML_SCHED_TRACE_NODES")) {
