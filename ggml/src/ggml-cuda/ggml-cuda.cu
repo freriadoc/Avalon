@@ -3693,6 +3693,39 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // sigmoid of the shared expert's gate -> gated shared expert, the weighted reduction of the routed
+    // experts, then their sum: one kernel (qwen-style MoE with a gated shared expert). The gate's
+    // product stays a kernel of its own: the output may reuse the memory of its input.
+    if (node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID && i + 2 < cgraph->n_nodes) {
+        const ggml_tensor * sig   = node;
+        const ggml_tensor * logit = sig->src[0];
+        const ggml_tensor * gated = cgraph->nodes[i + 1];
+        const ggml_tensor * sh    = gated->op == GGML_OP_MUL ? (gated->src[0] == sig ? gated->src[1] : gated->src[0]) : nullptr;
+        ggml_cuda_moe_weighted_reduction_match match;
+        if (logit->type == GGML_TYPE_F32 && ggml_is_contiguous(logit) && logit->ne[0] == 1 && logit->ne[2] == 1 && logit->ne[3] == 1 &&
+                sh && (gated->src[0] == sig || gated->src[1] == sig) && sh->type == GGML_TYPE_F32 && ggml_is_contiguous(sh) &&
+                ggml_is_contiguous(gated) && sh->ne[1] == logit->ne[1] &&
+                ggml_cuda_match_moe_weighted_reduction(cgraph, i + 2, match) && i + 2 + match.node_count < cgraph->n_nodes) {
+            const int add_idx = i + 2 + match.node_count;
+            const ggml_tensor * add = cgraph->nodes[add_idx];
+            const int count = match.node_count + 3;
+            if (add->op == GGML_OP_ADD && ggml_is_contiguous(add) && add->type == GGML_TYPE_F32 && count < 32 &&
+                    ((add->src[0] == match.dst && add->src[1] == gated) || (add->src[0] == gated && add->src[1] == match.dst)) &&
+                    ggml_are_same_shape(add, match.dst) && ggml_are_same_shape(sh, match.dst)) {
+                enum ggml_op ops[32];
+                for (int k = 0; k < count; k++) {
+                    ops[k] = cgraph->nodes[i + k]->op;
+                }
+                if (ggml_can_fuse_subgraph(cgraph, i, count, ops, &add_idx, 1) &&
+                        ggml_cuda_check_fusion_memory_ranges(cgraph, i, count, &add_idx, 1)) {
+                    ggml_cuda_op_moe_weighted_reduction(*cuda_ctx, match.experts, match.expert_scale, match.weights,
+                                                        cgraph->nodes[add_idx], sh, logit);
+                    return count - 1;
+                }
+            }
+        }
+    }
+
     if (node->op == GGML_OP_MUL) {
         ggml_cuda_moe_weighted_reduction_match match;
         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {

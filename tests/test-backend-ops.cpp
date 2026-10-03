@@ -7206,16 +7206,18 @@ struct test_moe_reduce : public test_case {
     const bool unaligned_experts;
     const bool with_expert_scale;
     const bool interleaved_views_adds;
+    const bool with_shared; // plus a shared expert gated by sigmoid(w . x), as qwen-style MoE
 
     test_moe_reduce(
             int64_t n_embd, int64_t n_expert_used, int64_t n_tokens,
-            bool unaligned_experts = false, bool with_expert_scale = false, bool interleaved_views_adds = false) :
+            bool unaligned_experts = false, bool with_expert_scale = false, bool interleaved_views_adds = false,
+            bool with_shared = false) :
         n_embd(n_embd), n_expert_used(n_expert_used), n_tokens(n_tokens),
         unaligned_experts(unaligned_experts), with_expert_scale(with_expert_scale),
-        interleaved_views_adds(interleaved_views_adds) {}
+        interleaved_views_adds(interleaved_views_adds), with_shared(with_shared) {}
 
     std::string vars() override {
-        return VARS_TO_STR6(n_embd, n_expert_used, n_tokens, unaligned_experts, with_expert_scale, interleaved_views_adds);
+        return VARS_TO_STR7(n_embd, n_expert_used, n_tokens, unaligned_experts, with_expert_scale, interleaved_views_adds, with_shared);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -7239,6 +7241,21 @@ struct test_moe_reduce : public test_case {
         ggml_set_name(experts, "experts");
         ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_expert_used, n_tokens);
         ggml_set_name(weights, "weights");
+
+        ggml_tensor * gated = nullptr;
+        if (with_shared) {
+            ggml_tensor * sh = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+            ggml_set_name(sh, "shared");
+            ggml_tensor * gw = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, 1);
+            ggml_set_name(gw, "shared_gate_w");
+            ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+            ggml_set_name(x, "shared_gate_x");
+            ggml_tensor * gate = ggml_mul_mat(ctx, gw, x);
+            ggml_set_name(gate, "shared_gate");
+            gated = ggml_mul(ctx, sh, ggml_sigmoid(ctx, gate));
+            ggml_set_name(gated, "shared_gated");
+            ggml_build_forward_expand(gf, gated);
+        }
 
         ggml_tensor * scaled = experts;
         if (with_expert_scale) {
@@ -7266,6 +7283,9 @@ struct test_moe_reduce : public test_case {
             if (!interleaved_views_adds && mode == MODE_TEST) {
                 ggml_build_forward_expand(gf, out);
             }
+        }
+        if (gated) {
+            out = ggml_add(ctx, out, gated);
         }
         ggml_set_name(out, "moe_reduce");
         return out;
@@ -11450,6 +11470,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_reduce(63,   12, 33, true,  true, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 15, 40, false, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 16, 32, false, true));
+    test_cases.emplace_back(new test_moe_reduce(2560, 10, 1, false, false, false, true));
+    test_cases.emplace_back(new test_moe_reduce(2560, 10, 3, false, false, false, true));
+    test_cases.emplace_back(new test_moe_reduce(300,  8,  7, false, true,  true,  true));
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
