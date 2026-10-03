@@ -790,11 +790,12 @@ bool llama_memory_hybrid_idx_context::get_kpool_cache_safe() const {
 
 void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, ggml_tensor * pool_idxs, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
         ggml_tensor * gather_mask, bool gather, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
-        const llama_ubatch * ubatch, ggml_tensor * new_pool_pos) const {
+        const llama_ubatch * ubatch, ggml_tensor * new_pool_pos,
+        ggml_tensor * pool_end_t, ggml_tensor * cell_pos_t, ggml_tensor * tok_pos_t, ggml_tensor * tok_rank_t) const {
     GGML_ASSERT(mem != nullptr && mem->get_mem_idx() != nullptr);
     GGML_ASSERT(ggml_backend_buffer_is_host(pool_cells->buffer));
     GGML_ASSERT(ggml_backend_buffer_is_host(pool_idxs->buffer));
-    GGML_ASSERT(ggml_backend_buffer_is_host(pool_mask->buffer));
+    GGML_ASSERT(pool_mask == nullptr || ggml_backend_buffer_is_host(pool_mask->buffer));
     GGML_ASSERT(ggml_backend_buffer_is_host(tail_idxs->buffer));
 
     const uint32_t kpool = mem->get_kpool();
@@ -813,7 +814,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
 
     GGML_ASSERT(n_pool == kpool_pad(st.n_pool_real));
     GGML_ASSERT(st.is_new.size() == st.n_pool_real);
-    GGML_ASSERT(pool_mask->ne[0] == (int64_t) n_pool && pool_mask->ne[1] == (int64_t) n_tokens);
+    GGML_ASSERT(pool_mask == nullptr || (pool_mask->ne[0] == (int64_t) n_pool && pool_mask->ne[1] == (int64_t) n_tokens));
     GGML_ASSERT(tail_idxs->ne[0] == (int64_t) kpool - 1 && tail_idxs->ne[1] == (int64_t) n_tokens);
     GGML_ASSERT(pool_idxs->ne[0] == (int64_t) kpool && pool_idxs->ne[1] == (int64_t) n_pool);
     GGML_ASSERT(st.cache_safe == (new_pool_rep != nullptr));
@@ -1001,7 +1002,36 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
             }
         }
     };
-    if (pool_mask->type == GGML_TYPE_F16) {
+    if (pool_mask == nullptr) {
+        // the graph tests pool_end <= tok_rank for a pool (as fill_mask does: the pool's last member against
+        // the token, by rank in order mode, by position otherwise) and cell_pos <= tok_pos for a cell
+        GGML_ASSERT(pool_end_t && cell_pos_t && tok_pos_t && tok_rank_t);
+        GGML_ASSERT(pool_end_t->ne[0] == (int64_t) n_pool && tok_pos_t->ne[0] == (int64_t) n_tokens &&
+                    tok_rank_t->ne[0] == (int64_t) n_tokens && cell_pos_t->ne[0] == (int64_t) n_kv);
+        const llama_seq_id s0 = ubatch->seq_id[0][0];
+        int32_t * pe = (int32_t *) pool_end_t->data;
+        for (uint32_t ip = 0; ip < n_pool; ++ip) {
+            if (ip >= pool_end.size()) {
+                pe[ip] = -1;
+            } else if (by_order) {
+                // fill_mask counts the first (rank + 1)/kpool pools of the sequence as visible
+                pe[ip] = (int32_t) ((ip - seq_pool_start[s0] + 1)*kpool - 1);
+            } else {
+                pe[ip] = (int32_t) pool_end[ip];
+            }
+        }
+        int32_t * tp = (int32_t *) tok_pos_t->data;
+        int32_t * tr = (int32_t *) tok_rank_t->data;
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            tp[i] = (int32_t) ubatch->pos[i];
+            tr[i] = by_order ? (int32_t) rank[i] : (int32_t) ubatch->pos[i];
+        }
+        const auto & cells = mem->get_mem_idx()->get_cells(s0);
+        int32_t * cp = (int32_t *) cell_pos_t->data;
+        for (uint32_t j = 0; j < n_kv; ++j) {
+            cp[j] = !cells.is_empty(j) && cells.seq_has(j, s0) ? (int32_t) cells.pos_get(j) : -1;
+        }
+    } else if (pool_mask->type == GGML_TYPE_F16) {
         fill_mask((ggml_fp16_t *) pool_mask->data);
     } else {
         fill_mask((float *) pool_mask->data);
@@ -1039,4 +1069,8 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
             }
         }
     }
+}
+
+bool llama_memory_hybrid_idx_context::kpool_pos_mode(const llama_ubatch & ubatch) const {
+    return mem != nullptr && mem->get_mem_idx() != nullptr && mem->get_mem_idx()->get_n_stream() == 1 && ubatch.n_seqs_unq == 1;
 }

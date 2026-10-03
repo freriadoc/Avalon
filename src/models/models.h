@@ -6,6 +6,7 @@
 
 // note: almost all graphs require at least sqrtf, so include cmath globally
 #include <cmath>
+#include <functional>
 #include <map>
 
 class llama_memory_hybrid_idx_context;
@@ -2531,6 +2532,10 @@ struct llama_model_qwen4exp : public llama_model_base {
             ggml_tensor * dense    = nullptr; // additive mask [n_kv, n_tokens], kq_mask included
             ggml_tensor * rows     = nullptr; // few queries: the cells to gather [n_sel, n_tokens]
             ggml_tensor * mask_sel = nullptr; // and their additive mask [n_sel, n_tokens]
+            // long contexts: the dense mask [n_kv, n] of the queries [t0, t0 + n), built slice by slice
+            // (n_slice queries) so that no tensor of the selection exceeds a fixed size
+            std::function<ggml_tensor * (int64_t t0, int64_t n)> dense_slice;
+            int64_t n_slice = 0;
         };
 
         // self-attention over the cells the QSA selection keeps
