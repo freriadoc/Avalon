@@ -5013,6 +5013,68 @@ struct test_mul_mat_multi : public test_case {
     }
 };
 
+// conv state of a recurrent cache as qwen4exp builds it: gather the row, concat the new tokens, copy
+// the window's tail into rollback slots of the cache, ssm_conv + silu (one CUDA kernel). The output
+// also reads the slots back, so the copies are compared too.
+struct test_ssm_conv_cached : public test_case {
+    const int64_t n_ch;
+    const int64_t n_t;
+    const int64_t n_slots;
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_ch, n_t, n_slots);
+    }
+
+    test_ssm_conv_cached(int64_t n_ch = 64, int64_t n_t = 1, int64_t n_slots = 1) : n_ch(n_ch), n_t(n_t), n_slots(n_slots) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SSM_CONV_CACHED";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t mem = 4;   // cache rows per slot
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 3 * n_ch, mem * n_slots);
+        ggml_tensor * ids   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_tensor * x     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_ch, n_t);
+        ggml_tensor * w     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, n_ch);
+        ggml_set_name(ids, "state_ids");
+        ggml_tensor * state = ggml_reshape_3d(ctx, ggml_get_rows(ctx, cache, ids), 3, n_ch, 1);
+        ggml_tensor * x3    = ggml_reshape_3d(ctx, x, n_ch, n_t, 1);
+        ggml_tensor * win   = ggml_concat(ctx, state, ggml_transpose(ctx, x3), 0);
+        std::vector<ggml_tensor *> copies;
+        for (int64_t slot = 0; slot < n_slots; slot++) {
+            const int64_t s_idx = std::max<int64_t>(0, win->ne[0] - 3 - slot);
+            ggml_tensor * tail = ggml_view_3d(ctx, win, 3, n_ch, 1, win->nb[1], win->nb[2], s_idx * sizeof(float));
+            ggml_tensor * dst  = ggml_view_2d(ctx, cache, 3 * n_ch, 1, cache->nb[1], (slot * mem + 1) * cache->nb[1]);
+            ggml_tensor * cpy  = ggml_cpy(ctx, tail, dst);
+            ggml_build_forward_expand(gf, cpy);
+            copies.push_back(cpy);
+        }
+        ggml_tensor * out = ggml_silu(ctx, ggml_ssm_conv(ctx, win, w));
+        ggml_build_forward_expand(gf, out);
+        out = ggml_reshape_1d(ctx, out, ggml_nelements(out));
+        for (ggml_tensor * c : copies) {
+            out = ggml_concat(ctx, out, ggml_reshape_1d(ctx, c, ggml_nelements(c)), 0);
+        }
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "state_ids") == 0) {
+                const int32_t row = 2;
+                ggml_backend_tensor_set(t, &row, 0, sizeof(row));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 struct test_gated_delta_net_cache_fusion : public test_case {
     const ggml_type type;
 
@@ -11635,6 +11697,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     test_cases.emplace_back(new test_gdn_gates(48, 1));
+    test_cases.emplace_back(new test_ssm_conv_cached(256, 1, 1));
+    test_cases.emplace_back(new test_ssm_conv_cached(10240, 1, 1));
+    test_cases.emplace_back(new test_ssm_conv_cached(256, 3, 3));
     test_cases.emplace_back(new test_mul_mat_multi(GGML_TYPE_Q8_0, 256, 1, {64, 48, 8, 0}));
     test_cases.emplace_back(new test_mul_mat_multi(GGML_TYPE_Q8_0, 2560, 3, {1024, 48, 48, 512}));
     test_cases.emplace_back(new test_mul_mat_multi(GGML_TYPE_Q4_K, 512, 2, {64, 40, 0, 0}));
