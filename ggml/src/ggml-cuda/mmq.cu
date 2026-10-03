@@ -2,8 +2,10 @@
 #include "mmq.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
+#include "ggml-backend-impl.h"
 
 #include <cstdint>
+#include <cstring>
 
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream, const ggml_prec prec_src1) {
     switch (args.type_x) {
@@ -135,6 +137,72 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggm
     return GGML_PREC_Q4;
 }
 
+// The scratch of a MUL_MAT(_ID) node: the expert ids helper's outputs first (fixed sizes), then the
+// quantized activation, whose tail (padding read by the kernels) depends on the weight type.
+static constexpr size_t mmq_scratch_align = 256;
+
+struct mmq_scratch_layout {
+    size_t ids_src1      = 0;
+    size_t ids_dst       = 0;
+    size_t expert_bounds = 0;
+    size_t src1_q8_1     = 0;
+    size_t size          = 0;
+};
+
+static mmq_scratch_layout mmq_scratch_get_layout(const ggml_tensor * dst, int cc) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const ggml_tensor * ids  = dst->op == GGML_OP_MUL_MAT_ID ? dst->src[2] : nullptr;
+
+    const int64_t ne10_padded = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING);
+    const bool    fallback    = src0->ne[1] % 128 != 0;
+    const size_t  q8_1_tail   = ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, src1->ne[1]) * sizeof(block_q8_1_mmq);
+
+    mmq_scratch_layout l;
+    size_t off = 0;
+    if (ids) {
+        const int64_t ne_get_rows = src1->ne[2] * ids->ne[0];
+        l.ids_src1      = off; off += GGML_PAD(ne_get_rows*sizeof(int32_t), mmq_scratch_align);
+        l.ids_dst       = off; off += GGML_PAD(ne_get_rows*sizeof(int32_t), mmq_scratch_align);
+        l.expert_bounds = off; off += GGML_PAD((src0->ne[2] + 1)*sizeof(int32_t), mmq_scratch_align);
+        l.src1_q8_1     = off; off += ne_get_rows*ne10_padded * sizeof(block_q8_1_mmq)/QK8_1_MMQ + q8_1_tail;
+    } else {
+        l.src1_q8_1     = off;
+        off += src1->ne[3]*src1->ne[2] * src1->ne[1]*ne10_padded * sizeof(block_q8_1_mmq)/QK8_1_MMQ + q8_1_tail;
+    }
+    l.size = off;
+    return l;
+}
+
+size_t ggml_cuda_mmq_scratch_size(const ggml_tensor * dst, int cc, int64_t key[GGML_CUDA_MMQ_SCRATCH_KEY]) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const ggml_tensor * ids  = dst->op == GGML_OP_MUL_MAT_ID ? dst->src[2] : nullptr;
+
+    // the native FP4 path also needs per-row scales: it keeps the pool
+    if (ggml_cuda_mmq_get_prec_src1(src0, dst, cc) != GGML_PREC_Q8) {
+        return 0;
+    }
+
+    // the quantized activation depends on the activation, on the weight type only through the layout of
+    // the block scales, and for MUL_MAT_ID on the ids (the activation is scattered to the experts' rows)
+    for (int i = 0; i < GGML_CUDA_MMQ_SCRATCH_KEY; i++) {
+        key[i] = 0;
+    }
+    key[0] = (int64_t) (intptr_t) src1;
+    key[1] = (int64_t) (intptr_t) ids;
+    key[2] = (int64_t) mmq_get_q8_1_ds_layout(src0->type);
+    for (int i = 0; i < 4; i++) {
+        key[3 + i] = src1->ne[i];
+    }
+    if (ids) {
+        key[7] = ids->ne[0];
+        key[8] = ids->ne[1];
+        key[9] = src0->ne[2];
+    }
+    return mmq_scratch_get_layout(dst, cc).size;
+}
+
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
@@ -187,16 +255,30 @@ void ggml_cuda_mul_mat_q(
     const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
     const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
 
+    // the scratch the scheduler placed in the compute buffer (GGML_SCHED_SCRATCH_SRC), else pool memory;
+    // a node sharing the previous node's scratch and key finds its quantized activation (and ids) there
+    int64_t key[GGML_CUDA_MMQ_SCRATCH_KEY] = {0};
+    const size_t        scratch_need = ggml_cuda_mmq_scratch_size(dst, cc, key);
+    const ggml_tensor * scratch_t    = dst->src[GGML_SCHED_SCRATCH_SRC];
+    char * scratch = scratch_need > 0 && scratch_t && scratch_t->data && ggml_nbytes(scratch_t) >= scratch_need ?
+        (char *) scratch_t->data : nullptr;
+    const bool scratch_reuse = scratch && ctx.mmq_scratch_last == scratch_t &&
+        memcmp(ctx.mmq_scratch_key, key, sizeof(key)) == 0;
+    ctx.mmq_scratch_last = scratch ? scratch_t : nullptr;
+    memcpy(ctx.mmq_scratch_key, key, sizeof(key));
+    const mmq_scratch_layout scratch_l = scratch ? mmq_scratch_get_layout(dst, cc) : mmq_scratch_layout();
+
     if (!ids) {
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block +
             ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
-        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
+        ggml_cuda_pool_alloc<char> src1_q8_1_pool(ctx.pool());
+        char * src1_q8_1 = scratch ? scratch + scratch_l.src1_q8_1 : src1_q8_1_pool.alloc(nbytes_src1_q8_1);
         ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
         if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
             src1_scale.alloc(ne13*ne12*ne11);
         }
 
-        {
+        if (!scratch_reuse) {
             const int64_t s11 = src1->nb[1] / ts_src1;
             const int64_t s12 = src1->nb[2] / ts_src1;
             const int64_t s13 = src1->nb[3] / ts_src1;
@@ -204,11 +286,11 @@ void ggml_cuda_mul_mat_q(
                 static constexpr size_t align_float8 = 32;
                 const bool use_aligned_float8 = ggml_cuda_is_aligned(src1, align_float8);
                 static_assert(sizeof(block_fp4_mmq) == 4 * sizeof(block_q8_1));
-                quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
+                quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1, src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
                                         ne11, ne12, ne13, stream);
 
             } else {
-                quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
+                quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1, src0->type, ne10, s11, s12, s13, ne10_padded,
                                        ne11, ne12, ne13, stream);
             }
             CUDA_CHECK(cudaGetLastError());
@@ -221,7 +303,7 @@ void ggml_cuda_mul_mat_q(
         const int64_t s13 = ne12*s12;
 
         const mmq_args args = {
-            src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, dst_d,
+            src0_d, src0->type, (const int *) src1_q8_1, nullptr, nullptr, dst_d,
             src0->type == GGML_TYPE_NVFP4 && use_native_fp4 ? src1_scale.ptr : nullptr,
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
@@ -239,27 +321,31 @@ void ggml_cuda_mul_mat_q(
     const int64_t ne_get_rows = ne12 * n_expert_used;
     GGML_ASSERT(ne1 == n_expert_used);
 
-    ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
-    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows);
-    ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
+    ggml_cuda_pool_alloc<int32_t> ids_src1_pool(ctx.pool());
+    ggml_cuda_pool_alloc<int32_t> ids_dst_pool(ctx.pool());
+    ggml_cuda_pool_alloc<int32_t> expert_bounds_pool(ctx.pool());
+    int32_t * ids_src1      = scratch ? (int32_t *) (scratch + scratch_l.ids_src1)      : ids_src1_pool.alloc(ne_get_rows);
+    int32_t * ids_dst       = scratch ? (int32_t *) (scratch + scratch_l.ids_dst)       : ids_dst_pool.alloc(ne_get_rows);
+    int32_t * expert_bounds = scratch ? (int32_t *) (scratch + scratch_l.expert_bounds) : expert_bounds_pool.alloc(ne02 + 1);
 
     // gate/up activations are broadcast across experts (ne11 == 1): quantize each token once and
     // scatter to its slots. ids_src1 then holds the inverse map (token slot -> compact row).
     const bool dedup_bcast = ne11 == 1 && n_expert_used > 1;
 
-    {
+    if (!scratch_reuse) {
         GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
         const int si1  = ids->nb[1] / ggml_element_size(ids);
         const int sis1 = nb12 / nb11;
 
-        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
+        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1, ids_dst, expert_bounds,
             ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
         CUDA_CHECK(cudaGetLastError());
     }
 
     const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block +
         ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
+    ggml_cuda_pool_alloc<char> src1_q8_1_pool(ctx.pool());
+    char * src1_q8_1 = scratch ? scratch + scratch_l.src1_q8_1 : src1_q8_1_pool.alloc(nbytes_src1_q8_1);
     ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
     if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
         src1_scale.alloc(ne12*n_expert_used);
@@ -269,7 +355,7 @@ void ggml_cuda_mul_mat_q(
     const int64_t ne12_flat = 1;
     const int64_t ne13_flat = 1;
 
-    {
+    if (!scratch_reuse) {
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
@@ -278,17 +364,17 @@ void ggml_cuda_mul_mat_q(
             static constexpr size_t align_float8 = 32;
             const bool use_aligned_float8 = ggml_cuda_is_aligned(src1, align_float8);
             if (dedup_bcast) {
-                quantize_scatter_mmq_fp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10,
+                quantize_scatter_mmq_fp4_cuda(src1_d, ids_src1, src1_q8_1, src1_scale.ptr, src0->type, use_aligned_float8, ne10,
                                         /*stride_token=*/s12, ne10_padded, ne12, ne11_flat, n_expert_used, stream);
             } else {
-                quantize_mmq_fp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13,
+                quantize_mmq_fp4_cuda(src1_d, ids_src1, src1_q8_1, src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13,
                                         ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
             }
         } else if (dedup_bcast) {
-            quantize_scatter_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10,
+            quantize_scatter_mmq_q8_1_cuda(src1_d, ids_src1, src1_q8_1, src0->type, ne10,
                                     /*stride_token=*/s12, ne10_padded, ne12, ne11_flat, n_expert_used, stream);
         } else {
-            quantize_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
+            quantize_mmq_q8_1_cuda(src1_d, ids_src1, src1_q8_1, src0->type, ne10, s11, s12, s13,
                                    ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
         }
         CUDA_CHECK(cudaGetLastError());
@@ -308,7 +394,7 @@ void ggml_cuda_mul_mat_q(
 
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
     const mmq_args args = {
-        src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
+        src0_d, src0->type, (const int *) src1_q8_1, ids_dst, expert_bounds, dst_d,
         src1_scale.ptr,
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,

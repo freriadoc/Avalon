@@ -1,4 +1,5 @@
 #include "mmvq.cuh"
+#include "ggml-backend-impl.h"
 #include "moe-cache-mmv-tuning.h"
 #include "quantize.cuh"
 #include "unary.cuh"
@@ -1693,9 +1694,12 @@ void ggml_cuda_mul_mat_vec_q(
         const int64_t s13 = src1->nb[3] / ts_src1;
         src1_q8_1 = ggml_cuda_q8_1_reuse(ctx, src1_d, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
         if (!src1_q8_1) {
-            src1_q8_1_tmp.alloc(ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-            quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1_tmp.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
-            src1_q8_1 = src1_q8_1_tmp.get();
+            // the scheduler's scratch when it gave one (GGML_SCHED_SCRATCH_SRC), else pool memory
+            const size_t need = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
+            const ggml_tensor * scratch = dst->src[GGML_SCHED_SCRATCH_SRC];
+            char * buf = scratch && scratch->data && ggml_nbytes(scratch) >= need ? (char *) scratch->data : src1_q8_1_tmp.alloc(need);
+            quantize_row_q8_1_cuda(src1_d, nullptr, buf, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+            src1_q8_1 = buf;
         }
     }
 

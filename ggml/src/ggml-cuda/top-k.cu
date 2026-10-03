@@ -1,5 +1,6 @@
 #include "argsort.cuh"
 #include "top-k.cuh"
+#include "ggml-backend-impl.h"
 
 #ifdef GGML_CUDA_USE_CUB
 #    include <cub/cub.cuh>
@@ -181,24 +182,39 @@ static __global__ void top_k_radix_gather(
     }
 }
 
+static constexpr int top_k_radix_bins = 1 << 8;
+
+static int top_k_radix_blocks_per_row(int ncols) {
+    return std::min((ncols + 1023) / 1024, 64);
+}
+
+// sized for the next power of two of blocks_per_row: it grows with ncols (with the context, for an indexer's
+// scores), and the legacy pool keeps every buffer it outgrows; this way they add up to at most the last one
+static size_t top_k_radix_hist_count(int ncols, int nrows) {
+    int hist_blocks = 1;
+    while (hist_blocks < top_k_radix_blocks_per_row(ncols)) {
+        hist_blocks *= 2;
+    }
+    return (size_t) nrows * hist_blocks * top_k_radix_bins;
+}
+
+static size_t top_k_radix_states_bytes(int nrows) {
+    return GGML_PAD(nrows * sizeof(top_k_radix_state), 256);
+}
+
 static void top_k_radix_cuda(
-        ggml_cuda_pool & pool,
+        ggml_cuda_pool & pool, char * scratch,
         const float * src, int * dst, int ncols, int nrows, int k, cudaStream_t stream) {
     constexpr int BLOCK_SIZE = 256;
     constexpr int RADIX_BITS = 8;
     constexpr int NBINS = 1 << RADIX_BITS;
-    const int blocks_per_row = std::min((ncols + 1023) / 1024, 64);
+    static_assert(NBINS == top_k_radix_bins, "top-k radix bins");
+    const int blocks_per_row = top_k_radix_blocks_per_row(ncols);
 
-    ggml_cuda_pool_alloc<top_k_radix_state> states_alloc(pool, nrows);
-    // sized for the next power of two of blocks_per_row: it grows with ncols (with the context, for an indexer's
-    // scores), and the legacy pool keeps every buffer it outgrows; this way they add up to at most the last one
-    int hist_blocks = 1;
-    while (hist_blocks < blocks_per_row) {
-        hist_blocks *= 2;
-    }
-    ggml_cuda_pool_alloc<int> histograms_alloc(pool, (size_t) nrows * hist_blocks * NBINS);
-    top_k_radix_state * states = states_alloc.get();
-    int * histograms = histograms_alloc.get();
+    ggml_cuda_pool_alloc<top_k_radix_state> states_alloc(pool);
+    ggml_cuda_pool_alloc<int> histograms_alloc(pool);
+    top_k_radix_state * states = scratch ? (top_k_radix_state *) scratch : states_alloc.alloc(nrows);
+    int * histograms = scratch ? (int *) (scratch + top_k_radix_states_bytes(nrows)) : histograms_alloc.alloc(top_k_radix_hist_count(ncols, nrows));
 
     top_k_radix_init<<<(nrows + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(states, nrows, k);
 
@@ -268,18 +284,40 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         dst_d  += k     * iter_nrows;
     }
 #else                             // GGML_CUDA_USE_CUB
+    // the scheduler's scratch when it gave one (GGML_SCHED_SCRATCH_SRC), else pool memory
+    const ggml_tensor * scratch_t = dst->src[GGML_SCHED_SCRATCH_SRC];
+    const size_t        need      = ggml_cuda_top_k_scratch_size(dst);
+    char * scratch = need > 0 && scratch_t && scratch_t->data && ggml_nbytes(scratch_t) >= need ? (char *) scratch_t->data : nullptr;
 #if defined(GGML_USE_HIP)
     if (ncols > 1024) {
-        top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
+        top_k_radix_cuda(pool, scratch, src0_d, dst_d, ncols, nrows, k, stream);
     } else {
 #endif // defined(GGML_USE_HIP)
-        ggml_cuda_pool_alloc<int> temp_dst_alloc(pool, ncols * nrows);
-        int *                     tmp_dst = temp_dst_alloc.get();
+        ggml_cuda_pool_alloc<int> temp_dst_alloc(pool);
+        int *                     tmp_dst = scratch ? (int *) scratch : temp_dst_alloc.alloc(ncols * nrows);
         argsort_f32_i32_cuda_bitonic(src0_d, tmp_dst, ncols, nrows, GGML_SORT_ORDER_DESC, stream);
         CUDA_CHECK(cudaMemcpy2DAsync(dst_d, k * sizeof(int), tmp_dst, ncols * sizeof(int), k * sizeof(int), nrows,
                                      cudaMemcpyDeviceToDevice, stream));
 #if defined(GGML_USE_HIP)
     }
 #endif // defined(GGML_USE_HIP)
+#endif
+}
+
+size_t ggml_cuda_top_k_scratch_size(const ggml_tensor * dst) {
+#if !defined(GGML_CUDA_USE_CUB)
+    const ggml_tensor * src0 = dst->src[0];
+    const int ncols = (int) src0->ne[0];
+    const int nrows = (int) ggml_nrows(src0);
+#if defined(GGML_USE_HIP)
+    if (ncols > 1024) {
+        return top_k_radix_states_bytes(nrows) + top_k_radix_hist_count(ncols, nrows) * sizeof(int);
+    }
+#endif
+    // the bitonic sort's full index rows
+    return (size_t) ncols * nrows * sizeof(int);
+#else
+    GGML_UNUSED(dst);
+    return 0;
 #endif
 }

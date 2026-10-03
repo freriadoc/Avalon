@@ -1377,6 +1377,14 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         GGML_ABORT("%s: failed to initialize context\n", __func__);
     }
 
+    // scratch tensors set by a previous split of this graph lived in the context just reset (add_scratch)
+    for (int i = 0; i < graph->n_nodes; i++) {
+        const char * src = (const char *) graph->nodes[i]->src[GGML_SCHED_SCRATCH_SRC];
+        if (src >= (const char *) sched->context_buffer && src < (const char *) sched->context_buffer + sched->context_buffer_size) {
+            graph->nodes[i]->src[GGML_SCHED_SCRATCH_SRC] = nullptr;
+        }
+    }
+
     graph->uid = ggml_graph_next_uid();
 
     // pass 1: assign backends to ops with pre-allocated inputs
@@ -1761,15 +1769,31 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     // TODO: this may create many small allocations in the scheduler, restructure to use a flat array
     std::unordered_map<ggml_tensor *, std::vector<ggml_tensor *>> alloc_deps;
 
+    struct opt_user_data {
+        std::unordered_map<ggml_tensor *, std::vector<ggml_tensor *>> * alloc_deps;
+        ggml_backend_sched_t sched;
+    } opt_ud = { &alloc_deps, sched };
+
     struct ggml_backend_graph_optimize_params opt_params = {
         /* .add_alloc_dep = */ [](void * user_data, ggml_tensor * tensor, ggml_tensor * until) {
-            auto & deps = *(std::unordered_map<ggml_tensor *, std::vector<ggml_tensor *>> *) user_data;
+            auto & deps = *((opt_user_data *) user_data)->alloc_deps;
             std::vector<ggml_tensor *> & keep = deps[until];
             if (std::find(keep.begin(), keep.end(), tensor) == keep.end()) {
                 keep.push_back(tensor);
             }
         },
-        /* .user_data     = */ &alloc_deps,
+        /* .user_data     = */ &opt_ud,
+        /* .add_scratch   = */ [](void * user_data, ggml_tensor ** nodes, int n_nodes, size_t size) {
+            ggml_backend_sched_t sched = ((opt_user_data *) user_data)->sched;
+            // a node source, not a node: ggml-alloc allocates it before its first reader and frees it after
+            // its last, and the split inputs are already known, so it is never copied between backends
+            ggml_tensor * scratch = ggml_new_tensor_1d(sched->ctx, GGML_TYPE_I8, (int64_t) size);
+            ggml_format_name(scratch, "scratch (%s)", nodes[0]->name);
+            for (int i = 0; i < n_nodes; i++) {
+                GGML_ASSERT(nodes[i]->src[GGML_SCHED_SCRATCH_SRC] == nullptr);
+                nodes[i]->src[GGML_SCHED_SCRATCH_SRC] = scratch;
+            }
+        },
     };
 
     for (int i = 0; i < sched->n_splits; i++) {

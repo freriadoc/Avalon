@@ -1451,6 +1451,11 @@ struct ggml_cuda_stream_context {
     }
 };
 
+#define GGML_CUDA_MMQ_SCRATCH_KEY 12
+
+// capacity of the q8_1 reuse buffer (ggml_cuda_q8_1_reuse): larger activations are quantized elsewhere
+#define GGML_CUDA_Q8_1_REUSE_BYTES (1u << 20)
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1466,6 +1471,11 @@ struct ggml_backend_cuda_context {
     // The last activation quantized to q8_1 for mmvq on the main stream (ggml_cuda_q8_1_reuse): the
     // products of a graph that read the same activation share it. Reset at the start of every graph,
     // dropped as soon as a node writes over the activation.
+    // the MUL_MAT(_ID) scratch (GGML_SCHED_SCRATCH_SRC) last filled by mmq, and what it holds: a node
+    // with the same scratch and key reads the quantized activation (and expert ids) as they are
+    const ggml_tensor * mmq_scratch_last = nullptr;
+    int64_t             mmq_scratch_key[GGML_CUDA_MMQ_SCRATCH_KEY] = {0};
+
     struct q8_1_reuse_state {
         char *        buf   = nullptr;   // allocated once, outside a graph capture
         size_t        size  = 0;

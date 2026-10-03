@@ -1631,4 +1631,8 @@ extern DECL_MMQ_CASE_W4A4(GGML_TYPE_NVFP4);
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
 
+// bytes of scratch ggml_cuda_mul_mat_q takes for dst (MUL_MAT or MUL_MAT_ID) instead of pool memory, 0 if it
+// would not use one; key: what the scratch then holds, the same for nodes that can share its content
+size_t ggml_cuda_mmq_scratch_size(const ggml_tensor * dst, int cc, int64_t key[GGML_CUDA_MMQ_SCRATCH_KEY]);
+
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);

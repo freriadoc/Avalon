@@ -117,7 +117,15 @@ extern "C" {
         // can be called multiple times for the same tensor: the longest lifetime applies
         void (*add_alloc_dep)(void * user_data, struct ggml_tensor * tensor, struct ggml_tensor * until);
         void * user_data;
+
+        // (optional, may be NULL) temporary memory of `size` bytes for `nodes` (in graph order), set as
+        // their source GGML_SCHED_SCRATCH_SRC (which must be NULL): ggml-alloc places it in the compute
+        // buffer before the first of them and frees it after the last, so it is counted in the reservation
+        // instead of being allocated by the backend while the graph runs
+        void (*add_scratch)(void * user_data, struct ggml_tensor ** nodes, int n_nodes, size_t size);
     };
+
+    #define GGML_SCHED_SCRATCH_SRC (GGML_MAX_SRC - 1)
 
     struct ggml_backend_i {
         const char * (*get_name)(ggml_backend_t backend);
