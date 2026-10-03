@@ -1,6 +1,7 @@
 #include "cpy.cuh"
 #include "dequantize.cuh"
 #include "cpy-utils.cuh"
+#include "convert.cuh"
 #if defined(GGML_USE_MUSA) && defined(GGML_MUSA_MUDNN_COPY)
 #include "ggml-musa/mudnn.cuh"
 #endif // GGML_USE_MUSA && GGML_MUSA_MUDNN_COPY
@@ -477,6 +478,18 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
     } else if (ggml_cuda_cpy_as_memcpy_2d(src0, src1, mc_width, mc_height, mc_spitch, mc_dpitch)) {
         CUDA_CHECK(cudaMemcpy2DAsync(src1_ddc, mc_dpitch, src0_ddc, mc_spitch,
                                      mc_width, mc_height, cudaMemcpyDeviceToDevice, main_stream));
+    } else if ((src0->type == GGML_TYPE_Q8_0 || src0->type == GGML_TYPE_Q4_0) && src1->type == GGML_TYPE_F16) {
+        // the conversion flash attention makes of a quantized K/V, as a graph node that several
+        // attention nodes can share
+        GGML_ASSERT(ggml_is_contiguous(src1));
+        if (ggml_is_contiguously_allocated(src0)) {
+            ggml_get_to_fp16_cuda(src0->type)(src0_ddc, (half *) src1_ddc, ne, main_stream);
+        } else {
+            const int64_t ts = ggml_type_size(src0->type);
+            GGML_ASSERT(nb00 == ts);
+            ggml_get_to_fp16_nc_cuda(src0->type)(src0_ddc, (half *) src1_ddc, ne00, ne01, ne02, src0->ne[3],
+                    nb01/ts, nb02/ts, nb03/ts, main_stream);
+        }
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
         if (can_be_transposed) {
             ggml_cpy_scalar_cuda<float, float, true>
