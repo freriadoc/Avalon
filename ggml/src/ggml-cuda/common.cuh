@@ -1462,6 +1462,19 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
+    // The last activation quantized to q8_1 for mmvq on the main stream (ggml_cuda_q8_1_reuse): the
+    // products of a graph that read the same activation share it. Reset at the start of every graph,
+    // dropped as soon as a node writes over the activation.
+    struct q8_1_reuse_state {
+        char *        buf   = nullptr;   // allocated once, outside a graph capture
+        size_t        size  = 0;
+        bool          valid = false;
+        const float * x     = nullptr;
+        int64_t       key[8] = {0};
+        const char *  lo    = nullptr;   // bytes of the activation
+        const char *  hi    = nullptr;
+    } q8_1_reuse;
+
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)

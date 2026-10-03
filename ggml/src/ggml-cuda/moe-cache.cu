@@ -6182,10 +6182,16 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
 
     // resident rows: activations quantized, up/gate/swiglu into the glu result (alive until down has
     // read it), its quantization, down into the block's output
-    char * q8_act = st->d_q8_act;
+    // the activations are quantized through the context's reuse buffer: the shared expert's
+    // gate / up read the same ones
+    const char * q8_act = (const char *) ggml_cuda_q8_1_reuse(ctx, (const float *) act->data, n_embd, n_embd,
+                                                              n_tokens * n_embd, n_tokens * n_embd, padded_embd, n_tokens, 1, 1, stream);
+    if (!q8_act) {
+        quantize_row_q8_1_cuda((const float *) act->data, nullptr, st->d_q8_act, wtype, n_embd, n_embd, n_tokens * n_embd,
+                               n_tokens * n_embd, padded_embd, n_tokens, 1, 1, stream);
+        q8_act = st->d_q8_act;
+    }
     char * q8_mid = st->d_q8_mid;
-    quantize_row_q8_1_cuda((const float *) act->data, nullptr, q8_act, wtype, n_embd, n_embd, n_tokens * n_embd,
-                           n_tokens * n_embd, padded_embd, n_tokens, 1, 1, stream);
     ggml_cuda_moe_cache_mmv_fused(layer->base, layer->base, wtype, q8_act, layer->d_plan, layer->d_plan + rows,
                                   layer->d_act_ids, (float *) glu->data, n_embd, n_ff, (int64_t) gate->src[0]->nb[2],
                                   rows, n_tokens, -INFINITY, INFINITY, -INFINITY, INFINITY, stream);
@@ -6216,6 +6222,7 @@ void ggml_cuda_moe_hosted_flush(ggml_backend_cuda_context & ctx, const ggml_tens
             return;
         }
     }
+    ggml_cuda_q8_1_reuse_written(ctx, p.down);
     k_moe_hosted_merge<<<p.rows, 256, 0, ctx.stream()>>>(p.layer->d_expect, p.layer->m_flags + 16,
                                                           p.layer->d_plan + 2 * p.rows, p.layer->m_res,
                                                           (float *) p.down->data, (int) p.layer->n_embd);

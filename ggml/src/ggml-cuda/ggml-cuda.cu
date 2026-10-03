@@ -736,6 +736,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+    if (q8_1_reuse.buf != nullptr) {
+        CUDA_CHECK(cudaFree(q8_1_reuse.buf));
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -4538,6 +4541,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            cuda_ctx->q8_1_reuse.valid = false;
+            // a node (or a fused group, a hosted MoE block) computed nodes [first, last]: drop the
+            // reused activation quantization if one of them wrote over it
+            const auto written = [&](int first, int last) {
+                for (int k = first; k <= last && k < cgraph->n_nodes; k++) {
+                    if (!ggml_cuda_is_view_or_noop(cgraph->nodes[k])) {
+                        ggml_cuda_q8_1_reuse_written(*cuda_ctx, cgraph->nodes[k]);
+                    }
+                }
+            };
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -4593,6 +4606,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     if (covered <= 0) {
                         GGML_ABORT("%s: MUL_MAT_ID with host weights outside a hosted MoE block (%s)", __func__, node->name);
                     }
+                    written(i, i + covered);
                     i += covered;
                     continue;
                 }
@@ -4600,6 +4614,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
+                    written(i, i + nodes_to_skip);
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
@@ -4627,6 +4642,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 #endif  // NDEBUG
 
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                written(i, i);
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
@@ -4697,6 +4713,18 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+
+    // the q8_1 reuse buffer (ggml_cuda_q8_1_reuse): allocated here, never inside a graph capture;
+    // 1 MiB holds the activations of up to 64 rows of 10240 (larger ones are not reused)
+    if (!cuda_ctx->q8_1_reuse.buf) {
+        const size_t size = 1u << 20;
+        if (cudaMalloc((void **) &cuda_ctx->q8_1_reuse.buf, size) == cudaSuccess) {
+            cuda_ctx->q8_1_reuse.size = size;
+        } else {
+            (void) cudaGetLastError();
+            cuda_ctx->q8_1_reuse.buf = nullptr;
+        }
+    }
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;

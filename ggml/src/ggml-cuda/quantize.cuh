@@ -68,3 +68,14 @@ void quantize_scatter_mmq_q8_1_cuda(const float *   x,
                                     int64_t         nrows_dst,
                                     int             n_expert_used,
                                     cudaStream_t    stream);
+
+// q8_1 rows of the activation x for mmvq (the layout of quantize_row_q8_1_cuda), quantized into the
+// context's reuse buffer unless the last call quantized the same activation with the same layout
+// and nothing wrote over it since. nullptr when the buffer cannot serve (too small, not the main
+// stream): quantize into a temporary buffer as before.
+const void * ggml_cuda_q8_1_reuse(ggml_backend_cuda_context & ctx, const float * x,
+        int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
+        int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
+
+// a node wrote dst: drop the reused quantization if dst overlaps its activation
+void ggml_cuda_q8_1_reuse_written(ggml_backend_cuda_context & ctx, const ggml_tensor * dst);
