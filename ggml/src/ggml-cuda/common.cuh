@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1474,6 +1475,10 @@ struct ggml_backend_cuda_context {
         const char *  lo    = nullptr;   // bytes of the activation
         const char *  hi    = nullptr;
     } q8_1_reuse;
+
+    // GET_ROWS of a recurrent state left to the gated delta net that reads it (it reads the cache
+    // rows itself, ggml_cuda_gdn_state_gather_of); reset at the start of every graph
+    std::unordered_set<const ggml_tensor *> gdn_gathers;
 
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context

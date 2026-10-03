@@ -12,3 +12,7 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
 // same op, but writes the snapshot(s) into the cache instead of dst (see ggml_cuda_try_gdn_cache_fusion)
 void ggml_cuda_op_gated_delta_net_fused_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
                                               ggml_cuda_gated_delta_net_fused_cache cache);
+
+// the GET_ROWS node behind a gated delta net's state (through reshapes) when the graph evaluation
+// left that gather to the kernel, nullptr otherwise
+const ggml_tensor * ggml_cuda_gdn_state_gather_of(const ggml_backend_cuda_context & ctx, const ggml_tensor * state);

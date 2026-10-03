@@ -2962,6 +2962,66 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
 
 // match gated_delta_net + the strided cpy that scatters its state snapshots into the cache
 // (slot i -> rollback group i, slot 0 newest), so the kernel can write them and skip the cpy.
+
+// A recurrent state gathered by GET_ROWS (one cache row per sequence) that only a gated delta net
+// reads, through reshapes: the kernel can read the cache rows itself (one copy of the state, 3 MiB
+// per layer in qwen4exp, and a kernel less). Each block reads its columns of the state before it
+// writes them, so the kernel may write the new state over the row it reads; no node in between may
+// write the cache.
+static bool ggml_cuda_gdn_absorbs_gather(const ggml_cgraph * cgraph, int idx) {
+    const ggml_tensor * gr = cgraph->nodes[idx];
+    const ggml_tensor * src = gr->src[0];
+    const ggml_tensor * ids = gr->src[1];
+    if (gr->op != GGML_OP_GET_ROWS || gr->type != GGML_TYPE_F32 || src->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 ||
+            !ggml_is_contiguous(gr) || src->nb[0] != sizeof(float) || !ggml_is_contiguous(ids) ||
+            gr->ne[2] != 1 || gr->ne[3] != 1 || src->ne[2] != 1 || src->ne[3] != 1 || ids->ne[0] != gr->ne[1] ||
+            (gr->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    // the cache and the row indices must still hold their values when the GDN runs: ggml-alloc
+    // takes the GET_ROWS for the last reader of the indices and may give their memory to a node in
+    // between (seen in a prefill graph: the kernel then read past the cache and hung the queue)
+    const char * src_lo = (const char *) src->data;
+    const char * src_hi = src_lo + ggml_nbytes(src);
+    const char * ids_lo = (const char *) ids->data;
+    const char * ids_hi = ids_lo + ggml_nbytes(ids);
+    const auto root = [](const ggml_tensor * t) {
+        while (t && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW) && t->view_offs == 0) {
+            t = t->src[0];
+        }
+        return t;
+    };
+    int gdn_idx = -1;
+    for (int k = idx + 1; k < cgraph->n_nodes; k++) {
+        const ggml_tensor * n = cgraph->nodes[k];
+        if (n->op == GGML_OP_GATED_DELTA_NET && root(n->src[5]) == gr) {
+            const ggml_tensor * v = n->src[2];
+            if (gdn_idx >= 0 || gr->ne[0] != v->ne[0] * v->ne[0] * v->ne[1] || gr->ne[1] != v->ne[3] ||
+                    !ggml_is_contiguous(n->src[5])) {
+                return false;
+            }
+            gdn_idx = k;
+            continue;
+        }
+        // any other reader of the gathered rows (a view of them is fine only on the way to the GDN)
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            const ggml_tensor * s = n->src[j];
+            if (s && (s == gr || s->view_src == gr) && !(ggml_cuda_is_view_or_noop(n) && root(n) == gr)) {
+                return false;
+            }
+        }
+        // nothing may write the cache or the indices before the GDN has read them
+        if (gdn_idx < 0 && !ggml_cuda_is_view_or_noop(n) && n->data && ggml_nbytes(n) > 0) {
+            const char * lo = (const char *) n->data;
+            const char * hi = lo + ggml_nbytes(n);
+            if ((lo < src_hi && src_lo < hi) || (lo < ids_hi && ids_lo < hi)) {
+                return false;
+            }
+        }
+    }
+    return gdn_idx >= 0;
+}
+
 static int ggml_cuda_try_gdn_cache_fusion(
         const ggml_cgraph * cgraph, int node_idx, ggml_cuda_gated_delta_net_fused_cache & fused_state_cpy) {
     const ggml_tensor * gdn = cgraph->nodes[node_idx];
@@ -4575,6 +4635,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
 
             cuda_ctx->q8_1_reuse.valid = false;
+            cuda_ctx->gdn_gathers.clear();
             // a node (or a fused group, a hosted MoE block) computed nodes [first, last]: drop the
             // reused activation quantization if one of them wrote over it
             const auto written = [&](int first, int last) {
@@ -4641,6 +4702,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     }
                     written(i, i + covered);
                     i += covered;
+                    continue;
+                }
+
+                // a recurrent state's gather left to the gated delta net that reads it
+                if (node->op == GGML_OP_GET_ROWS && ggml_cuda_gdn_absorbs_gather(cgraph, i)) {
+                    cuda_ctx->gdn_gathers.insert(node);
                     continue;
                 }
 
