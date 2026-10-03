@@ -1149,8 +1149,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 
     const float eps_norm = hparams.f_norm_rms_eps;
 
-    q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
-    k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
+    // q and k are neighbours in the conv output with the same head size: one normalization of the
+    // view that spans both, then q and k as views of it (one kernel instead of two)
+    {
+        ggml_tensor * qk_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, 2 * num_k_heads, n_seq_tokens, n_seqs,
+                ggml_row_size(conv_qkv_mix->type, head_k_dim), nb1_qkv, nb1_qkv * n_seq_tokens, 0);
+        ggml_tensor * qk_norm = build_gdn_l2_norm(ctx0, qk_conv, eps_norm);
+        q_conv = ggml_view_4d(ctx0, qk_norm, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
+                qk_norm->nb[1], qk_norm->nb[2], qk_norm->nb[3], 0);
+        k_conv = ggml_view_4d(ctx0, qk_norm, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
+                qk_norm->nb[1], qk_norm->nb[2], qk_norm->nb[3], num_k_heads * qk_norm->nb[1]);
+    }
 
     // repeat to match shapes when head keys != value keys; unneeded with the fused GDN
     if (num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch)) {
