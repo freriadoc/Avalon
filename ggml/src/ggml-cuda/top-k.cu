@@ -190,7 +190,13 @@ static void top_k_radix_cuda(
     const int blocks_per_row = std::min((ncols + 1023) / 1024, 64);
 
     ggml_cuda_pool_alloc<top_k_radix_state> states_alloc(pool, nrows);
-    ggml_cuda_pool_alloc<int> histograms_alloc(pool, (size_t) nrows * blocks_per_row * NBINS);
+    // sized for the next power of two of blocks_per_row: it grows with ncols (with the context, for an indexer's
+    // scores), and the legacy pool keeps every buffer it outgrows; this way they add up to at most the last one
+    int hist_blocks = 1;
+    while (hist_blocks < blocks_per_row) {
+        hist_blocks *= 2;
+    }
+    ggml_cuda_pool_alloc<int> histograms_alloc(pool, (size_t) nrows * hist_blocks * NBINS);
     top_k_radix_state * states = states_alloc.get();
     int * histograms = histograms_alloc.get();
 
