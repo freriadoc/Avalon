@@ -646,6 +646,30 @@ static void test_reallocation() {
     }
 }
 
+// An input leaf no node reads (kept allocated for its setter) that grows must reallocate the graph,
+// else it keeps its previous slot and overflows onto the next tensor
+static void test_unread_leaf_grows() {
+    dummy_backend    backend = dummy_backend_init(SIZE_MAX, /*align*/ 4);
+    ggml_gallocr_ptr galloc;
+    for (int64_t size : { 8, 32 }) {
+        auto [ctx, graph, ctx_ptr] = make_context();
+        ggml_tensor * unread = make_input_with_size(ctx, size);
+        ggml_tensor * a      = make_input_with_size(ctx, 8);
+        ggml_tensor * b      = make_input_with_size(ctx, 8);
+        ggml_tensor * sum    = ggml_add(ctx, a, b);
+        assign_names(ctx);
+        ggml_set_output(sum);
+        ggml_build_forward_expand(graph, unread);
+        ggml_build_forward_expand(graph, sum);
+        if (!galloc) {
+            galloc = ggml_gallocr_ptr(ggml_gallocr_new(&backend.buffer_type));
+        }
+        GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+        check_all_allocated(graph);
+        GGML_ASSERT(!memory_overlap(unread, a) && !memory_overlap(unread, b) && !memory_overlap(unread, sum));
+    }
+}
+
 static void test_backend_graph_optimize(ggml_backend_t /*backend*/, ggml_cgraph * graph, ggml_backend_graph_optimize_params * params) {
     GGML_ASSERT(graph->n_nodes == 3);
     params->add_alloc_dep(params->user_data, graph->nodes[0], graph->nodes[2]);
@@ -1164,6 +1188,7 @@ int main() {
     run("test_multiple_buffer_types", test_multiple_buffer_types);
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reallocation", test_reallocation);
+    run("test_unread_leaf_grows", test_unread_leaf_grows);
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
     run("test_buft_alloc_buffer_n_single_buffer", test_buft_alloc_buffer_n_single_buffer);
     run("test_buft_alloc_buffer_n_multi_buffer", test_buft_alloc_buffer_n_multi_buffer);
