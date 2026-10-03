@@ -5076,30 +5076,42 @@ struct test_ssm_conv_cached : public test_case {
     }
 };
 
-// GGML_OP_QSA_SELECT: mask or rows of a QSA selection (sentinel cells, invisible pools)
+// GGML_OP_QSA_SELECT: rows or masks of a QSA selection (sentinel cells, invisible pools), the
+// visibility from a dense mask or from positions
 struct test_qsa_select : public test_case {
     const int64_t n_kv;
     const int64_t n_top;
     const int64_t kpool;
     const int64_t n_t;
     const int     mode;
+    const bool    by_pos;
 
     std::string vars() override {
-        return VARS_TO_STR5(n_kv, n_top, kpool, n_t, mode);
+        return VARS_TO_STR6(n_kv, n_top, kpool, n_t, mode, by_pos);
     }
 
-    test_qsa_select(int64_t n_kv = 256, int64_t n_top = 16, int64_t kpool = 4, int64_t n_t = 1, int mode = GGML_QSA_SELECT_MASK)
-        : n_kv(n_kv), n_top(n_top), kpool(kpool), n_t(n_t), mode(mode) {}
+    test_qsa_select(int64_t n_kv = 256, int64_t n_top = 16, int64_t kpool = 4, int64_t n_t = 1, int mode = GGML_QSA_SELECT_MASK,
+            bool by_pos = false)
+        : n_kv(n_kv), n_top(n_top), kpool(kpool), n_t(n_t), mode(mode), by_pos(by_pos) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t n_sel = n_top*kpool + kpool - 1;
         ggml_tensor * sel   = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_sel, n_t);
         ggml_tensor * score = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_top, n_t);
-        ggml_tensor * kq    = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, n_t);
         ggml_set_name(sel, "sel");
         ggml_set_name(score, "score");
-        ggml_set_name(kq, "kq_mask");
-        return ggml_qsa_select(ctx, sel, score, kq, (int32_t) kpool, (ggml_qsa_select_mode) mode);
+        ggml_tensor * vis;
+        ggml_tensor * tok = nullptr;
+        if (by_pos) {
+            vis = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_kv);
+            tok = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_t);
+            ggml_set_name(vis, "cell_pos");
+            ggml_set_name(tok, "tok_pos");
+        } else {
+            vis = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, n_t);
+            ggml_set_name(vis, "kq_mask");
+        }
+        return ggml_qsa_select(ctx, sel, score, vis, tok, (int32_t) kpool, (ggml_qsa_select_mode) mode);
     }
 
     void initialize_tensors(ggml_context * ctx) override {
@@ -5128,6 +5140,12 @@ struct test_qsa_select : public test_case {
                 std::vector<ggml_fp16_t> v(ggml_nelements(t));
                 for (auto & x : v) {
                     x = ggml_fp32_to_fp16(rng() % 3 == 0 ? -INFINITY : 0.0f);
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "cell_pos") == 0 || strcmp(t->name, "tok_pos") == 0) {
+                std::vector<int32_t> v(ggml_nelements(t));
+                for (auto & x : v) {
+                    x = rng() % 6 == 0 ? -1 : (int32_t) (rng() % (2*n_kv));   // some empty cells
                 }
                 ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
             } else {
@@ -11759,9 +11777,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     test_cases.emplace_back(new test_gdn_gates(48, 1));
-    for (int m : { GGML_QSA_SELECT_ROWS, GGML_QSA_SELECT_MASK, GGML_QSA_SELECT_DENSE }) {
-        test_cases.emplace_back(new test_qsa_select(256,  16, 4, 1, m));
-        test_cases.emplace_back(new test_qsa_select(4096, 512, 4, 3, m));
+    for (int m : { GGML_QSA_SELECT_ROWS, GGML_QSA_SELECT_MASK, GGML_QSA_SELECT_DENSE, GGML_QSA_SELECT_CAUSAL }) {
+        for (bool by_pos : { false, true }) {
+            if (m == GGML_QSA_SELECT_CAUSAL && !by_pos) {
+                continue;
+            }
+            test_cases.emplace_back(new test_qsa_select(256,  16, 4, 1, m, by_pos));
+            test_cases.emplace_back(new test_qsa_select(4096, 512, 4, 3, m, by_pos));
+        }
     }
     test_cases.emplace_back(new test_ssm_conv_cached(256, 1, 1));
     test_cases.emplace_back(new test_ssm_conv_cached(10240, 1, 1));

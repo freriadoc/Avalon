@@ -12448,19 +12448,36 @@ void ggml_compute_forward_qsa_select(const ggml_compute_params * params, ggml_te
     }
     const ggml_tensor * sel       = dst->src[0];
     const ggml_tensor * top_score = dst->src[1];
-    const ggml_tensor * kq_mask   = dst->src[2];
-    const int32_t kpool = ggml_get_op_params_i32(dst, 0);
-    const int32_t mode  = ggml_get_op_params_i32(dst, 1);
-    const int64_t n_sel = sel->ne[0];
-    const int64_t n_t   = sel->ne[1];
-    const int64_t n_top = top_score->ne[0];
-    const int64_t n_kv  = kq_mask->ne[0];
+    const ggml_tensor * vis       = dst->src[2];
+    const ggml_tensor * tok_pos   = dst->src[3];
+    const int32_t kpool  = ggml_get_op_params_i32(dst, 0);
+    const int32_t mode   = ggml_get_op_params_i32(dst, 1);
+    const bool    by_pos = vis->type == GGML_TYPE_I32;
+    const int64_t n_kv   = vis->ne[0];
+    const int64_t n_t    = dst->ne[1];
     const ggml_fp16_t neg_inf = GGML_CPU_FP32_TO_FP16(-INFINITY);
+    const ggml_fp16_t zero    = GGML_CPU_FP32_TO_FP16(0.0f);
     for (int64_t t = 0; t < n_t; t++) {
+        char * d_row = (char *) dst->data + t*dst->nb[1];
+        const int32_t q = by_pos ? ((const int32_t *) tok_pos->data)[t] : 0;
+        const ggml_fp16_t * m_row = by_pos ? nullptr : (const ggml_fp16_t *) ((const char *) vis->data + t*vis->nb[1]);
+        auto visibility = [&](int32_t c) {
+            if (!by_pos) {
+                return m_row[c];
+            }
+            const int32_t pc = ((const int32_t *) vis->data)[c];
+            return pc >= 0 && pc <= q ? zero : neg_inf;
+        };
+        if (mode == GGML_QSA_SELECT_CAUSAL) {
+            for (int64_t c = 0; c < n_kv; c++) {
+                ((ggml_fp16_t *) d_row)[c] = visibility((int32_t) c);
+            }
+            continue;
+        }
+        const int64_t n_sel = sel->ne[0];
+        const int64_t n_top = top_score->ne[0];
         const int32_t * s_row  = (const int32_t *) ((const char *) sel->data + t*sel->nb[1]);
         const float   * sc_row = (const float *)   ((const char *) top_score->data + t*top_score->nb[1]);
-        const ggml_fp16_t * m_row = (const ggml_fp16_t *) ((const char *) kq_mask->data + t*kq_mask->nb[1]);
-        char * d_row = (char *) dst->data + t*dst->nb[1];
         if (mode == GGML_QSA_SELECT_DENSE) {
             for (int64_t c = 0; c < n_kv; c++) {
                 ((ggml_fp16_t *) d_row)[c] = neg_inf;
@@ -12473,9 +12490,9 @@ void ggml_compute_forward_qsa_select(const ggml_compute_params * params, ggml_te
             if (mode == GGML_QSA_SELECT_ROWS) {
                 ((int32_t *) d_row)[j] = cell ? c : 0;
             } else if (mode == GGML_QSA_SELECT_MASK) {
-                ((ggml_fp16_t *) d_row)[j] = live ? m_row[c] : neg_inf;
+                ((ggml_fp16_t *) d_row)[j] = live ? visibility(c) : neg_inf;
             } else if (live) {
-                ((ggml_fp16_t *) d_row)[c] = m_row[c];
+                ((ggml_fp16_t *) d_row)[c] = visibility(c);
             }
         }
     }

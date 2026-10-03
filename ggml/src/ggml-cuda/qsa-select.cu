@@ -1,13 +1,29 @@
 #include "qsa-select.cuh"
 
+// visibility of cell c for query t: the dense mask, or 0 / -inf from the positions
+template <bool by_pos>
+static __device__ __forceinline__ half qsa_visibility(const void * vis, const int32_t * tok_pos, const int64_t s_mask,
+                                                      const int64_t t, const int32_t c) {
+    if constexpr (by_pos) {
+        const int32_t pc = ((const int32_t *) vis)[c];
+        return pc >= 0 && pc <= tok_pos[t] ? __float2half(0.0f) : __float2half(-INFINITY);
+    } else {
+        return ((const half *) vis)[t*s_mask + c];
+    }
+}
+
 // see ggml_qsa_select: a thread per (slot, query)
-template <int mode>
-static __global__ void k_qsa_select(const int32_t * sel, const float * top_score, const half * kq_mask, void * dst,
-        const int64_t n_sel, const int64_t n_top, const int64_t n_kv, const int32_t kpool,
+template <int mode, bool by_pos>
+static __global__ void k_qsa_select(const int32_t * sel, const float * top_score, const void * vis, const int32_t * tok_pos,
+        void * dst, const int64_t n_sel, const int64_t n_top, const int64_t n_kv, const int32_t kpool,
         const int64_t s_sel, const int64_t s_score, const int64_t s_mask, const int64_t s_dst) {
     const int64_t j = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     const int64_t t = blockIdx.y;
     if (j >= n_sel) {
+        return;
+    }
+    if constexpr (mode == GGML_QSA_SELECT_CAUSAL) {
+        ((half *) dst)[t*s_dst + j] = qsa_visibility<by_pos>(vis, tok_pos, s_mask, t, (int32_t) j);
         return;
     }
     const int32_t c    = sel[t*s_sel + j];
@@ -16,11 +32,11 @@ static __global__ void k_qsa_select(const int32_t * sel, const float * top_score
     if constexpr (mode == GGML_QSA_SELECT_ROWS) {
         ((int32_t *) dst)[t*s_dst + j] = cell ? c : 0;
     } else if constexpr (mode == GGML_QSA_SELECT_MASK) {
-        ((half *) dst)[t*s_dst + j] = live ? kq_mask[t*s_mask + c] : __float2half(-INFINITY);
+        ((half *) dst)[t*s_dst + j] = live ? qsa_visibility<by_pos>(vis, tok_pos, s_mask, t, c) : __float2half(-INFINITY);
     } else {
         // live slots name distinct cells
         if (live) {
-            ((half *) dst)[t*s_dst + c] = kq_mask[t*s_mask + c];
+            ((half *) dst)[t*s_dst + c] = qsa_visibility<by_pos>(vis, tok_pos, s_mask, t, c);
         }
     }
 }
@@ -32,39 +48,42 @@ static __global__ void k_qsa_fill_neg_inf(half * dst, const int64_t n) {
     }
 }
 
-void ggml_cuda_op_qsa_select(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+template <int mode, bool by_pos>
+static void qsa_select_launch(const ggml_tensor * dst, const dim3 grid, const int threads, cudaStream_t stream,
+                              const int64_t n_sel, const int64_t n_top) {
     const ggml_tensor * sel       = dst->src[0];
     const ggml_tensor * top_score = dst->src[1];
-    const ggml_tensor * kq_mask   = dst->src[2];
-    const int32_t kpool = ggml_get_op_params_i32(dst, 0);
-    const int32_t mode  = ggml_get_op_params_i32(dst, 1);
-    const int64_t n_sel = sel->ne[0];
-    const int64_t n_t   = sel->ne[1];
+    const ggml_tensor * vis       = dst->src[2];
+    const ggml_tensor * tok_pos   = dst->src[3];
+    k_qsa_select<mode, by_pos><<<grid, threads, 0, stream>>>(
+        sel ? (const int32_t *) sel->data : nullptr, top_score ? (const float *) top_score->data : nullptr, vis->data,
+        tok_pos ? (const int32_t *) tok_pos->data : nullptr, dst->data, n_sel, n_top, vis->ne[0],
+        ggml_get_op_params_i32(dst, 0),
+        sel ? sel->nb[1] / sizeof(int32_t) : 0, top_score ? top_score->nb[1] / sizeof(float) : 0,
+        by_pos ? 0 : vis->nb[1] / sizeof(half), dst->nb[1] / ggml_type_size(dst->type));
+}
+
+void ggml_cuda_op_qsa_select(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const int32_t mode   = ggml_get_op_params_i32(dst, 1);
+    const bool    by_pos = dst->src[2]->type == GGML_TYPE_I32;
+    const int64_t n_t    = dst->ne[1];
+    const int64_t n_sel  = mode == GGML_QSA_SELECT_CAUSAL ? dst->ne[0] : dst->src[0]->ne[0];
+    const int64_t n_top  = mode == GGML_QSA_SELECT_CAUSAL ? 0 : dst->src[1]->ne[0];
     const int threads = 256;
     const dim3 grid((n_sel + threads - 1) / threads, n_t, 1);
-    const int64_t s_sel   = sel->nb[1] / sizeof(int32_t);
-    const int64_t s_score = top_score->nb[1] / sizeof(float);
-    const int64_t s_mask  = kq_mask->nb[1] / sizeof(half);
-    const int64_t s_dst   = dst->nb[1] / ggml_type_size(dst->type);
     cudaStream_t stream = ctx.stream();
-    const int32_t * sd = (const int32_t *) sel->data;
-    const float   * td = (const float *) top_score->data;
-    const half    * md = (const half *) kq_mask->data;
-    switch (mode) {
-        case GGML_QSA_SELECT_ROWS:
-            k_qsa_select<GGML_QSA_SELECT_ROWS><<<grid, threads, 0, stream>>>(sd, td, md, dst->data, n_sel, top_score->ne[0],
-                kq_mask->ne[0], kpool, s_sel, s_score, s_mask, s_dst);
-            break;
-        case GGML_QSA_SELECT_MASK:
-            k_qsa_select<GGML_QSA_SELECT_MASK><<<grid, threads, 0, stream>>>(sd, td, md, dst->data, n_sel, top_score->ne[0],
-                kq_mask->ne[0], kpool, s_sel, s_score, s_mask, s_dst);
-            break;
-        default: {
-            const int64_t n = ggml_nelements(dst);
-            k_qsa_fill_neg_inf<<<(n + threads - 1) / threads, threads, 0, stream>>>((half *) dst->data, n);
-            k_qsa_select<GGML_QSA_SELECT_DENSE><<<grid, threads, 0, stream>>>(sd, td, md, dst->data, n_sel, top_score->ne[0],
-                kq_mask->ne[0], kpool, s_sel, s_score, s_mask, s_dst);
-        } break;
+    if (mode == GGML_QSA_SELECT_DENSE) {
+        const int64_t n = ggml_nelements(dst);
+        k_qsa_fill_neg_inf<<<(n + threads - 1) / threads, threads, 0, stream>>>((half *) dst->data, n);
     }
+#define QSA_LAUNCH(M) (by_pos ? qsa_select_launch<M, true>(dst, grid, threads, stream, n_sel, n_top) \
+                              : qsa_select_launch<M, false>(dst, grid, threads, stream, n_sel, n_top))
+    switch (mode) {
+        case GGML_QSA_SELECT_ROWS:   QSA_LAUNCH(GGML_QSA_SELECT_ROWS);   break;
+        case GGML_QSA_SELECT_MASK:   QSA_LAUNCH(GGML_QSA_SELECT_MASK);   break;
+        case GGML_QSA_SELECT_DENSE:  QSA_LAUNCH(GGML_QSA_SELECT_DENSE);  break;
+        default:                     QSA_LAUNCH(GGML_QSA_SELECT_CAUSAL); break;
+    }
+#undef QSA_LAUNCH
     CUDA_CHECK(cudaGetLastError());
 }

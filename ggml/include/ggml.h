@@ -2661,27 +2661,34 @@ extern "C" {
             struct ggml_tensor  * state,
             int64_t               K);
 
-    // QSA selection for an attention over the selected cells only (K/V gathered by these cells)
+    // QSA selection for an attention over the selected cells only, or over all cells with the
+    // selection's mask
     //
     // sel:       I32 [n_sel, n_t]   cell of each slot; < 0 or >= n_kv names no cell (padded pool, missing tail cell)
     // top_score: F32 [n_top, n_t]   score of the pool behind slots [p*kpool, (p+1)*kpool); -inf: an invisible
     //                               pool, its slots are dead (the slots after n_top*kpool are the tail)
-    // kq_mask:   F16 [n_kv, n_t]    the additive causal / sequence mask of the dense attention
-    // mode GGML_QSA_SELECT_ROWS:  result I32 [n_sel, n_t], sel where it names a cell, 0 elsewhere (rows to gather)
-    // mode GGML_QSA_SELECT_MASK:  result F16 [n_sel, n_t], kq_mask[sel, t] at a live slot, -inf at a dead one
-    // mode GGML_QSA_SELECT_DENSE: result F16 [n_kv, n_t], kq_mask at the cells of the live slots, -inf elsewhere
-    //                             (the additive mask of a dense attention over the selection)
+    // vis:       F16 [n_kv, n_t]    the additive causal / sequence mask of the dense attention, or
+    //            I32 [n_kv]         the position of each cell (-1: empty or foreign), with
+    // tok_pos:   I32 [n_t]          the position of each query: a cell is visible when 0 <= pos <= tok_pos
+    //
+    // mode ROWS:   result I32 [n_sel, n_t], sel where it names a cell, 0 elsewhere (rows to gather)
+    // mode MASK:   result F16 [n_sel, n_t], the visibility of the cell at a live slot, -inf at a dead one
+    // mode DENSE:  result F16 [n_kv, n_t], the visibility at the cells of the live slots, -inf elsewhere
+    // mode CAUSAL: result F16 [n_kv, n_t], the visibility of every cell (sel and top_score unused, may be NULL;
+    //              positions only)
     enum ggml_qsa_select_mode {
-        GGML_QSA_SELECT_ROWS  = 0,
-        GGML_QSA_SELECT_MASK  = 1,
-        GGML_QSA_SELECT_DENSE = 2,
+        GGML_QSA_SELECT_ROWS   = 0,
+        GGML_QSA_SELECT_MASK   = 1,
+        GGML_QSA_SELECT_DENSE  = 2,
+        GGML_QSA_SELECT_CAUSAL = 3,
     };
 
     GGML_API struct ggml_tensor * ggml_qsa_select(
             struct ggml_context    * ctx,
             struct ggml_tensor     * sel,
             struct ggml_tensor     * top_score,
-            struct ggml_tensor     * kq_mask,
+            struct ggml_tensor     * vis,
+            struct ggml_tensor     * tok_pos,
             int32_t                  kpool,
             enum ggml_qsa_select_mode mode);
 
