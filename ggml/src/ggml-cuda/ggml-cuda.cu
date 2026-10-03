@@ -231,8 +231,16 @@ static int ggml_cuda_parse_id(char devName[]) {
 // prefetch, draft compute, MoE cache fills and zone moves, VBR transcodes, null stream,
 // auxiliaries): 8 queues give each its own. Set at library load, before the HIP runtime reads
 // its settings on its first call; an explicit GPU_MAX_HW_QUEUES is kept.
+//
+// rocBLAS (behind hipBLAS) gives each handle 32 MiB of device memory at its first GEMM, which it
+// offers to Tensile for the solutions that use a workspace; ggml makes one handle per backend
+// context, after the MoE cache was sized from the free memory (target and MTP draft: 64 MiB on top
+// of the peak). The GEMMs ggml sends run without it: with 64 KiB (0 would mean the managed 32 MiB)
+// the prefill is unchanged (956 vs 955 t/s, 11k prompt) and nothing fails. An explicit
+// ROCBLAS_DEVICE_MEMORY_SIZE is kept.
 __attribute__((constructor)) static void ggml_hip_set_hw_queues() {
     setenv("GPU_MAX_HW_QUEUES", "8", /*overwrite =*/ 0);
+    setenv("ROCBLAS_DEVICE_MEMORY_SIZE", "65536", /*overwrite =*/ 0);
 }
 #endif
 
