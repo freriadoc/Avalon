@@ -3891,10 +3891,14 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
+static bool ggml_cuda_fusion_disabled() {
+    static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
+    return disable_fusion;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
-    static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
-    if (disable_fusion) {
+    if (ggml_cuda_fusion_disabled()) {
         return 0;
     }
 
@@ -5089,7 +5093,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 // a recurrent state's gather left to the gated delta net or the cached ssm_conv that reads it
-                if (node->op == GGML_OP_GET_ROWS && (ggml_cuda_gdn_absorbs_gather(cgraph, i) || ggml_cuda_conv_absorbs_gather(cgraph, i))) {
+                // (only with fusions on: the cached ssm_conv that reads the conv state's rows is a fusion)
+                if (node->op == GGML_OP_GET_ROWS && !ggml_cuda_fusion_disabled() &&
+                        (ggml_cuda_gdn_absorbs_gather(cgraph, i) || ggml_cuda_conv_absorbs_gather(cgraph, i))) {
                     cuda_ctx->gdn_gathers.insert(node);
                     continue;
                 }
