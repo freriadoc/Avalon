@@ -4942,6 +4942,33 @@ struct test_gdn_gates : public test_case {
     }
 };
 
+// gated norm, rms_norm(x) * w * sigmoid(z) (the end of qwen4exp's linear attention; one CUDA kernel)
+struct test_gated_norm : public test_case {
+    const std::array<int64_t, 4> ne;
+
+    std::string vars() override {
+        return VARS_TO_STR1(ne);
+    }
+
+    test_gated_norm(std::array<int64_t, 4> ne = {128, 48, 1, 1}) : ne(ne) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GATED_NORM";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * z = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        ggml_build_forward_expand(gf, z);
+        ggml_tensor * n = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
+        return ggml_mul(ctx, n, ggml_sigmoid(ctx, z));
+    }
+};
+
 struct test_gated_delta_net_cache_fusion : public test_case {
     const ggml_type type;
 
@@ -11564,6 +11591,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     test_cases.emplace_back(new test_gdn_gates(48, 1));
+    test_cases.emplace_back(new test_gated_norm({128, 48, 1, 1}));
+    test_cases.emplace_back(new test_gated_norm({128, 48, 3, 1}));
+    test_cases.emplace_back(new test_gated_norm({100, 7, 5, 2}));
     test_cases.emplace_back(new test_gdn_gates(48, 3));
     test_cases.emplace_back(new test_gdn_gates(7, 33));
     test_cases.emplace_back(new test_gated_delta_net_gather(48, 128, 1, 1));

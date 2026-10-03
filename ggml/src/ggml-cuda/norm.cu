@@ -729,3 +729,51 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
 }
+
+// rms_norm(x) * w * sigmoid(gate) per row (a gated norm, as qwen4exp ends its linear attention); w is
+// one vector of ncols. A block reads its row of x and of gate before writing it: dst may alias x or
+// gate exactly.
+template <int block_size>
+static __global__ void rms_norm_mul_sigmoid_gate_f32(const float * x, const float * w, const float * gate, float * dst,
+        const int ncols, const int64_t sx1, const int64_t sx2, const int64_t sx3,
+        const int64_t sg1, const int64_t sg2, const int64_t sg3, const float eps) {
+    const int nrows     = gridDim.x;
+    const int nchannels = gridDim.y;
+    const int row       = blockIdx.x;
+    const int channel   = blockIdx.y;
+    const int sample    = blockIdx.z;
+    const int tid       = threadIdx.x;
+
+    x    += sample*sx3 + channel*sx2 + row*sx1;
+    gate += sample*sg3 + channel*sg2 + row*sg1;
+    dst  += ((int64_t) (sample*nchannels + channel)*nrows + row)*ncols;
+
+    float tmp = 0.0f;
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = x[col];
+        tmp += xi * xi;
+    }
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    const float scale = rsqrtf(tmp / ncols + eps);
+
+    for (int col = tid; col < ncols; col += block_size) {
+        const float g = 1.0f / (1.0f + expf(-gate[col]));
+        dst[col] = scale * x[col] * w[col] * g;
+    }
+}
+
+void ggml_cuda_op_rms_norm_mul_sigmoid_gate(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm,
+        const ggml_tensor * w, const ggml_tensor * gate, ggml_tensor * dst) {
+    const ggml_tensor * x = rms_norm->src[0];
+    float eps = 0.0f;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+    const int64_t ncols = x->ne[0];
+    const dim3 blocks_num(x->ne[1], x->ne[2], x->ne[3]);
+    const int64_t sx1 = x->nb[1] / sizeof(float), sx2 = x->nb[2] / sizeof(float), sx3 = x->nb[3] / sizeof(float);
+    const int64_t sg1 = gate->nb[1] / sizeof(float), sg2 = gate->nb[2] / sizeof(float), sg3 = gate->nb[3] / sizeof(float);
+    constexpr int block_size = 128;
+    rms_norm_mul_sigmoid_gate_f32<block_size><<<blocks_num, block_size, 32 * sizeof(float), ctx.stream()>>>(
+        (const float *) x->data, (const float *) w->data, (const float *) gate->data, (float *) dst->data,
+        (int) ncols, sx1, sx2, sx3, sg1, sg2, sg3, eps);
+}

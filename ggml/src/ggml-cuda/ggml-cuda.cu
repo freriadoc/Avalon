@@ -4555,6 +4555,56 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
+    // gated norm: rms_norm(x) * w * sigmoid(gate), w one vector
+    if (node->op == GGML_OP_RMS_NORM && i + 3 < cgraph->n_nodes) {
+        // the next three computing nodes (views in between, such as the gate's reshape)
+        int idx[3];
+        int k = i;
+        for (int j = 0; j < 3; j++) {
+            k++;
+            while (k < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[k])) {
+                k++;
+            }
+            idx[j] = k < cgraph->n_nodes ? k : cgraph->n_nodes - 1;
+        }
+        const ggml_tensor * mul_w = cgraph->nodes[idx[0]];
+        const ggml_tensor * sig   = cgraph->nodes[idx[1]];
+        ggml_tensor *       out   = cgraph->nodes[idx[2]];
+        const ggml_tensor * x     = node->src[0];
+        const ggml_tensor * w     = mul_w->op == GGML_OP_MUL ? (mul_w->src[0] == node ? mul_w->src[1] : mul_w->src[0]) : nullptr;
+        const ggml_tensor * gate  = sig->src[0];
+        if (w && (mul_w->src[0] == node || mul_w->src[1] == node) &&
+                sig->op == GGML_OP_UNARY && ggml_get_unary_op(sig) == GGML_UNARY_OP_SIGMOID &&
+                out->op == GGML_OP_MUL && ((out->src[0] == mul_w && out->src[1] == sig) || (out->src[0] == sig && out->src[1] == mul_w)) &&
+                x->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float) && ggml_is_contiguous(out) && out->type == GGML_TYPE_F32 &&
+                w->type == GGML_TYPE_F32 && ggml_is_contiguous(w) && ggml_nelements(w) == x->ne[0] &&
+                gate->type == GGML_TYPE_F32 && gate->nb[0] == sizeof(float) && ggml_are_same_shape(gate, x) && ggml_are_same_shape(out, x)) {
+            // the computing nodes only: the gate's reshape in between is a view of a tensor computed
+            // before the group
+            const int nodes[4] = { i, idx[0], idx[1], idx[2] };
+            const enum ggml_op ops[4] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL };
+            const int out_idx = idx[2];
+            const int count = idx[2] - i + 1;
+            // a row of x and of gate is read before it is written: out may alias either exactly, not w
+            const auto aliasing_ok = [&]() {
+                const char * lo = (const char *) out->data, * hi = lo + ggml_nbytes(out);
+                const ggml_tensor * ins[3] = { x, gate, w };
+                for (int j = 0; j < 3; j++) {
+                    const char * il = (const char *) ins[j]->data, * ih = il + ggml_nbytes(ins[j]);
+                    const bool exact = j < 2 && il == lo && ih == hi && ggml_is_contiguous(ins[j]);
+                    if (!exact && il < hi && lo < ih) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+            if (ggml_can_fuse_subgraph_ext(cgraph, nodes, 4, ops, &out_idx, 1) && aliasing_ok()) {
+                ggml_cuda_op_rms_norm_mul_sigmoid_gate(*cuda_ctx, node, w, gate, out);
+                return count - 1;
+            }
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 4]);
         return 4;
