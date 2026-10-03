@@ -86,7 +86,7 @@ public:
 
     // Which cells of a sequence make up which pool of kpool consecutive positions (or cells, in order mode).
     // It is kept here because it outlives the batch: pools are fixed by the positions relative to the
-    // sequence's first one, so a ubatch only ever appends to it. Sequence edits drop it, see mem_idx_stale.
+    // sequence's first one, so a ubatch only ever appends to it. A sequence edit at p redoes it from p, see mem_idx_stale.
     struct kpool_layout;
 
     const kpool_layout & kpool_layout_update();

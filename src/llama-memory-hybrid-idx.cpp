@@ -409,7 +409,7 @@ bool llama_memory_hybrid_idx::kpool_layout_shared() const {
 }
 
 // Pools are fixed by the positions relative to the sequence's first one, so the layout survives a plain
-// append. A sequence edit can regroup them, and mem_idx_stale tells us it happened.
+// append. A sequence edit at p can regroup the pools from p on, and mem_idx_stale tells us where.
 const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_layout_update() {
     GGML_ASSERT(mem_idx != nullptr);
 
@@ -441,17 +441,34 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
         sq.strm = unified ? 0 : mem_idx->get_stream(s);
 
         size_t n_kept = 0;
+        bool   kept   = false;
         if (mem_idx_stale[s] == POS_CLEAN && !sq.cells.empty() && !sp.empty() &&
                 sq.pos_min == sp.begin()->first) {
             n_kept = sq.cells.size();
             for (auto it = sp.upper_bound(sq.cells.back()); it != sp.end(); ++it) {
                 sq.cells.push_back(*it);
             }
+            kept = true;
+        } else if (mem_idx_stale[s] != POS_CLEAN && mem_idx_stale[s] > 0 && !sq.shared && !sq.cells.empty() &&
+                !sp.empty() && sq.pos_min == sp.begin()->first) {
+            // an edit at p leaves the cells before p alone (see mem_idx_stale_set), and so the pools made of them:
+            // the scan decides a pool from its own cells only. Keep them and redo the rest, as a rebuild would
+            // (a speculative step removes its rejected drafts every token: a rebuild walks the whole sequence)
+            const llama_pos p = mem_idx_stale[s];
+            n_kept = std::lower_bound(sq.cells.begin(), sq.cells.end(), std::make_pair(p, 0u)) - sq.cells.begin();
+            sq.cells.resize(n_kept);
+            while (!sq.pools.empty() && sq.pools.back() + kpool > n_kept) {
+                sq.pools.pop_back();
+            }
+            sq.j_next = sq.pools.empty() ? 0 : sq.pools.back() + kpool;
+            for (auto it = sp.lower_bound(std::make_pair(p, 0u)); it != sp.end(); ++it) {
+                sq.cells.push_back(*it);
+            }
+            kept = true;
         }
 
-        // the appended tail accounts for every cell only if nothing before it was dropped, but an edit can
-        // regroup a sequence without changing its cell count, so a stale sequence must rebuild regardless
-        if (sq.cells.size() != sp.size() || mem_idx_stale[s] != POS_CLEAN) {
+        // the appended tail accounts for every cell only if nothing before it was dropped
+        if (!kept || sq.cells.size() != sp.size()) {
             sq.cells.assign(sp.begin(), sp.end());
             sq.pools.clear();
             sq.j_next  = 0;
