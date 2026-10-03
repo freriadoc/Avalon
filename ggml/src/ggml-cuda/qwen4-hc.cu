@@ -85,6 +85,12 @@ static bool qwen4_hc_span_fusable(const ggml_cgraph * cgraph, const qwen4_hc_spa
     return ggml_can_fuse_subgraph_ext(cgraph, span.all, span.n_all, span.ops, outputs, n);
 }
 
+static bool qwen4_hc_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    const char * al = (const char *) a->data, * ah = al + ggml_nbytes(a);
+    const char * bl = (const char *) b->data, * bh = bl + ggml_nbytes(b);
+    return al < bh && bl < ah;
+}
+
 static const ggml_tensor * qwen4_hc_view_base(const ggml_tensor * t) {
     while (t && qwen4_hc_is_view(t)) {
         t = t->src[0];
@@ -396,11 +402,27 @@ int ggml_cuda_try_fuse_qwen4_hc(ggml_backend_cuda_context & ctx, ggml_cgraph * c
     cudaStream_t stream = ctx.stream();
 
     if (node->op == GGML_OP_SCALE && qwen4_hc_match_k1(cgraph, i)) {
-        // one token: a single workgroup reads all inputs before writing, aliasing is safe
-        const int outputs[] = { i + 3, i + 5 };
-        if (cgraph->nodes[i + 3]->src[1]->ne[2] != 1 && !check_ranges(cgraph, i, 6, outputs, 2)) {
+        // A workgroup per token reads all of its token's inputs before writing its token's outputs: an
+        // output may alias the residual exactly (same layout: ggml-alloc gives the new residual the
+        // previous one's memory), whatever the number of tokens. Any other overlap refuses the fusion
+        // (the block output and the inject have another per-token layout, gamma is shared).
+        const ggml_tensor * post_n = cgraph->nodes[i + 3];
+        const ggml_tensor * mul_n  = cgraph->nodes[i + 5];
+        const ggml_tensor * ins[3] = { post_n->src[0], cgraph->nodes[i]->src[0], mul_n->src[1] };
+        const ggml_tensor * res    = post_n->src[1];
+        const ggml_tensor * outs[2] = { post_n, mul_n };
+        bool ok = !qwen4_hc_overlap(post_n, mul_n);
+        for (const ggml_tensor * o : outs) {
+            for (const ggml_tensor * in : ins) {
+                ok = ok && !qwen4_hc_overlap(o, in);
+            }
+            ok = ok && (!qwen4_hc_overlap(o, res) ||
+                        (o->data == res->data && ggml_nbytes(o) == ggml_nbytes(res) && ggml_is_contiguous(res) && ggml_is_contiguous(o)));
+        }
+        if (!ok) {
             return 0;
         }
+        GGML_UNUSED(check_ranges);
         const ggml_tensor * sc1  = cgraph->nodes[i];
         const ggml_tensor * sc2  = cgraph->nodes[i + 2];
         ggml_tensor *       post = cgraph->nodes[i + 3];
@@ -448,14 +470,25 @@ int ggml_cuda_try_fuse_qwen4_hc(ggml_backend_cuda_context & ctx, ggml_cgraph * c
 
     qwen4_hc_span span3;
     if (node->op == GGML_OP_MUL_MAT && qwen4_hc_match_k3(cgraph, i, span3)) {
-        const int outputs[] = { span3.idx[1] };
-        if (!check_ranges(cgraph, i, span3.n_all, outputs, 1)) {
-            return 0;
-        }
         const ggml_tensor * mm  = cgraph->nodes[span3.idx[0]];
         ggml_tensor *       pre = cgraph->nodes[span3.idx[1]];
         const ggml_tensor * lo  = mm->src[1];
         const ggml_tensor * xn  = pre->src[0];
+        // the kernel reads the weights, lo (every workgroup, into shared memory) and xn. ggml-alloc may
+        // give the output the memory of lo, dead once the product read it: lo is then copied first (two
+        // launches, against three unfused), so the fusion no longer depends on the placement. An
+        // overlap with xn refuses it.
+        if (qwen4_hc_overlap(pre, xn) || !ggml_is_contiguous(lo)) {
+            return 0;
+        }
+        GGML_UNUSED(check_ranges);
+        ggml_cuda_pool_alloc<float> lo_copy(ctx.pool());
+        const float * lo_d = (const float *) lo->data;
+        if (qwen4_hc_overlap(pre, lo)) {
+            lo_copy.alloc(ggml_nelements(lo));
+            CUDA_CHECK(cudaMemcpyAsync(lo_copy.get(), lo->data, ggml_nbytes(lo), cudaMemcpyDeviceToDevice, stream));
+            lo_d = lo_copy.get();
+        }
         const int n_lo   = (int) lo->ne[0];
         const int n_embd = (int) xn->ne[0];
         const int hc     = (int) xn->ne[1];
@@ -463,7 +496,7 @@ int ggml_cuda_try_fuse_qwen4_hc(ggml_backend_cuda_context & ctx, ggml_cgraph * c
         const int warps = 8;
         const size_t smem = (size_t) T * (n_lo + (n_lo / QK8_0) * sizeof(float));
         qwen4_hc_up_pre_q8_0<<<(n_embd + warps - 1) / warps, warps*WARP_SIZE, smem, stream>>>(
-                (const block_q8_0 *) mm->src[0]->data, (const float *) lo->data, (const float *) xn->data,
+                (const block_q8_0 *) mm->src[0]->data, lo_d, (const float *) xn->data,
                 (float *) pre->data, n_lo, n_embd, hc, T, ggml_get_op_params_f32(pre, 0));
         return span3.n_all - 1;
     }
