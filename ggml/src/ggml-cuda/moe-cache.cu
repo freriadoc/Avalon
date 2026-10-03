@@ -299,6 +299,12 @@ struct moe_cache_scratch {
     size_t out = 0;
 };
 
+// device-to-device moves when lending: issued then waited for at once, so they go to the null stream,
+// whose hardware queue exists anyway. A stream of their own cost a queue of its own on ROCm (38.4 MiB
+// of wave save area on a 7900 XT) for no overlap; every other stream here is non-blocking, so the null
+// stream does not synchronize with them.
+static constexpr cudaStream_t moe_cache_zone_stream = nullptr;
+
 struct moe_cache_device {
     moe_cache_device(int logical, int physical) : logical(logical), physical(physical) {}
 
@@ -331,7 +337,6 @@ struct moe_cache_device {
     std::thread worker;
 
     cudaStream_t compute_stream = nullptr;
-    cudaStream_t zone_stream = nullptr;   // device-to-device moves when lending
     std::vector<char *> owned_regions;    // extra regions this device allocated itself (tests)
 
     // seating of the chunks ggml-alloc announced (moe_cache_plan_borrows): the pool of each
@@ -2414,10 +2419,6 @@ static void moe_cache_free_device(moe_cache_device & device) {
     if (device.compute_stream) {
         cudaStreamDestroy(device.compute_stream);
         device.compute_stream = nullptr;
-    }
-    if (device.zone_stream) {
-        cudaStreamDestroy(device.zone_stream);
-        device.zone_stream = nullptr;
     }
     for (char * region : device.owned_regions) {
         cudaFree(region);
@@ -5017,7 +5018,7 @@ static void moe_cache_zone_check(moe_cache_device & device, moe_cache_pool & poo
 
 // Empty a run of entries of one pool. Preconditions (caller holds session.mu): no fill queued
 // or in flight, no reader, zone not lent. Every slot is therefore either free or valid
-// and linked in the LRU. Copies are issued on device.zone_stream and waited for by the
+// and linked in the LRU. Copies are issued on moe_cache_zone_stream and waited for by the
 // caller. The destinations of the moved entries are appended to 'moved'.
 static void moe_cache_evacuate(
         moe_cache_device & device, moe_cache_pool & pool, int b, int e, std::vector<int> & moved) {
@@ -5069,7 +5070,7 @@ static void moe_cache_evacuate(
 
         cudaMemcpyAsync(moe_cache_slot_ptr(pool, destination),
                 moe_cache_slot_ptr(pool, source),
-                pool.expert_size, cudaMemcpyDeviceToDevice, device.zone_stream);
+                pool.expert_size, cudaMemcpyDeviceToDevice, moe_cache_zone_stream);
 
         moe_cache_slot & dst = pool.slots[destination];
         dst.key = src.key;
@@ -5193,19 +5194,13 @@ static int moe_cache_lend(void * opaque, void * backend, size_t bytes, void ** z
     }
 
     ggml_cuda_set_device(device->logical);
-    if (!device->zone_stream &&
-            cudaStreamCreateWithFlags(&device->zone_stream, cudaStreamNonBlocking) != cudaSuccess) {
-        (void) cudaGetLastError();
-        device->zone_stream = nullptr;
-        return 0;
-    }
 
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<std::vector<int>> moved(chosen.size());
     for (size_t i = 0; i < chosen.size(); i++) {
         moe_cache_evacuate(*device, *chosen[i], chosen[i]->zone_begin, chosen[i]->zone_end, moved[i]);
     }
-    const cudaError_t error = cudaStreamSynchronize(device->zone_stream);
+    const cudaError_t error = cudaStreamSynchronize(moe_cache_zone_stream);
     if (error != cudaSuccess) {
         // the bookkeeping already points at the destinations: the copies must land
         moe_cache_cuda_ok(*device, error, "zone evacuation", true);
@@ -5486,12 +5481,6 @@ static void * moe_cache_borrow(void * opaque, void * backend, size_t bytes) {
     }
 
     ggml_cuda_set_device(device->logical);
-    if (!device->zone_stream &&
-            cudaStreamCreateWithFlags(&device->zone_stream, cudaStreamNonBlocking) != cudaSuccess) {
-        (void) cudaGetLastError();
-        device->zone_stream = nullptr;
-        return nullptr;
-    }
 
     const int low = moe_cache_pool_lend_low(*chosen);
     const int begin = low - slots;
@@ -5499,7 +5488,7 @@ static void * moe_cache_borrow(void * opaque, void * backend, size_t bytes) {
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<int> moved;
     moe_cache_evacuate(*device, *chosen, begin, low, moved);
-    const cudaError_t error = cudaStreamSynchronize(device->zone_stream);
+    const cudaError_t error = cudaStreamSynchronize(moe_cache_zone_stream);
     if (error != cudaSuccess) {
         moe_cache_cuda_ok(*device, error, "borrow evacuation", true);
     }
