@@ -1600,6 +1600,8 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * shared_gate = nullptr;
     ggml_tensor * shared_dst = nullptr;
 };
+#define GGML_CUDA_MMVQ_MULTI_MAX 4
+
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
     const void * gate = nullptr;
@@ -1612,6 +1614,13 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * shared_gate = nullptr;
     float * shared_dst = nullptr;
     uint32_t shared_stride_col_dst = 0;
+    // mmvq over several matrices of one type and width reading the same activation (one launch): the
+    // rows of matrix m end at multi_row_end[m] (rows counted across the matrices), its output is
+    // multi_dst[m]; 0 = one matrix
+    int          multi_n = 0;
+    uint32_t     multi_row_end[GGML_CUDA_MMVQ_MULTI_MAX] = {0};
+    const void * multi_x[GGML_CUDA_MMVQ_MULTI_MAX]       = {nullptr};
+    float *      multi_dst[GGML_CUDA_MMVQ_MULTI_MAX]     = {nullptr};
 };
 
 struct ggml_cuda_kernel_launch_params {

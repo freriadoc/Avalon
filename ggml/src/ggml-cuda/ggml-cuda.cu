@@ -4657,6 +4657,74 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
+    // consecutive mmvq products of the same activation by matrices of one type and width (qkv / z /
+    // alpha / beta, Q / K / V): one launch. Last among the fusions, so that the others keep their nodes.
+    if (node->op == GGML_OP_MUL_MAT) {
+        const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+        const ggml_tensor * src1 = node->src[1];
+        const auto member = [&](const ggml_tensor * mm) {
+            const ggml_tensor * w = mm->src[0];
+            const ggml_tensor * a = mm->src[1];
+            return mm->op == GGML_OP_MUL_MAT && w->type == node->src[0]->type && ggml_is_quantized(w->type) &&
+                   w->ne[0] == node->src[0]->ne[0] && w->ne[2] == 1 && w->ne[3] == 1 && w->nb[0] == ggml_type_size(w->type) &&
+                   w->buffer && ggml_backend_buft_is_cuda(w->buffer->buft) &&
+                   // a compute-buffer matrix would need its padding cleared first, as ggml_cuda_mul_mat_vec_q does
+                   ggml_backend_buffer_get_usage(w->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+                   (a == src1 || (a->data == src1->data && ggml_are_same_shape(a, src1) && ggml_are_same_stride(a, src1))) &&
+                   a->type == GGML_TYPE_F32 && a->nb[0] == sizeof(float) && a->ne[2] == 1 && a->ne[3] == 1 &&
+                   mm->type == GGML_TYPE_F32 && ggml_is_contiguous(mm) &&
+                   !ggml_cuda_op_mul_mat_use_fwht(mm) &&
+                   !ggml_cuda_should_use_mmvf(w->type, cc, w->ne, w->nb, a->ne[1]) &&
+                   ggml_cuda_should_use_mmvq(w->type, cc, a->ne[1]);
+        };
+        // a member whose result an existing fusion takes next (bias add, glu) is left alone
+        const auto taken_by_fusion = [&](int idx) {
+            for (int k = idx + 1; k < std::min(idx + 4, cgraph->n_nodes); k++) {
+                const ggml_tensor * n = cgraph->nodes[k];
+                if ((n->op == GGML_OP_GLU || n->op == GGML_OP_ADD) && (n->src[0] == cgraph->nodes[idx] || n->src[1] == cgraph->nodes[idx])) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        if (member(node) && !taken_by_fusion(i)) {
+            int idx[GGML_CUDA_MMVQ_MULTI_MAX] = { i };
+            int n = 1;
+            for (int k = i + 1; k < cgraph->n_nodes && n < GGML_CUDA_MMVQ_MULTI_MAX; k++) {
+                const ggml_tensor * nk = cgraph->nodes[k];
+                if (ggml_cuda_is_view_or_noop(nk)) {
+                    continue;
+                }
+                if (!member(nk) || taken_by_fusion(k) || nk->src[0]->ne[1] % 8 != 0 ||
+                        cgraph->nodes[idx[n - 1]]->src[0]->ne[1] % 8 != 0) {
+                    break;
+                }
+                idx[n++] = k;
+            }
+            if (n >= 2) {
+                const ggml_tensor * w[GGML_CUDA_MMVQ_MULTI_MAX];
+                ggml_tensor *       d[GGML_CUDA_MMVQ_MULTI_MAX];
+                bool ok = true;
+                for (int m = 0; m < n; m++) {
+                    w[m] = cgraph->nodes[idx[m]]->src[0];
+                    d[m] = cgraph->nodes[idx[m]];
+                    // the outputs overlap neither the activation nor each other
+                    const char * lo = (const char *) d[m]->data, * hi = lo + ggml_nbytes(d[m]);
+                    const char * al = (const char *) src1->data, * ah = al + ggml_nbytes(src1);
+                    ok = ok && !(lo < ah && al < hi);
+                    for (int q = 0; q < m && ok; q++) {
+                        const char * ql = (const char *) d[q]->data, * qh = ql + ggml_nbytes(d[q]);
+                        ok = !(lo < qh && ql < hi);
+                    }
+                }
+                if (ok) {
+                    ggml_cuda_mul_mat_vec_q_multi(*cuda_ctx, w, d, n, src1);
+                    return idx[n - 1] - i;
+                }
+            }
+        }
+    }
+
     return 0;
 }
 

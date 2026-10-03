@@ -4969,6 +4969,50 @@ struct test_gated_norm : public test_case {
     }
 };
 
+// several products of one activation by matrices of the same type and width, next to each other (the
+// CUDA backend runs them in one mmvq launch); outputs concatenated for the comparison
+struct test_mul_mat_multi : public test_case {
+    const ggml_type type;
+    const int64_t k;
+    const int64_t n;
+    const std::array<int64_t, 4> rows; // 0 = no matrix
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, k, n, rows);
+    }
+
+    test_mul_mat_multi(ggml_type type = GGML_TYPE_Q8_0, int64_t k = 256, int64_t n = 1, std::array<int64_t, 4> rows = {64, 48, 8, 0})
+        : type(type), k(k), n(n), rows(rows) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_MULTI";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        std::vector<ggml_tensor *> outs;
+        for (int64_t r : rows) {
+            if (r == 0) {
+                continue;
+            }
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, type, k, r);
+            ggml_tensor * y = ggml_mul_mat(ctx, w, x);
+            ggml_build_forward_expand(gf, y);
+            outs.push_back(y);
+        }
+        ggml_tensor * out = outs[0];
+        for (size_t i = 1; i < outs.size(); i++) {
+            out = ggml_concat(ctx, out, outs[i], 0);
+        }
+        return out;
+    }
+};
+
 struct test_gated_delta_net_cache_fusion : public test_case {
     const ggml_type type;
 
@@ -11591,6 +11635,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     test_cases.emplace_back(new test_gdn_gates(48, 1));
+    test_cases.emplace_back(new test_mul_mat_multi(GGML_TYPE_Q8_0, 256, 1, {64, 48, 8, 0}));
+    test_cases.emplace_back(new test_mul_mat_multi(GGML_TYPE_Q8_0, 2560, 3, {1024, 48, 48, 512}));
+    test_cases.emplace_back(new test_mul_mat_multi(GGML_TYPE_Q4_K, 512, 2, {64, 40, 0, 0}));
+    test_cases.emplace_back(new test_mul_mat_multi(GGML_TYPE_IQ4_NL, 256, 1, {24, 16, 7, 0}));
     test_cases.emplace_back(new test_gated_norm({128, 48, 1, 1}));
     test_cases.emplace_back(new test_gated_norm({128, 48, 3, 1}));
     test_cases.emplace_back(new test_gated_norm({100, 7, 5, 2}));

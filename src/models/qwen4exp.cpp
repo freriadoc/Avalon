@@ -986,6 +986,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     // Qwen3Next uses a single Q projection that outputs query + gate
     ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
     cb(Qcur_full, "Qcur_full", il);
+    // Q, K and V are queued next to each other: a backend can run the three products of the same
+    // input in one launch
+    ggml_build_forward_expand(gf, Qcur_full);
 
     ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
         ggml_element_size(Qcur_full) * n_embd_head * 2,
@@ -997,9 +1000,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
 
     ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
     cb(Kcur, "Kcur", il);
+    ggml_build_forward_expand(gf, Kcur);
 
     ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
     cb(Vcur, "Vcur", il);
+    ggml_build_forward_expand(gf, Vcur);
 
     Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
     Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
@@ -1076,8 +1081,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     auto qkvz = build_qkvz(cur, il);
     ggml_tensor * qkv_mixed = qkvz.first;
     ggml_tensor * z         = qkvz.second;
-    // z is queued here, with the block's other input products: the gated norm at the end of the
-    // block (rms_norm, mul, sigmoid(z), mul) then follows itself in the graph, one kernel for a backend
+    // qkv and z are queued here, with the block's other input products (beta, alpha below): the four
+    // products of the same input follow each other (one launch for a backend), and the gated norm at
+    // the end of the block (rms_norm, mul, sigmoid(z), mul) follows itself, one kernel for a backend
+    ggml_build_forward_expand(gf, qkv_mixed);
     ggml_build_forward_expand(gf, z);
 
     ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
