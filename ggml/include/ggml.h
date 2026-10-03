@@ -586,6 +586,7 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_QSA_SELECT,
 
         GGML_OP_UNARY,
 
@@ -2659,6 +2660,22 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
             int64_t               K);
+
+    // QSA selection for an attention over the selected cells only (K/V gathered by these cells)
+    //
+    // sel:       I32 [n_sel, n_t]   cell of each slot; < 0 or >= n_kv names no cell (padded pool, missing tail cell)
+    // top_score: F32 [n_top, n_t]   score of the pool behind slots [p*kpool, (p+1)*kpool); -inf: an invisible
+    //                               pool, its slots are dead (the slots after n_top*kpool are the tail)
+    // kq_mask:   F16 [n_kv, n_t]    the additive causal / sequence mask of the dense attention
+    // mask:      result F16 [n_sel, n_t], kq_mask[sel, t] at a live slot, -inf at a dead one
+    // !mask:     result I32 [n_sel, n_t], sel where it names a cell, 0 elsewhere (rows to gather)
+    GGML_API struct ggml_tensor * ggml_qsa_select(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * sel,
+            struct ggml_tensor  * top_score,
+            struct ggml_tensor  * kq_mask,
+            int32_t               kpool,
+            bool                  mask);
 
     // DSA lightning indexer
     //

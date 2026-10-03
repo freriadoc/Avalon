@@ -1092,6 +1092,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "QSA_SELECT",
 
     "UNARY",
 
@@ -1109,7 +1110,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1207,6 +1208,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "qsa_select(sel, top_score, kq_mask)",
 
     "unary(x)",
 
@@ -1224,7 +1226,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6436,6 +6438,34 @@ struct ggml_tensor * ggml_gated_delta_net(
 }
 
 // ggml_lightning_indexer
+
+struct ggml_tensor * ggml_qsa_select(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * sel,
+        struct ggml_tensor  * top_score,
+        struct ggml_tensor  * kq_mask,
+        int32_t               kpool,
+        bool                  mask) {
+    GGML_ASSERT(sel->type == GGML_TYPE_I32 && ggml_is_contiguous(sel) && sel->ne[2] == 1 && sel->ne[3] == 1);
+    GGML_ASSERT(top_score->type == GGML_TYPE_F32 && ggml_is_contiguous(top_score) && top_score->ne[1] == sel->ne[1]);
+    GGML_ASSERT(top_score->ne[0]*kpool <= sel->ne[0]);
+    GGML_ASSERT(kq_mask->type == GGML_TYPE_F16 && kq_mask->nb[0] == ggml_type_size(GGML_TYPE_F16));
+    GGML_ASSERT(kq_mask->ne[1]*kq_mask->ne[2]*kq_mask->ne[3] == sel->ne[1]);
+    GGML_ASSERT(kq_mask->nb[2] == kq_mask->ne[1]*kq_mask->nb[1] && kq_mask->nb[3] == kq_mask->ne[2]*kq_mask->nb[2]);
+    GGML_ASSERT(kpool > 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, mask ? GGML_TYPE_F16 : GGML_TYPE_I32, sel->ne[0], sel->ne[1]);
+
+    ggml_set_op_params_i32(result, 0, kpool);
+    ggml_set_op_params_i32(result, 1, mask ? 1 : 0);
+
+    result->op     = GGML_OP_QSA_SELECT;
+    result->src[0] = sel;
+    result->src[1] = top_score;
+    result->src[2] = kq_mask;
+
+    return result;
+}
 
 struct ggml_tensor * ggml_lightning_indexer(
         struct ggml_context * ctx,

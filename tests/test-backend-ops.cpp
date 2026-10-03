@@ -5075,6 +5075,61 @@ struct test_ssm_conv_cached : public test_case {
     }
 };
 
+// GGML_OP_QSA_SELECT: mask or rows of a QSA selection (sentinel cells, invisible pools)
+struct test_qsa_select : public test_case {
+    const int64_t n_kv;
+    const int64_t n_top;
+    const int64_t kpool;
+    const int64_t n_t;
+    const bool    mask;
+
+    std::string vars() override {
+        return VARS_TO_STR5(n_kv, n_top, kpool, n_t, mask);
+    }
+
+    test_qsa_select(int64_t n_kv = 256, int64_t n_top = 16, int64_t kpool = 4, int64_t n_t = 1, bool mask = true)
+        : n_kv(n_kv), n_top(n_top), kpool(kpool), n_t(n_t), mask(mask) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_sel = n_top*kpool + kpool - 1;
+        ggml_tensor * sel   = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_sel, n_t);
+        ggml_tensor * score = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_top, n_t);
+        ggml_tensor * kq    = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, n_t);
+        ggml_set_name(sel, "sel");
+        ggml_set_name(score, "score");
+        ggml_set_name(kq, "kq_mask");
+        return ggml_qsa_select(ctx, sel, score, kq, (int32_t) kpool, mask);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "sel") == 0) {
+                std::vector<int32_t> v(ggml_nelements(t));
+                for (auto & x : v) {
+                    const int r = (int) (rng() % 8);
+                    x = r == 0 ? (int32_t) n_kv : (int32_t) (rng() % n_kv);   // some sentinels
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "score") == 0) {
+                std::vector<float> v(ggml_nelements(t));
+                for (auto & x : v) {
+                    x = rng() % 4 == 0 ? -INFINITY : (float) (rng() % 100);   // some invisible pools
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "kq_mask") == 0) {
+                std::vector<ggml_fp16_t> v(ggml_nelements(t));
+                for (auto & x : v) {
+                    x = ggml_fp32_to_fp16(rng() % 3 == 0 ? -INFINITY : 0.0f);
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 struct test_gated_delta_net_cache_fusion : public test_case {
     const ggml_type type;
 
@@ -11697,6 +11752,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     test_cases.emplace_back(new test_gdn_gates(48, 1));
+    for (bool m : { true, false }) {
+        test_cases.emplace_back(new test_qsa_select(256,  16, 4, 1, m));
+        test_cases.emplace_back(new test_qsa_select(4096, 512, 4, 3, m));
+    }
     test_cases.emplace_back(new test_ssm_conv_cached(256, 1, 1));
     test_cases.emplace_back(new test_ssm_conv_cached(10240, 1, 1));
     test_cases.emplace_back(new test_ssm_conv_cached(256, 3, 3));
