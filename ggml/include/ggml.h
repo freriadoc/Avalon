@@ -2667,15 +2667,23 @@ extern "C" {
     // top_score: F32 [n_top, n_t]   score of the pool behind slots [p*kpool, (p+1)*kpool); -inf: an invisible
     //                               pool, its slots are dead (the slots after n_top*kpool are the tail)
     // kq_mask:   F16 [n_kv, n_t]    the additive causal / sequence mask of the dense attention
-    // mask:      result F16 [n_sel, n_t], kq_mask[sel, t] at a live slot, -inf at a dead one
-    // !mask:     result I32 [n_sel, n_t], sel where it names a cell, 0 elsewhere (rows to gather)
+    // mode GGML_QSA_SELECT_ROWS:  result I32 [n_sel, n_t], sel where it names a cell, 0 elsewhere (rows to gather)
+    // mode GGML_QSA_SELECT_MASK:  result F16 [n_sel, n_t], kq_mask[sel, t] at a live slot, -inf at a dead one
+    // mode GGML_QSA_SELECT_DENSE: result F16 [n_kv, n_t], kq_mask at the cells of the live slots, -inf elsewhere
+    //                             (the additive mask of a dense attention over the selection)
+    enum ggml_qsa_select_mode {
+        GGML_QSA_SELECT_ROWS  = 0,
+        GGML_QSA_SELECT_MASK  = 1,
+        GGML_QSA_SELECT_DENSE = 2,
+    };
+
     GGML_API struct ggml_tensor * ggml_qsa_select(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * sel,
-            struct ggml_tensor  * top_score,
-            struct ggml_tensor  * kq_mask,
-            int32_t               kpool,
-            bool                  mask);
+            struct ggml_context    * ctx,
+            struct ggml_tensor     * sel,
+            struct ggml_tensor     * top_score,
+            struct ggml_tensor     * kq_mask,
+            int32_t                  kpool,
+            enum ggml_qsa_select_mode mode);
 
     // DSA lightning indexer
     //

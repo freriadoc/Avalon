@@ -12450,23 +12450,32 @@ void ggml_compute_forward_qsa_select(const ggml_compute_params * params, ggml_te
     const ggml_tensor * top_score = dst->src[1];
     const ggml_tensor * kq_mask   = dst->src[2];
     const int32_t kpool = ggml_get_op_params_i32(dst, 0);
-    const bool    mask  = ggml_get_op_params_i32(dst, 1) != 0;
+    const int32_t mode  = ggml_get_op_params_i32(dst, 1);
     const int64_t n_sel = sel->ne[0];
     const int64_t n_t   = sel->ne[1];
     const int64_t n_top = top_score->ne[0];
     const int64_t n_kv  = kq_mask->ne[0];
+    const ggml_fp16_t neg_inf = GGML_CPU_FP32_TO_FP16(-INFINITY);
     for (int64_t t = 0; t < n_t; t++) {
         const int32_t * s_row  = (const int32_t *) ((const char *) sel->data + t*sel->nb[1]);
         const float   * sc_row = (const float *)   ((const char *) top_score->data + t*top_score->nb[1]);
         const ggml_fp16_t * m_row = (const ggml_fp16_t *) ((const char *) kq_mask->data + t*kq_mask->nb[1]);
+        char * d_row = (char *) dst->data + t*dst->nb[1];
+        if (mode == GGML_QSA_SELECT_DENSE) {
+            for (int64_t c = 0; c < n_kv; c++) {
+                ((ggml_fp16_t *) d_row)[c] = neg_inf;
+            }
+        }
         for (int64_t j = 0; j < n_sel; j++) {
             const int32_t c = s_row[j];
             const bool cell = c >= 0 && c < n_kv;
             const bool live = cell && (j >= n_top*kpool || sc_row[j/kpool] != -INFINITY);
-            if (mask) {
-                ((ggml_fp16_t *) ((char *) dst->data + t*dst->nb[1]))[j] = live ? m_row[c] : GGML_CPU_FP32_TO_FP16(-INFINITY);
-            } else {
-                ((int32_t *) ((char *) dst->data + t*dst->nb[1]))[j] = cell ? c : 0;
+            if (mode == GGML_QSA_SELECT_ROWS) {
+                ((int32_t *) d_row)[j] = cell ? c : 0;
+            } else if (mode == GGML_QSA_SELECT_MASK) {
+                ((ggml_fp16_t *) d_row)[j] = live ? m_row[c] : neg_inf;
+            } else if (live) {
+                ((ggml_fp16_t *) d_row)[c] = m_row[c];
             }
         }
     }

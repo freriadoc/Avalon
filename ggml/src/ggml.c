@@ -6445,7 +6445,7 @@ struct ggml_tensor * ggml_qsa_select(
         struct ggml_tensor  * top_score,
         struct ggml_tensor  * kq_mask,
         int32_t               kpool,
-        bool                  mask) {
+        enum ggml_qsa_select_mode mode) {
     GGML_ASSERT(sel->type == GGML_TYPE_I32 && ggml_is_contiguous(sel) && sel->ne[2] == 1 && sel->ne[3] == 1);
     GGML_ASSERT(top_score->type == GGML_TYPE_F32 && ggml_is_contiguous(top_score) && top_score->ne[1] == sel->ne[1]);
     GGML_ASSERT(top_score->ne[0]*kpool <= sel->ne[0]);
@@ -6454,10 +6454,12 @@ struct ggml_tensor * ggml_qsa_select(
     GGML_ASSERT(kq_mask->nb[2] == kq_mask->ne[1]*kq_mask->nb[1] && kq_mask->nb[3] == kq_mask->ne[2]*kq_mask->nb[2]);
     GGML_ASSERT(kpool > 0);
 
-    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, mask ? GGML_TYPE_F16 : GGML_TYPE_I32, sel->ne[0], sel->ne[1]);
+    struct ggml_tensor * result = mode == GGML_QSA_SELECT_ROWS ? ggml_new_tensor_2d(ctx, GGML_TYPE_I32, sel->ne[0], sel->ne[1]) :
+                                  mode == GGML_QSA_SELECT_MASK ? ggml_new_tensor_2d(ctx, GGML_TYPE_F16, sel->ne[0], sel->ne[1]) :
+                                                                 ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kq_mask->ne[0], sel->ne[1]);
 
     ggml_set_op_params_i32(result, 0, kpool);
-    ggml_set_op_params_i32(result, 1, mask ? 1 : 0);
+    ggml_set_op_params_i32(result, 1, (int32_t) mode);
 
     result->op     = GGML_OP_QSA_SELECT;
     result->src[0] = sel;

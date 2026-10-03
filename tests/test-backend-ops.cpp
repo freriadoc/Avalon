@@ -21,6 +21,7 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <numeric>
 #include <atomic>
 #include <array>
 #include <cfloat>
@@ -5081,14 +5082,14 @@ struct test_qsa_select : public test_case {
     const int64_t n_top;
     const int64_t kpool;
     const int64_t n_t;
-    const bool    mask;
+    const int     mode;
 
     std::string vars() override {
-        return VARS_TO_STR5(n_kv, n_top, kpool, n_t, mask);
+        return VARS_TO_STR5(n_kv, n_top, kpool, n_t, mode);
     }
 
-    test_qsa_select(int64_t n_kv = 256, int64_t n_top = 16, int64_t kpool = 4, int64_t n_t = 1, bool mask = true)
-        : n_kv(n_kv), n_top(n_top), kpool(kpool), n_t(n_t), mask(mask) {}
+    test_qsa_select(int64_t n_kv = 256, int64_t n_top = 16, int64_t kpool = 4, int64_t n_t = 1, int mode = GGML_QSA_SELECT_MASK)
+        : n_kv(n_kv), n_top(n_top), kpool(kpool), n_t(n_t), mode(mode) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t n_sel = n_top*kpool + kpool - 1;
@@ -5098,17 +5099,23 @@ struct test_qsa_select : public test_case {
         ggml_set_name(sel, "sel");
         ggml_set_name(score, "score");
         ggml_set_name(kq, "kq_mask");
-        return ggml_qsa_select(ctx, sel, score, kq, (int32_t) kpool, mask);
+        return ggml_qsa_select(ctx, sel, score, kq, (int32_t) kpool, (ggml_qsa_select_mode) mode);
     }
 
     void initialize_tensors(ggml_context * ctx) override {
         std::mt19937 rng(1234);
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             if (strcmp(t->name, "sel") == 0) {
+                // distinct cells per query (as a selection names them), some sentinels
                 std::vector<int32_t> v(ggml_nelements(t));
-                for (auto & x : v) {
-                    const int r = (int) (rng() % 8);
-                    x = r == 0 ? (int32_t) n_kv : (int32_t) (rng() % n_kv);   // some sentinels
+                const int64_t n_sel = t->ne[0];
+                for (int64_t q = 0; q < t->ne[1]; q++) {
+                    std::vector<int32_t> perm(n_kv);
+                    std::iota(perm.begin(), perm.end(), 0);
+                    std::shuffle(perm.begin(), perm.end(), rng);
+                    for (int64_t j = 0; j < n_sel; j++) {
+                        v[q*n_sel + j] = rng() % 8 == 0 ? (int32_t) n_kv : perm[j];
+                    }
                 }
                 ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
             } else if (strcmp(t->name, "score") == 0) {
@@ -11752,7 +11759,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     test_cases.emplace_back(new test_gdn_gates(48, 1));
-    for (bool m : { true, false }) {
+    for (int m : { GGML_QSA_SELECT_ROWS, GGML_QSA_SELECT_MASK, GGML_QSA_SELECT_DENSE }) {
         test_cases.emplace_back(new test_qsa_select(256,  16, 4, 1, m));
         test_cases.emplace_back(new test_qsa_select(4096, 512, 4, 3, m));
     }
