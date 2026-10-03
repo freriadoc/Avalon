@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.cuh"
+#include "ggml-backend-impl.h"
 #include "convert.cuh"
 #include "vecdotq.cuh"
 
@@ -977,6 +978,27 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
+// the temporary memory of launch_fattn: the mask's KV bounds or sparse lists, the partial results of
+// the parallel blocks and their meta data (or the stream-k fixup's), each 256-byte aligned
+struct fattn_scratch_layout {
+    size_t KV_max       = 0;
+    size_t dst_tmp      = 0;
+    size_t dst_tmp_meta = 0;
+    size_t size         = 0;
+};
+
+static fattn_scratch_layout fattn_scratch_get_layout(size_t KV_max_n, size_t dst_tmp_n, size_t dst_tmp_meta_n) {
+    fattn_scratch_layout l;
+    l.KV_max       = l.size; l.size += GGML_PAD(KV_max_n       * sizeof(int),    256);
+    l.dst_tmp      = l.size; l.size += GGML_PAD(dst_tmp_n      * sizeof(float),  256);
+    l.dst_tmp_meta = l.size; l.size += GGML_PAD(dst_tmp_meta_n * sizeof(float2), 256);
+    return l;
+}
+
+// set by ggml_cuda_flash_attn_ext_scratch_size: launch_fattn writes its scratch size there and returns
+// before any allocation or launch
+extern thread_local size_t * g_fattn_scratch_query;
+
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
@@ -1014,9 +1036,141 @@ void launch_fattn(
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
         ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K, need_f16_V);
 
+    const int ntiles_x     = ((Q->ne[1] + ncols1 - 1) / ncols1);
+    const int gqa_ratio    = Q->ne[2] / K->ne[2];
+    const int ntiles_z_gqa = ((gqa_ratio + ncols2 - 1) / ncols2);
+    const int ntiles_dst   = ntiles_x * ntiles_z_gqa * K->ne[2] * Q->ne[3];
+
+    // The launch configuration and the temporary memory first, without side effects: a size query
+    // (ggml_cuda_flash_attn_ext_scratch_size) stops there.
+
+    // sparse: a query tile of ncols1 queries shares one index list, the union of the queries' visible columns
+    int32_t n_kv_max = 0;
+    size_t  n_lists  = 0;
+    size_t  KV_max_n = 0;
+    if (use_sparse) {
+        GGML_ASSERT(mask != nullptr);
+        const int32_t n_kv_max_query = ggml_get_op_params_i32(KQV, 4);
+        GGML_ASSERT(n_kv_max_query > 0);
+        n_kv_max = std::min<int64_t>(K->ne[1], int64_t(ncols1)*n_kv_max_query);
+        n_lists  = size_t(ntiles_x) * mask->ne[3];
+        KV_max_n = size_t(n_kv_max)*n_lists + n_lists;
+    }
+
+    // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
+    // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
+    //     multiple sequences of possibly different lengths.
+    const bool scan_mask = !use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1);
+    const dim3 blocks_num_KV_max(ntiles_x, Q->ne[3], 1);
+    if (scan_mask) {
+        KV_max_n = blocks_num_KV_max.x*blocks_num_KV_max.y;
+    }
+
+    const dim3 block_dim(warp_size, nwarps, 1);
+    int max_blocks_per_sm = 1; // Max. number of active blocks limited by occupancy.
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, fattn_kernel, block_dim.x * block_dim.y * block_dim.z, nbytes_shared));
+    GGML_ASSERT(max_blocks_per_sm > 0);
+    int parallel_blocks = max_blocks_per_sm;
+
+    const int64_t n_kv = use_sparse ? n_kv_max : K->ne[1];
+    const int ntiles_KV = (n_kv + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
+
+    size_t dst_tmp_n      = 0;
+    size_t dst_tmp_meta_n = 0;
+
+    dim3 blocks_num;
+    if (stream_k) {
+        auto should_use_stream_k = [](const int cc, const int ntiles_dst, const int max_blocks, const int DKQ) {
+            const int tiles_nwaves             = (ntiles_dst + max_blocks - 1) / max_blocks;
+            const int tiles_efficiency_percent = 100 * ntiles_dst / (max_blocks*tiles_nwaves);
+
+            if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_ADA_LOVELACE) {
+                return true;
+            }
+            if (amd_wmma_available(cc) && DKQ == 64) {
+                return true; // TODO better configuration
+            }
+            return tiles_efficiency_percent < 75;
+        };
+
+        const int  max_blocks   = max_blocks_per_sm*nsm;
+        const bool use_stream_k = should_use_stream_k(cc, ntiles_dst, max_blocks, Q->ne[0]);
+
+        blocks_num.x = ntiles_dst;
+        blocks_num.y = 1;
+        blocks_num.z = 1;
+
+        if(use_stream_k) {
+            const int nblocks_stream_k_raw = std::min(max_blocks, ntiles_KV*ntiles_dst);
+            // Round down to a multiple of ntiles_dst so that each output tile gets the same number of blocks (avoids fixup).
+            // Only do this if the occupancy loss from rounding is acceptable.
+            const int nblocks_stream_k_rounded = (nblocks_stream_k_raw / ntiles_dst) * ntiles_dst;
+            const int max_efficiency_loss_percent = 5;
+            const int efficiency_loss_percent = nblocks_stream_k_rounded > 0
+                ? 100 * (nblocks_stream_k_raw - nblocks_stream_k_rounded) / nblocks_stream_k_raw
+                : 100;
+            const int nblocks_stream_k = efficiency_loss_percent <= max_efficiency_loss_percent
+                ? nblocks_stream_k_rounded
+                : nblocks_stream_k_raw;
+
+            blocks_num.x = nblocks_stream_k;
+        }
+
+        if (ntiles_dst % blocks_num.x != 0) { // Fixup is only needed if the SMs work on fractional tiles.
+            dst_tmp_meta_n = size_t(blocks_num.x) * ncols * (2 + DV/2);
+        }
+    } else {
+        // parallel_blocks must not be larger than what the tensor size allows:
+        parallel_blocks = std::min(parallel_blocks, ntiles_KV);
+
+        // If ntiles_total % blocks_per_wave != 0 then some efficiency is lost due to tail effects.
+        // Test whether parallel_blocks can be set to a higher value for better efficiency.
+        const int blocks_per_wave = nsm * max_blocks_per_sm;
+        int nwaves_best = 0;
+        int efficiency_percent_best = 0;
+        for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
+            const int nblocks_total = ntiles_dst * parallel_blocks_test;
+            const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
+            const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
+
+            // Stop trying configurations with more waves if we already have good efficiency to avoid excessive overhead.
+            if (efficiency_percent_best >= 95 && nwaves > nwaves_best) {
+                break;
+            }
+
+            if (efficiency_percent > efficiency_percent_best) {
+                nwaves_best = nwaves;
+                efficiency_percent_best = efficiency_percent;
+                parallel_blocks = parallel_blocks_test;
+            }
+        }
+
+        blocks_num.x = ntiles_x;
+        blocks_num.y = parallel_blocks;
+        blocks_num.z = ntiles_z_gqa*K->ne[2]*Q->ne[3];
+
+        if (parallel_blocks > 1) {
+            dst_tmp_n      = parallel_blocks*ggml_nelements(KQV);
+            dst_tmp_meta_n = parallel_blocks*ggml_nrows(KQV);
+        }
+    }
+
+    // the temporary memory: the scheduler's scratch (GGML_SCHED_SCRATCH_SRC) when it gave one, else pool memory
+    const fattn_scratch_layout scratch_l = fattn_scratch_get_layout(KV_max_n, dst_tmp_n, dst_tmp_meta_n);
+    if (g_fattn_scratch_query != nullptr) {
+        *g_fattn_scratch_query = scratch_l.size;
+        return;
+    }
+    const ggml_tensor * scratch_t = dst->src[GGML_SCHED_SCRATCH_SRC];
+    char * scratch = scratch_l.size > 0 && scratch_t && scratch_t->data && ggml_nbytes(scratch_t) >= scratch_l.size ?
+        (char *) scratch_t->data : nullptr;
+
     ggml_cuda_pool_alloc<int>    KV_max(pool);
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
     ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
+    int    * KV_max_ptr       = KV_max_n       == 0 ? nullptr : scratch ? (int    *) (scratch + scratch_l.KV_max)       : KV_max.alloc(KV_max_n);
+    float  * dst_tmp_ptr      = dst_tmp_n      == 0 ? nullptr : scratch ? (float  *) (scratch + scratch_l.dst_tmp)      : dst_tmp.alloc(dst_tmp_n);
+    float2 * dst_tmp_meta_ptr = dst_tmp_meta_n == 0 ? nullptr : scratch ? (float2 *) (scratch + scratch_l.dst_tmp_meta) : dst_tmp_meta.alloc(dst_tmp_meta_n);
 
     const char * K_data = (const char *) K->data;
     size_t nb11 = K->nb[1];
@@ -1092,129 +1246,22 @@ void launch_fattn(
         }
     }
 
-    const int ntiles_x     = ((Q->ne[1] + ncols1 - 1) / ncols1);
-    const int gqa_ratio    = Q->ne[2] / K->ne[2];
-    const int ntiles_z_gqa = ((gqa_ratio + ncols2 - 1) / ncols2);
-    const int ntiles_dst   = ntiles_x * ntiles_z_gqa * K->ne[2] * Q->ne[3];
-
-    // sparse: a query tile of ncols1 queries shares one index list, the union of the queries' visible columns
-    int32_t n_kv_max = 0;
     if (use_sparse) {
-        GGML_ASSERT(mask != nullptr);
-        const int32_t n_kv_max_query = ggml_get_op_params_i32(KQV, 4);
-        GGML_ASSERT(n_kv_max_query > 0);
-        n_kv_max = std::min<int64_t>(K->ne[1], int64_t(ncols1)*n_kv_max_query);
-
-        const size_t n_lists = size_t(ntiles_x) * mask->ne[3];
-
-        KV_max.alloc(size_t(n_kv_max)*n_lists + n_lists);
-        ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max, main_stream);
+        ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max_ptr, KV_max_ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max, main_stream);
     }
 
-    // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
-    // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
-    //     multiple sequences of possibly different lengths.
-    if (!use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
+    if (scan_mask) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
 
-        const dim3 blocks_num_KV_max(ntiles_x, Q->ne[3], 1);
         const dim3 block_dim_KV_max(FATTN_KQ_STRIDE/2, 1, 1);
 
-        const int ne_KV_max = blocks_num_KV_max.x*blocks_num_KV_max.y;
         const int iter_k = K->ne[1] / FATTN_KQ_STRIDE;
 
-        KV_max.alloc(ne_KV_max);
         ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
         ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1>, launch_params,
-            (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
+            (const half2 *) mask->data, KV_max_ptr, iter_k, s31, s33);
         CUDA_CHECK(cudaGetLastError());
-    }
-
-    const dim3 block_dim(warp_size, nwarps, 1);
-    int max_blocks_per_sm = 1; // Max. number of active blocks limited by occupancy.
-    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, fattn_kernel, block_dim.x * block_dim.y * block_dim.z, nbytes_shared));
-    GGML_ASSERT(max_blocks_per_sm > 0);
-    int parallel_blocks = max_blocks_per_sm;
-
-    const int64_t n_kv = use_sparse ? n_kv_max : K->ne[1];
-    const int ntiles_KV = (n_kv + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
-
-    dim3 blocks_num;
-    if (stream_k) {
-        auto should_use_stream_k = [](const int cc, const int ntiles_dst, const int max_blocks, const int DKQ) {
-            const int tiles_nwaves             = (ntiles_dst + max_blocks - 1) / max_blocks;
-            const int tiles_efficiency_percent = 100 * ntiles_dst / (max_blocks*tiles_nwaves);
-
-            if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_ADA_LOVELACE) {
-                return true;
-            }
-            if (amd_wmma_available(cc) && DKQ == 64) {
-                return true; // TODO better configuration
-            }
-            return tiles_efficiency_percent < 75;
-        };
-
-        const int  max_blocks   = max_blocks_per_sm*nsm;
-        const bool use_stream_k = should_use_stream_k(cc, ntiles_dst, max_blocks, Q->ne[0]);
-
-        blocks_num.x = ntiles_dst;
-        blocks_num.y = 1;
-        blocks_num.z = 1;
-
-        if(use_stream_k) {
-            const int nblocks_stream_k_raw = std::min(max_blocks, ntiles_KV*ntiles_dst);
-            // Round down to a multiple of ntiles_dst so that each output tile gets the same number of blocks (avoids fixup).
-            // Only do this if the occupancy loss from rounding is acceptable.
-            const int nblocks_stream_k_rounded = (nblocks_stream_k_raw / ntiles_dst) * ntiles_dst;
-            const int max_efficiency_loss_percent = 5;
-            const int efficiency_loss_percent = nblocks_stream_k_rounded > 0
-                ? 100 * (nblocks_stream_k_raw - nblocks_stream_k_rounded) / nblocks_stream_k_raw
-                : 100;
-            const int nblocks_stream_k = efficiency_loss_percent <= max_efficiency_loss_percent
-                ? nblocks_stream_k_rounded
-                : nblocks_stream_k_raw;
-
-            blocks_num.x = nblocks_stream_k;
-        }
-
-        if (ntiles_dst % blocks_num.x != 0) { // Fixup is only needed if the SMs work on fractional tiles.
-            dst_tmp_meta.alloc((size_t(blocks_num.x) * ncols * (2 + DV/2)));
-        }
-    } else {
-        // parallel_blocks must not be larger than what the tensor size allows:
-        parallel_blocks = std::min(parallel_blocks, ntiles_KV);
-
-        // If ntiles_total % blocks_per_wave != 0 then some efficiency is lost due to tail effects.
-        // Test whether parallel_blocks can be set to a higher value for better efficiency.
-        const int blocks_per_wave = nsm * max_blocks_per_sm;
-        int nwaves_best = 0;
-        int efficiency_percent_best = 0;
-        for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
-            const int nblocks_total = ntiles_dst * parallel_blocks_test;
-            const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
-            const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
-
-            // Stop trying configurations with more waves if we already have good efficiency to avoid excessive overhead.
-            if (efficiency_percent_best >= 95 && nwaves > nwaves_best) {
-                break;
-            }
-
-            if (efficiency_percent > efficiency_percent_best) {
-                nwaves_best = nwaves;
-                efficiency_percent_best = efficiency_percent;
-                parallel_blocks = parallel_blocks_test;
-            }
-        }
-
-        blocks_num.x = ntiles_x;
-        blocks_num.y = parallel_blocks;
-        blocks_num.z = ntiles_z_gqa*K->ne[2]*Q->ne[3];
-
-        if (parallel_blocks > 1) {
-            dst_tmp.alloc(parallel_blocks*ggml_nelements(KQV));
-            dst_tmp_meta.alloc(parallel_blocks*ggml_nrows(KQV));
-        }
     }
 
     float scale         = 1.0f;
@@ -1247,8 +1294,8 @@ void launch_fattn(
         V_data,
         mask ? ((const char *) mask->data) : nullptr,
         sinks ? ((const char *) sinks->data) : nullptr,
-        KV_max.ptr,
-        !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
+        KV_max_ptr,
+        !stream_k && parallel_blocks > 1 ? dst_tmp_ptr : (float *) KQV->data, dst_tmp_meta_ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
         K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
@@ -1273,7 +1320,7 @@ void launch_fattn(
 
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, 0, main_stream);
             ggml_cuda_kernel_launch(flash_attn_stream_k_fixup_uniform<DV, ncols1, ncols2>, launch_params,
-                (float *) KQV->data, dst_tmp_meta.ptr,
+                (float *) KQV->data, dst_tmp_meta_ptr,
                  Q->ne[1], Q->ne[2], K->ne[2], nblocks_sk,
                  gqa_ratio, bpt, fd0, fd1, fd2);
         } else if (ntiles_dst % blocks_num.x != 0) {
@@ -1290,7 +1337,7 @@ void launch_fattn(
 
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, 0, main_stream);
             ggml_cuda_kernel_launch(flash_attn_stream_k_fixup_general<DV, ncols1, ncols2>, launch_params,
-                (float *) KQV->data, dst_tmp_meta.ptr,
+                (float *) KQV->data, dst_tmp_meta_ptr,
                  Q->ne[1], Q->ne[2], gqa_ratio, total_work,
                  fd_k_j_z_ne12, fd_k_j_z, fd_k_j, fd_k);
         }
@@ -1301,7 +1348,7 @@ void launch_fattn(
 
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream);
         ggml_cuda_kernel_launch(flash_attn_combine_results<DV>, launch_params,
-            dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
+            dst_tmp_ptr, dst_tmp_meta_ptr, (float *) KQV->data, parallel_blocks);
     }
     CUDA_CHECK(cudaGetLastError());
 }

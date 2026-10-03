@@ -755,6 +755,16 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
+thread_local size_t * g_fattn_scratch_query = nullptr;
+
+size_t ggml_cuda_flash_attn_ext_scratch_size(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    size_t size = 0;
+    g_fattn_scratch_query = &size;
+    ggml_cuda_flash_attn_ext(ctx, dst);
+    g_fattn_scratch_query = nullptr;
+    return size;
+}
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {

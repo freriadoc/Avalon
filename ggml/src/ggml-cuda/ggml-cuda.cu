@@ -5443,11 +5443,11 @@ static size_t ggml_cuda_mul_mat_scratch_size(const ggml_tensor * dst, int device
 }
 
 // The temporary memory of the matrix products (mmq's and mmvq's quantized activation, mmq's expert ids,
-// cuBLAS's conversions) and of the radix top-k comes from the compute buffer: the scheduler counts it in the reservation, where the pool
+// cuBLAS's conversions), of the radix top-k and of flash attention comes from the compute buffer: the scheduler counts it in the reservation, where the pool
 // kept the largest request of each size for good (~380 MiB at 8192-token ubatches). Consecutive mmq
 // nodes that quantize the same activation the same way (q/k/v, gate and up, hc down and inject) share
 // one scratch, filled by the first: as long as no node in between writes over that activation.
-static void ggml_cuda_add_mmq_scratch(const ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph,
+static void ggml_cuda_add_mmq_scratch(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph,
         ggml_backend_graph_optimize_params * params) {
     if (params->add_scratch == nullptr) {
         return;
@@ -5471,6 +5471,13 @@ static void ggml_cuda_add_mmq_scratch(const ggml_backend_cuda_context * cuda_ctx
         size_t  need = 0;
         if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->src[GGML_SCHED_SCRATCH_SRC] == nullptr) {
             need = ggml_cuda_mul_mat_scratch_size(node, cuda_ctx->device, key);
+        } else if (node->op == GGML_OP_FLASH_ATTN_EXT && node->src[GGML_SCHED_SCRATCH_SRC] == nullptr) {
+            ggml_cuda_set_device(cuda_ctx->device);
+            need = ggml_cuda_flash_attn_ext_scratch_size(*cuda_ctx, node);
+            for (int k = 0; k < GGML_CUDA_MMQ_SCRATCH_KEY; k++) {
+                key[k] = 0;
+            }
+            key[0] = -(int64_t) (intptr_t) node;
         } else if (node->op == GGML_OP_TOP_K && node->src[GGML_SCHED_SCRATCH_SRC] == nullptr) {
             need = ggml_cuda_top_k_scratch_size(node);
             for (int k = 0; k < GGML_CUDA_MMQ_SCRATCH_KEY; k++) {
@@ -5506,7 +5513,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
 
     // not with GGML_CUDA_GRAPH_OPT: it reorders the nodes onto concurrent streams below
     static const bool graph_opt = getenv("GGML_CUDA_GRAPH_OPT") != nullptr && atoi(getenv("GGML_CUDA_GRAPH_OPT")) == 1;
-    static const bool no_mmq_scratch = getenv("GGML_CUDA_MMQ_SCRATCH") != nullptr && atoi(getenv("GGML_CUDA_MMQ_SCRATCH")) == 0;
+    static const bool no_mmq_scratch = getenv("GGML_CUDA_SCRATCH") != nullptr && atoi(getenv("GGML_CUDA_SCRATCH")) == 0;
 
     auto add_alloc_deps = [&](size_t start, size_t last_node) {
 
