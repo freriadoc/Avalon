@@ -733,3 +733,28 @@ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_n
         unary_cuda<op_relu_sqr>((const float *)src->data, (float *)sqr_node->data, k, stream);
     }
 }
+
+// gated delta net gates in one kernel: g = softplus(alpha + dt) * A (dt, A: one value per head,
+// the first dimension of alpha) and beta = sigmoid(b), elementwise; an output may alias its input
+static __global__ void k_gdn_gates(const float * __restrict__ alpha, const float * __restrict__ dt,
+                                   const float * __restrict__ a, const float * __restrict__ b,
+                                   float * __restrict__ g, float * __restrict__ beta, const int64_t n, const int64_t n_heads) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const int64_t h = i % n_heads;
+    const float g_i = op_softplus(alpha[i] + dt[h]) * a[h];
+    const float b_i = op_sigmoid(b[i]);
+    g[i]    = g_i;
+    beta[i] = b_i;
+}
+
+void ggml_cuda_op_gdn_gates(ggml_backend_cuda_context & ctx, const ggml_tensor * alpha, const ggml_tensor * dt,
+                            const ggml_tensor * a, const ggml_tensor * b, ggml_tensor * g, ggml_tensor * beta) {
+    const int64_t n = ggml_nelements(g);
+    const int threads = 256;
+    k_gdn_gates<<<(n + threads - 1) / threads, threads, 0, ctx.stream()>>>(
+        (const float *) alpha->data, (const float *) dt->data, (const float *) a->data, (const float *) b->data,
+        (float *) g->data, (float *) beta->data, n, alpha->ne[0]);
+}

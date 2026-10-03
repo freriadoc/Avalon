@@ -121,3 +121,7 @@ __device__ __forceinline__ float ggml_cuda_op_swiglu_clamp_single(float gate, fl
 
     return ggml_cuda_op_silu_single(gate) * up;
 }
+
+// g = softplus(alpha + dt) * A and beta = sigmoid(b) of a gated delta net in one kernel
+void ggml_cuda_op_gdn_gates(ggml_backend_cuda_context & ctx, const ggml_tensor * alpha, const ggml_tensor * dt,
+                            const ggml_tensor * a, const ggml_tensor * b, ggml_tensor * g, ggml_tensor * beta);

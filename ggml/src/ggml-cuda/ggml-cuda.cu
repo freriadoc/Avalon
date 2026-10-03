@@ -3786,6 +3786,80 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // gated delta net gates: add(alpha, dt) -> softplus -> mul(A), then sigmoid(b), next to each other
+    // (views in between): one kernel
+    if (node->op == GGML_OP_ADD && i + 3 < cgraph->n_nodes) {
+        int idx[4] = { i, -1, -1, -1 };   // add, softplus, mul, sigmoid
+        int k = i + 1;
+        const auto next_real = [&](int from) {
+            while (from < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[from])) {
+                from++;
+            }
+            return from;
+        };
+        k = next_real(k);       idx[1] = k < cgraph->n_nodes ? k : -1;
+        k = next_real(k + 1);   idx[2] = idx[1] >= 0 && k < cgraph->n_nodes ? k : -1;
+        k = next_real(k + 1);   idx[3] = idx[2] >= 0 && k < cgraph->n_nodes ? k : -1;
+        if (idx[3] >= 0) {
+            const ggml_tensor * add = node;
+            const ggml_tensor * sp  = cgraph->nodes[idx[1]];
+            ggml_tensor *       mul = cgraph->nodes[idx[2]];
+            ggml_tensor *       sig = cgraph->nodes[idx[3]];
+            const auto vec = [](const ggml_tensor * t, int64_t n) {
+                return t && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && ggml_nelements(t) == n;
+            };
+            const int64_t H = add->ne[0];
+            const int64_t n = ggml_nelements(add);
+            const ggml_tensor * dt    = add->src[1];
+            const ggml_tensor * alpha = add->src[0];
+            const ggml_tensor * a     = mul->src[0] == sp ? mul->src[1] : mul->src[0];
+            const ggml_tensor * b     = sig->src[0];
+            if (sp->op == GGML_OP_UNARY && ggml_get_unary_op(sp) == GGML_UNARY_OP_SOFTPLUS && sp->src[0] == add &&
+                    mul->op == GGML_OP_MUL && (mul->src[0] == sp || mul->src[1] == sp) &&
+                    sig->op == GGML_OP_UNARY && ggml_get_unary_op(sig) == GGML_UNARY_OP_SIGMOID &&
+                    vec(add, n) && vec(alpha, n) && vec(dt, H) && dt->ne[0] == H && vec(a, H) && a->ne[0] == H &&
+                    vec(sp, n) && vec(mul, n) && vec(sig, n) && vec(b, n) && ggml_are_same_shape(add, alpha)) {
+                const int count = idx[3] - i + 1;
+                enum ggml_op ops[32];
+                bool fits = count < 32;
+                for (int j = 0; fits && j < count; j++) {
+                    ops[j] = cgraph->nodes[i + j]->op;
+                }
+                // the outputs, and the views in between (the GDN reads g through a reshape)
+                int outs[32];
+                int n_outs = 0;
+                for (int j = i; fits && j <= idx[3]; j++) {
+                    if (j == idx[2] || j == idx[3] || ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+                        outs[n_outs++] = j;
+                    }
+                }
+                // each thread reads alpha[i] and b[i] before writing g[i] and beta[i]: an output may alias
+                // alpha or b exactly (ggml-alloc gives beta the memory of alpha once the add has read
+                // it), not dt or A (read by every token)
+                const auto no_overlap = [&]() {
+                    const ggml_tensor * ins[4] = { alpha, b, dt, a };
+                    const ggml_tensor * os[2]  = { mul, sig };
+                    for (const ggml_tensor * o : os) {
+                        const char * lo = (const char *) o->data, * hi = lo + ggml_nbytes(o);
+                        for (int j = 0; j < 4; j++) {
+                            const char * il = (const char *) ins[j]->data, * ih = il + ggml_nbytes(ins[j]);
+                            const bool exact = j < 2 && il == lo && ih == hi;
+                            if (!exact && il < hi && lo < ih) {
+                                return false;
+                            }
+                        }
+                    }
+                    const char * m0 = (const char *) mul->data, * s0 = (const char *) sig->data;
+                    return !(m0 < s0 + ggml_nbytes(sig) && s0 < m0 + ggml_nbytes(mul));
+                };
+                if (fits && ggml_can_fuse_subgraph(cgraph, i, count, ops, outs, n_outs) && no_overlap()) {
+                    ggml_cuda_op_gdn_gates(*cuda_ctx, alpha, dt, a, b, mul, sig);
+                    return count - 1;
+                }
+            }
+        }
+    }
+
     if (node->op == GGML_OP_MUL) {
         ggml_cuda_moe_weighted_reduction_match match;
         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {

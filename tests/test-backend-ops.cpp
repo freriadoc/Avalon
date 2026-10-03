@@ -4909,6 +4909,39 @@ struct test_gated_delta_net_gather : public test_case {
     }
 };
 
+// gated delta net gates as qwen-style models build them: g = softplus(alpha + dt) * A, beta = sigmoid(b)
+// (the CUDA backend computes both in one kernel)
+struct test_gdn_gates : public test_case {
+    const int64_t n_heads;
+    const int64_t n_tokens;
+
+    std::string vars() override {
+        return VARS_TO_STR2(n_heads, n_tokens);
+    }
+
+    test_gdn_gates(int64_t n_heads = 48, int64_t n_tokens = 1) : n_heads(n_heads), n_tokens(n_tokens) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GDN_GATES";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * alpha = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_heads, n_tokens);
+        ggml_tensor * dt    = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_heads);
+        ggml_tensor * a     = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_heads);
+        ggml_tensor * b     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, n_heads, n_tokens, 1);
+        ggml_tensor * g     = ggml_mul(ctx, ggml_softplus(ctx, ggml_add(ctx, alpha, dt)), a);
+        g = ggml_reshape_4d(ctx, g, 1, n_heads, n_tokens, 1);
+        ggml_build_forward_expand(gf, g);
+        ggml_tensor * beta  = ggml_sigmoid(ctx, b);
+        ggml_build_forward_expand(gf, beta);
+        return ggml_add(ctx, g, beta);   // one output reading both
+    }
+};
+
 struct test_gated_delta_net_cache_fusion : public test_case {
     const ggml_type type;
 
@@ -11530,6 +11563,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_reduce(300,  8,  7, false, true,  true,  true));
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
+    test_cases.emplace_back(new test_gdn_gates(48, 1));
+    test_cases.emplace_back(new test_gdn_gates(48, 3));
+    test_cases.emplace_back(new test_gdn_gates(7, 33));
     test_cases.emplace_back(new test_gated_delta_net_gather(48, 128, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net_gather(4, 32, 3, 2));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
