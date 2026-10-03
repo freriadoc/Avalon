@@ -5720,11 +5720,16 @@ static __device__ __forceinline__ void moe_hosted_pause() {
 #endif
 }
 
-// the activations and the router's ids of the block to mapped host memory, written by the kernel
-// (a copy node of the graph would wait in a copy engine's queue for the previous layers, holding
-// back the cache's fills on that engine)
-static __global__ void k_moe_hosted_stage(const float * act, float * h_act, int64_t n_act,
-                                          const int32_t * ids, int64_t ids_nb1, int32_t * h_ids, int n_used, int n_tokens) {
+// Entering a hosted block, in one kernel: the activations and the router's ids to mapped host memory
+// (written by a kernel: a copy node of the graph would wait in a copy engine's queue for the previous
+// layers, holding back the cache's fills on that engine), every block its share; the last block to
+// finish (blocks done counted in d_seq[1]) publishes the layer in the mailbox, waits for the host's
+// plan and copies it to device memory. (Three kernels before: stage, publish, wait_plan.)
+static __global__ void k_moe_hosted_enter(const float * act, float * h_act, int64_t n_act,
+                                          const int32_t * ids, int64_t ids_nb1, int32_t * h_ids, int n_used, int n_tokens,
+                                          uint32_t * d_seq, uint32_t * d_expect, volatile moe_hosted_mailbox * mail,
+                                          uint32_t slot, const volatile uint32_t * flag,
+                                          const volatile int32_t * m_plan, int32_t * d_plan, int n_plan) {
     for (int64_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n_act; i += (int64_t) gridDim.x * blockDim.x) {
         h_act[i] = act[i];
     }
@@ -5733,33 +5738,35 @@ static __global__ void k_moe_hosted_stage(const float * act, float * h_act, int6
         const int t = i / n_used;
         h_ids[i] = *(const int32_t *) ((const char *) ids + (int64_t) t * ids_nb1 + (int64_t) (i % n_used) * sizeof(int32_t));
     }
-}
-
-static __global__ void k_moe_hosted_publish(uint32_t * d_seq, uint32_t * d_expect,
-                                            volatile moe_hosted_mailbox * mail, uint32_t slot, uint32_t n_tokens) {
-    const uint32_t value = *d_seq + 1;
-    *d_seq = value;
-    *d_expect = value;
-    mail->slot = slot;
-    mail->n_tokens = n_tokens;
+    // this block's writes reach the host before it counts itself
     __threadfence_system();
-    mail->seq = value;
-    __threadfence_system();
-}
-
-// thread 0 waits for the plan, then the block copies it to device memory
-static __global__ void k_moe_hosted_wait_plan(const uint32_t * d_expect, const volatile uint32_t * flag,
-                                              const volatile int32_t * m_plan, int32_t * d_plan, int n) {
-    __shared__ uint32_t expect;
+    __syncthreads();
+    __shared__ bool last;
     if (threadIdx.x == 0) {
-        expect = *d_expect;
-        while ((int32_t) (*flag - expect) < 0) {
+        last = atomicAdd(d_seq + 1, 1u) == gridDim.x - 1;
+    }
+    __syncthreads();
+    if (!last) {
+        return;
+    }
+    if (threadIdx.x == 0) {
+        d_seq[1] = 0;   // for the next layer (stream-ordered)
+        __threadfence();
+        const uint32_t value = d_seq[0] + 1;
+        d_seq[0]  = value;
+        *d_expect = value;
+        mail->slot     = slot;
+        mail->n_tokens = (uint32_t) n_tokens;
+        __threadfence_system();
+        mail->seq = value;
+        __threadfence_system();
+        while ((int32_t) (*flag - value) < 0) {
             moe_hosted_pause();
         }
         __threadfence_system();
     }
     __syncthreads();
-    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+    for (int i = threadIdx.x; i < n_plan; i += blockDim.x) {
         d_plan[i] = m_plan[i];
     }
 }
@@ -6011,8 +6018,8 @@ static moe_hosted_state * moe_hosted_state_for(moe_cache_session & session, moe_
     st->n_threads = threads ? std::max(1, atoi(threads)) : std::max(1, hw / 2);
     if (!moe_hosted_host_alloc((void **) &st->h_mail, sizeof(moe_hosted_mailbox)) ||
         !(st->m_mail = moe_hosted_device_ptr(st->h_mail)) ||
-        cudaMalloc((void **) &st->d_seq, sizeof(uint32_t)) != cudaSuccess ||
-        cudaMemset(st->d_seq, 0, sizeof(uint32_t)) != cudaSuccess) {
+        cudaMalloc((void **) &st->d_seq, 2 * sizeof(uint32_t)) != cudaSuccess ||   // [0] seq, [1] blocks done (stage)
+        cudaMemset(st->d_seq, 0, 2 * sizeof(uint32_t)) != cudaSuccess) {
         (void) cudaGetLastError();
         return nullptr;
     }
@@ -6175,10 +6182,10 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
     const int64_t padded_ff = GGML_PAD(n_ff, MATRIX_ROW_PADDING);
 
     // activations and ids to the host, then the mailbox
-    k_moe_hosted_stage<<<8, 256, 0, stream>>>((const float *) act->data, layer->m_act, (int64_t) n_tokens * n_embd,
-                                              (const int32_t *) ids->data, ids->nb[1], layer->m_ids, n_used, n_tokens);
-    k_moe_hosted_publish<<<1, 1, 0, stream>>>(st->d_seq, layer->d_expect, st->m_mail, (uint32_t) slot, (uint32_t) n_tokens);
-    k_moe_hosted_wait_plan<<<1, 64, 0, stream>>>(layer->d_expect, layer->m_flags, layer->m_plan, layer->d_plan, 3 * rows);
+    k_moe_hosted_enter<<<8, 256, 0, stream>>>((const float *) act->data, layer->m_act, (int64_t) n_tokens * n_embd,
+                                              (const int32_t *) ids->data, ids->nb[1], layer->m_ids, n_used, n_tokens,
+                                              st->d_seq, layer->d_expect, st->m_mail, (uint32_t) slot, layer->m_flags,
+                                              layer->m_plan, layer->d_plan, 3 * rows);
 
     // resident rows: activations quantized, up/gate/swiglu into the glu result (alive until down has
     // read it), its quantization, down into the block's output
