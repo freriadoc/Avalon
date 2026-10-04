@@ -156,7 +156,8 @@ static mmq_scratch_layout mmq_scratch_get_layout(const ggml_tensor * dst, int cc
 
     const int64_t ne10_padded = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING);
     const bool    fallback    = src0->ne[1] % 128 != 0;
-    const size_t  q8_1_tail   = ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, src1->ne[1]) * sizeof(block_q8_1_mmq);
+    // MUL_MAT_ID: the tokens are src1->ne[2] (#29941: J_max of the tokens, not of the experts per token)
+    const size_t  q8_1_tail   = ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ids ? src1->ne[2] : src1->ne[1]) * sizeof(block_q8_1_mmq);
 
     mmq_scratch_layout l;
     size_t off = 0;
@@ -343,7 +344,7 @@ void ggml_cuda_mul_mat_q(
     }
 
     const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block +
-        ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
+        ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne12) * sizeof(block_q8_1_mmq);
     ggml_cuda_pool_alloc<char> src1_q8_1_pool(ctx.pool());
     char * src1_q8_1 = scratch ? scratch + scratch_l.src1_q8_1 : src1_q8_1_pool.alloc(nbytes_src1_q8_1);
     ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
