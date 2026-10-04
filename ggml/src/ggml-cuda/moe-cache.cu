@@ -316,6 +316,9 @@ struct moe_cache_device {
     std::vector<std::unique_ptr<moe_cache_pool>> pools;
     std::vector<moe_cache_shape> shapes;
     std::unordered_map<const void *, moe_cache_seen_tensor> seen_tensors;
+    // the expert tensors registered in place (page-rounded ranges, one per tensor): fills copied straight from the
+    // weights by the SDMA engine, without the memcpy to the stage
+    std::vector<std::pair<uintptr_t, uintptr_t>> pinned;
     std::unordered_map<moe_cache_key, moe_cache_demand, moe_cache_key_hash> demand_count;
     size_t visits_since_new_tensor = 0;
     bool budget_ready = false;
@@ -1643,6 +1646,12 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
         cap = bytes;
         return true;
     };
+    // a job's source when it lies in a registered expert tensor (copied straight from it), else nullptr
+    const auto pinned_source = [&](const moe_cache_job & j) -> const void * {
+        const uintptr_t src = (uintptr_t) j.source;
+        auto range = std::upper_bound(device->pinned.begin(), device->pinned.end(), std::make_pair(src, UINTPTR_MAX));
+        return range != device->pinned.begin() && src + j.bytes <= (--range)->second ? j.source : nullptr;
+    };
     // the entry a job fills (session lock taken)
     // Both staging buffers sized once to the largest expert of the pools: freeing pinned memory
     // synchronizes every stream (each gives its SDMA engine back) and, once generation runs, the fill
@@ -1740,8 +1749,11 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
             error = error != cudaSuccess ? error : cudaErrorInvalidValue;
         } else {
             bufs[0] = stage;
-            memcpy(bufs[b], cur.source, cur.bytes);
-            error = cudaMemcpyAsync(cur_dst, bufs[b], cur.bytes, cudaMemcpyHostToDevice, stream);
+            const void * direct = pinned_source(cur);
+            if (!direct) {
+                memcpy(bufs[b], cur.source, cur.bytes);
+            }
+            error = cudaMemcpyAsync(cur_dst, direct ? direct : bufs[b], cur.bytes, cudaMemcpyHostToDevice, stream);
         }
         for (;;) {
             moe_cache_job next;
@@ -1760,7 +1772,9 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                     have = false;
                 } else {
                     bufs[b ^ 1] = nb;
-                    memcpy(bufs[b ^ 1], next.source, next.bytes);
+                    if (!pinned_source(next)) {
+                        memcpy(bufs[b ^ 1], next.source, next.bytes);
+                    }
                 }
             }
             if (error == cudaSuccess) {
@@ -1782,7 +1796,8 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
             cur = next;
             cur_pool = next_pool;
             cur_dst = next_dst;
-            error = cudaMemcpyAsync(cur_dst, bufs[b], cur.bytes, cudaMemcpyHostToDevice, stream);
+            const void * direct_next = pinned_source(cur);
+            error = cudaMemcpyAsync(cur_dst, direct_next ? direct_next : bufs[b], cur.bytes, cudaMemcpyHostToDevice, stream);
         }
         {
             std::lock_guard<std::mutex> lock(session->mu);
@@ -1874,10 +1889,13 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                 static const bool ft = getenv("GGML_CUDA_MOE_FILL_STATS") != nullptr;
                 static int64_t f_n = 0, f_cpy = 0, f_dma = 0, f_idle = 0, f_last = 0;
                 const int64_t t0 = ft ? ggml_time_us() : 0;
-                memcpy(stage, job.source, job.bytes);
+                const bool pinned = pinned_source(job) != nullptr;
+                if (!pinned) {
+                    memcpy(stage, job.source, job.bytes);
+                }
                 const int64_t t1 = ft ? ggml_time_us() : 0;
                 error = cudaMemcpyAsync(
-                        destination, stage, job.bytes, cudaMemcpyHostToDevice, stream);
+                        destination, pinned ? job.source : stage, job.bytes, cudaMemcpyHostToDevice, stream);
                 static int64_t f_call = 0;
                 const int64_t t1b = ft ? ggml_time_us() : 0;
                 if (error == cudaSuccess) {
@@ -2178,6 +2196,43 @@ static size_t moe_cache_zone_bytes(const moe_cache_session & session);
 static void moe_cache_setup_zone(moe_cache_device & device, size_t zone_bytes, int n_zones);
 static void moe_cache_attach_test_region(moe_cache_device & device);
 
+// Every expert tensor registered in place (hipHostRegister, read-only; GGML_CUDA_MOE_PIN=0 disables), once the
+// tensors are known and before any graph runs:
+// - registering synchronizes every stream, which then gives back its SDMA engine; once generation runs, the
+//   draft and main streams took both engines back before the fill stream (fills 0.6 - 1.25 ms instead of
+//   ~60 us): here no stream holds one yet;
+// - the range of a tensor is rounded outwards to whole pages: a prefetch copies a whole tensor, and a copy
+//   that ends outside a registered range went through ROCm's staged path on registered pages, prefill -8 %
+//   (and with one range per expert, 73 728 of them: -25 %);
+// - the pages are not locked in RAM (the GPU mapping follows them by MMU notifiers); the GPU page tables
+//   (~2 MiB per GiB, ~94 MiB here) come after the budget was fixed: out of the reserve.
+// Measured (32k MTP, 3 pairs): fills 115 -> 61 us, CPU per hosted layer -4 to -6 %, generation ~+1.6 %,
+// prefill unchanged.
+static void moe_cache_pin_experts(moe_cache_device & device) {
+    static const bool enabled = !getenv("GGML_CUDA_MOE_PIN") || atoi(getenv("GGML_CUDA_MOE_PIN")) != 0;
+    if (!enabled || !device.pinned.empty()) {
+        return;
+    }
+    const int64_t t0 = ggml_time_us();
+    ggml_cuda_set_device(device.logical);
+    size_t bytes = 0, fail = 0;
+    for (const auto & t : device.seen_tensors) {
+        const uintptr_t b = (uintptr_t) t.first;
+        const uintptr_t ib = b & ~(uintptr_t) 4095;
+        const uintptr_t ie = GGML_PAD(b + (size_t) t.second.n_expert * t.second.expert_size, 4096);
+        if (cudaHostRegister((void *) ib, ie - ib, cudaHostRegisterReadOnly) == cudaSuccess) {
+            device.pinned.push_back({ib, ie});
+            bytes += ie - ib;
+        } else {
+            (void) cudaGetLastError();
+            fail++;
+        }
+    }
+    std::sort(device.pinned.begin(), device.pinned.end());
+    MOE_CACHE_LOG("[moe-cache] CUDA%d pin: %zu expert tensors registered (%zu MiB) in %.1f s, %zu failed\n",
+            device.physical, device.pinned.size(), bytes >> 20, (ggml_time_us() - t0) / 1e6, fail);
+}
+
 static void moe_cache_build_pending(
         moe_cache_session & session, moe_cache_device & device) {
     if (!moe_cache_prepare_budget(session, device)) {
@@ -2188,6 +2243,8 @@ static void moe_cache_build_pending(
         }
         return;
     }
+
+    moe_cache_pin_experts(device);
 
     const size_t scratch_reserve =
         moe_cache_scratch_total(device.scratch_reserve);
@@ -2580,6 +2637,10 @@ static void moe_cache_cancel_queue_locked(
 
 static void moe_cache_free_device(moe_cache_device & device) {
     ggml_cuda_set_device(device.logical);
+    for (const auto & r : device.pinned) {
+        (void) cudaHostUnregister((void *) r.first);
+    }
+    device.pinned.clear();
     if (device.compute_stream) {
         cudaStreamSynchronize(device.compute_stream);
     }
