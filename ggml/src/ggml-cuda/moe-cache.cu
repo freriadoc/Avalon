@@ -230,7 +230,19 @@ struct moe_cache_job {
     const void * source = nullptr;
     size_t bytes = 0;
     bool rewarm = false;   // an entry lending evicted, restored: joins the LRU at its cold end
+    // SPLIT: a tensor of an expert moved to the GPU for the layer being computed; the last one of the expert
+    // to arrive raises the layer's flag
+    uint32_t * split_flag = nullptr;
+    int * split_pending = nullptr;
+    uint32_t split_seq = 0;
 };
+
+// SPLIT: one tensor of the moved expert done (copied, failed or cancelled): the last one raises the flag
+static void moe_cache_split_done_locked(const moe_cache_job & job) {
+    if (job.split_flag && --*job.split_pending == 0) {
+        __atomic_store_n(job.split_flag, job.split_seq, __ATOMIC_RELEASE);
+    }
+}
 
 struct moe_cache_demand {
     uint16_t count = 0;
@@ -1959,6 +1971,7 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                     }
                 }
             }
+            moe_cache_split_done_locked(job);
             moe_cache_rewarm_feed_locked(*session, *device);
             session->idle_cv.notify_all();
         }
@@ -2616,6 +2629,7 @@ static void moe_cache_cancel_queue_locked(
     for (std::deque<moe_cache_job> * q : {&device.queue, &device.pregate_queue})
     for (auto it = q->begin(); it != q->end();) {
         if (all || moe_cache_ranges_overlap(it->source, it->bytes, base, size)) {
+            moe_cache_split_done_locked(*it);   // a GPU waiting for it must not wait forever
             device.queued_bytes = it->bytes <= device.queued_bytes
                 ? device.queued_bytes - it->bytes : 0;
             if (it->pool >= 0 && it->pool < (int)device.pools.size()) {
@@ -5894,7 +5908,13 @@ struct moe_hosted_layer {
     int32_t * h_ids = nullptr;
     int32_t * h_plan = nullptr;     // up ids, gate ids, down ids: rows each
     float * h_res = nullptr;        // rows x n_embd
-    uint32_t * h_flags = nullptr;   // [0] plan ready, [16] CPU rows ready
+    uint32_t * h_flags = nullptr;   // [0] plan ready, [16] CPU rows ready, [24] moved expert ready (SPLIT)
+    int32_t * h_plan2 = nullptr;    // SPLIT: the moved expert's rows (up, gate, down ids; -1 elsewhere)
+    int32_t * m_plan2 = nullptr;
+    int32_t * d_plan2 = nullptr;
+    int split_pending = 0;          // SPLIT: its tensors still copying (session lock)
+    float * h_chk = nullptr;        // DIAGNOSTIC (GGML_CUDA_MOE_SPLIT_VERIFY=1): the GPU results of the moved rows (rows x n_embd)
+    float * m_chk = nullptr;
     int32_t * h_pred = nullptr;     // PREGATE: [0] stamp (publication it belongs to), [1] count, then expert ids
     int last_tokens = 1;            // PREGATE: tokens of the last publication (read by the serving thread)
     int32_t * m_pred = nullptr;
@@ -5929,6 +5949,7 @@ struct moe_hosted_state {
     size_t q8_mid_bytes = 0;
     int n_threads = 1;
     std::vector<moe_cache_pin> pins;                         // held by the last plan
+    int64_t split_moved = 0;                                 // SPLIT: experts moved to the GPU
     // served by the thread that waits for the stream (ggml_cuda_moe_hosted_wait)
     std::mutex serve_mu;
     uint32_t last_seq = 0;
@@ -5947,6 +5968,7 @@ struct moe_hosted_pending {
     moe_hosted_layer * layer = nullptr;
     const ggml_tensor * down = nullptr;
     int rows = 0;
+    bool split = false;   // SPLIT: the merge skips the rows of the moved expert
 };
 static thread_local moe_hosted_pending g_hosted_pending;
 
@@ -6118,12 +6140,47 @@ static __global__ void k_moe_hosted_enter(const float * act, float * h_act, int6
 }
 
 // a block per row: the rows the CPU computed (down id -1) are copied in once they are ready
+// SPLIT: the moved expert arrived (or none was moved): its plan to the device
+static __global__ void k_moe_split_wait(const uint32_t * d_expect, const volatile uint32_t * flag,
+                                        const volatile int32_t * m_plan2, int32_t * d_plan2, int n_plan) {
+    if (threadIdx.x == 0) {
+        const uint32_t expect = *d_expect;
+        while ((int32_t) (*flag - expect) < 0) {
+            moe_hosted_pause();
+        }
+        __threadfence_system();
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < n_plan; i += blockDim.x) {
+        d_plan2[i] = m_plan2[i];
+    }
+}
+
+// DIAGNOSTIC (GGML_CUDA_MOE_SPLIT_VERIFY=1): the moved rows as the GPU computed them, to the host; then flag [28]
+static __global__ void k_moe_split_check(const uint32_t * d_expect, const int32_t * d_moved_down_ids, const float * dst,
+                                         float * m_chk, uint32_t * flag, int n_embd, int rows) {
+    for (int row = 0; row < rows; row++) {
+        if (d_moved_down_ids[row] < 0) {
+            continue;
+        }
+        for (int i = threadIdx.x; i < n_embd; i += blockDim.x) {
+            m_chk[(size_t) row * n_embd + i] = dst[(size_t) row * n_embd + i];
+        }
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        *(volatile uint32_t *) flag = *d_expect;
+        __threadfence_system();
+    }
+}
+
 static __global__ void k_moe_hosted_merge(const uint32_t * d_expect, const volatile uint32_t * flag,
-                                          const int32_t * d_down_ids, const volatile float * m_res,
-                                          float * dst, int n_embd) {
+                                          const int32_t * d_down_ids, const int32_t * d_moved_down_ids,
+                                          const volatile float * m_res, float * dst, int n_embd) {
     const int row = blockIdx.x;
-    if (d_down_ids[row] >= 0) {
-        return;
+    if (d_down_ids[row] >= 0 || (d_moved_down_ids && d_moved_down_ids[row] >= 0)) {
+        return;   // resident, or moved to the GPU (SPLIT)
     }
     __shared__ uint32_t expect;
     if (threadIdx.x == 0) {
@@ -6227,6 +6284,179 @@ static int moe_hosted_plan(moe_hosted_state & st, moe_hosted_layer & layer, cons
     }
     if (wake_worker) {
         session.cv.notify_all();
+    }
+    return n_cpu;
+}
+
+// SPLIT (GGML_CUDA_MOE_SPLIT=0 disables): in a pass of 2 tokens or more, at most one expert of the CPU rows is moved to
+// the GPU when it can arrive and be computed before the CPU finishes the others. Its missing tensors take cache
+// entries (an admission) and go to the front of the fill queue; the last one to arrive raises the layer's flag,
+// which a kernel queued after the resident rows waits for. Costs (us, measured on this machine): CPU rows
+// 7 + 45 per distinct expert + 35 per row; a copy 5 + bytes / 11.5 GB/s, after a fill already copying (60);
+// the moved rows on the GPU 20; the CPU slowed by the copy (RAM shared) 22. Returns the CPU rows left.
+static bool moe_split_enabled() {
+    static const bool enabled = !getenv("GGML_CUDA_MOE_SPLIT") || atoi(getenv("GGML_CUDA_MOE_SPLIT")) != 0;
+    return enabled;
+}
+
+static int moe_hosted_split(moe_hosted_state * st, moe_hosted_layer * layer, int rows, int n_tokens, uint32_t seq,
+                            int32_t * cpu_rows, int n_cpu) {
+    if (!moe_split_enabled() || n_tokens < 2) {
+        return n_cpu;
+    }
+    int32_t * plan2 = layer->h_plan2;
+    for (int i = 0; i < 3 * rows; i++) {
+        plan2[i] = -1;
+    }
+    int jobs = 0;
+    if (n_cpu > 0) {
+        moe_cache_session & session = *st->session;
+        moe_cache_device & device = *st->device;
+        std::lock_guard<std::mutex> lock(session.mu);
+        const bool usable = !session.stopping && !session.dormant && !device.dead.load() &&
+            layer->pool_index >= 0 && layer->pool_index < (int) device.pools.size() &&
+            layer->down_pool_index >= 0 && layer->down_pool_index < (int) device.pools.size();
+        if (usable) {
+            moe_cache_pool * pools[3] = {device.pools[layer->pool_index].get(), device.pools[layer->pool_index].get(),
+                                         device.pools[layer->down_pool_index].get()};
+            const void * base[3] = {layer->up_w->data, layer->gate_w->data, layer->down_w->data};
+            const int idx[3] = {layer->pool_index, layer->pool_index, layer->down_pool_index};
+            const size_t tsz[3] = {ggml_nbytes(layer->up_w) / layer->up_w->ne[2], ggml_nbytes(layer->gate_w) / layer->gate_w->ne[2],
+                                   ggml_nbytes(layer->down_w) / layer->down_w->ne[2]};
+            struct cand { int32_t e; int rows; int slot[3]; bool valid[3]; double arrival; };
+            std::vector<cand> c;
+            for (int j = 0; j < n_cpu; j++) {
+                const int32_t e = layer->h_ids[cpu_rows[j]];
+                bool seen = false;
+                for (auto & x : c) {
+                    if (x.e == e) { x.rows++; seen = true; }
+                }
+                if (!seen) {
+                    c.push_back({e, 1, {-1, -1, -1}, {false, false, false}, 60.0});
+                }
+            }
+            for (auto & x : c) {
+                for (int k = 0; k < 3; k++) {
+                    const auto f = pools[k]->map.find(moe_cache_key{base[k], x.e});
+                    if (f != pools[k]->map.end()) {
+                        x.slot[k] = f->second;
+                        x.valid[k] = pools[k]->slots[f->second].state == moe_cache_slot_state::valid;
+                    }
+                    if (!x.valid[k]) {
+                        x.arrival += 5.0 + tsz[k] / 11500.0;
+                    }
+                }
+            }
+            const auto cpu_cost = [](int d, int r) { return d > 0 ? 7.0 + 45.0 * d + 35.0 * r : 0.0; };
+            const int D = (int) c.size();
+            const double all = cpu_cost(D, n_cpu);
+            int best = -1;
+            double best_gain = 0.0;
+            for (int i = 0; i < D; i++) {
+                const double crit = std::max(cpu_cost(D - 1, n_cpu - c[i].rows) + 22.0, c[i].arrival + 20.0);
+                if (all - crit > best_gain) {
+                    best_gain = all - crit;
+                    best = i;
+                }
+            }
+            if (best >= 0) {
+                cand & x = c[best];
+                // its missing tensors: queued admissions are promoted, the others reserved now; one copying
+                // already (in flight, or a prefetch) cannot be waited for: no move
+                std::vector<std::deque<moe_cache_job>::iterator> found(3, device.queue.end());
+                bool ok = true;
+                for (int k = 0; k < 3 && ok; k++) {
+                    if (x.valid[k] || x.slot[k] < 0) {
+                        continue;
+                    }
+                    for (auto it = device.queue.begin(); it != device.queue.end(); ++it) {
+                        if (it->key == moe_cache_key{base[k], x.e} && it->slot == x.slot[k]) {
+                            found[k] = it;
+                        }
+                    }
+                    ok = found[k] != device.queue.end();
+                }
+                // the resident tensors pinned before reserving the others: a reservation evicts the cold end of
+                // the pool, which can be this expert's own gate or up
+                const bool pinned_resident = ok;
+                for (int k = 0; k < 3 && ok; k++) {
+                    if (x.valid[k]) {
+                        pools[k]->slots[x.slot[k]].readers++;
+                    }
+                }
+                for (int k = 0; k < 3 && ok; k++) {
+                    if (x.valid[k] || x.slot[k] >= 0) {
+                        continue;
+                    }
+                    int inserts_left = 1;
+                    bool wake = false;
+                    ok = moe_cache_enqueue_locked(session, device, *pools[k], idx[k], base[k], x.e, tsz[k], inserts_left, wake,
+                                                  true, false, false);
+                    if (ok) {
+                        x.slot[k] = device.queue.back().slot;
+                    }
+                }
+                if (!ok) {
+                    for (int k = 0; k < 3; k++) {
+                        if (x.valid[k] && pinned_resident) {
+                            pools[k]->slots[x.slot[k]].readers--;
+                        }
+                    }
+                }
+                if (ok) {
+                    std::vector<moe_cache_job> moved;
+                    for (int k = 0; k < 3; k++) {
+                        if (x.valid[k]) {
+                            continue;
+                        }
+                        for (auto it = device.queue.begin(); it != device.queue.end(); ++it) {
+                            if (it->key == moe_cache_key{base[k], x.e} && it->slot == x.slot[k]) {
+                                moved.push_back(*it);
+                                device.queue.erase(it);
+                                break;
+                            }
+                        }
+                    }
+                    for (auto & j : moved) {
+                        j.split_flag = layer->h_flags + 24;
+                        j.split_pending = &layer->split_pending;
+                        j.split_seq = seq;
+                    }
+                    for (auto it = moved.rbegin(); it != moved.rend(); ++it) {
+                        device.queue.push_front(*it);
+                    }
+                    jobs = (int) moved.size();
+                    layer->split_pending = jobs;
+                    for (int k = 0; k < 3; k++) {
+                        if (!x.valid[k]) {
+                            pools[k]->slots[x.slot[k]].readers++;   // the resident ones are pinned already
+                        }
+                        st->pins.push_back({pools[k], x.slot[k]});
+                    }
+                    static const bool verify = getenv("GGML_CUDA_MOE_SPLIT_VERIFY") && atoi(getenv("GGML_CUDA_MOE_SPLIT_VERIFY")) > 0;
+                    int left = 0;
+                    for (int j = 0; j < n_cpu; j++) {
+                        const int row = cpu_rows[j];
+                        if (layer->h_ids[row] == x.e) {
+                            for (int k = 0; k < 3; k++) {
+                                plan2[k * rows + row] = moe_cache_gpu_index(*pools[k], x.slot[k]);
+                            }
+                            if (verify) {
+                                cpu_rows[left++] = row;   // computed on both sides, compared
+                            }
+                        } else {
+                            cpu_rows[left++] = row;
+                        }
+                    }
+                    n_cpu = left;
+                    st->split_moved++;
+                    session.cv.notify_all();
+                }
+            }
+        }
+    }
+    if (jobs == 0) {
+        __atomic_store_n(&layer->h_flags[24], seq, __ATOMIC_RELEASE);
     }
     return n_cpu;
 }
@@ -6340,8 +6570,9 @@ static void moe_hosted_serve_one(moe_hosted_state * st, uint32_t seq) {
     cpu_rows.resize(moe_hosted_rows_max);
     const int rows = layer->n_used * n_tokens;
     layer->last_tokens = n_tokens;
-    const int n_cpu = moe_hosted_plan(*st, *layer, layer->h_ids, rows, layer->h_plan, cpu_rows.data());
+    int n_cpu = moe_hosted_plan(*st, *layer, layer->h_ids, rows, layer->h_plan, cpu_rows.data());
     __atomic_store_n(&layer->h_flags[0], seq, __ATOMIC_RELEASE);
+    n_cpu = moe_hosted_split(st, layer, rows, n_tokens, seq, cpu_rows.data(), n_cpu);
     const int64_t t_plan = stats_every > 0 ? ggml_time_us() : 0;
 
     // the CPU rows in one call, one column each (k = 1) with its token's activations: exactly the
@@ -6366,6 +6597,43 @@ static void moe_hosted_serve_one(moe_hosted_state * st, uint32_t seq) {
         }
     }
     __atomic_store_n(&layer->h_flags[16], seq, __ATOMIC_RELEASE);
+    {
+        // DIAGNOSTIC (GGML_CUDA_MOE_SPLIT_VERIFY=1): the moved rows, CPU against GPU (relative L2 error per row)
+        static const bool verify = getenv("GGML_CUDA_MOE_SPLIT_VERIFY") && atoi(getenv("GGML_CUDA_MOE_SPLIT_VERIFY")) > 0;
+        static int64_t vn = 0, vbad = 0;
+        static double vsum = 0, vmax = 0;
+        if (verify && n_tokens >= 2) {
+            bool any = false;
+            for (int r = 0; r < rows; r++) any |= layer->h_plan2[2 * rows + r] >= 0;
+            if (any) {
+                while ((int32_t) (__atomic_load_n(&layer->h_flags[28], __ATOMIC_ACQUIRE) - seq) < 0) {
+#if defined(__x86_64__)
+                    __builtin_ia32_pause();
+#endif
+                }
+                for (int r = 0; r < rows; r++) {
+                    if (layer->h_plan2[2 * rows + r] < 0) continue;
+                    double d2 = 0, n2 = 0;
+                    for (int i = 0; i < layer->n_embd; i++) {
+                        const double a = layer->h_res[(size_t) r * layer->n_embd + i], b = layer->h_chk[(size_t) r * layer->n_embd + i];
+                        d2 += (a - b) * (a - b); n2 += a * a;
+                    }
+                    const double rel = sqrt(d2 / std::max(n2, 1e-30));
+                    vn++; vsum += rel; vmax = std::max(vmax, rel); vbad += rel > 0.2;
+                    if (rel > 0.2) {
+                        double g2 = 0;
+                        for (int i = 0; i < layer->n_embd; i++) g2 += (double) layer->h_chk[(size_t) r * layer->n_embd + i] * layer->h_chk[(size_t) r * layer->n_embd + i];
+                        GGML_LOG_INFO("split verify: slot %u row %d expert %d relative error %.3f, |cpu| %.3e |gpu| %.3e\n",
+                                      slot, r, layer->h_ids[r], rel, sqrt(n2), sqrt(g2));
+                    }
+                }
+                if (vn % 2000 < 4) {
+                    GGML_LOG_INFO("split verify: %lld rows, relative error mean %.4f, max %.4f, above 0.2: %lld\n",
+                                  (long long) vn, vsum / vn, vmax, (long long) vbad);
+                }
+            }
+        }
+    }
     if (pregate_k > 0) {
         moe_hosted_pregate(st, slot, layer, seq);
     }
@@ -6382,6 +6650,7 @@ static void moe_hosted_serve_one(moe_hosted_state * st, uint32_t seq) {
                         (long long) st->device->pregate_predicted, (long long) st->device->pregate_enqueued,
                         (long long) st->device->pregate_served);
             }
+            GGML_LOG_INFO("moe hosted: %lld experts moved to the GPU\n", (long long) st->split_moved);
             GGML_LOG_INFO("moe hosted: %lld layers: GPU between layers %.1f us, plan %.1f us, CPU rows %.1f us (%.2f rows); "
                     "last %d layers, CPU rows with up+gate %.2f, down only %.2f, up or gate %.2f, nothing %.2f\n",
                     (long long) st->st_n, st->st_gaps ? (double) st->st_gap / st->st_gaps : 0.0,
@@ -6522,11 +6791,15 @@ static moe_hosted_layer * moe_hosted_register(moe_hosted_state & st, moe_cache_d
               moe_hosted_host_alloc((void **) &layer->h_plan, 3 * rows * sizeof(int32_t)) &&
               moe_hosted_host_alloc((void **) &layer->h_res, (size_t) rows * layer->n_embd * sizeof(float)) &&
               moe_hosted_host_alloc((void **) &layer->h_flags, 128) &&
-              moe_hosted_host_alloc((void **) &layer->h_pred, (2 + rows) * sizeof(int32_t));
+              moe_hosted_host_alloc((void **) &layer->h_pred, (2 + rows) * sizeof(int32_t)) &&
+              moe_hosted_host_alloc((void **) &layer->h_plan2, 3 * rows * sizeof(int32_t)) &&
+              moe_hosted_host_alloc((void **) &layer->h_chk, (size_t) rows * layer->n_embd * sizeof(float));
     ok = ok && (layer->m_act = moe_hosted_device_ptr(layer->h_act)) && (layer->m_ids = moe_hosted_device_ptr(layer->h_ids)) &&
          (layer->m_plan = moe_hosted_device_ptr(layer->h_plan)) && (layer->m_res = moe_hosted_device_ptr(layer->h_res)) &&
-         (layer->m_flags = moe_hosted_device_ptr(layer->h_flags)) && (layer->m_pred = moe_hosted_device_ptr(layer->h_pred));
+         (layer->m_flags = moe_hosted_device_ptr(layer->h_flags)) && (layer->m_pred = moe_hosted_device_ptr(layer->h_pred)) &&
+         (layer->m_plan2 = moe_hosted_device_ptr(layer->h_plan2)) && (layer->m_chk = moe_hosted_device_ptr(layer->h_chk));
     ok = ok && cudaMalloc((void **) &layer->d_plan, 3 * rows * sizeof(int32_t)) == cudaSuccess &&
+         cudaMalloc((void **) &layer->d_plan2, 3 * rows * sizeof(int32_t)) == cudaSuccess &&
          cudaMalloc((void **) &layer->d_act_ids, rows * sizeof(int32_t)) == cudaSuccess &&
          cudaMalloc((void **) &layer->d_expect, sizeof(uint32_t)) == cudaSuccess;
     if (ok) {
@@ -6643,6 +6916,24 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
     (void) ggml_cuda_moe_cache_mmv(layer->down_base, down->src[0]->type, q8_mid, layer->d_plan + 2 * rows, nullptr,
                                    (float *) down->data, n_ff, n_embd, 0, (int64_t) down->src[0]->nb[2], rows, rows,
                                    true, stream);
+    // SPLIT: the rows of the expert moved to the GPU, once it arrived; the kernels skip every other row
+    const bool split_on = moe_split_enabled() && n_tokens >= 2;
+    if (split_on) {
+        k_moe_split_wait<<<1, 256, 0, stream>>>(layer->d_expect, layer->m_flags + 24, layer->m_plan2, layer->d_plan2, 3 * rows);
+        ggml_cuda_moe_cache_mmv_fused(layer->base, layer->base, wtype, q8_act, layer->d_plan2, layer->d_plan2 + rows,
+                                      layer->d_act_ids, (float *) glu->data, n_embd, n_ff, (int64_t) gate->src[0]->nb[2],
+                                      rows, n_tokens, -INFINITY, INFINITY, -INFINITY, INFINITY, stream);
+        quantize_row_q8_1_cuda((const float *) glu->data, nullptr, q8_mid, wtype, n_ff, n_ff, (int64_t) rows * n_ff,
+                               (int64_t) rows * n_ff, padded_ff, rows, 1, 1, stream);
+        (void) ggml_cuda_moe_cache_mmv(layer->down_base, down->src[0]->type, q8_mid, layer->d_plan2 + 2 * rows, nullptr,
+                                       (float *) down->data, n_ff, n_embd, 0, (int64_t) down->src[0]->nb[2], rows, rows,
+                                       true, stream);
+        static const bool verify = getenv("GGML_CUDA_MOE_SPLIT_VERIFY") && atoi(getenv("GGML_CUDA_MOE_SPLIT_VERIFY")) > 0;
+        if (verify) {
+            k_moe_split_check<<<1, 256, 0, stream>>>(layer->d_expect, layer->d_plan2 + 2 * rows, (const float *) down->data,
+                                                     layer->m_chk, layer->m_flags + 28, (int) n_embd, rows);
+        }
+    }
     // PREGATE: the next layer's router (the next MUL_MAT with as many outputs as experts, F32 weights) on this
     // layer's MoE input; queued after the resident rows, it runs while the GPU would wait for the CPU rows
     const int pregate_k = moe_pregate_k();
@@ -6675,7 +6966,7 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
     // the CPU rows are copied in when a node first reads the block's output (the shared expert,
     // queued in between, runs while the CPU computes them)
     CUDA_CHECK(cudaGetLastError());
-    g_hosted_pending = {layer, down, rows};
+    g_hosted_pending = {layer, down, rows, split_on};
     return 3;
 }
 
@@ -6696,7 +6987,8 @@ void ggml_cuda_moe_hosted_flush(ggml_backend_cuda_context & ctx, const ggml_tens
     }
     ggml_cuda_q8_1_reuse_written(ctx, p.down);
     k_moe_hosted_merge<<<p.rows, 256, 0, ctx.stream()>>>(p.layer->d_expect, p.layer->m_flags + 16,
-                                                          p.layer->d_plan + 2 * p.rows, p.layer->m_res,
+                                                          p.layer->d_plan + 2 * p.rows, p.split ? p.layer->d_plan2 + 2 * p.rows : nullptr,
+                                                          p.layer->m_res,
                                                           (float *) p.down->data, (int) p.layer->n_embd);
     CUDA_CHECK(cudaGetLastError());
     p = {};
