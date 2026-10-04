@@ -6288,12 +6288,12 @@ static int moe_hosted_plan(moe_hosted_state & st, moe_hosted_layer & layer, cons
     return n_cpu;
 }
 
-// SPLIT (GGML_CUDA_MOE_SPLIT=0 disables): in a pass of 2 tokens or more, at most one expert of the CPU rows is moved to
-// the GPU when it can arrive and be computed before the CPU finishes the others. Its missing tensors take cache
+// SPLIT (GGML_CUDA_MOE_SPLIT=0 disables): in a pass of 2 tokens or more, one or two experts of the CPU rows are moved to
+// the GPU when they can arrive and be computed before the CPU finishes the others. Their missing tensors take cache
 // entries (an admission) and go to the front of the fill queue; the last one to arrive raises the layer's flag,
 // which a kernel queued after the resident rows waits for. Costs (us, measured on this machine): CPU rows
 // 7 + 45 per distinct expert + 35 per row; a copy 5 + bytes / 11.5 GB/s, after a fill already copying (60);
-// the moved rows on the GPU 20; the CPU slowed by the copy (RAM shared) 22. Returns the CPU rows left.
+// the moved rows on the GPU 20; the CPU slowed by each copy (RAM shared) 22. Returns the CPU rows left.
 static bool moe_split_enabled() {
     static const bool enabled = !getenv("GGML_CUDA_MOE_SPLIT") || atoi(getenv("GGML_CUDA_MOE_SPLIT")) != 0;
     return enabled;
@@ -6350,40 +6350,63 @@ static int moe_hosted_split(moe_hosted_state * st, moe_hosted_layer * layer, int
             const auto cpu_cost = [](int d, int r) { return d > 0 ? 7.0 + 45.0 * d + 35.0 * r : 0.0; };
             const int D = (int) c.size();
             const double all = cpu_cost(D, n_cpu);
-            int best = -1;
+            // the best single expert or pair (copies one after another, one GPU pass, the CPU slowed by each
+            // copy). Measured with pairs: arrival after the CPU finished in 1.0 % of the layers moving one
+            // expert (85 us late on average) and 1.6 % of those moving two (226 us), ~0.7 us per layer in all
+            std::vector<int> best;
             double best_gain = 0.0;
             for (int i = 0; i < D; i++) {
                 const double crit = std::max(cpu_cost(D - 1, n_cpu - c[i].rows) + 22.0, c[i].arrival + 20.0);
                 if (all - crit > best_gain) {
                     best_gain = all - crit;
-                    best = i;
+                    best = {i};
                 }
             }
-            if (best >= 0) {
-                cand & x = c[best];
-                // its missing tensors: queued admissions are promoted, the others reserved now; one copying
-                // already (in flight, or a prefetch) cannot be waited for: no move
-                std::vector<std::deque<moe_cache_job>::iterator> found(3, device.queue.end());
+            for (int i = 0; i < D; i++) {
+                for (int j = i + 1; j < D; j++) {
+                    const double crit = std::max(cpu_cost(D - 2, n_cpu - c[i].rows - c[j].rows) + 44.0,
+                                                 c[i].arrival + c[j].arrival - 60.0 + 20.0);
+                    if (all - crit > best_gain) {
+                        best_gain = all - crit;
+                        best = {i, j};
+                    }
+                }
+            }
+            static const bool verify = getenv("GGML_CUDA_MOE_SPLIT_VERIFY") && atoi(getenv("GGML_CUDA_MOE_SPLIT_VERIFY")) > 0;
+            std::vector<moe_cache_job> moved;
+            std::vector<int32_t> moved_experts;
+            // an expert whose missing tensor is copying already (in flight, or a prefetch) cannot be waited
+            // for: not moved; queued admissions are promoted, the other missing tensors reserved
+            std::vector<int> chosen;
+            for (int b : best) {
+                const cand & x = c[b];
                 bool ok = true;
                 for (int k = 0; k < 3 && ok; k++) {
                     if (x.valid[k] || x.slot[k] < 0) {
                         continue;
                     }
-                    for (auto it = device.queue.begin(); it != device.queue.end(); ++it) {
-                        if (it->key == moe_cache_key{base[k], x.e} && it->slot == x.slot[k]) {
-                            found[k] = it;
-                        }
-                    }
-                    ok = found[k] != device.queue.end();
-                }
-                // the resident tensors pinned before reserving the others: a reservation evicts the cold end of
-                // the pool, which can be this expert's own gate or up
-                const bool pinned_resident = ok;
-                for (int k = 0; k < 3 && ok; k++) {
-                    if (x.valid[k]) {
-                        pools[k]->slots[x.slot[k]].readers++;
+                    ok = false;
+                    for (const auto & j : device.queue) {
+                        ok |= j.key == moe_cache_key{base[k], x.e} && j.slot == x.slot[k];
                     }
                 }
+                if (ok) {
+                    chosen.push_back(b);
+                }
+            }
+            // the resident tensors of every chosen expert pinned before any reservation: a reservation evicts the
+            // cold end of the pool, which can be a resident gate, up or down of a chosen expert (entries still
+            // copying are not in the LRU)
+            for (int b : chosen) {
+                for (int k = 0; k < 3; k++) {
+                    if (c[b].valid[k]) {
+                        pools[k]->slots[c[b].slot[k]].readers++;
+                    }
+                }
+            }
+            for (int b : chosen) {
+                cand & x = c[b];
+                bool ok = true;
                 for (int k = 0; k < 3 && ok; k++) {
                     if (x.valid[k] || x.slot[k] >= 0) {
                         continue;
@@ -6398,60 +6421,59 @@ static int moe_hosted_split(moe_hosted_state * st, moe_hosted_layer * layer, int
                 }
                 if (!ok) {
                     for (int k = 0; k < 3; k++) {
-                        if (x.valid[k] && pinned_resident) {
+                        if (x.valid[k]) {
                             pools[k]->slots[x.slot[k]].readers--;
                         }
                     }
+                    continue;
                 }
-                if (ok) {
-                    std::vector<moe_cache_job> moved;
-                    for (int k = 0; k < 3; k++) {
-                        if (x.valid[k]) {
-                            continue;
-                        }
-                        for (auto it = device.queue.begin(); it != device.queue.end(); ++it) {
-                            if (it->key == moe_cache_key{base[k], x.e} && it->slot == x.slot[k]) {
-                                moved.push_back(*it);
-                                device.queue.erase(it);
-                                break;
-                            }
-                        }
-                    }
-                    for (auto & j : moved) {
-                        j.split_flag = layer->h_flags + 24;
-                        j.split_pending = &layer->split_pending;
-                        j.split_seq = seq;
-                    }
-                    for (auto it = moved.rbegin(); it != moved.rend(); ++it) {
-                        device.queue.push_front(*it);
-                    }
-                    jobs = (int) moved.size();
-                    layer->split_pending = jobs;
-                    for (int k = 0; k < 3; k++) {
-                        if (!x.valid[k]) {
-                            pools[k]->slots[x.slot[k]].readers++;   // the resident ones are pinned already
-                        }
+                for (int k = 0; k < 3; k++) {
+                    if (x.valid[k]) {
                         st->pins.push_back({pools[k], x.slot[k]});
+                        continue;
                     }
-                    static const bool verify = getenv("GGML_CUDA_MOE_SPLIT_VERIFY") && atoi(getenv("GGML_CUDA_MOE_SPLIT_VERIFY")) > 0;
-                    int left = 0;
-                    for (int j = 0; j < n_cpu; j++) {
-                        const int row = cpu_rows[j];
-                        if (layer->h_ids[row] == x.e) {
-                            for (int k = 0; k < 3; k++) {
-                                plan2[k * rows + row] = moe_cache_gpu_index(*pools[k], x.slot[k]);
-                            }
-                            if (verify) {
-                                cpu_rows[left++] = row;   // computed on both sides, compared
-                            }
-                        } else {
-                            cpu_rows[left++] = row;
+                    for (auto it = device.queue.begin(); it != device.queue.end(); ++it) {
+                        if (it->key == moe_cache_key{base[k], x.e} && it->slot == x.slot[k]) {
+                            moved.push_back(*it);
+                            device.queue.erase(it);
+                            break;
                         }
                     }
-                    n_cpu = left;
-                    st->split_moved++;
-                    session.cv.notify_all();
+                    pools[k]->slots[x.slot[k]].readers++;
+                    st->pins.push_back({pools[k], x.slot[k]});
                 }
+                for (int j = 0; j < n_cpu; j++) {
+                    const int row = cpu_rows[j];
+                    if (layer->h_ids[row] == x.e) {
+                        for (int k = 0; k < 3; k++) {
+                            plan2[k * rows + row] = moe_cache_gpu_index(*pools[k], x.slot[k]);
+                        }
+                    }
+                }
+                moved_experts.push_back(x.e);
+            }
+            if (!moved.empty()) {
+                for (auto & j : moved) {
+                    j.split_flag = layer->h_flags + 24;
+                    j.split_pending = &layer->split_pending;
+                    j.split_seq = seq;
+                }
+                for (auto it = moved.rbegin(); it != moved.rend(); ++it) {
+                    device.queue.push_front(*it);
+                }
+                jobs = (int) moved.size();
+                layer->split_pending = jobs;
+                int left = 0;
+                for (int j = 0; j < n_cpu; j++) {
+                    const int row = cpu_rows[j];
+                    const bool gone = std::find(moved_experts.begin(), moved_experts.end(), layer->h_ids[row]) != moved_experts.end();
+                    if (!gone || verify) {
+                        cpu_rows[left++] = row;   // with VERIFY computed on both sides, compared
+                    }
+                }
+                n_cpu = left;
+                st->split_moved += (int64_t) moved_experts.size();
+                session.cv.notify_all();
             }
         }
     }
@@ -6597,7 +6619,7 @@ static void moe_hosted_serve_one(moe_hosted_state * st, uint32_t seq) {
         }
     }
     __atomic_store_n(&layer->h_flags[16], seq, __ATOMIC_RELEASE);
-    {
+{
         // DIAGNOSTIC (GGML_CUDA_MOE_SPLIT_VERIFY=1): the moved rows, CPU against GPU (relative L2 error per row)
         static const bool verify = getenv("GGML_CUDA_MOE_SPLIT_VERIFY") && atoi(getenv("GGML_CUDA_MOE_SPLIT_VERIFY")) > 0;
         static int64_t vn = 0, vbad = 0;
