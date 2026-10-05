@@ -1372,6 +1372,28 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return nullptr;
     }
 
+    // an F32 tensor whose values are all BF16 values (a model converted from BF16): the same values in half the
+    // bytes, for a device buffer (a CPU product would convert its activations to BF16); read once here to check
+    if ((flags & TENSOR_BF16_IF_EXACT) && cur->type == GGML_TYPE_F32 && !(flags & TENSOR_ALLOW_RESHAPE) && !is_lazy &&
+            !no_alloc && !use_direct_io && !ggml_backend_buft_is_host(buft) && ggml_is_contiguous(cur)) {
+        const llama_tensor_weight & w = require_weight(tn.str().c_str());
+        std::vector<uint32_t> bits(ggml_nelements(cur));
+        files.at(w.idx)->seek(w.offs, SEEK_SET);
+        files.at(w.idx)->read_raw(bits.data(), bits.size() * sizeof(uint32_t));
+        bool exact = true;
+        for (const uint32_t b : bits) {
+            exact = exact && (b & 0xFFFF) == 0;
+        }
+        if (exact) {
+            t_meta.type  = GGML_TYPE_BF16;
+            t_meta.nb[0] = ggml_type_size(GGML_TYPE_BF16);
+            for (int dim = 1; dim < GGML_MAX_DIMS; dim++) {
+                t_meta.nb[dim] = t_meta.nb[dim-1]*t_meta.ne[dim-1];
+            }
+            bf16_from_f32.insert(tn.str());
+        }
+    }
+
     ggml_context * ctx = ctx_for_buft(buft);
 
     // if duplicated, check if the original tensor was allocated in the same buffer type context and avoid creating a new one
@@ -1397,6 +1419,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 }
 
 void llama_model_loader::done_getting_tensors(bool partial) const {
+    if (!bf16_from_f32.empty()) {
+        LLAMA_LOG_INFO("%s: %zu F32 tensors loaded as BF16 (their values are BF16 values)\n", __func__, bf16_from_f32.size());
+    }
     if (n_created > n_tensors) {
         throw std::runtime_error(format("%s: too many tensors created; expected %d, got %d", __func__, n_tensors, n_created));
     }
@@ -1639,6 +1664,25 @@ bool llama_model_loader::load_all_data(
             if (!progress_callback((float) size_done / size_data, progress_callback_user_data)) {
                 return false;
             }
+        }
+
+        // stored as F32, loaded as BF16 (TENSOR_BF16_IF_EXACT: the low halves are all zero)
+        if (bf16_from_f32.count(ggml_get_name(cur))) {
+            const size_t n = ggml_nelements(cur);
+            std::vector<uint32_t> bits(n);
+            if (use_mmap || lazy.has(cur)) {
+                memcpy(bits.data(), (const uint8_t *) mappings.at(weight->idx)->addr() + weight->offs, n * sizeof(uint32_t));
+            } else {
+                files.at(weight->idx)->seek(weight->offs, SEEK_SET);
+                files.at(weight->idx)->read_raw(bits.data(), n * sizeof(uint32_t));
+            }
+            std::vector<uint16_t> half(n);
+            for (size_t k = 0; k < n; k++) {
+                half[k] = (uint16_t) (bits[k] >> 16);
+            }
+            ggml_backend_tensor_set(cur, half.data(), 0, ggml_nbytes(cur));
+            size_done += n * sizeof(uint32_t);
+            continue;
         }
 
         size_t n_size = ggml_nbytes(cur);

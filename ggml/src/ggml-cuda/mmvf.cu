@@ -243,7 +243,28 @@ static __global__ void mul_mat_vec_f(
                 gate_x2 = (const int *) gate_x;
             }
         }
-        for (int col2 = tid; col2 < ncols2; col2 += block_size) {
+        // four values per load when the layout allows (8 bytes of weights per load, as the F32 path): with two the
+        // loads in flight halve and a BF16 matrix is read hardly faster than the same matrix in F32
+        bool wide = ncols2 % 2 == 0 && stride_col_y2 % 2 == 0 && (uintptr_t) x % 8 == 0 && (uintptr_t) y2 % 16 == 0;
+        if constexpr (has_fusion) {
+            wide = wide && !use_gate;
+        }
+        if (wide) {
+            const int2   * x4 = (const int2 *) x;
+            const float4 * y4 = (const float4 *) y2;
+            for (int col4 = tid; col4 < ncols2/2; col4 += block_size) {
+                const int2 tmpx = x4[col4];
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    const float4 tmpy = y4[j*(stride_col_y2/2) + col4];
+                    ggml_cuda_mad(sumf[j], ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx.x)[0]), tmpy.x);
+                    ggml_cuda_mad(sumf[j], ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx.x)[1]), tmpy.y);
+                    ggml_cuda_mad(sumf[j], ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx.y)[0]), tmpy.z);
+                    ggml_cuda_mad(sumf[j], ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx.y)[1]), tmpy.w);
+                }
+            }
+        }
+        for (int col2 = wide ? ncols2 : tid; col2 < ncols2; col2 += block_size) {
             const int tmpx = x2[col2];
             int tmpx_gate = 0;
             if constexpr (has_fusion) {

@@ -70,6 +70,7 @@ struct llama_model_loader {
     static const int TENSOR_SKIP_IF_VIRTUAL = 1 << 3;
     static const int TENSOR_ALLOW_RESHAPE   = 1 << 4;
     static const int TENSOR_READ_LAZY       = 1 << 5; // read rows on demand instead of loading whole tensor; requires mmap for now
+    static const int TENSOR_BF16_IF_EXACT   = 1 << 6; // an F32 tensor whose values are all BF16 values, in a device buffer, is loaded as BF16
 
     int n_kv      = 0;
     int n_tensors = 0;
@@ -138,6 +139,9 @@ struct llama_model_loader {
 
     size_t size_done = 0;
     size_t size_data = 0;
+
+    // TENSOR_BF16_IF_EXACT: tensors stored as F32 and loaded as BF16 (exactly the same values)
+    std::set<std::string> bf16_from_f32;
     std::vector<std::pair<size_t, size_t>> mmaps_used;
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:

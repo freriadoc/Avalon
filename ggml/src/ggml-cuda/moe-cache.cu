@@ -6009,8 +6009,18 @@ static __device__ __forceinline__ void moe_hosted_pause() {
 // its k best experts written to host memory with the stamp of the publication that follows
 // 128 threads per expert (two experts per block): each thread issues its 5 float4 weight loads at once
 // (n_embd = 2560 = 128 x 5 x 4), multiplies them by every token's activations, then warp + block sums
-template <int max_tokens, int per_thread>
-static __global__ void k_pregate_logits(const float * w, const float * act, float * logits, int n_embd, int n_expert, int n_tokens) {
+// the router's weights in F32 or in BF16 (converted exactly: the same products)
+static __device__ __forceinline__ float4 pregate_w4(const float * w, int i) {
+    return ((const float4 *) w)[i];
+}
+static __device__ __forceinline__ float4 pregate_w4(const uint16_t * w, int i) {
+    const uint2 u = ((const uint2 *) w)[i];
+    return make_float4(__uint_as_float(u.x << 16), __uint_as_float(u.x & 0xFFFF0000u),
+                       __uint_as_float(u.y << 16), __uint_as_float(u.y & 0xFFFF0000u));
+}
+
+template <int max_tokens, int per_thread, typename wt>
+static __global__ void k_pregate_logits(const wt * w, const float * act, float * logits, int n_embd, int n_expert, int n_tokens) {
     const int e = blockIdx.x * 2 + threadIdx.x / 128;
     const int tid = threadIdx.x % 128;
     const int lane = threadIdx.x % warpSize;
@@ -6018,11 +6028,11 @@ static __global__ void k_pregate_logits(const float * w, const float * act, floa
     __shared__ float part[2][4][max_tokens];
     float sum[max_tokens] = {0.0f};
     if (e < n_expert) {
-        const float4 * w4 = (const float4 *) (w + (size_t) e * n_embd);
+        const wt * we = w + (size_t) e * n_embd;
         float4 wv[per_thread];
 #pragma unroll
         for (int c = 0; c < per_thread; c++) {
-            wv[c] = w4[tid + c * 128];
+            wv[c] = pregate_w4(we, tid + c * 128);
         }
 #pragma unroll
         for (int t = 0; t < max_tokens; t++) {
@@ -6956,7 +6966,7 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
                                                      layer->m_chk, layer->m_flags + 28, (int) n_embd, rows);
         }
     }
-    // PREGATE: the next layer's router (the next MUL_MAT with as many outputs as experts, F32 weights) on this
+    // PREGATE: the next layer's router (the next MUL_MAT with as many outputs as experts, F32 or BF16 weights) on this
     // layer's MoE input; queued after the resident rows, it runs while the GPU would wait for the CPU rows
     const int pregate_k = moe_pregate_k();
     // from 2 tokens: with one, the CPU rows (~1.5 per layer) are not the critical path and it does not pay
@@ -6965,7 +6975,7 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
         const ggml_tensor * w_next = nullptr;
         for (int j = i + 4; j < cgraph->n_nodes && !w_next; j++) {
             const ggml_tensor * n = cgraph->nodes[j];
-            if (n->op == GGML_OP_MUL_MAT && n->src[0]->type == GGML_TYPE_F32 && n->src[0]->ne[1] == n_expert &&
+            if (n->op == GGML_OP_MUL_MAT && (n->src[0]->type == GGML_TYPE_F32 || n->src[0]->type == GGML_TYPE_BF16) && n->src[0]->ne[1] == n_expert &&
                 n->src[0]->ne[0] == n_embd && ggml_is_contiguous(n->src[0])) {
                 w_next = n->src[0];
             }
@@ -6979,8 +6989,13 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
                 CUDA_CHECK(cudaMalloc((void **) &st->d_pg_logits, (size_t) moe_hosted_rows_max * n_expert * sizeof(float)));
             }
             // two experts per block; up to 8 tokens (the MTP verification has 3)
-            k_pregate_logits<8, 5><<<(unsigned) ((n_expert + 1) / 2), 256, 0, stream>>>((const float *) w_next->data, (const float *) act->data,
-                                                                st->d_pg_logits, (int) n_embd, (int) n_expert, n_tokens);
+            if (w_next->type == GGML_TYPE_BF16) {
+                k_pregate_logits<8, 5><<<(unsigned) ((n_expert + 1) / 2), 256, 0, stream>>>((const uint16_t *) w_next->data, (const float *) act->data,
+                                                                    st->d_pg_logits, (int) n_embd, (int) n_expert, n_tokens);
+            } else {
+                k_pregate_logits<8, 5><<<(unsigned) ((n_expert + 1) / 2), 256, 0, stream>>>((const float *) w_next->data, (const float *) act->data,
+                                                                    st->d_pg_logits, (int) n_embd, (int) n_expert, n_tokens);
+            }
             k_pregate_topk<<<(unsigned) n_tokens, 512, 0, stream>>>(st->d_pg_logits, (int) n_expert, n_tokens, pregate_k, st->d_seq, layer->m_pred);
         }
     }
