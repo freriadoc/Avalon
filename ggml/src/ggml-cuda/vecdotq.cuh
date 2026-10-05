@@ -24,6 +24,37 @@ static __device__ __forceinline__ int get_int_b2(const void * x, const int & i32
     return x32;
 }
 
+// Weights are read once per token: with non-temporal loads (HIP: slc dlc) the caches keep the kernels' code and
+// the activations instead (a decoding layer streams ~45 MB of weights through the 6 MB L2 and the 80 MB infinity
+// cache; a kernel then refetches its code from VRAM: the MoE top-k 6.4 -> 10.5 us in a bench). The same values.
+static __device__ __forceinline__ int get_int_b2_nt(const void * x, const int & i32) {
+#if defined(GGML_USE_HIP)
+    // one 32-bit load at a 2-byte aligned address (the hardware allows it; the compiler merges the two 16-bit
+    // loads of get_int_b2 the same way, but drops the non-temporal hint of two separate loads when it does)
+    return __builtin_nontemporal_load((const int *) ((const uint16_t *) x + 2*i32));
+#else
+    return get_int_b2(x, i32);
+#endif // defined(GGML_USE_HIP)
+}
+
+static __device__ __forceinline__ half load_half_nt(const half * x) {
+#if defined(GGML_USE_HIP)
+    return __ushort_as_half(__builtin_nontemporal_load((const unsigned short *) x));
+#else
+    return *x;
+#endif // defined(GGML_USE_HIP)
+}
+
+// one weight value (byte, 16 bits) with a non-temporal load
+template <typename T>
+static __device__ __forceinline__ T ld_nt(const T * x) {
+#if defined(GGML_USE_HIP)
+    return __builtin_nontemporal_load(x);
+#else
+    return *x;
+#endif // defined(GGML_USE_HIP)
+}
+
 static __device__ __forceinline__ int get_int_b4(const void * x, const int & i32) {
     return ((const int *) x)[i32]; // assume at least 4 byte alignment
 }
@@ -858,11 +889,11 @@ static __device__ __forceinline__ float vec_dot_q8_0_q8_1(
 
 #pragma unroll
     for (int i = 0; i < VDR_Q8_0_Q8_1_MMVQ; ++i) {
-        v[i] = get_int_b2(bq8_0->qs, iqs + i);
+        v[i] = get_int_b2_nt(bq8_0->qs, iqs + i);   // weights
         u[i] = get_int_b4(bq8_1->qs, iqs + i);
     }
 
-    return vec_dot_q8_0_q8_1_impl<float, VDR_Q8_0_Q8_1_MMVQ>(v, u, bq8_0->d, __low2half(bq8_1->ds));
+    return vec_dot_q8_0_q8_1_impl<float, VDR_Q8_0_Q8_1_MMVQ>(v, u, load_half_nt(&bq8_0->d), __low2half(bq8_1->ds));
 }
 
 static __device__ __forceinline__ float vec_dot_q2_K_q8_1(
@@ -1126,16 +1157,17 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
 
     const block_iq2_s * bq2 = (const block_iq2_s *) vbq + kbx;
 
-    const int       qs_packed = get_int_b2(bq2->qs, iqs/2);
+    const int       qs_packed = get_int_b2_nt(bq2->qs, iqs/2);   // weights: non-temporal loads
     const uint8_t * qs        = (const uint8_t *) &qs_packed;
 
-    const int qh = bq2->qh[iqs/2];
+    const int qh = ld_nt(&bq2->qh[iqs/2]);
 
-    const int       signs_packed_32 = get_int_b2(bq2->qs, QK_K/32 + iqs/2);
+    const int       signs_packed_32 = get_int_b2_nt(bq2->qs, QK_K/32 + iqs/2);
     const uint8_t * signs_packed_8  = (const uint8_t *) &signs_packed_32;
 
-    const int ls0 = bq2->scales[iqs/2] & 0x0F;
-    const int ls1 = bq2->scales[iqs/2] >> 4;
+    const int scales = ld_nt(&bq2->scales[iqs/2]);
+    const int ls0 = scales & 0x0F;
+    const int ls1 = scales >> 4;
 
     int sumi0 = 0;
     int sumi1 = 0;
@@ -1162,7 +1194,7 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
     }
     const int sumi = (sumi0*ls0 + sumi1*ls1 + (sumi0 + sumi1)/2)/4;
 
-    const float d = __half2float(bq2->d) * __low2float(bq8_1[iqs/2].ds);
+    const float d = __half2float(load_half_nt(&bq2->d)) * __low2float(bq8_1[iqs/2].ds);
     return d * sumi;
 }
 
@@ -1340,14 +1372,14 @@ static __device__ __forceinline__ float vec_dot_iq4_nl_q8_1(
     int sumi = 0;
 #pragma unroll
     for (int l = 0; l < VDR_Q4_0_Q8_1_MMVQ; ++l) {
-        const int aux_q4 = get_int_b2(bq4->qs, iqs + l);
+        const int aux_q4 = get_int_b2_nt(bq4->qs, iqs + l);   // weights: non-temporal loads
         const int2 v = get_int_from_table_16(aux_q4, kvalues_iq4nl);
 
         sumi = ggml_cuda_dp4a(v.x, q8[l + 0], sumi);
         sumi = ggml_cuda_dp4a(v.y, q8[l + 4], sumi);
     }
 
-    const float d = __half2float(bq4->d) * __low2float(bq8_1->ds);
+    const float d = __half2float(load_half_nt(&bq4->d)) * __low2float(bq8_1->ds);
     return d * sumi;
 }
 
@@ -1401,9 +1433,9 @@ static __device__ __forceinline__ float vec_dot_iq3_k_q8_1(
     const uint8_t * aux8 = (const uint8_t *)&aux32;
 
     const int hshift = 4*(1-ib128);
-    const uint16_t sh = bq3->scales_h >> (8*ib128 + il8/2);
+    const uint16_t sh = ld_nt(&bq3->scales_h) >> (8*ib128 + il8/2);   // weights: non-temporal loads
 
-    const uint8_t extra = bq3->extra >> (8*ib128 + il8/2);
+    const uint8_t extra = ld_nt(&bq3->extra) >> (8*ib128 + il8/2);
     const uint32_t extra32 = uint32_t(extra) * 0x01010101;
     const uint32_t extra32_1 = (extra32 << 3) & 0x88888888;
     const uint32_t extra32_2 = (extra32 << 1) & 0x88888888;
@@ -1412,8 +1444,8 @@ static __device__ __forceinline__ float vec_dot_iq3_k_q8_1(
     int sumi[4] = {0, 0, 0, 0};
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
-        const uint32_t vl = ql[2*i+0] | (ql[2*i+1] << 16);
-        const uint32_t vh = ((qh[2*i+0] | (qh[2*i+1] << 16)) << hshift);
+        const uint32_t vl = ld_nt(&ql[2*i+0]) | (ld_nt(&ql[2*i+1]) << 16);
+        const uint32_t vh = ((ld_nt(&qh[2*i+0]) | (ld_nt(&qh[2*i+1]) << 16)) << hshift);
 
         const uint32_t val1 = ((vl >> 0) & 0x33333333) | extra32_1 | ((vh >> 2) & 0x04040404) | ((vh >> 0) & 0x40404040);
         const uint32_t val2 = ((vl >> 2) & 0x33333333) | extra32_2 | ((vh >> 3) & 0x04040404) | ((vh >> 1) & 0x40404040);
@@ -1432,9 +1464,9 @@ static __device__ __forceinline__ float vec_dot_iq3_k_q8_1(
         q8 += sizeof(block_q8_1)/4;
         sumi[3] = ggml_cuda_dp4a(v2.y, q8[i], sumi[3]);
     }
-    const float d = __half2float(bq3->d);
+    const float d = __half2float(load_half_nt(&bq3->d));
     const uint16_t * sl16 = (const uint16_t *)bq3->scales_l + 2*ib128;
-    aux32 = ((((sl16[0] | (sl16[1] << 16)) >> shift) & 0x0f0f0f0f) << 1) | 0x01010101;
+    aux32 = ((((ld_nt(&sl16[0]) | (ld_nt(&sl16[1]) << 16)) >> shift) & 0x0f0f0f0f) << 1) | 0x01010101;
     return d * (__low2float(bq8_1[4*ib128+0].ds) * aux8[0] * (sh & 0x01 ? -1 : 1) * sumi[0] +
                 __low2float(bq8_1[4*ib128+1].ds) * aux8[1] * (sh & 0x04 ? -1 : 1) * sumi[1] +
                 __low2float(bq8_1[4*ib128+2].ds) * aux8[2] * (sh & 0x10 ? -1 : 1) * sumi[2] +
