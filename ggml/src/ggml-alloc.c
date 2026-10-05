@@ -937,7 +937,7 @@ static bool ggml_gallocr_reserve_n_impl(
 
         // even if there are no tensors allocated in this buffer, we still need to allocate it to initialize views
         bool realloc = galloc->buffers[i] == NULL;
-        // a buffer borrowed from a cache is returned as soon as a graph needs less of it
+        // a buffer borrowed from a cache is returned when a graph needs much less of it (below)
         const bool shrink = galloc->shrink && !no_alloc && galloc->buffers[i] && ggml_moe_cache.borrows && ggml_moe_cache.borrows(galloc->bufts[i]);
         size_t new_size = 0;
         for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
@@ -948,8 +948,24 @@ static bool ggml_gallocr_reserve_n_impl(
                 realloc = true;
             }
         }
-        if (shrink && !realloc && new_size < ggml_vbuffer_size(galloc->buffers[i])) {
+        // returned only when the graph needs half of it or less and that frees 256 MiB or more: the prompt's
+        // buffers (GiB) when generation starts, not the tens of MiB a speculative decoder's verification batch
+        // varies by (1 to 4 tokens: 16 to 40 MiB here). A reallocation moves the tensors, and the graph of
+        // another draft length could no longer be replayed; 24 MiB back in the cache would be ~0.06 point of hits
+        const size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;
+        bool shrinking = false;
+        if (shrink && !realloc && new_size * 2 <= cur_size && cur_size - new_size >= ((size_t) 256 << 20)) {
             realloc = true;
+            shrinking = true;
+        }
+        // a buffer that grows keeps every chunk at least at its size: graphs of different shapes needing more in
+        // different chunks (the verification batches of a speculative decoder) otherwise reallocated it at
+        // every change of shape; it settles at the largest of them
+        if (realloc && !shrinking && galloc->buffers[i]) {
+            for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
+                struct tallocr_chunk * chunk = galloc->buf_tallocs[i]->chunks[c];
+                chunk->max_size = MAX(chunk->max_size, ggml_vbuffer_chunk_size(galloc->buffers[i], c));
+            }
         }
         if (realloc) {
 #ifndef NDEBUG

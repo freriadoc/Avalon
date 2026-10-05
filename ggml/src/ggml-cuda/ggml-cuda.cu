@@ -2902,8 +2902,16 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     return use_cuda_graph;
 }
 
+// one graph per shape: the first node alone gave the verification batches of a speculative decoder (2, 3 or 4
+// tokens, built in the same memory by llama.cpp) one shared entry, each change of draft length reset it (a step
+// run kernel by kernel, then a new capture); the node count and the first node's shape tell them apart, and a
+// collision only costs a capture (the properties of every node are compared before a replay)
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return cgraph->nodes[0];
+    const ggml_tensor * n0 = cgraph->nodes[0];
+    uintptr_t key = (uintptr_t) n0;
+    key ^= (uintptr_t) cgraph->n_nodes * 0x9E3779B97F4A7C15ull;
+    key ^= (uintptr_t) (n0->ne[1] * 0xC2B2AE3D27D4EB4Full + n0->ne[2] * 0x165667B19E3779F9ull);
+    return (const void *) key;
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
