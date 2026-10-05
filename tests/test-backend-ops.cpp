@@ -4388,6 +4388,54 @@ struct test_qwen4_hc_combine_norm : public test_dsv4_hc {
     }
 };
 
+// K1 followed by K2 on its xn: ggml-cuda runs them together (K1 also writes xn in f16 for K2)
+struct test_qwen4_hc_combine_down : public test_dsv4_hc {
+    const int64_t n_embd;
+    const int64_t n_lo;
+    const int64_t n_tokens;
+    ggml_tensor * post_node   = nullptr;
+    ggml_tensor * xn_node     = nullptr;
+    ggml_tensor * inject_node = nullptr;
+    ggml_tensor * lo_node     = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "QWEN4_HC_COMBINE_DOWN"; }
+    std::string vars() override { return VARS_TO_STR3(n_embd, n_lo, n_tokens); }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { post_node, xn_node, inject_node, lo_node }; }
+    double max_nmse_err() override { return 5e-4; }   // CPU: xn quantized to Q8_0 (~5e-5); 9 tokens: cuBLAS in F16 (~1.5e-4)
+
+    test_qwen4_hc_combine_down(int64_t n_embd = 2560, int64_t n_lo = 320, int64_t n_tokens = 1)
+        : n_embd(n_embd), n_lo(n_lo), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * inject   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+        ggml_set_name(inject, "gate");
+        ggml_tensor * block    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(block, "x");
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(residual, "residual");
+        ggml_tensor * gamma    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, hc);
+        ggml_set_name(gamma, "post");
+        ggml_tensor * wi = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_embd*hc, hc);
+        ggml_tensor * wd = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_embd*hc, n_lo);
+
+        ggml_tensor * w = ggml_sigmoid(ctx, ggml_scale(ctx, inject, 1.0f/hc));
+        w = ggml_scale(ctx, w, 2.0f);
+        post_node = ggml_dsv4_hc_post(ctx, block, residual, w, nullptr);
+        xn_node = ggml_mul(ctx, ggml_rms_norm(ctx, post_node, 1e-6f), gamma);
+        ggml_tensor * x = ggml_reshape_2d(ctx, xn_node, n_embd*hc, n_tokens);
+        inject_node = ggml_mul_mat(ctx, wi, x);
+        ggml_prec_set_src(inject_node, GGML_PREC_F16, 1);
+        ggml_tensor * down = ggml_mul_mat(ctx, wd, x);
+        ggml_prec_set_src(down, GGML_PREC_F16, 1);
+        lo_node = ggml_silu(ctx, ggml_scale(ctx, down, 1.0f/hc));
+        // the products first in the graph, right after K1 (depth-first order of the first operand)
+        out = ggml_add(ctx, ggml_add(ctx, inject_node, ggml_sum_rows(ctx, lo_node)),
+                ggml_add(ctx, ggml_sum(ctx, xn_node), ggml_sum(ctx, post_node)));
+        return out;
+    }
+};
+
 struct test_qwen4_hc_down_inject : public test_dsv4_hc {
     const int64_t n_embd;
     const int64_t n_lo;
@@ -4399,7 +4447,7 @@ struct test_qwen4_hc_down_inject : public test_dsv4_hc {
     std::string vars() override { return VARS_TO_STR3(n_embd, n_lo, n_tokens); }
     bool run_whole_graph() override { return true; }
     std::vector<ggml_tensor *> fusion_test_nodes() override { return { inject_node, lo_node }; }
-    double max_nmse_err() override { return 1e-7; }
+    double max_nmse_err() override { return 5e-4; }   // CPU: x quantized to Q8_0 (~5e-5); 9 tokens: cuBLAS in F16 (~1.4e-4)
 
     test_qwen4_hc_down_inject(int64_t n_embd = 2560, int64_t n_lo = 320, int64_t n_tokens = 1)
         : n_embd(n_embd), n_lo(n_lo), n_tokens(n_tokens) {}
@@ -4411,7 +4459,10 @@ struct test_qwen4_hc_down_inject : public test_dsv4_hc {
         ggml_tensor * wd = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_embd*hc, n_lo);
 
         inject_node = ggml_mul_mat(ctx, wi, x);
-        lo_node = ggml_silu(ctx, ggml_scale(ctx, ggml_mul_mat(ctx, wd, x), 1.0f/hc));
+        ggml_prec_set_src(inject_node, GGML_PREC_F16, 1);   // as qwen4exp allows: x in f16
+        ggml_tensor * down = ggml_mul_mat(ctx, wd, x);
+        ggml_prec_set_src(down, GGML_PREC_F16, 1);
+        lo_node = ggml_silu(ctx, ggml_scale(ctx, down, 1.0f/hc));
         out = ggml_add(ctx, inject_node, ggml_sum_rows(ctx, lo_node));
         return out;
     }
@@ -9718,6 +9769,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t n_tokens : { 1, 3, 8, 9 }) {
         test_cases.emplace_back(new test_qwen4_hc_combine_norm(2560, n_tokens));
         test_cases.emplace_back(new test_qwen4_hc_down_inject(2560, 320, n_tokens));
+        test_cases.emplace_back(new test_qwen4_hc_combine_down(2560, 320, n_tokens));
         test_cases.emplace_back(new test_qwen4_hc_up_pre(2560, 320, n_tokens));
     }
     for (int64_t n_hc : {1, 2, 3, 5, 8, 65}) {
@@ -11894,6 +11946,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int64_t n_tokens : { 1, 3 }) {
         test_cases.emplace_back(new test_qwen4_hc_combine_norm(2560, n_tokens));
         test_cases.emplace_back(new test_qwen4_hc_down_inject(2560, 320, n_tokens));
+        test_cases.emplace_back(new test_qwen4_hc_combine_down(2560, 320, n_tokens));
         test_cases.emplace_back(new test_qwen4_hc_up_pre(2560, 320, n_tokens));
     }
 

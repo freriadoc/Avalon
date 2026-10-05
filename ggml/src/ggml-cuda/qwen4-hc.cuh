@@ -13,3 +13,9 @@ int ggml_cuda_try_fuse_qwen4_hc(ggml_backend_cuda_context & ctx, ggml_cgraph * c
 // computes the same way
 bool ggml_cuda_mul_mat_q8_0_f32_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
 void ggml_cuda_mul_mat_q8_0_f32(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+
+// Q8_0 x f32 product of at most 8 columns with the activation converted to f16 (src[1] that may be converted
+// down to F16, ggml_prec_set_src: qwen4exp's hyper-connection down and inject); the fused down/inject kernel
+// computes the same way
+bool ggml_cuda_mul_mat_q8_0_f16_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
+void ggml_cuda_mul_mat_q8_0_f16(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);

@@ -340,13 +340,23 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
 
     // the scatter weights read the same normalized streams as the low-rank gate: build them here,
     // next to it, rather than where the combine consumes them
+    // while decoding, xn (n_embd*hc = 10240 per token) may be converted to f16 for the down and inject products
+    // rather than quantized: far more precise and, read by every row, half the f32 size; larger batches keep
+    // the backend's batched product (see the gate below)
+    const auto allow_f16 = [nt](ggml_tensor * mm) {
+        if (mm->op == GGML_OP_MUL_MAT && nt <= 8) {
+            ggml_prec_set_src(mm, GGML_PREC_F16, 1);
+        }
+    };
     if (inject) {
         *inject = build_lora_mm(w_inject, xn);
+        allow_f16(*inject);
         cb(*inject, "hc_inject", il);
         ggml_build_forward_expand(gf, *inject);
     }
 
     ggml_tensor * lo = build_lora_mm(w_down, xn);
+    allow_f16(lo);
     lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
     ggml_tensor * gate = build_lora_mm(w_up, lo);
     if (gate->op == GGML_OP_MUL_MAT && nt <= 8) {

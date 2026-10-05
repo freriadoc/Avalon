@@ -9,7 +9,7 @@
 // data that fits in cache, while only the three low-rank weights are real memory traffic.
 // Three kernels do the same work:
 //   K1 combine + grouped norm   (reads the residual once, writes the new residual and xn)
-//   K2 W_i and W_d over xn      (one pass; xn quantized once per workgroup, dp4a)
+//   K2 W_i and W_d over xn      (one pass; xn in f16, written by K1 when the two follow each other)
 //   K3 W_u with the gated stream mean as its epilogue (the four rows of an embedding
 //      channel, e + c*n_embd, are computed by the same warp)
 
@@ -110,7 +110,7 @@ static constexpr int QWEN4_HC_K1_PER_THREAD = 4; // n_embd <= 4096
 
 static __global__ void qwen4_hc_combine_norm_f32(
         const float * residual, const float * block, const float * inject, const float * gamma,
-        float * res_out, float * xn,
+        float * res_out, float * xn, half * xh,
         int n_embd, int hc, float s1, float b1, float s2, float b2, float eps) {
     const int c = blockIdx.x;
     const int t = blockIdx.y;
@@ -150,7 +150,11 @@ static __global__ void qwen4_hc_combine_norm_f32(
         const int e = threadIdx.x + k*QWEN4_HC_K1_THREADS;
         if (e < n_embd) {
             r_out[e] = r[k];
-            x_out[e] = r[k] * scale * g[e];
+            const float xv = r[k] * scale * g[e];
+            x_out[e] = xv;
+            if (xh) {
+                xh[((size_t) t*hc + c)*n_embd + e] = __float2half(xv);   // for K2, the same layout as xn
+            }
         }
     }
 }
@@ -193,34 +197,41 @@ static bool qwen4_hc_match_k1(const ggml_cgraph * cgraph, int i) {
 
 // ---------------------------------------------------------------- K2
 
-// Activations are quantized like quantize_q8_1 does for mul_mat_vec_q (per block of 32:
-// d = amax/127, q = round(x/d), d then kept in f16) and dotted with the Q8_0 weights by dp4a: the fused
-// kernels give the numbers of the unfused path.
-// The activation (T x n_in, n_in = n_embd*hc = 10240) is quantized once, by its own launch: the matrices
-// have few rows (hc + n_lo = 324) and long ones, so each row takes a whole workgroup whose warps split
-// it; quantizing the activation in every workgroup would read it 324 times.
-static __global__ void qwen4_hc_quantize_q8(const float * x, int8_t * xq, float * xd, int n_blocks) {
-    const int ib   = blockIdx.x * (blockDim.x / WARP_SIZE) + threadIdx.x / WARP_SIZE;
-    const int lane = threadIdx.x % WARP_SIZE;
-    if (ib >= n_blocks) {
-        return;
+// xn is multiplied in f16 (the graph allows converting it down to F16, ggml_prec_set_src): the Q8_0 weights
+// convert exactly, the products of two f16 are exact in f32 and are summed in f32. The activation is 10240
+// per token and every row's workgroup reads it all, so its size matters: f16 halves the f32 traffic, and the
+// conversion is free when K1 writes it (otherwise one launch, like the q8 quantization it replaces).
+// Against an f64 reference (tests/hcbench, random data) the NMSE is ~3e-8, against 2 - 6e-5 for q8_1.
+static __global__ void qwen4_hc_to_f16(const float * x, half * xh, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        xh[i] = __float2half(x[i]);
     }
-    const float v = x[(size_t) ib*QK8_1 + lane];
-    const float amax = warp_reduce_max(fabsf(v));
-    const float d = amax / 127.0f;
-    xq[(size_t) ib*QK8_1 + lane] = amax == 0.0f ? 0 : (int8_t) roundf(v / d);
-    if (lane == 0) {
-        xd[ib] = __half2float(__float2half(d)); // block_q8_1 keeps d in f16
-    }
+}
+
+// c + a.x*b.x + a.y*b.y with f32 accumulation
+static __device__ __forceinline__ float qwen4_hc_dot2(const half2 a, const half2 b, const float c) {
+#if defined(GGML_USE_HIP) && (defined(RDNA2) || defined(RDNA3) || defined(RDNA4) || defined(CDNA))
+    typedef _Float16 h2 __attribute__((ext_vector_type(2)));
+    h2 av, bv;
+    memcpy(&av, &a, 4);
+    memcpy(&bv, &b, 4);
+    return __builtin_amdgcn_fdot2(av, bv, c, false);
+#else
+    const float2 af = __half22float2(a);
+    const float2 bf = __half22float2(b);
+    return fmaf(af.y, bf.y, fmaf(af.x, bf.x, c));
+#endif
 }
 
 static constexpr int QWEN4_HC_K2_WARPS = 4; // warps sharing one output row
 
 // one workgroup per output row: rows [0, n_a) from W_a, [n_a, n_a + n_b) from W_b (then scale + silu);
-// a thread takes whole Q8_0 blocks, neighbouring threads neighbouring blocks
+// a thread takes whole Q8_0 blocks, neighbouring threads neighbouring blocks. With n_b = 0 it is a plain
+// product (ggml_cuda_mul_mat_q8_0_f16, the unfused path), with the same numbers.
 template <int T>
-static __global__ void qwen4_hc_down_inject_q8_0(
-        const block_q8_0 * wa, const block_q8_0 * wb, const int8_t * xq, const float * xd,
+static __global__ void qwen4_hc_down_inject_f16(
+        const block_q8_0 * wa, const block_q8_0 * wb, const half * xh,
         float * out_a, float * out_b, int n_in, int n_a, int n_b, float s, float b) {
     const int nb   = n_in / QK8_0;
     const int row  = blockIdx.x;
@@ -231,20 +242,29 @@ static __global__ void qwen4_hc_down_inject_q8_0(
     float acc[T] = { 0.0f };
     for (int ib = threadIdx.x; ib < nb; ib += blockDim.x) {
         const float dw = __half2float(w[ib].d);
-        int wi[QK8_0/4];
+        half2 wh[QK8_0/2];
 #pragma unroll
-        for (int k = 0; k < QK8_0/4; ++k) {
-            wi[k] = get_int_b2(w[ib].qs, k);
+        for (int j = 0; j < QK8_0/4; ++j) {
+            const int wi = get_int_b2(w[ib].qs, j);
+            wh[2*j + 0] = make_half2(__int2half_rn((int8_t) wi),         __int2half_rn((int8_t) (wi >> 8)));
+            wh[2*j + 1] = make_half2(__int2half_rn((int8_t) (wi >> 16)), __int2half_rn((int8_t) (wi >> 24)));
         }
 #pragma unroll
         for (int t = 0; t < T; ++t) {
-            const int * xi = (const int *) (xq + (size_t) t*n_in + ib*QK8_0);
-            int sumi = 0;
+            const int4 * xb = (const int4 *) (xh + (size_t) t*n_in + ib*QK8_0);
+            float sum = 0.0f;
 #pragma unroll
-            for (int k = 0; k < QK8_0/4; ++k) {
-                sumi = ggml_cuda_dp4a(wi[k], xi[k], sumi);
+            for (int q = 0; q < QK8_0/8; ++q) {
+                const int4 v = xb[q];
+                const int vv[4] = { v.x, v.y, v.z, v.w };
+#pragma unroll
+                for (int u = 0; u < 4; ++u) {
+                    half2 xv;
+                    memcpy(&xv, &vv[u], 4);
+                    sum = qwen4_hc_dot2(wh[4*q + u], xv, sum);
+                }
             }
-            acc[t] += dw * xd[t*nb + ib] * (float) sumi;
+            acc[t] += dw * sum;
         }
     }
 
@@ -275,16 +295,37 @@ static __global__ void qwen4_hc_down_inject_q8_0(
 
 template <int T>
 static void qwen4_hc_down_inject_launch(
-        const block_q8_0 * wa, const block_q8_0 * wb, const int8_t * xq, const float * xd,
+        const block_q8_0 * wa, const block_q8_0 * wb, const half * xh,
         float * out_a, float * out_b, int n_in, int n_a, int n_b, int T_run, float s, float b, cudaStream_t stream) {
     if constexpr (T > 1) {
         if (T_run < T) {
-            qwen4_hc_down_inject_launch<T - 1>(wa, wb, xq, xd, out_a, out_b, n_in, n_a, n_b, T_run, s, b, stream);
+            qwen4_hc_down_inject_launch<T - 1>(wa, wb, xh, out_a, out_b, n_in, n_a, n_b, T_run, s, b, stream);
             return;
         }
     }
-    qwen4_hc_down_inject_q8_0<T><<<n_a + n_b, QWEN4_HC_K2_WARPS*WARP_SIZE, 0, stream>>>(
-            wa, wb, xq, xd, out_a, out_b, n_in, n_a, n_b, s, b);
+    qwen4_hc_down_inject_f16<T><<<n_a + n_b, QWEN4_HC_K2_WARPS*WARP_SIZE, 0, stream>>>(
+            wa, wb, xh, out_a, out_b, n_in, n_a, n_b, s, b);
+}
+
+static void qwen4_hc_to_f16_launch(const float * x, half * xh, int n, cudaStream_t stream) {
+    qwen4_hc_to_f16<<<(n + 255) / 256, 256, 0, stream>>>(x, xh, n);
+}
+
+bool ggml_cuda_mul_mat_q8_0_f16_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    return src0->type == GGML_TYPE_Q8_0 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+        ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
+        src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+        src1->ne[1] >= 1 && src1->ne[1] <= QWEN4_HC_MAX_TOKENS && src0->ne[0] % QK8_0 == 0;
+}
+
+void ggml_cuda_mul_mat_q8_0_f16(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_ASSERT(ggml_cuda_mul_mat_q8_0_f16_supported(src0, src1, dst));
+    const int n = (int) src0->ne[0];
+    const int T = (int) src1->ne[1];
+    ggml_cuda_pool_alloc<half> xh(ctx.pool(), (size_t) T * n);
+    qwen4_hc_to_f16_launch((const float *) src1->data, xh.get(), T * n, ctx.stream());
+    qwen4_hc_down_inject_launch<QWEN4_HC_MAX_TOKENS>((const block_q8_0 *) src0->data, nullptr, xh.get(),
+            (float *) dst->data, nullptr, n, (int) src0->ne[1], 0, T, 1.0f, 0.0f, ctx.stream());
 }
 
 static bool qwen4_hc_match_k2(const ggml_cgraph * cgraph, int i, qwen4_hc_span & span) {
@@ -299,8 +340,11 @@ static bool qwen4_hc_match_k2(const ggml_cgraph * cgraph, int i, qwen4_hc_span &
     const ggml_tensor * silu = cgraph->nodes[span.idx[3]];
     const ggml_tensor * x    = mm_a->src[1];
 
+    // the fused kernel multiplies xn in f16, as the unfused products do when the graph allows it
     return qwen4_hc_is_unary(silu, GGML_UNARY_OP_SILU) && silu->src[0] == sc && sc->src[0] == mm_b &&
         mm_b->src[1] == x &&
+        (ggml_prec) ggml_get_op_params_i32(mm_a, 3) == GGML_PREC_F16 &&
+        (ggml_prec) ggml_get_op_params_i32(mm_b, 3) == GGML_PREC_F16 &&
         mm_a->src[0]->type == GGML_TYPE_Q8_0 && mm_b->src[0]->type == GGML_TYPE_Q8_0 &&
         ggml_is_contiguous(mm_a->src[0]) && ggml_is_contiguous(mm_b->src[0]) &&
         ggml_nelements(mm_a->src[0]) == mm_a->src[0]->ne[0]*mm_a->src[0]->ne[1] &&
@@ -314,8 +358,8 @@ static bool qwen4_hc_match_k2(const ggml_cgraph * cgraph, int i, qwen4_hc_span &
 // ---------------------------------------------------------------- K3
 
 // one warp per embedding channel e: the rows e + c*n_embd of W_u (c < hc <= 4) go to four groups
-// of 8 lanes, lane k of a group takes the whole blocks k, k + 8, ... of its row (independent loads
-// in flight rather than one int of every block); each group reduces its gate, then the gated mean over the streams is the epilogue
+// of 8 lanes (qwen4_hc_row_q8_0_f32); each group reduces its gate, then the gated mean over the streams
+// is the epilogue
 static constexpr int QWEN4_HC_K3_THREADS = 256;
 static constexpr int QWEN4_HC_K3_MAX_LO  = 512;
 
@@ -495,6 +539,25 @@ static bool qwen4_hc_match_k3(const ggml_cgraph * cgraph, int i, qwen4_hc_span &
 
 // ---------------------------------------------------------------- entry
 
+// views write nothing: only K2's two real outputs enter the overlap check
+static bool qwen4_hc_k2_ranges_ok(const ggml_cgraph * cgraph, int i, const qwen4_hc_span & span,
+        bool (*check_ranges)(const ggml_cgraph *, int, int, const int *, int)) {
+    const int outputs[] = { span.idx[0], span.idx[3] };
+    return check_ranges(cgraph, i, span.n_all, outputs, 2);
+}
+
+static void qwen4_hc_k2_launch(const ggml_cgraph * cgraph, const qwen4_hc_span & span, const half * xh, cudaStream_t stream) {
+    ggml_tensor *       mm_a = cgraph->nodes[span.idx[0]];
+    const ggml_tensor * mm_b = cgraph->nodes[span.idx[1]];
+    const ggml_tensor * sc   = cgraph->nodes[span.idx[2]];
+    ggml_tensor *       silu = cgraph->nodes[span.idx[3]];
+    const ggml_tensor * x    = mm_a->src[1];
+    qwen4_hc_down_inject_launch<QWEN4_HC_MAX_TOKENS>(
+            (const block_q8_0 *) mm_a->src[0]->data, (const block_q8_0 *) mm_b->src[0]->data, xh,
+            (float *) mm_a->data, (float *) silu->data, (int) x->ne[0], (int) mm_a->src[0]->ne[1], (int) mm_b->src[0]->ne[1],
+            (int) x->ne[1], ggml_get_op_params_f32(sc, 0), ggml_get_op_params_f32(sc, 1), stream);
+}
+
 int ggml_cuda_try_fuse_qwen4_hc(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i,
         bool (*check_ranges)(const ggml_cgraph *, int, int, const int *, int)) {
     static const bool disabled = getenv("GGML_CUDA_DISABLE_QWEN4_HC") != nullptr; // A/B against the unfused ops
@@ -525,7 +588,6 @@ int ggml_cuda_try_fuse_qwen4_hc(ggml_backend_cuda_context & ctx, ggml_cgraph * c
         if (!ok) {
             return 0;
         }
-        GGML_UNUSED(check_ranges);
         const ggml_tensor * sc1  = cgraph->nodes[i];
         const ggml_tensor * sc2  = cgraph->nodes[i + 2];
         ggml_tensor *       post = cgraph->nodes[i + 3];
@@ -537,41 +599,39 @@ int ggml_cuda_try_fuse_qwen4_hc(ggml_backend_cuda_context & ctx, ggml_cgraph * c
         const int T      = (int) residual->ne[2];
         float eps;
         memcpy(&eps, rms->op_params, sizeof(float));
+
+        // K2 right after (views in between) on this xn: K1 also writes xn in f16 for it, no conversion launch
+        int j = i + 6;
+        while (j < cgraph->n_nodes && qwen4_hc_is_view(cgraph->nodes[j])) {
+            ++j;
+        }
+        qwen4_hc_span span2;
+        const bool with_k2 = j < cgraph->n_nodes && cgraph->nodes[j]->op == GGML_OP_MUL_MAT &&
+            qwen4_hc_match_k2(cgraph, j, span2) && qwen4_hc_view_base(cgraph->nodes[span2.idx[0]]->src[1]) == mul &&
+            qwen4_hc_k2_ranges_ok(cgraph, j, span2, check_ranges);
+        ggml_cuda_pool_alloc<half> xh(ctx.pool());
+        if (with_k2) {
+            xh.alloc((size_t) T * hc * n_embd);
+        }
         qwen4_hc_combine_norm_f32<<<dim3(hc, T), QWEN4_HC_K1_THREADS, 0, stream>>>(
                 (const float *) residual->data, (const float *) post->src[0]->data,
                 (const float *) sc1->src[0]->data, (const float *) mul->src[1]->data,
-                (float *) post->data, (float *) mul->data, n_embd, hc,
+                (float *) post->data, (float *) mul->data, with_k2 ? xh.get() : nullptr, n_embd, hc,
                 ggml_get_op_params_f32(sc1, 0), ggml_get_op_params_f32(sc1, 1),
                 ggml_get_op_params_f32(sc2, 0), ggml_get_op_params_f32(sc2, 1), eps);
-        return 5;
+        if (!with_k2) {
+            return 5;
+        }
+        qwen4_hc_k2_launch(cgraph, span2, xh.get(), stream);
+        return (j - i) + span2.n_all - 1;
     }
 
     qwen4_hc_span span2;
-    if (node->op == GGML_OP_MUL_MAT && qwen4_hc_match_k2(cgraph, i, span2)) {
-        // views write nothing: only the two real outputs enter the overlap check
-        const int outputs[] = { span2.idx[0], span2.idx[3] };
-        if (!check_ranges(cgraph, i, span2.n_all, outputs, 2)) {
-            return 0;
-        }
-        ggml_tensor * mm_a = cgraph->nodes[span2.idx[0]];
-        const ggml_tensor * mm_b = cgraph->nodes[span2.idx[1]];
-        const ggml_tensor * sc   = cgraph->nodes[span2.idx[2]];
-        ggml_tensor * silu = cgraph->nodes[span2.idx[3]];
-        const ggml_tensor * x = mm_a->src[1];
-        const int n_in = (int) x->ne[0];
-        const int T    = (int) x->ne[1];
-        const int n_a  = (int) mm_a->src[0]->ne[1];
-        const int n_b  = (int) mm_b->src[0]->ne[1];
-        const int nb_x = n_in / QK8_0 * T;
-        ggml_cuda_pool_alloc<int8_t> xq(ctx.pool(), (size_t) T * n_in);
-        ggml_cuda_pool_alloc<float>  xd(ctx.pool(), nb_x);
-        const int qwarps = 8;
-        qwen4_hc_quantize_q8<<<(nb_x + qwarps - 1) / qwarps, qwarps*WARP_SIZE, 0, stream>>>(
-                (const float *) x->data, xq.get(), xd.get(), nb_x);
-        qwen4_hc_down_inject_launch<QWEN4_HC_MAX_TOKENS>(
-                (const block_q8_0 *) mm_a->src[0]->data, (const block_q8_0 *) mm_b->src[0]->data,
-                xq.get(), xd.get(), (float *) mm_a->data, (float *) silu->data,
-                n_in, n_a, n_b, T, ggml_get_op_params_f32(sc, 0), ggml_get_op_params_f32(sc, 1), stream);
+    if (node->op == GGML_OP_MUL_MAT && qwen4_hc_match_k2(cgraph, i, span2) && qwen4_hc_k2_ranges_ok(cgraph, i, span2, check_ranges)) {
+        const ggml_tensor * x = cgraph->nodes[span2.idx[0]]->src[1];
+        ggml_cuda_pool_alloc<half> xh(ctx.pool(), (size_t) ggml_nelements(x));
+        qwen4_hc_to_f16_launch((const float *) x->data, xh.get(), (int) ggml_nelements(x), stream);
+        qwen4_hc_k2_launch(cgraph, span2, xh.get(), stream);
         return span2.n_all - 1;
     }
 
