@@ -11888,6 +11888,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // qwen4exp hyper-connection boundary while decoding (1 token) and verifying an MTP draft (3 tokens)
+    for (int64_t n_tokens : { 1, 3 }) {
+        test_cases.emplace_back(new test_qwen4_hc_combine_norm(2560, n_tokens));
+        test_cases.emplace_back(new test_qwen4_hc_down_inject(2560, 320, n_tokens));
+        test_cases.emplace_back(new test_qwen4_hc_up_pre(2560, 320, n_tokens));
+    }
+
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
