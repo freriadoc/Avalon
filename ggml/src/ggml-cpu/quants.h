@@ -103,6 +103,12 @@ void ggml_vec_dot_iq1_m_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, 
 void ggml_vec_dot_iq4_nl_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_iq4_xs_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 
+// MoE experts with several rows on the CPU (ggml_cpu_moe_experts): one weight row against up to 8 activation rows,
+// each weight block decoded once (s[c] for vy[c])
+void ggml_vec_dot_iq2_s_q8_K_multi (int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int nc);
+void ggml_vec_dot_iq3_k_q8_K_multi (int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int nc);
+void ggml_vec_dot_iq4_nl_q8_0_multi(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int nc);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1374,3 +1374,17 @@ void quantize_row_iq4_xs(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, 
     assert(k % QK_K == 0);
     quantize_iq4_xs(x, y, 1, k, NULL);
 }
+
+
+#if !defined(__x86_64__) && !defined(_M_X64)
+// several activation rows against one weight row: one-row kernels on other architectures
+void ggml_vec_dot_iq2_s_q8_K_multi(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int nc) {
+    for (int c = 0; c < nc; c++) ggml_vec_dot_iq2_s_q8_K(n, s + c, 0, vx, 0, vy[c], 0, 1);
+}
+void ggml_vec_dot_iq3_k_q8_K_multi(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int nc) {
+    for (int c = 0; c < nc; c++) ggml_vec_dot_iq3_k_q8_K(n, s + c, 0, vx, 0, vy[c], 0, 1);
+}
+void ggml_vec_dot_iq4_nl_q8_0_multi(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int nc) {
+    for (int c = 0; c < nc; c++) ggml_vec_dot_iq4_nl_q8_0(n, s + c, 0, vx, 0, vy[c], 0, 1);
+}
+#endif

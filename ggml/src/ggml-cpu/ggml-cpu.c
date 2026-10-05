@@ -4511,6 +4511,139 @@ int ggml_cpu_has_sme2(void) {
 #endif
 }
 
+// The experts of the MoE block hosted by the GPU, IQ2_S / IQ3_K gate and up, IQ4_NL down, without a graph: an expert
+// with several rows (tokens of an MTP verification) has each weight block decoded once for all of them
+// (ggml_vec_dot_*_multi); an expert with one row keeps the format's vec_dot. False for other types or
+// shapes (the graph computes them).
+static bool ggml_cpu_moe_experts_multi(const struct ggml_tensor * gate_w, const struct ggml_tensor * up_w,
+                                       const struct ggml_tensor * down_w, const float * act,
+                                       const int32_t * experts, int n, float * out, int n_threads) {
+#if defined(__AVX2__) && defined(GGML_USE_OPENMP)
+    const enum ggml_type tk = gate_w->type;
+    const int64_t n_embd = gate_w->ne[0];
+    const int64_t n_ff   = gate_w->ne[1];
+    if ((tk != GGML_TYPE_IQ2_S && tk != GGML_TYPE_IQ3_K) || up_w->type != tk || down_w->type != GGML_TYPE_IQ4_NL ||
+        n_embd % QK_K != 0 || n_ff % QK8_0 != 0 || down_w->ne[0] != n_ff || down_w->ne[1] != n_embd || n <= 0 || n > 256) {
+        return false;
+    }
+    static _Thread_local uint8_t * buf = NULL;
+    static _Thread_local size_t buf_size = 0;
+    const size_t a_row = (size_t) (n_embd / QK_K) * sizeof(block_q8_K);
+    const size_t h_row = (size_t) (n_ff / QK8_0) * sizeof(block_q8_0);
+    const size_t need = (size_t) n * (a_row + h_row + 2 * n_ff * sizeof(float)) + (size_t) 3 * n * sizeof(int32_t) + 256;
+    if (buf_size < need) {
+        free(buf);
+        buf = malloc(need);
+        buf_size = buf ? need : 0;
+        if (!buf) {
+            return false;
+        }
+    }
+    uint8_t * a8 = buf;
+    uint8_t * h8 = a8 + (size_t) n * a_row;
+    float   * g  = (float *) GGML_PAD((uintptr_t) (h8 + (size_t) n * h_row), 64);
+    float   * u  = g + (size_t) n * n_ff;
+    int32_t * uniq  = (int32_t *) (u + (size_t) n * n_ff);   // distinct experts
+    int32_t * first = uniq + n;                               // their rows, as a list: first row, next row
+    int32_t * next  = first + n;
+    int n_uniq = 0;
+    for (int j = 0; j < n; j++) {
+        next[j] = -1;
+        int k = 0;
+        while (k < n_uniq && uniq[k] != experts[j]) k++;
+        if (k == n_uniq) {
+            uniq[n_uniq] = experts[j];
+            first[n_uniq] = j;
+            n_uniq++;
+        } else {
+            int r = first[k];
+            while (next[r] >= 0) r = next[r];
+            next[r] = j;
+        }
+    }
+    const ggml_from_float_t q8k = type_traits_cpu[GGML_TYPE_Q8_K].from_float;
+    const ggml_from_float_t q80 = type_traits_cpu[GGML_TYPE_Q8_0].from_float;
+    const ggml_vec_dot_t dot_k  = type_traits_cpu[tk].vec_dot;
+    const ggml_vec_dot_t dot_nl = type_traits_cpu[GGML_TYPE_IQ4_NL].vec_dot;
+    for (int j = 0; j < n; j++) {
+        q8k(act + (size_t) j * n_embd, a8 + (size_t) j * a_row, n_embd);
+    }
+    const int rb1 = 16, n_ch1 = (int) ((n_ff + rb1 - 1) / rb1);
+    const int rb3 = 32, n_ch3 = (int) ((n_embd + rb3 - 1) / rb3);
+    void (*multi_k)(int, float *, const void *, const void * const *, int) =
+        tk == GGML_TYPE_IQ2_S ? ggml_vec_dot_iq2_s_q8_K_multi : ggml_vec_dot_iq3_k_q8_K_multi;
+    #pragma omp parallel num_threads(n_threads)
+    {
+        float   hrow[n_ff];
+        const void * ys[8];
+        int          rs[8];
+        float        res[8];
+        // gate and up
+        #pragma omp for schedule(dynamic, 1)
+        for (int it = 0; it < n_uniq * 2 * n_ch1; it++) {
+            const int ue = it / (2 * n_ch1), t = (it / n_ch1) % 2, ch = it % n_ch1;
+            const struct ggml_tensor * W = t ? up_w : gate_w;
+            float * dst = t ? u : g;
+            const int32_t e = uniq[ue];
+            const int r0 = first[ue];
+            for (int64_t row = (int64_t) ch * rb1; row < (int64_t) (ch + 1) * rb1 && row < n_ff; row++) {
+                const char * wr = (const char *) W->data + (size_t) e * W->nb[2] + (size_t) row * W->nb[1];
+                if (next[r0] < 0) {
+                    dot_k((int) n_embd, dst + (size_t) r0 * n_ff + row, 0, wr, 0, a8 + (size_t) r0 * a_row, 0, 1);
+                } else {
+                    for (int r = r0; r >= 0; ) {
+                        int nc = 0;
+                        for (; r >= 0 && nc < 8; r = next[r], nc++) {
+                            rs[nc] = r;
+                            ys[nc] = a8 + (size_t) r * a_row;
+                        }
+                        multi_k((int) n_embd, res, wr, ys, nc);
+                        for (int c = 0; c < nc; c++) dst[(size_t) rs[c] * n_ff + row] = res[c];
+                    }
+                }
+            }
+        }
+        // swiglu, then the activations of down
+        #pragma omp for
+        for (int j = 0; j < n; j++) {
+            for (int64_t i = 0; i < n_ff; i++) {
+                const float x = g[(size_t) j * n_ff + i];
+                hrow[i] = x / (1.0f + expf(-x)) * u[(size_t) j * n_ff + i];
+            }
+            q80(hrow, h8 + (size_t) j * h_row, n_ff);
+        }
+        // down
+        #pragma omp for schedule(dynamic, 1)
+        for (int it = 0; it < n_uniq * n_ch3; it++) {
+            const int ue = it / n_ch3, ch = it % n_ch3;
+            const int32_t e = uniq[ue];
+            const int r0 = first[ue];
+            for (int64_t row = (int64_t) ch * rb3; row < (int64_t) (ch + 1) * rb3 && row < n_embd; row++) {
+                const char * wr = (const char *) down_w->data + (size_t) e * down_w->nb[2] + (size_t) row * down_w->nb[1];
+                if (next[r0] < 0) {
+                    dot_nl((int) n_ff, out + (size_t) r0 * n_embd + row, 0, wr, 0, h8 + (size_t) r0 * h_row, 0, 1);
+                } else {
+                    for (int r = r0; r >= 0; ) {
+                        int nc = 0;
+                        for (; r >= 0 && nc < 8; r = next[r], nc++) {
+                            rs[nc] = r;
+                            ys[nc] = h8 + (size_t) r * h_row;
+                        }
+                        ggml_vec_dot_iq4_nl_q8_0_multi((int) n_ff, res, wr, ys, nc);
+                        for (int c = 0; c < nc; c++) out[(size_t) rs[c] * n_embd + row] = res[c];
+                    }
+                }
+            }
+        }
+    }
+    return true;
+#else
+    GGML_UNUSED(gate_w); GGML_UNUSED(up_w); GGML_UNUSED(down_w); GGML_UNUSED(act);
+    GGML_UNUSED(experts); GGML_UNUSED(n); GGML_UNUSED(out); GGML_UNUSED(n_threads);
+    return false;
+#endif
+}
+
 // Whole experts of one token on the CPU for the MoE block the GPU hosts (ggml_moe_cache.cpu_experts):
 // a small graph gate / up / swiglu / down over the given experts only, on the model's weight
 // tensors, computed by this thread and n_threads - 1 others. The thread that calls it has no MoE
@@ -4520,6 +4653,34 @@ static void ggml_cpu_moe_experts(const struct ggml_tensor * gate_w, const struct
                                  const int32_t * experts, int k, int n_tokens, float * out, int n_threads) {
     const int n = k * n_tokens;
     const int64_t t_call = ggml_time_us();
+    // the experts without a graph, each weight block decoded once for all the rows of its expert (GGML_CPU_MOE_MULTI=0:
+    // the graph); DIAGNOSTIC GGML_CPU_MOE_MULTI_CHECK=1 computes them both ways and compares
+    static int multi = -1, multi_check = 0;
+    if (multi < 0) {
+        multi = !getenv("GGML_CPU_MOE_MULTI") || atoi(getenv("GGML_CPU_MOE_MULTI")) != 0;
+        multi_check = getenv("GGML_CPU_MOE_MULTI_CHECK") && atoi(getenv("GGML_CPU_MOE_MULTI_CHECK")) > 0;
+    }
+    static _Thread_local float * chk = NULL;
+    static _Thread_local size_t chk_size = 0;
+    bool checking = false;
+    if (multi && k == 1) {
+        float * dst = out;
+        if (multi_check) {
+            const size_t bytes = (size_t) gate_w->ne[0] * n * sizeof(float);
+            if (chk_size < bytes) {
+                free(chk);
+                chk = malloc(bytes);
+                chk_size = chk ? bytes : 0;
+            }
+            dst = chk;
+        }
+        if (dst && ggml_cpu_moe_experts_multi(gate_w, up_w, down_w, act, experts, n, dst, n_threads)) {
+            if (!multi_check) {
+                return;
+            }
+            checking = true;
+        }
+    }
     static _Thread_local void * mem = NULL;
     static _Thread_local size_t mem_size = 0;
     static _Thread_local uint8_t * work = NULL;
@@ -4574,6 +4735,23 @@ static void ggml_cpu_moe_experts(const struct ggml_tensor * gate_w, const struct
 
     memcpy(out, d->data, (size_t) n_embd * n * sizeof(float));
     ggml_free(ctx);
+    if (checking) {
+        static _Thread_local int64_t c_rows = 0, c_bad = 0;
+        static _Thread_local double c_max = 0.0, c_sum = 0.0;
+        for (int j = 0; j < n; j++) {
+            double d2 = 0.0, n2 = 0.0;
+            for (int64_t i = 0; i < n_embd; i++) {
+                const double a = out[(size_t) j * n_embd + i], b = chk[(size_t) j * n_embd + i];
+                d2 += (a - b) * (a - b); n2 += a * a;
+            }
+            const double rel = sqrt(d2 / (n2 > 1e-30 ? n2 : 1e-30));
+            c_rows++; c_sum += rel; c_max = rel > c_max ? rel : c_max; c_bad += rel > 1e-3;
+        }
+        if (c_rows % 5000 < (int64_t) n) {
+            GGML_LOG_INFO("cpu experts multi check: %lld rows, relative error mean %.2e, max %.2e, above 1e-3: %lld\n",
+                          (long long) c_rows, c_sum / c_rows, c_max, (long long) c_bad);
+        }
+    }
 
     // DIAGNOSTIC (GGML_CPU_MOE_EXPERTS_STATS=1): graph build and compute time per call, compute by rows (1, 2, 3, 4+)
     static _Thread_local int64_t st_by_n[5], st_cnt_n[5];
