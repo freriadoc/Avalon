@@ -1823,6 +1823,10 @@ static ggml_type ggml_cuda_cublas_compute_type(const ggml_tensor * src0, const g
     } else if (prec == GGML_PREC_F32) {
         compute_type = GGML_TYPE_F32;
     }
+    // src1 that may not be converted below F32
+    if ((ggml_prec) ggml_get_op_params_i32(dst, 3) == GGML_PREC_F32) {
+        compute_type = GGML_TYPE_F32;
+    }
 
     const char * env_c = getenv("GGML_CUDA_CUBLAS_COMPUTE_TYPE");
     if (env_c != nullptr) {
@@ -2073,6 +2077,7 @@ enum ggml_cuda_mul_mat_path {
     GGML_CUDA_MM_MMVQ,
     GGML_CUDA_MM_MMQ,
     GGML_CUDA_MM_CUBLAS,
+    GGML_CUDA_MM_Q8_0_F32,       // src1 that may not be converted below F32 (ggml_prec_set_src), small batch
 };
 
 static ggml_cuda_mul_mat_path ggml_cuda_mul_mat_get_path(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, int device,
@@ -2092,6 +2097,11 @@ static ggml_cuda_mul_mat_path ggml_cuda_mul_mat_get_path(const ggml_tensor * src
         ggml_nbytes(src0) != ggml_backend_buft_get_alloc_size(ggml_backend_cuda_buffer_type(device), src0) && src0->view_src;
     if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return GGML_CUDA_MM_CUBLAS;
+    }
+
+    // src1 may not be converted below F32: MMVQ and MMQ would quantize it, cuBLAS then computes in F32
+    if (ggml_is_quantized(src0->type) && (ggml_prec) ggml_get_op_params_i32(dst, 3) == GGML_PREC_F32) {
+        return ggml_cuda_mul_mat_q8_0_f32_supported(src0, src1, dst) ? GGML_CUDA_MM_Q8_0_F32 : GGML_CUDA_MM_CUBLAS;
     }
 
     const int cc        = ggml_cuda_info().devices[device].cc;
@@ -2159,6 +2169,9 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             return;
         case GGML_CUDA_MM_CUBLAS:
             ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+            return;
+        case GGML_CUDA_MM_Q8_0_F32:
+            ggml_cuda_mul_mat_q8_0_f32(ctx, src0, src1, dst);
             return;
     }
 }

@@ -349,6 +349,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     ggml_tensor * lo = build_lora_mm(w_down, xn);
     lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
     ggml_tensor * gate = build_lora_mm(w_up, lo);
+    if (gate->op == GGML_OP_MUL_MAT && nt <= 8) {
+        // lo (n_lo = 320 per token) not quantized for this product while decoding: more precise, and as fast
+        // (the weights' bandwidth is the cost). Not for larger batches: a backend whose batched product
+        // only quantizes would fall back to a slower one (prefill -1.2 % with hipBLAS in F32)
+        ggml_prec_set_src(gate, GGML_PREC_F32, 1);
+    }
     cb(gate, "hc_gate", il);
 
     ggml_tensor * mixed = nullptr;

@@ -4425,7 +4425,7 @@ struct test_qwen4_hc_up_pre : public test_dsv4_hc {
     std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "QWEN4_HC_UP_PRE"; }
     std::string vars() override { return VARS_TO_STR3(n_embd, n_lo, n_tokens); }
     bool run_whole_graph() override { return true; }
-    double max_nmse_err() override { return 1e-7; }
+    double max_nmse_err() override { return 5e-5; }   // the CPU quantizes lo to Q8_0 anyway (~1.3e-5)
 
     test_qwen4_hc_up_pre(int64_t n_embd = 2560, int64_t n_lo = 320, int64_t n_tokens = 1)
         : n_embd(n_embd), n_lo(n_lo), n_tokens(n_tokens) {}
@@ -4437,7 +4437,9 @@ struct test_qwen4_hc_up_pre : public test_dsv4_hc {
         ggml_set_name(xn, "residual");
         ggml_tensor * wu = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_lo, n_embd*hc);
 
-        ggml_tensor * gate = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, wu, lo), n_embd, hc, n_tokens);
+        ggml_tensor * mm = ggml_mul_mat(ctx, wu, lo);
+        ggml_prec_set_src(mm, GGML_PREC_F32, 1);   // as qwen4exp asks: lo not quantized
+        ggml_tensor * gate = ggml_reshape_3d(ctx, mm, n_embd, hc, n_tokens);
         out = ggml_dsv4_hc_pre_gated(ctx, xn, gate, 1.0f/hc);
         return out;
     }
