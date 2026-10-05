@@ -3153,7 +3153,10 @@ static const ggml_tensor * ggml_cuda_view_root(const ggml_tensor * t) {
     return t;
 }
 
-static bool ggml_cuda_match_conv_cached(const ggml_cgraph * cgraph, int ci, ggml_cuda_conv_cached_match & m) {
+// root_absorbed: the state's GET_ROWS is left to the kernel (ggml_cuda_conv_absorbs_gather), which then reads the
+// cache rows and never the gathered copy: that copy's memory, dead once the window is built, may hold the output
+static bool ggml_cuda_match_conv_cached(const ggml_cgraph * cgraph, int ci, ggml_cuda_conv_cached_match & m,
+        bool root_absorbed) {
     const ggml_tensor * cc = cgraph->nodes[ci];
     if (cc->op != GGML_OP_CONCAT || cc->type != GGML_TYPE_F32 || ggml_get_op_params_i32(cc, 0) != 0) {
         return false;
@@ -3247,6 +3250,9 @@ static bool ggml_cuda_match_conv_cached(const ggml_cgraph * cgraph, int ci, ggml
     const bool x_alias_ok = m.out->data == x->data && x->nb[1] == sizeof(float) &&
                             x->nb[0] == (size_t) n_ch * sizeof(float) && x->nb[2] == (size_t) (n_ch * n_t) * sizeof(float);
     for (const ggml_tensor * r : reads) {
+        if (r == root && root_absorbed && root->op == GGML_OP_GET_ROWS) {
+            continue;
+        }
         if (overlap(m.out, r) && !(r == x && x_alias_ok)) {
             return false;
         }
@@ -3273,7 +3279,7 @@ static bool ggml_cuda_conv_absorbs_gather(const ggml_cgraph * cgraph, int idx) {
         const ggml_tensor * n = cgraph->nodes[k];
         if (n->op == GGML_OP_CONCAT && ggml_cuda_view_root(n->src[0]) == gr) {
             ggml_cuda_conv_cached_match m;
-            if (!ggml_cuda_match_conv_cached(cgraph, k, m)) {
+            if (!ggml_cuda_match_conv_cached(cgraph, k, m, true)) {
                 return false;
             }
             // nothing after reads the gathered rows (the concat's views are inside the fused group)
@@ -4076,9 +4082,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // the conv state's window, its rollback copies and the convolution: one kernel
     if (node->op == GGML_OP_CONCAT) {
         ggml_cuda_conv_cached_match m;
-        if (ggml_cuda_match_conv_cached(cgraph, i, m)) {
+        const bool gathered = cuda_ctx->gdn_gathers.count(ggml_cuda_view_root(node->src[0])) > 0;
+        if (ggml_cuda_match_conv_cached(cgraph, i, m, gathered)) {
             const ggml_tensor * state = node->src[0];
-            const bool gathered = cuda_ctx->gdn_gathers.count(m.root) > 0;
             const float *   st  = gathered ? (const float *) m.root->src[0]->data : (const float *) m.root->data;
             const int32_t * ids = gathered ? (const int32_t *) m.root->src[1]->data : nullptr;
             const int64_t   row = gathered ? (int64_t) (m.root->src[0]->nb[1] / sizeof(float)) : state->ne[0] * state->ne[1];
