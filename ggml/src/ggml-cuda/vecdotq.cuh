@@ -24,6 +24,26 @@ static __device__ __forceinline__ int get_int_b2(const void * x, const int & i32
     return x32;
 }
 
+// Weights read once per token (the main model's large matrices while decoding): with non-temporal loads (HIP: slc
+// dlc) they no longer evict from the L2 and the infinity cache the code and the data of the other kernels. One 32-bit
+// load at a 2-byte aligned address (the hardware allows it; two 16-bit non-temporal loads would be merged by the
+// compiler without the hint). The same values.
+static __device__ __forceinline__ int get_int_b2_nt(const void * x, const int & i32) {
+#if defined(GGML_USE_HIP)
+    return __builtin_nontemporal_load((const int *) ((const uint16_t *) x + 2*i32));
+#else
+    return get_int_b2(x, i32);
+#endif // defined(GGML_USE_HIP)
+}
+
+static __device__ __forceinline__ half load_half_nt(const half * x) {
+#if defined(GGML_USE_HIP)
+    return __ushort_as_half(__builtin_nontemporal_load((const unsigned short *) x));
+#else
+    return *x;
+#endif // defined(GGML_USE_HIP)
+}
+
 static __device__ __forceinline__ int get_int_b4(const void * x, const int & i32) {
     return ((const int *) x)[i32]; // assume at least 4 byte alignment
 }
@@ -863,6 +883,24 @@ static __device__ __forceinline__ float vec_dot_q8_0_q8_1(
     }
 
     return vec_dot_q8_0_q8_1_impl<float, VDR_Q8_0_Q8_1_MMVQ>(v, u, bq8_0->d, __low2half(bq8_1->ds));
+}
+
+// the same with non-temporal loads of the weights (a backend whose weights are read once, see get_int_b2_nt)
+static __device__ __forceinline__ float vec_dot_q8_0_q8_1_nt(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_q8_0 * bq8_0 = (const block_q8_0 *) vbq + kbx;
+
+    int v[VDR_Q8_0_Q8_1_MMVQ];
+    int u[VDR_Q8_0_Q8_1_MMVQ];
+
+#pragma unroll
+    for (int i = 0; i < VDR_Q8_0_Q8_1_MMVQ; ++i) {
+        v[i] = get_int_b2_nt(bq8_0->qs, iqs + i);
+        u[i] = get_int_b4(bq8_1->qs, iqs + i);
+    }
+
+    return vec_dot_q8_0_q8_1_impl<float, VDR_Q8_0_Q8_1_MMVQ>(v, u, load_half_nt(&bq8_0->d), __low2half(bq8_1->ds));
 }
 
 static __device__ __forceinline__ float vec_dot_q2_K_q8_1(

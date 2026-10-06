@@ -375,6 +375,12 @@ llama_context::llama_context(
                 if (ggml_backend_set_n_threads_fn) {
                     set_n_threads_fns.emplace_back(backend.get(), ggml_backend_set_n_threads_fn);
                 }
+                // a model's large matrices are read once per token while decoding; an MTP draft reads its small ones
+                // again for every piece of a prefill, they must stay in the caches
+                auto set_weights_read_once_fn = (void (*)(ggml_backend_t, bool)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_weights_read_once");
+                if (set_weights_read_once_fn) {
+                    set_weights_read_once_fn(backend.get(), cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP);
+                }
             }
         }
 

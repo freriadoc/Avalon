@@ -1458,6 +1458,9 @@ struct ggml_cuda_stream_context {
 
 struct ggml_backend_cuda_context {
     int device;
+    // the weights are read once per token (a model's large matrices while decoding, not an MTP draft's, which
+    // reads its small matrices again for every piece of a prefill): Q8_0 mat-vec with non-temporal weight loads
+    bool nt_weights = false;
     std::string name;
     cudaEvent_t copy_event = nullptr;
 
