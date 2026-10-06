@@ -345,6 +345,10 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         else ()
             if (GGML_NATIVE)
                 list(APPEND ARCH_FLAGS -march=native)
+                # no SSE4a (AMD): INSERTQ / EXTRQ have no VEX form, and on a register whose upper half AVX-256 code has
+                # just written, Zen 2 merges it for ~250 cycles (58 ns measured against 0.7). Clang picks INSERTQ on
+                # its own to assemble vectors (seen in an IQ3_K kernel: 5 times slower)
+                list(APPEND ARCH_FLAGS -mno-sse4a)
             else ()
                 if (GGML_SSE42)
                     list(APPEND ARCH_FLAGS -msse4.2)
