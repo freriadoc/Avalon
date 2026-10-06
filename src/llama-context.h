@@ -355,6 +355,8 @@ private:
 
     ggml_backend_sched_ptr sched;
 
+    size_t sched_max_nodes = 0; // the size of sched, see sched_reserve
+
     bool sched_need_reserve = true;
 
     ggml_backend_t backend_cpu = nullptr;

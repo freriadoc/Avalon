@@ -2605,11 +2605,18 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
 struct common_speculative_init_result::impl {
     impl() = default;
-    ~impl() = default;
 
     // note: the order in which model, context, etc. are declared matters because their destructors will be called bottom-to-top
     llama_model_ptr   model;
+    std::vector<llama_sampler *> samplers; // the MTP draft's backend samplers at creation, freed after the context
     llama_context_ptr context;
+
+    ~impl() {
+        context.reset();
+        for (auto * s : samplers) {
+            llama_sampler_free(s);
+        }
+    }
 };
 
 common_speculative_init_result::common_speculative_init_result(
@@ -2636,6 +2643,22 @@ common_speculative_init_result::common_speculative_init_result(
     //       the extra memory for small models is likely negligible?
     cparams.n_rs_seq  = 0;
     cparams.ctx_other = ctx_tgt;
+
+    // the MTP draft samples on the backend with a top-k chain per sequence (common_speculative_impl_draft_mtp): the
+    // context is created with chains of that shape, so its first reservations already include the sampling graph.
+    // Attached only later, they made the context reserve again with a compute buffer a few KiB larger: freed and
+    // allocated again (694 MiB at 256k) after the expert cache was sized, a step above the VRAM peak.
+    std::vector<llama_sampler_seq_config> sampler_configs;
+    if (spec_mtp && params.speculative.draft.backend_sampling) {
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) cparams.n_seq_max; ++seq_id) {
+            llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+            llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
+            pimpl->samplers.push_back(chain);
+            sampler_configs.push_back({ seq_id, chain });
+        }
+        cparams.samplers   = sampler_configs.data();
+        cparams.n_samplers = sampler_configs.size();
+    }
 
     std::string model_path;
     if (has_draft) {

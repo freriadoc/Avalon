@@ -753,14 +753,22 @@ void llama_context::sched_reserve() {
                 cparams.moe_cache_profile_path.empty() ? nullptr : cparams.moe_cache_profile_path.c_str());
     };
 
-    // a new reserve rebuilds the scheduler: its MoE cache session carries over (contents kept,
-    // not resized on a free-memory figure that lags behind the frees of the old scheduler)
-    void * moe_cache_kept = sched ? ggml_backend_sched_detach_moe_cache(sched.get()) : nullptr;
-    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
-    if (moe_cache_kept) {
-        ggml_backend_sched_attach_moe_cache(sched.get(), moe_cache_kept);
+    // a scheduler of the same size is kept: its compute buffers are reused if the new worst case fits (a new one
+    // freed them and allocated buffers of the same size, both counted for a moment by the driver: a 694 MiB step
+    // above the VRAM peak when the MTP draft re-reserves for its backend sampler)
+    if (sched && sched_max_nodes == max_nodes) {
+        ggml_backend_sched_reset(sched.get());
     } else {
-        set_moe_cache();
+        // a new scheduler: its MoE cache session carries over (contents kept, not resized on a free-memory
+        // figure that lags behind the frees of the old scheduler)
+        void * moe_cache_kept = sched ? ggml_backend_sched_detach_moe_cache(sched.get()) : nullptr;
+        sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+        sched_max_nodes = max_nodes;
+        if (moe_cache_kept) {
+            ggml_backend_sched_attach_moe_cache(sched.get(), moe_cache_kept);
+        } else {
+            set_moe_cache();
+        }
     }
 
     llama_memory_context_ptr mctx;
