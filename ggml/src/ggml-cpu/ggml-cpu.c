@@ -4565,19 +4565,24 @@ static bool ggml_cpu_moe_experts_multi(const struct ggml_tensor * gate_w, const 
     const ggml_from_float_t q80 = type_traits_cpu[GGML_TYPE_Q8_0].from_float;
     const ggml_vec_dot_t dot_k  = type_traits_cpu[tk].vec_dot;
     const ggml_vec_dot_t dot_nl = type_traits_cpu[GGML_TYPE_IQ4_NL].vec_dot;
-    for (int j = 0; j < n; j++) {
-        q8k(act + (size_t) j * n_embd, a8 + (size_t) j * a_row, n_embd);
-    }
+    const int nb_k = (int) (n_embd / QK_K), nb_0 = (int) (n_ff / QK8_0);
     const int rb1 = 16, n_ch1 = (int) ((n_ff + rb1 - 1) / rb1);
     const int rb3 = 32, n_ch3 = (int) ((n_embd + rb3 - 1) / rb3);
     void (*multi_k)(int, float *, const void *, const void * const *, int) =
         tk == GGML_TYPE_IQ2_S ? ggml_vec_dot_iq2_s_q8_K_multi : ggml_vec_dot_iq3_k_q8_K_multi;
     #pragma omp parallel num_threads(n_threads)
     {
-        float   hrow[n_ff];
+        float   hrow[QK8_0];
         const void * ys[8];
         int          rs[8];
         float        res[8];
+        // the activations, a q8_K block per item: ~2 rows of 10 blocks spread over the team (quantized by the calling
+        // thread alone they took 6.9 us of a 144 us call)
+        #pragma omp for
+        for (int it = 0; it < n * nb_k; it++) {
+            const int j = it / nb_k, b = it % nb_k;
+            q8k(act + (size_t) j * n_embd + (size_t) b * QK_K, a8 + (size_t) j * a_row + (size_t) b * sizeof(block_q8_K), QK_K);
+        }
         // gate and up
         #pragma omp for schedule(dynamic, 1)
         for (int it = 0; it < n_uniq * 2 * n_ch1; it++) {
@@ -4603,14 +4608,16 @@ static bool ggml_cpu_moe_experts_multi(const struct ggml_tensor * gate_w, const 
                 }
             }
         }
-        // swiglu, then the activations of down
+        // swiglu, then the activations of down, a q8_0 block per item (every thread works, not one per row)
         #pragma omp for
-        for (int j = 0; j < n; j++) {
-            for (int64_t i = 0; i < n_ff; i++) {
-                const float x = g[(size_t) j * n_ff + i];
-                hrow[i] = x / (1.0f + expf(-x)) * u[(size_t) j * n_ff + i];
+        for (int it = 0; it < n * nb_0; it++) {
+            const int j = it / nb_0, b = it % nb_0;
+            const float * gj = g + (size_t) j * n_ff + (size_t) b * QK8_0;
+            const float * uj = u + (size_t) j * n_ff + (size_t) b * QK8_0;
+            for (int i = 0; i < QK8_0; i++) {
+                hrow[i] = gj[i] / (1.0f + expf(-gj[i])) * uj[i];
             }
-            q80(hrow, h8 + (size_t) j * h_row, n_ff);
+            q80(hrow, h8 + (size_t) j * h_row + (size_t) b * sizeof(block_q8_0), QK8_0);
         }
         // down
         #pragma omp for schedule(dynamic, 1)
