@@ -241,11 +241,11 @@ static __global__ void qwen4_hc_down_inject_f16(
 
     float acc[T] = { 0.0f };
     for (int ib = threadIdx.x; ib < nb; ib += blockDim.x) {
-        const float dw = __half2float(load_half_nt(&w[ib].d));
+        const float dw = __half2float(w[ib].d);
         half2 wh[QK8_0/2];
 #pragma unroll
         for (int j = 0; j < QK8_0/4; ++j) {
-            const int wi = get_int_b2_nt(w[ib].qs, j);
+            const int wi = get_int_b2(w[ib].qs, j);
             wh[2*j + 0] = make_half2(__int2half_rn((int8_t) wi),         __int2half_rn((int8_t) (wi >> 8)));
             wh[2*j + 1] = make_half2(__int2half_rn((int8_t) (wi >> 16)), __int2half_rn((int8_t) (wi >> 24)));
         }
@@ -378,8 +378,8 @@ static __device__ __forceinline__ void qwen4_hc_row_q8_0_f32(
     }
 #pragma unroll 2
     for (int ib = 0; ib < nb; ++ib) {
-        const float dw = __half2float(load_half_nt(&wr[ib].d));
-        const int   wi = get_int_b2_nt(wr[ib].qs, k);
+        const float dw = __half2float(wr[ib].d);
+        const int   wi = get_int_b2(wr[ib].qs, k);
         const float w0 = (float) (int8_t) (wi      );
         const float w1 = (float) (int8_t) (wi >>  8);
         const float w2 = (float) (int8_t) (wi >> 16);
