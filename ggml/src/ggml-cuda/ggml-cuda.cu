@@ -4113,6 +4113,56 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    // the mean of groups of gathered rows, as qwen4exp's indexer pools a block's raw keys (build_qsa_sel): GET_ROWS,
+    // RESHAPE [n, n_group, n_out], CONT of the first VIEW [n, n_out], an ADD per following VIEW, SCALE; one kernel
+    // (the same order of additions) instead of six
+    if (node->op == GGML_OP_GET_ROWS && node->type == GGML_TYPE_F32 && i + 4 < cgraph->n_nodes &&
+            (node->src[0]->type == GGML_TYPE_Q8_0 || node->src[0]->type == GGML_TYPE_Q4_0) &&
+            node->src[1]->type == GGML_TYPE_I32 && ggml_is_contiguous(node->src[1]) && ggml_is_contiguous(node) &&
+            node->ne[2] == 1 && node->ne[3] == 1 && node->src[0]->ne[2] == 1 && node->src[0]->ne[3] == 1) {
+        const ggml_tensor * rs = cgraph->nodes[i + 1];
+        const int n_group = rs->op == GGML_OP_RESHAPE && rs->src[0] == node && rs->ne[3] == 1 ? (int) rs->ne[1] : 0;
+        const int count = 2 + 2*n_group + 1;   // GET_ROWS, RESHAPE, (VIEW, CONT|ADD) per member, SCALE
+        if (n_group >= 2 && n_group <= 8 && i + count <= cgraph->n_nodes && node->ne[0] % 2 == 0) {
+            bool ok = true;
+            const ggml_tensor * prev = nullptr;
+            for (int k = 0; k < n_group && ok; ++k) {
+                const ggml_tensor * view = cgraph->nodes[i + 2 + 2*k];
+                const ggml_tensor * op   = cgraph->nodes[i + 3 + 2*k];
+                ok = view->op == GGML_OP_VIEW && view->src[0] == rs && view->view_offs == (size_t) k*rs->nb[1] &&
+                     view->ne[0] == rs->ne[0] && view->ne[1] == rs->ne[2] && view->ne[2] == 1 && view->ne[3] == 1 &&
+                     view->nb[1] == rs->nb[2] && op->type == GGML_TYPE_F32 && ggml_is_contiguous(op) &&
+                     ggml_are_same_shape(op, view) &&
+                     (k == 0 ? op->op == GGML_OP_CONT && op->src[0] == view
+                             : op->op == GGML_OP_ADD && op->src[0] == prev && op->src[1] == view);
+                prev = op;
+            }
+            ggml_tensor * scale = cgraph->nodes[i + count - 1];
+            if (ok && scale->op == GGML_OP_SCALE && scale->src[0] == prev && ggml_is_contiguous(scale) &&
+                    scale->type == GGML_TYPE_F32) {
+                enum ggml_op ops[2 + 2*8 + 1];
+                for (int k = 0; k < count; ++k) {
+                    ops[k] = cgraph->nodes[i + k]->op;
+                }
+                const int out_idx = i + count - 1;
+                // the output must not cover the rows or the indices the kernel reads
+                const auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+                    const char * a0 = (const char *) a->data; const char * b0 = (const char *) b->data;
+                    return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+                };
+                if (ggml_can_fuse_subgraph(cgraph, i, count, ops, &out_idx, 1) &&
+                        !overlaps(scale, node->src[0]) && !overlaps(scale, node->src[1])) {
+                    float sc, bias;
+                    memcpy(&sc,   (const float *) scale->op_params + 0, sizeof(float));
+                    memcpy(&bias, (const float *) scale->op_params + 1, sizeof(float));
+                    if (ggml_cuda_get_rows_mean(*cuda_ctx, node, (float *) scale->data, n_group, sc, bias)) {
+                        return count - 1;
+                    }
+                }
+            }
+        }
+    }
+
     // rows gathered to f32, then converted to f16 (the K/V cells a small batch attends, qwen4exp's QSA gather): the
     // rows are written to f16 at once (get_rows dequantizes to half as well), the f32 copy is never made
     if (node->op == GGML_OP_GET_ROWS && node->type == GGML_TYPE_F32 && i + 1 < cgraph->n_nodes &&

@@ -9033,6 +9033,67 @@ struct test_lightning_indexer : public test_case {
     }
 };
 
+// the mean of groups of gathered rows, as qwen4exp's indexer pools the raw keys of a block (get_rows, then the
+// sum of its kpool slices and a scale); ggml-cuda computes it in one kernel
+struct test_get_rows_mean : public test_case {
+    const ggml_type type;
+    const int64_t n_group;
+    const int64_t n_out;
+    const int64_t n_cells;
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, n_group, n_out, n_cells);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GET_ROWS_MEAN";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_get_rows_mean(ggml_type type = GGML_TYPE_Q8_0, int64_t n_group = 4, int64_t n_out = 1, int64_t n_cells = 64)
+        : type(type), n_group(n_group), n_out(n_out), n_cells(n_cells) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n = 128;
+        // a cache row: the raw key, then the pooled key
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, type, 2*n, n_cells);
+        ggml_set_name(cache, "cache");
+        ggml_tensor * keys = ggml_view_2d(ctx, cache, n, n_cells, cache->nb[1], 0);
+
+        ggml_tensor * rows_idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_group*n_out);
+        ggml_set_name(rows_idx, "rows");
+
+        ggml_tensor * rows = ggml_reshape_3d(ctx, ggml_get_rows(ctx, keys, rows_idx), n, n_group, n_out);
+        ggml_tensor * sum = nullptr;
+        for (int64_t k = 0; k < n_group; ++k) {
+            ggml_tensor * slice = ggml_view_2d(ctx, rows, n, n_out, rows->nb[2], k*rows->nb[1]);
+            sum = sum ? ggml_add(ctx, sum, slice) : ggml_cont(ctx, slice);
+        }
+        ggml_tensor * out = ggml_scale(ctx, sum, 1.0f/(float) n_group);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op) || t->op != GGML_OP_NONE) {
+                continue;
+            }
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (auto & v : data) {
+                    v = rand() % n_cells;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_LIGHTNING_INDEXER on keys gathered by GET_ROWS from cache rows (qwen4exp's pooled keys: one per pool,
 // stored after the key | gate of the pool's last cell); ggml-cuda reads them in place through the row indices
 struct test_lightning_indexer_gather : public test_case {
@@ -12027,6 +12088,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0}) {
             test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, 32, 4, 1, type_K));
         }
+    }
+
+    for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_F32}) {
+        test_cases.emplace_back(new test_get_rows_mean(type, 4, 1, 64));
+        test_cases.emplace_back(new test_get_rows_mean(type, 4, 7, 64));
+        test_cases.emplace_back(new test_get_rows_mean(type, 2, 300, 2000));
     }
 
     for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {

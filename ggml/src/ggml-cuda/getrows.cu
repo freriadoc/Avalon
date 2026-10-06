@@ -40,6 +40,62 @@ static __global__ void k_get_rows(
     }
 }
 
+template<int qk, int qr, dequantize_kernel_t dequantize_kernel>
+static __global__ void k_get_rows_mean(
+        const void * __restrict__ src0, const int32_t * __restrict__ ids, float * __restrict__ dst,
+        const int64_t ne00, const size_t nb01, const int n_group, const float scale, const float bias) {
+    const int64_t i00 = 2*((int64_t) blockIdx.y*blockDim.x + threadIdx.x);
+    if (i00 >= ne00) {
+        return;
+    }
+    const int64_t p = blockIdx.x;
+
+    const int ib   =  i00/qk;
+    const int iqs  = (i00%qk)/qr;
+    const int iybs = i00 - i00%qk;
+    const int y_offset = qr == 1 ? 1 : qk/2;
+
+    float2 sum;
+    dequantize_kernel((const char *) src0 + (int64_t) ids[p*n_group]*nb01, ib, iqs, sum);
+    for (int k = 1; k < n_group; ++k) {
+        float2 v;
+        dequantize_kernel((const char *) src0 + (int64_t) ids[p*n_group + k]*nb01, ib, iqs, v);
+        sum.x += v.x;
+        sum.y += v.y;
+    }
+    float * dst_row = dst + p*ne00;
+    dst_row[iybs + iqs + 0]        = sum.x*scale + bias;
+    dst_row[iybs + iqs + y_offset] = sum.y*scale + bias;
+}
+
+template<int qk, int qr, dequantize_kernel_t dq>
+static void get_rows_mean_cuda(const void * src0_d, const int32_t * ids, float * dst, int64_t ne00, size_t nb01,
+                               int64_t n_out, int n_group, float scale, float bias, cudaStream_t stream) {
+    // a thread per pair of values: 64 threads for qwen4exp's 128-wide keys, not 256 with three quarters idle
+    const int block_size  = std::min<int64_t>(CUDA_GET_ROWS_BLOCK_SIZE, GGML_PAD(ne00/2, WARP_SIZE));
+    const int block_num_y = (ne00/2 + block_size - 1) / block_size;
+    k_get_rows_mean<qk, qr, dq><<<dim3(n_out, block_num_y, 1), block_size, 0, stream>>>(src0_d, ids, dst, ne00, nb01, n_group, scale, bias);
+}
+
+bool ggml_cuda_get_rows_mean(ggml_backend_cuda_context & ctx, const ggml_tensor * get_rows, float * dst, int n_group,
+                             float scale, float bias) {
+    const ggml_tensor * src0 = get_rows->src[0];
+    const int32_t * ids = (const int32_t *) get_rows->src[1]->data;
+    const int64_t ne00  = src0->ne[0];
+    const int64_t n_out = get_rows->ne[1] / n_group;
+    cudaStream_t stream = ctx.stream();
+    switch (src0->type) {
+        case GGML_TYPE_Q4_0:
+            get_rows_mean_cuda<QK4_0, QR4_0, dequantize_q4_0>(src0->data, ids, dst, ne00, src0->nb[1], n_out, n_group, scale, bias, stream);
+            return true;
+        case GGML_TYPE_Q8_0:
+            get_rows_mean_cuda<QK8_0, QR8_0, dequantize_q8_0>(src0->data, ids, dst, ne00, src0->nb[1], n_out, n_group, scale, bias, stream);
+            return true;
+        default:
+            return false;
+    }
+}
+
 template<typename dst_t, dequantize_kq_t<dst_t> dequantize_kq>
 static __global__ void k_get_rows_kq(
         const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
