@@ -1050,8 +1050,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         const int64_t n_q = sel.rows->ne[1];
         ggml_tensor * idx   = ggml_reshape_1d(ctx0, sel.rows, n_sel*n_q);
         ggml_tensor * k_sel = ggml_get_rows(ctx0, ggml_view_2d(ctx0, k, k->ne[0]*k->ne[1], k->ne[2], k->nb[2], 0), idx);
+        // get_rows gives f32 and flash attention reads f16: converted right after the gather, so a backend can gather
+        // to f16 at once (ggml-cuda fuses the two: no f32 copy, written then read again)
+        k_sel = ggml_cast(ctx0, k_sel, GGML_TYPE_F16);
         ggml_tensor * v_sel = ggml_get_rows(ctx0, ggml_view_2d(ctx0, v, v->ne[0]*v->ne[1], v->ne[2], v->nb[2], 0), idx);
-        // get_rows gives f32, which build_attn_mha casts to f16 for flash attention
+        v_sel = ggml_cast(ctx0, v_sel, GGML_TYPE_F16);
         k_sel = ggml_reshape_4d(ctx0, k_sel, k->ne[0], k->ne[1], n_sel, n_q);
         v_sel = ggml_reshape_4d(ctx0, v_sel, v->ne[0], v->ne[1], n_sel, n_q);
         cb(k_sel, "qsa_k_sel", il);

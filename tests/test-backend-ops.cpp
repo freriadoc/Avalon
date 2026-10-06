@@ -2442,6 +2442,24 @@ struct test_get_rows : public test_case {
     }
 };
 
+// GGML_OP_GET_ROWS converted to f16 at once (ggml-cuda fuses the gather with the cast, as the QSA gather of qwen4exp)
+struct test_get_rows_cast : public test_get_rows {
+    using test_get_rows::test_get_rows;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GET_ROWS_CAST";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = ggml_cast(ctx, test_get_rows::build_graph(ctx), GGML_TYPE_F16);
+        ggml_set_name(out, "out_f16");
+        return out;
+    }
+};
+
 // GGML_OP_GET_ROWS_BACK
 struct test_get_rows_back : public test_case {
     const ggml_type type;
@@ -9829,6 +9847,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, false));
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+        test_cases.emplace_back(new test_get_rows_cast(type, 256, 300, 2051, 3, 1, false));
+        test_cases.emplace_back(new test_get_rows_cast(type, 512, 50, 7, 1, 2, false, true));
+    }
     for (ggml_type type : all_types) {
         for (int b : {1, 7}) {
             for (bool v : {false, true}) {

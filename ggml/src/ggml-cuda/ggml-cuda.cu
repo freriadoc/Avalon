@@ -4039,6 +4039,32 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    // rows gathered to f32, then converted to f16 (the K/V cells a small batch attends, qwen4exp's QSA gather): the
+    // rows are written to f16 at once (get_rows dequantizes to half as well), the f32 copy is never made
+    if (node->op == GGML_OP_GET_ROWS && node->type == GGML_TYPE_F32 && i + 1 < cgraph->n_nodes &&
+            ggml_can_fuse(cgraph, i, { GGML_OP_GET_ROWS, GGML_OP_CPY })) {
+        ggml_tensor * cpy = cgraph->nodes[i + 1];
+        // ggml_cast makes the copy its own src[1]: the generic overlap check would always refuse, so check what the
+        // fused kernel reads (rows and indices) against what it writes
+        auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+            const char * a0 = (const char *) a->data; const char * b0 = (const char *) b->data;
+            return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+        };
+        if (cpy->src[0] == node && cpy->type == GGML_TYPE_F16 && ggml_are_same_shape(node, cpy) &&
+                ggml_is_contiguous(node) && ggml_is_contiguous(cpy) &&
+                !overlaps(cpy, node->src[0]) && !overlaps(cpy, node->src[1])) {
+            ggml_tensor rows_f16 = *node;
+            rows_f16.type  = GGML_TYPE_F16;
+            rows_f16.data  = cpy->data;
+            rows_f16.nb[0] = ggml_type_size(GGML_TYPE_F16);
+            for (int d = 1; d < GGML_MAX_DIMS; d++) {
+                rows_f16.nb[d] = rows_f16.nb[d - 1] * rows_f16.ne[d - 1];
+            }
+            ggml_cuda_op_get_rows(*cuda_ctx, &rows_f16);
+            return 1;
+        }
+    }
+
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3)) {
         const int outputs[] = { i + 2, i + 5 };
