@@ -341,12 +341,5 @@ void ggml_cuda_op_gated_delta_net_fused_cache(
 }
 
 const ggml_tensor * ggml_cuda_gdn_state_gather_of(const ggml_backend_cuda_context & ctx, const ggml_tensor * state) {
-    if (ctx.gdn_gathers.empty()) {
-        return nullptr;
-    }
-    const ggml_tensor * t = state;
-    while (t && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW) && t->view_offs == 0) {
-        t = t->src[0];
-    }
-    return t && ctx.gdn_gathers.count(t) ? t : nullptr;
+    return ggml_cuda_gathered_rows_of(ctx, state);
 }

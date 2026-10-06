@@ -3156,6 +3156,80 @@ static bool ggml_cuda_gdn_absorbs_gather(const ggml_cgraph * cgraph, int idx) {
 }
 
 
+// The pooled keys of a lightning indexer gathered by GET_ROWS from the cache rows (qwen4exp's QSA: one key every
+// kpool cells, all of them gathered at every step) that only the indexer of a small batch reads, through reshapes:
+// the kernel reads each key in its cache row through the row indices (ggml_cuda_gathered_rows_of), with the
+// dequantization it already does for a quantized K. The gathered f32 copy is never made. No node in between may
+// write the cache or the indices.
+static bool ggml_cuda_indexer_absorbs_gather(const ggml_cgraph * cgraph, int idx) {
+    const ggml_tensor * gr = cgraph->nodes[idx];
+    const ggml_tensor * src = gr->src[0];
+    const ggml_tensor * ids = gr->src[1];
+    switch (src->type) {
+        case GGML_TYPE_F32: case GGML_TYPE_F16: case GGML_TYPE_BF16: case GGML_TYPE_Q4_0: case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0: case GGML_TYPE_Q5_1: case GGML_TYPE_Q8_0:
+            break;
+        default:
+            return false;
+    }
+    if (gr->op != GGML_OP_GET_ROWS || gr->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 ||
+            !ggml_is_contiguous(gr) || src->nb[0] != ggml_type_size(src->type) || !ggml_is_contiguous(ids) ||
+            gr->ne[2] != 1 || gr->ne[3] != 1 || src->ne[2] != 1 || src->ne[3] != 1 || ids->ne[0] != gr->ne[1] ||
+            (gr->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    const char * src_lo = (const char *) src->data;
+    const char * src_hi = src_lo + ggml_nbytes(src);
+    const char * ids_lo = (const char *) ids->data;
+    const char * ids_hi = ids_lo + ggml_nbytes(ids);
+    const auto root = [](const ggml_tensor * t) {
+        while (t && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW) && t->view_offs == 0) {
+            t = t->src[0];
+        }
+        return t;
+    };
+    int li_idx = -1;
+    for (int k = idx + 1; k < cgraph->n_nodes; k++) {
+        const ggml_tensor * n = cgraph->nodes[k];
+        if (n->op == GGML_OP_LIGHTNING_INDEXER && root(n->src[1]) == gr) {
+            const ggml_tensor * kt = n->src[1];
+            if (li_idx >= 0 || !ggml_is_contiguous(kt) || kt->ne[0] != gr->ne[0] || kt->ne[0]*kt->ne[1] != gr->ne[0] ||
+                    kt->ne[2] != gr->ne[1] || kt->ne[3] != 1) {
+                return false;
+            }
+            // small batches only (decoding, MTP verification): a prefill reads every key once per token, so its
+            // gather is amortized, and reading in place dequantizes each key again for every token (-0.5 % at 19 k)
+            if (n->src[0]->ne[2] > 8) {
+                return false;
+            }
+            // ggml-alloc frees the indices after the GET_ROWS: the scores may be placed over them (seen in a prefill)
+            const char * lo = (const char *) n->data;
+            const char * hi = lo + ggml_nbytes(n);
+            if ((lo < src_hi && src_lo < hi) || (lo < ids_hi && ids_lo < hi)) {
+                return false;
+            }
+            li_idx = k;
+            continue;
+        }
+        // any other reader of the gathered rows (a view of them is fine only on the way to the indexer)
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            const ggml_tensor * s = n->src[j];
+            if (s && (s == gr || s->view_src == gr) && !(ggml_cuda_is_view_or_noop(n) && root(n) == gr)) {
+                return false;
+            }
+        }
+        // nothing may write the cache or the indices before the indexer has read them
+        if (li_idx < 0 && !ggml_cuda_is_view_or_noop(n) && n->data && ggml_nbytes(n) > 0) {
+            const char * lo = (const char *) n->data;
+            const char * hi = lo + ggml_nbytes(n);
+            if ((lo < src_hi && src_lo < hi) || (lo < ids_hi && ids_lo < hi)) {
+                return false;
+            }
+        }
+    }
+    return li_idx >= 0;
+}
+
 // concat(conv state, x) -> rollback-slot copies of its tail -> ssm_conv (-> silu), as qwen4exp's linear
 // attention builds it (build_conv_state_at): one kernel, ggml_cuda_op_ssm_conv_cached
 struct ggml_cuda_conv_cached_match {
@@ -5254,10 +5328,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
-                // a recurrent state's gather left to the gated delta net or the cached ssm_conv that reads it
+                // a recurrent state's gather left to the gated delta net or the cached ssm_conv that reads it, the
+                // pooled keys' gather left to the lightning indexer
                 // (only with fusions on: the cached ssm_conv that reads the conv state's rows is a fusion)
                 if (node->op == GGML_OP_GET_ROWS && !ggml_cuda_fusion_disabled() &&
-                        (ggml_cuda_gdn_absorbs_gather(cgraph, i) || ggml_cuda_conv_absorbs_gather(cgraph, i))) {
+                        (ggml_cuda_gdn_absorbs_gather(cgraph, i) || ggml_cuda_conv_absorbs_gather(cgraph, i) ||
+                         ggml_cuda_indexer_absorbs_gather(cgraph, i))) {
                     cuda_ctx->gdn_gathers.insert(node);
                     continue;
                 }

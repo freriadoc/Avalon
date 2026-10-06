@@ -1489,8 +1489,9 @@ struct ggml_backend_cuda_context {
         const char *  hi    = nullptr;
     } q8_1_reuse;
 
-    // GET_ROWS of a recurrent state left to the gated delta net that reads it (it reads the cache
-    // rows itself, ggml_cuda_gdn_state_gather_of); reset at the start of every graph
+    // GET_ROWS left to the node that reads the gathered rows, which reads the source rows itself: a recurrent state
+    // (gated delta net, cached ssm_conv: ggml_cuda_gdn_state_gather_of), the pooled keys of the lightning indexer
+    // (ggml_cuda_gathered_rows_of); reset at the start of every graph
     std::unordered_set<const ggml_tensor *> gdn_gathers;
 
 #ifdef USE_CUDA_GRAPH
@@ -1600,6 +1601,17 @@ struct ggml_backend_cuda_context {
         return pool(device);
     }
 };
+
+// the GET_ROWS left to the node reading t (through reshapes and views at offset 0), or null
+static inline const ggml_tensor * ggml_cuda_gathered_rows_of(const ggml_backend_cuda_context & ctx, const ggml_tensor * t) {
+    if (ctx.gdn_gathers.empty()) {
+        return nullptr;
+    }
+    while (t && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW) && t->view_offs == 0) {
+        t = t->src[0];
+    }
+    return t && ctx.gdn_gathers.count(t) ? t : nullptr;
+}
 
 struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * x_bias = nullptr;
