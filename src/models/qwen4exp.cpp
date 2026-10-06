@@ -864,9 +864,9 @@ llama_model_qwen4exp::graph::qsa_sel llama_model_qwen4exp::graph::build_qsa_sel(
         pooled_new = pooled_new ? ggml_add(ctx0, pooled_new, slice) : ggml_cont(ctx0, slice);
     }
     pooled_new = ggml_scale(ctx0, pooled_new, 1.0f/(float) kpool);
-    pooled_new = build_norm(pooled_new, model.layers[il].index_k_norm, nullptr, LLM_NORM_RMS, il);
-
+    // shaped for the rotation before the norm: norm, weight and rotation adjacent, a backend can fuse them
     pooled_new = ggml_reshape_3d(ctx0, pooled_new, idx_dim, 1, n_new);
+    pooled_new = build_norm(pooled_new, model.layers[il].index_k_norm, nullptr, LLM_NORM_RMS, il);
     pooled_new = ggml_rope_multi(ctx0, pooled_new, inp_kpool->new_pool_pos, nullptr,
             n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
             ext_factor, attn_factor, beta_fast, beta_slow);
