@@ -108,6 +108,12 @@ void ggml_vec_dot_iq4_xs_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs,
 void ggml_vec_dot_iq2_s_q8_K_multi (int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int nc);
 void ggml_vec_dot_iq3_k_q8_K_multi (int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int nc);
 void ggml_vec_dot_iq4_nl_q8_0_multi(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int nc);
+// the same with q8_0 activations quantized as the GPU's q8_1 (quantize_row_q8_0_gpu)
+void ggml_vec_dot_iq2_s_q8_0_multi (int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int nc);
+void ggml_vec_dot_iq3_k_q8_0_multi (int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int nc);
+void ggml_vec_dot_iq2_s_q8_0_generic(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy);
+void ggml_vec_dot_iq3_k_q8_0_generic(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy);
+void quantize_row_q8_0_gpu(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 
 #ifdef __cplusplus
 }

@@ -1376,7 +1376,64 @@ void quantize_row_iq4_xs(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, 
 }
 
 
+// Activations quantized as the GPU's q8_1 (quantize_q8_1 of ggml-cuda), into q8_0 blocks: d = amax/127,
+// q = roundf(x/d) (halfway cases away from zero), d stored as f16; the same bytes, so that an expert computed by
+// the CPU or by the GPU starts from the same activations. k % QK8_0 == 0.
+void quantize_row_q8_0_gpu(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    block_q8_0 * GGML_RESTRICT y = vy;
+    for (int64_t ib = 0; ib < k / QK8_0; ++ib) {
+        const float * xb = x + ib*QK8_0;
+        float amax = 0.0f;
+        for (int j = 0; j < QK8_0; ++j) {
+            amax = fmaxf(amax, fabsf(xb[j]));
+        }
+        const float d = amax / 127.0f;
+        for (int j = 0; j < QK8_0; ++j) {
+            y[ib].qs[j] = amax == 0.0f ? 0 : (int8_t) roundf(xb[j] / d);
+        }
+        y[ib].d = GGML_CPU_FP32_TO_FP16(d);
+    }
+}
+
+// a weight row (IQ2_S, IQ3_K) against q8_0 activations, through the dequantized weights (other architectures)
+void ggml_vec_dot_iq2_s_q8_0_generic(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy) {
+    float w[QK_K];
+    const block_q8_0 * GGML_RESTRICT y = vy;
+    float sum = 0.0f;
+    for (int i = 0; i < n / QK_K; ++i) {
+        dequantize_row_iq2_s((const block_iq2_s *) vx + i, w, QK_K);
+        for (int b = 0; b < QK_K/QK8_0; ++b) {
+            const block_q8_0 * yb = y + i*(QK_K/QK8_0) + b;
+            float sb = 0.0f;
+            for (int j = 0; j < QK8_0; ++j) sb += w[b*QK8_0 + j] * yb->qs[j];
+            sum += sb * GGML_CPU_FP16_TO_FP32(yb->d);
+        }
+    }
+    *s = sum;
+}
+void ggml_vec_dot_iq3_k_q8_0_generic(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy) {
+    float w[QK_K];
+    const block_q8_0 * GGML_RESTRICT y = vy;
+    float sum = 0.0f;
+    for (int i = 0; i < n / QK_K; ++i) {
+        dequantize_row_iq3_k((const block_iq3_k *) vx + i, w, QK_K);
+        for (int b = 0; b < QK_K/QK8_0; ++b) {
+            const block_q8_0 * yb = y + i*(QK_K/QK8_0) + b;
+            float sb = 0.0f;
+            for (int j = 0; j < QK8_0; ++j) sb += w[b*QK8_0 + j] * yb->qs[j];
+            sum += sb * GGML_CPU_FP16_TO_FP32(yb->d);
+        }
+    }
+    *s = sum;
+}
+
 #if !defined(__x86_64__) && !defined(_M_X64)
+void ggml_vec_dot_iq2_s_q8_0_multi(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int nc) {
+    for (int c = 0; c < nc; c++) ggml_vec_dot_iq2_s_q8_0_generic(n, s + c, vx, vy[c]);
+}
+void ggml_vec_dot_iq3_k_q8_0_multi(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int nc) {
+    for (int c = 0; c < nc; c++) ggml_vec_dot_iq3_k_q8_0_generic(n, s + c, vx, vy[c]);
+}
 // several activation rows against one weight row: one-row kernels on other architectures
 void ggml_vec_dot_iq2_s_q8_K_multi(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int nc) {
     for (int c = 0; c < nc; c++) ggml_vec_dot_iq2_s_q8_K(n, s + c, 0, vx, 0, vy[c], 0, 1);

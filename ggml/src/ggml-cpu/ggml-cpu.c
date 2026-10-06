@@ -4513,8 +4513,9 @@ int ggml_cpu_has_sme2(void) {
 
 // The experts of the MoE block hosted by the GPU, IQ2_S / IQ3_K gate and up, IQ4_NL down, without a graph: an expert
 // with several rows (tokens of an MTP verification) has each weight block decoded once for all of them
-// (ggml_vec_dot_*_multi); an expert with one row keeps the format's vec_dot. False for other types or
-// shapes (the graph computes them).
+// (ggml_vec_dot_*_multi). The activations are quantized as the GPU's q8_1 (quantize_row_q8_0_gpu: blocks of 32),
+// not q8_K: the CPU and the GPU start from the same bytes (their results differ by 4e-4 instead of 1.5e-2) and the
+// CPU rounds closer to the exact product (-18 % error). False for other types or shapes (the graph computes them).
 static bool ggml_cpu_moe_experts_multi(const struct ggml_tensor * gate_w, const struct ggml_tensor * up_w,
                                        const struct ggml_tensor * down_w, const float * act,
                                        const int32_t * experts, int n, float * out, int n_threads) {
@@ -4528,7 +4529,7 @@ static bool ggml_cpu_moe_experts_multi(const struct ggml_tensor * gate_w, const 
     }
     static _Thread_local uint8_t * buf = NULL;
     static _Thread_local size_t buf_size = 0;
-    const size_t a_row = (size_t) (n_embd / QK_K) * sizeof(block_q8_K);
+    const size_t a_row = (size_t) (n_embd / QK8_0) * sizeof(block_q8_0);
     const size_t h_row = (size_t) (n_ff / QK8_0) * sizeof(block_q8_0);
     const size_t need = (size_t) n * (a_row + h_row + 2 * n_ff * sizeof(float)) + (size_t) 3 * n * sizeof(int32_t) + 256;
     if (buf_size < need) {
@@ -4561,27 +4562,24 @@ static bool ggml_cpu_moe_experts_multi(const struct ggml_tensor * gate_w, const 
             next[r] = j;
         }
     }
-    const ggml_from_float_t q8k = type_traits_cpu[GGML_TYPE_Q8_K].from_float;
-    const ggml_from_float_t q80 = type_traits_cpu[GGML_TYPE_Q8_0].from_float;
-    const ggml_vec_dot_t dot_k  = type_traits_cpu[tk].vec_dot;
     const ggml_vec_dot_t dot_nl = type_traits_cpu[GGML_TYPE_IQ4_NL].vec_dot;
-    const int nb_k = (int) (n_embd / QK_K), nb_0 = (int) (n_ff / QK8_0);
+    const int nb_a = (int) (n_embd / QK8_0), nb_0 = (int) (n_ff / QK8_0);
     const int rb1 = 16, n_ch1 = (int) ((n_ff + rb1 - 1) / rb1);
     const int rb3 = 32, n_ch3 = (int) ((n_embd + rb3 - 1) / rb3);
     void (*multi_k)(int, float *, const void *, const void * const *, int) =
-        tk == GGML_TYPE_IQ2_S ? ggml_vec_dot_iq2_s_q8_K_multi : ggml_vec_dot_iq3_k_q8_K_multi;
+        tk == GGML_TYPE_IQ2_S ? ggml_vec_dot_iq2_s_q8_0_multi : ggml_vec_dot_iq3_k_q8_0_multi;
     #pragma omp parallel num_threads(n_threads)
     {
         float   hrow[QK8_0];
         const void * ys[8];
         int          rs[8];
         float        res[8];
-        // the activations, a q8_K block per item: ~2 rows of 10 blocks spread over the team (quantized by the calling
-        // thread alone they took 6.9 us of a 144 us call)
+        // the activations, quantized as the GPU's q8_1 (blocks of 32, the same bytes: an expert computed by the CPU or
+        // by the GPU starts from the same activations), a block per item spread over the team
         #pragma omp for
-        for (int it = 0; it < n * nb_k; it++) {
-            const int j = it / nb_k, b = it % nb_k;
-            q8k(act + (size_t) j * n_embd + (size_t) b * QK_K, a8 + (size_t) j * a_row + (size_t) b * sizeof(block_q8_K), QK_K);
+        for (int it = 0; it < n * nb_a; it++) {
+            const int j = it / nb_a, b = it % nb_a;
+            quantize_row_q8_0_gpu(act + (size_t) j * n_embd + (size_t) b * QK8_0, a8 + (size_t) j * a_row + (size_t) b * sizeof(block_q8_0), QK8_0);
         }
         // gate and up
         #pragma omp for schedule(dynamic, 1)
@@ -4593,18 +4591,14 @@ static bool ggml_cpu_moe_experts_multi(const struct ggml_tensor * gate_w, const 
             const int r0 = first[ue];
             for (int64_t row = (int64_t) ch * rb1; row < (int64_t) (ch + 1) * rb1 && row < n_ff; row++) {
                 const char * wr = (const char *) W->data + (size_t) e * W->nb[2] + (size_t) row * W->nb[1];
-                if (next[r0] < 0) {
-                    dot_k((int) n_embd, dst + (size_t) r0 * n_ff + row, 0, wr, 0, a8 + (size_t) r0 * a_row, 0, 1);
-                } else {
-                    for (int r = r0; r >= 0; ) {
-                        int nc = 0;
-                        for (; r >= 0 && nc < 8; r = next[r], nc++) {
-                            rs[nc] = r;
-                            ys[nc] = a8 + (size_t) r * a_row;
-                        }
-                        multi_k((int) n_embd, res, wr, ys, nc);
-                        for (int c = 0; c < nc; c++) dst[(size_t) rs[c] * n_ff + row] = res[c];
+                for (int r = r0; r >= 0; ) {
+                    int nc = 0;
+                    for (; r >= 0 && nc < 8; r = next[r], nc++) {
+                        rs[nc] = r;
+                        ys[nc] = a8 + (size_t) r * a_row;
                     }
+                    multi_k((int) n_embd, res, wr, ys, nc);
+                    for (int c = 0; c < nc; c++) dst[(size_t) rs[c] * n_ff + row] = res[c];
                 }
             }
         }
@@ -4617,7 +4611,7 @@ static bool ggml_cpu_moe_experts_multi(const struct ggml_tensor * gate_w, const 
             for (int i = 0; i < QK8_0; i++) {
                 hrow[i] = gj[i] / (1.0f + expf(-gj[i])) * uj[i];
             }
-            q80(hrow, h8 + (size_t) j * h_row + (size_t) b * sizeof(block_q8_0), QK8_0);
+            quantize_row_q8_0_gpu(hrow, h8 + (size_t) j * h_row + (size_t) b * sizeof(block_q8_0), QK8_0);
         }
         // down
         #pragma omp for schedule(dynamic, 1)
