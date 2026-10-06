@@ -5083,7 +5083,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 return true;
             };
             if (ggml_can_fuse_subgraph_ext(cgraph, nodes, 4, ops, &out_idx, 1) && aliasing_ok()) {
-                ggml_cuda_op_rms_norm_mul_sigmoid_gate(*cuda_ctx, node, w, gate, out);
+                // the q8_1 of the output too when the next product reads it (whole warps per q8_1 block)
+                void * q8_1 = x->ne[0] % QK8_1 == 0 ? ggml_cuda_q8_1_produce(*cuda_ctx, cgraph, out_idx) : nullptr;
+                ggml_cuda_op_rms_norm_mul_sigmoid_gate(*cuda_ctx, node, w, gate, out, q8_1);
                 return count - 1;
             }
         }
@@ -5316,11 +5318,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             // a node (or a fused group, a hosted MoE block) computed nodes [first, last]: drop the
             // reused activation quantization if one of them wrote over it
             const auto written = [&](int first, int last) {
-                for (int k = first; k <= last && k < cgraph->n_nodes; k++) {
+                // a group that produced the quantization of its output wrote that output only (its other nodes
+                // are not computed, though their addresses may cover it)
+                for (int k = first; k <= last && k < cgraph->n_nodes && !cuda_ctx->q8_1_reuse.producer; k++) {
                     if (!ggml_cuda_is_view_or_noop(cgraph->nodes[k])) {
                         ggml_cuda_q8_1_reuse_written(*cuda_ctx, cgraph->nodes[k]);
                     }
                 }
+                cuda_ctx->q8_1_reuse.producer = nullptr;
             };
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];

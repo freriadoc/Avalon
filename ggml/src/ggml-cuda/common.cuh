@@ -1487,6 +1487,9 @@ struct ggml_backend_cuda_context {
         int64_t       key[8] = {0};
         const char *  lo    = nullptr;   // bytes of the activation
         const char *  hi    = nullptr;
+        // the node that just wrote the activation together with its quantization (ggml_cuda_q8_1_produce): the
+        // check that follows the launch of its group leaves it valid
+        const ggml_tensor * producer = nullptr;
     } q8_1_reuse;
 
     // GET_ROWS left to the node that reads the gathered rows, which reads the source rows itself: a recurrent state

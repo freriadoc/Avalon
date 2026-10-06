@@ -1,4 +1,5 @@
 #include "quantize.cuh"
+#include "mmvq.cuh"
 #include <cstdint>
 #include <cstring>
 
@@ -717,6 +718,45 @@ const void * ggml_cuda_q8_1_reuse(ggml_backend_cuda_context & ctx, const float *
     r.lo    = (const char *) x;
     r.hi    = (const char *) (x + (ne00 - 1) + (ne1 - 1)*s01 + (ne2 - 1)*s02 + (ne3 - 1)*s03 + 1);
     return r.buf;
+}
+
+void * ggml_cuda_q8_1_produce(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int out_idx) {
+    auto & r = ctx.q8_1_reuse;
+    const ggml_tensor * out = cgraph->nodes[out_idx];
+    if (!r.buf || ctx.curr_stream_no != 0 || out->type != GGML_TYPE_F32 || !ggml_is_contiguous(out)) {
+        return nullptr;
+    }
+    const auto root = [](const ggml_tensor * t) {
+        while (t && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW) && t->view_offs == 0) {
+            t = t->src[0];
+        }
+        return t;
+    };
+    // the first product that reads the output
+    for (int k = out_idx + 1; k < cgraph->n_nodes; k++) {
+        const ggml_tensor * n = cgraph->nodes[k];
+        // a product of float weights (an indexer's projection) reads the activation as it is
+        if (n->op != GGML_OP_MUL_MAT || root(n->src[1]) != out || !ggml_is_quantized(n->src[0]->type)) {
+            continue;
+        }
+        const ggml_tensor * src1 = n->src[1];
+        const int64_t ne10 = src1->ne[0], ne11 = src1->ne[1];
+            if (src1->type != GGML_TYPE_F32 || src1->data != out->data || !ggml_is_contiguous(src1) || src1->ne[2] != 1 ||
+                src1->ne[3] != 1 || ne10 % MATRIX_ROW_PADDING != 0 || ne11 > MMVQ_MAX_BATCH_SIZE ||
+                (size_t) (ne10*ne11) * sizeof(block_q8_1) / QK8_1 > r.size) {
+            return nullptr;
+        }
+        // the key ggml_cuda_q8_1_reuse builds for this product
+        const int64_t key[8] = {ne10, ne11 > 1 ? ne10 : 0, 0, 0, ne10, ne11, 1, 1};
+        r.valid    = true;
+        r.x        = (const float *) out->data;
+        memcpy(r.key, key, sizeof(key));
+        r.lo       = (const char *) out->data;
+        r.hi       = r.lo + ggml_nbytes(out);
+        r.producer = out;
+        return r.buf;
+    }
+    return nullptr;
 }
 
 void ggml_cuda_q8_1_reuse_written(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {

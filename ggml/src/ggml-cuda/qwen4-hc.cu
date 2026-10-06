@@ -15,6 +15,7 @@
 
 #include "qwen4-hc.cuh"
 #include "common.cuh"
+#include "quantize.cuh"
 #include "vecdotq.cuh"
 
 #include <cmath>
@@ -416,10 +417,12 @@ static __device__ __forceinline__ void qwen4_hc_load_shared(const float * x, int
     }
 }
 
+// mixed_q8_1 (null: none): the q8_1 of mixed as quantize_q8_1 writes it, for the product that reads it; then a
+// workgroup has QK8_1 warps (n_embd % QK8_1 == 0): its outputs are one q8_1 block per token
 template <int T>
 static __global__ void qwen4_hc_up_pre_q8_0(
         const block_q8_0 * w, const float * lo, const float * xn, float * mixed,
-        int n_lo, int n_embd, int hc, float scale) {
+        int n_lo, int n_embd, int hc, float scale, block_q8_1 * mixed_q8_1) {
     extern __shared__ float qwen4_hc_k3_smem[];
     const int nb = n_lo / QK8_0;
     qwen4_hc_load_shared<T*QWEN4_HC_K3_MAX_LO>(lo, T*n_lo, qwen4_hc_k3_smem);
@@ -442,6 +445,25 @@ static __global__ void qwen4_hc_up_pre_q8_0(
         m += __shfl_xor_sync(0xffffffff, m, 16, WARP_SIZE);
         if (lane == 0) {
             mixed[(size_t) t*n_embd + e] = scale * m;
+            if (mixed_q8_1) {
+                qwen4_hc_k3_smem[T*n_lo + t*QK8_1 + threadIdx.x / WARP_SIZE] = scale * m;
+            }
+        }
+    }
+    if (mixed_q8_1) {
+        // warp t quantizes the QK8_1 outputs of token t, lane = index in the block (quantize_q8_1's layout)
+        __syncthreads();
+        const int wt = threadIdx.x / WARP_SIZE;
+        if (wt < T) {
+            const float v    = qwen4_hc_k3_smem[T*n_lo + wt*QK8_1 + lane];
+            const float amax = warp_reduce_max<QK8_1>(fabsf(v));
+            const float sum  = warp_reduce_sum<QK8_1>(v);
+            const float d    = amax / 127.0f;
+            block_q8_1 & y = mixed_q8_1[((size_t) wt*n_embd + blockIdx.x * QK8_1) / QK8_1];
+            y.qs[lane] = amax == 0.0f ? 0 : roundf(v / d);
+            if (lane == 0) {
+                y.ds = make_half2(d, sum);
+            }
         }
     }
 }
@@ -501,14 +523,14 @@ void ggml_cuda_mul_mat_q8_0_f32(ggml_backend_cuda_context & ctx, const ggml_tens
 template <int T>
 static void qwen4_hc_up_pre_launch(int grid, int block, size_t smem, cudaStream_t stream,
         const block_q8_0 * w, const float * lo, const float * xn, float * mixed,
-        int n_lo, int n_embd, int hc, int T_run, float scale) {
+        int n_lo, int n_embd, int hc, int T_run, float scale, block_q8_1 * mixed_q8_1) {
     if constexpr (T > 1) {
         if (T_run < T) {
-            qwen4_hc_up_pre_launch<T - 1>(grid, block, smem, stream, w, lo, xn, mixed, n_lo, n_embd, hc, T_run, scale);
+            qwen4_hc_up_pre_launch<T - 1>(grid, block, smem, stream, w, lo, xn, mixed, n_lo, n_embd, hc, T_run, scale, mixed_q8_1);
             return;
         }
     }
-    qwen4_hc_up_pre_q8_0<T><<<grid, block, smem, stream>>>(w, lo, xn, mixed, n_lo, n_embd, hc, scale);
+    qwen4_hc_up_pre_q8_0<T><<<grid, block, smem, stream>>>(w, lo, xn, mixed, n_lo, n_embd, hc, scale, mixed_q8_1);
 }
 
 static bool qwen4_hc_match_k3(const ggml_cgraph * cgraph, int i, qwen4_hc_span & span) {
@@ -660,11 +682,14 @@ int ggml_cuda_try_fuse_qwen4_hc(ggml_backend_cuda_context & ctx, ggml_cgraph * c
         const int n_embd = (int) xn->ne[0];
         const int hc     = (int) xn->ne[1];
         const int T      = (int) xn->ne[2];
-        const int warps = QWEN4_HC_K3_THREADS / WARP_SIZE;
-        const size_t smem = (size_t) T * n_lo * sizeof(float);
+        // the q8_1 of the output too when the next quantized product reads it: QK8_1 warps per workgroup, the
+        // outputs of a workgroup quantized together at the end
+        block_q8_1 * q8_1 = n_embd % QK8_1 == 0 ? (block_q8_1 *) ggml_cuda_q8_1_produce(ctx, cgraph, span3.idx[1]) : nullptr;
+        const int warps = q8_1 ? QK8_1 : QWEN4_HC_K3_THREADS / WARP_SIZE;
+        const size_t smem = (size_t) T * (n_lo + (q8_1 ? QK8_1 : 0)) * sizeof(float);
         qwen4_hc_up_pre_launch<QWEN4_HC_MAX_TOKENS>((n_embd + warps - 1) / warps, warps*WARP_SIZE, smem, stream,
                 (const block_q8_0 *) mm->src[0]->data, lo_d, (const float *) xn->data,
-                (float *) pre->data, n_lo, n_embd, hc, T, ggml_get_op_params_f32(pre, 0));
+                (float *) pre->data, n_lo, n_embd, hc, T, ggml_get_op_params_f32(pre, 0), q8_1);
         return span3.n_all - 1;
     }
 

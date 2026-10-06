@@ -79,3 +79,9 @@ const void * ggml_cuda_q8_1_reuse(ggml_backend_cuda_context & ctx, const float *
 
 // a node wrote dst: drop the reused quantization if dst overlaps its activation
 void ggml_cuda_q8_1_reuse_written(ggml_backend_cuda_context & ctx, const ggml_tensor * dst);
+
+// A node whose kernel can write its f32 output together with its q8_1 quantization (the bytes quantize_q8_1
+// would write) for the mat-vec product that reads it next: the reuse buffer when the product reads the output as
+// it is (same address, two dimensions, contiguous, rows a multiple of MATRIX_ROW_PADDING), else null. The buffer
+// is then registered as holding that activation (call it right before the launch).
+void * ggml_cuda_q8_1_produce(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int out_idx);
