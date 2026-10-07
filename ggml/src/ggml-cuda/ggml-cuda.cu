@@ -3100,6 +3100,23 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
 // match gated_delta_net + the strided cpy that scatters its state snapshots into the cache
 // (slot i -> rollback group i, slot 0 newest), so the kernel can write them and skip the cpy.
 
+// Whether a node writes into [lo0, hi0) or [lo1, hi1): its result, or the temporary memory the scheduler gave it
+// (src[GGML_SCHED_SCRATCH_SRC]), which ggml-alloc may also place over a tensor whose last reader in the graph has run.
+static bool ggml_cuda_node_writes_into(const ggml_tensor * n, const char * lo0, const char * hi0, const char * lo1, const char * hi1) {
+    const ggml_tensor * written[2] = { n, n->src[GGML_SCHED_SCRATCH_SRC] };
+    for (const ggml_tensor * t : written) {
+        if (t == nullptr || t->data == nullptr || ggml_nbytes(t) == 0) {
+            continue;
+        }
+        const char * lo = (const char *) t->data;
+        const char * hi = lo + ggml_nbytes(t);
+        if ((lo < hi0 && lo0 < hi) || (lo < hi1 && lo1 < hi)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // A recurrent state gathered by GET_ROWS (one cache row per sequence) that only a gated delta net
 // reads, through reshapes: the kernel can read the cache rows itself (one copy of the state, 3 MiB
 // per layer in qwen4exp, and a kernel less). Each block reads its columns of the state before it
@@ -3137,6 +3154,12 @@ static bool ggml_cuda_gdn_absorbs_gather(const ggml_cgraph * cgraph, int idx) {
                     !ggml_is_contiguous(n->src[5])) {
                 return false;
             }
+            // ggml-alloc frees the indices after the GET_ROWS: the GDN's own result may be placed over them, and
+            // its blocks that finish first would overwrite indices others have not read yet (seen in a prefill:
+            // a block then read its state far past the cache and hung the queue)
+            if (ggml_cuda_node_writes_into(n, ids_lo, ids_hi, ids_lo, ids_hi)) {
+                return false;
+            }
             gdn_idx = k;
             continue;
         }
@@ -3148,12 +3171,8 @@ static bool ggml_cuda_gdn_absorbs_gather(const ggml_cgraph * cgraph, int idx) {
             }
         }
         // nothing may write the cache or the indices before the GDN has read them
-        if (gdn_idx < 0 && !ggml_cuda_is_view_or_noop(n) && n->data && ggml_nbytes(n) > 0) {
-            const char * lo = (const char *) n->data;
-            const char * hi = lo + ggml_nbytes(n);
-            if ((lo < src_hi && src_lo < hi) || (lo < ids_hi && ids_lo < hi)) {
-                return false;
-            }
+        if (gdn_idx < 0 && !ggml_cuda_is_view_or_noop(n) && ggml_cuda_node_writes_into(n, src_lo, src_hi, ids_lo, ids_hi)) {
+            return false;
         }
     }
     return gdn_idx >= 0;
@@ -3207,9 +3226,7 @@ static bool ggml_cuda_indexer_absorbs_gather(const ggml_cgraph * cgraph, int idx
                 return false;
             }
             // ggml-alloc frees the indices after the GET_ROWS: the scores may be placed over them (seen in a prefill)
-            const char * lo = (const char *) n->data;
-            const char * hi = lo + ggml_nbytes(n);
-            if ((lo < src_hi && src_lo < hi) || (lo < ids_hi && ids_lo < hi)) {
+            if (ggml_cuda_node_writes_into(n, src_lo, src_hi, ids_lo, ids_hi)) {
                 return false;
             }
             li_idx = k;
@@ -3223,12 +3240,8 @@ static bool ggml_cuda_indexer_absorbs_gather(const ggml_cgraph * cgraph, int idx
             }
         }
         // nothing may write the cache or the indices before the indexer has read them
-        if (li_idx < 0 && !ggml_cuda_is_view_or_noop(n) && n->data && ggml_nbytes(n) > 0) {
-            const char * lo = (const char *) n->data;
-            const char * hi = lo + ggml_nbytes(n);
-            if ((lo < src_hi && src_lo < hi) || (lo < ids_hi && ids_lo < hi)) {
-                return false;
-            }
+        if (li_idx < 0 && !ggml_cuda_is_view_or_noop(n) && ggml_cuda_node_writes_into(n, src_lo, src_hi, ids_lo, ids_hi)) {
+            return false;
         }
     }
     return li_idx >= 0;
