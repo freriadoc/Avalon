@@ -515,11 +515,14 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
         // Q2_K / Q5_K / IQ4_XS regress in full quant sweeps.
         if (ncols_dst == 1) {
             switch (type) {
+                case GGML_TYPE_Q8_0:
+                    // 7900 XT, qwen4exp's Q8_0 products (K 2560 and 6144, 2.5 - 16.5 k rows, weights read cold), replay
+                    // of a one-token pass: 8 warps 20.17 ms, 4 warps 19.45 - 19.50, 2 warps 19.18 - 19.26, 1 warp 19.62
+                    return 2;
                 case GGML_TYPE_Q4_0:
                 case GGML_TYPE_Q4_1:
                 case GGML_TYPE_Q5_0:
                 case GGML_TYPE_Q5_1:
-                case GGML_TYPE_Q8_0:
                     return 8;
                 case GGML_TYPE_Q6_K:
                     return 2;
@@ -529,7 +532,9 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                     return 1;
             }
         }
-        return 1;
+        // the same Q8_0 products for 2 - 4 columns (MTP verification of 3 tokens): 1 warp 24.65 - 24.79 ms, 2 warps
+        // 24.40 - 24.54, 4 warps 24.37 - 24.54, 8 warps 25.17; more rows per block slower (2: 25.0, 4: 25.7)
+        return type == GGML_TYPE_Q8_0 && ncols_dst <= 4 ? 4 : 1;
     }
     if (table_id == MMVQ_PARAMETERS_TURING) {
         if (ncols_dst == 1) {
