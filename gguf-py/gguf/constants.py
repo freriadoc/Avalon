@@ -6131,6 +6131,7 @@ class VisionProjectorType:
     MIMO_AUDIO     = "mimo_audio"
     GRANITE4_VISION = "granite4_vision"
     MUSE_GLIMMER   = "muse-glimmer"
+    COHERE2V       = "cohere2v"
 
 
 # Items here are (block size, type size)
