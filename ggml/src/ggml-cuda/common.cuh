@@ -1492,6 +1492,21 @@ struct ggml_backend_cuda_context {
         const ggml_tensor * producer = nullptr;
     } q8_1_reuse;
 
+    // a MoE top-k left to the hosted MoE block that reads its ids (its entry kernel computes it), see
+    // ggml_cuda_topk_moe_defer; launched as usual if anything else reads its ids or weights first
+    struct {
+        const float * logits = nullptr;
+        float * weights = nullptr;
+        int32_t * ids = nullptr;
+        const ggml_tensor * weights_t = nullptr;
+        const ggml_tensor * ids_t = nullptr;
+        int n_rows = 0;
+        int n_expert = 0;
+        int n_used = 0;
+        float clamp = -INFINITY;
+        float scale = 1.0f;
+    } topk_pending;
+
     // GET_ROWS left to the node that reads the gathered rows, which reads the source rows itself: a recurrent state
     // (gated delta net, cached ssm_conv: ggml_cuda_gdn_state_gather_of), the pooled keys of the lightning indexer
     // (ggml_cuda_gathered_rows_of); reset at the start of every graph

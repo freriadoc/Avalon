@@ -4438,7 +4438,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                         ggml_cuda_should_use_topk_moe(node, logits, weights, ids) &&
                         ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
-                    ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
+                    // the ids read next by a MoE block whose weights are in host memory (a hosted block): its entry
+                    // kernel computes the top-k, a kernel less
+                    bool hosted_reader = false;
+                    for (int k = i + (int) ops.size(); k < cgraph->n_nodes; k++) {
+                        const ggml_tensor * n = cgraph->nodes[k];
+                        if (n->op == GGML_OP_MUL_MAT_ID && n->src[2] == ids) {
+                            hosted_reader = n->src[0]->buffer && !ggml_backend_buft_is_cuda(n->src[0]->buffer->buft);
+                            break;
+                        }
+                    }
+                    if (!(hosted_reader && ggml_cuda_topk_moe_defer(*cuda_ctx, logits, weights, ids, clamp, scale, args))) {
+                        ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
+                    }
                     return ops.size() - 1;
                 }
             } else if (!args.norm && !args.prob_bias) {
@@ -5382,6 +5394,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                // a deferred top-k, before anything but its hosted block reads its ids or weights
+                if (cuda_ctx->topk_pending.logits) {
+                    const auto & tp = cuda_ctx->topk_pending;
+                    const bool hosted = node->op == GGML_OP_MUL_MAT_ID && node->src[2] == tp.ids_t;
+                    const auto root = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
+                    bool reads = false;
+                    for (int j = 0; j < GGML_MAX_SRC && !reads && !hosted; j++) {
+                        const ggml_tensor * src = node->src[j];
+                        reads = src && (root(src) == root(tp.ids_t) || root(src) == root(tp.weights_t));
+                    }
+                    if (reads) {
+                        ggml_cuda_topk_moe_pending_flush(*cuda_ctx);
+                    }
+                }
+
                 // the CPU rows of a hosted MoE block, before a node (or a fusion starting here)
                 // reads the block's output. Only the weighting reads it; the fusions that contain it
                 // start at it or, with the shared expert's gate, two nodes earlier (sigmoid, gated
@@ -5456,6 +5483,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                }
             }
             ggml_cuda_moe_hosted_flush(*cuda_ctx, nullptr);
+            ggml_cuda_topk_moe_pending_flush(*cuda_ctx);
         }
 
 #ifdef USE_CUDA_GRAPH

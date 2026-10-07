@@ -32,6 +32,7 @@ bool ggml_cuda_moe_hosted_wait(void * stream, void * event) {
 #else
 
 #include "common.cuh"
+#include "topk-moe.cuh"
 #include "mmvq.cuh"
 #include "quantize.cuh"
 #include "ggml-backend-impl.h"
@@ -6107,7 +6108,8 @@ static __global__ void k_pregate_topk(const float * logits, int n_expert, int n_
 }
 
 static __global__ void k_moe_hosted_enter(const float * act, float * h_act, block_q8_0 * h_act8, int64_t n_act,
-                                          const int32_t * ids, int64_t ids_nb1, int32_t * h_ids, int n_used, int n_tokens,
+                                          const float * tk_logits, float * tk_weights, float tk_clamp, float tk_scale,
+                                          int32_t * ids, int64_t ids_nb1, int32_t * h_ids, int n_used, int n_tokens,
                                           uint32_t * d_seq, uint32_t * d_expect, volatile moe_hosted_mailbox * mail,
                                           uint32_t slot, const volatile uint32_t * flag,
                                           const volatile int32_t * m_plan, int32_t * d_plan, int n_plan) {
@@ -6132,9 +6134,32 @@ static __global__ void k_moe_hosted_enter(const float * act, float * h_act, bloc
         }
     }
     const int n_ids = n_used * n_tokens;
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_ids; i += gridDim.x * blockDim.x) {
-        const int t = i / n_used;
-        h_ids[i] = *(const int32_t *) ((const char *) ids + (int64_t) t * ids_nb1 + (int64_t) (i % n_used) * sizeof(int32_t));
+    if (tk_logits) {
+        // the MoE top-k of the block's tokens (left to this kernel by ggml_cuda_topk_moe_defer): a warp per token in
+        // block 0, then its ids to the host
+        if (blockIdx.x == 0) {
+            const int warp = threadIdx.x / WARP_SIZE;
+            const int t    = warp < n_tokens ? warp : n_tokens - 1;
+            topk_moe_config config;
+            config.use_sigmoid       = false;
+            config.use_sqrt_softplus = false;
+            config.with_norm         = true;
+            config.delayed_softmax   = false;
+            topk_moe_warp<TOPK_MOE_HOSTED_N_EXPERT, false, true>(warp < n_tokens,
+                tk_logits + (int64_t) TOPK_MOE_HOSTED_N_EXPERT * t, tk_weights + (int64_t) n_used * t,
+                (int32_t *) ((char *) ids + (int64_t) t * ids_nb1), nullptr, n_used, tk_clamp, tk_scale, config,
+                threadIdx.x % WARP_SIZE);
+            __syncthreads();
+            for (int i = threadIdx.x; i < n_ids; i += blockDim.x) {
+                const int tt = i / n_used;
+                h_ids[i] = *(const int32_t *) ((const char *) ids + (int64_t) tt * ids_nb1 + (int64_t) (i % n_used) * sizeof(int32_t));
+            }
+        }
+    } else {
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_ids; i += gridDim.x * blockDim.x) {
+            const int t = i / n_used;
+            h_ids[i] = *(const int32_t *) ((const char *) ids + (int64_t) t * ids_nb1 + (int64_t) (i % n_used) * sizeof(int32_t));
+        }
     }
     // this block's writes reach the host before it counts itself
     __threadfence_system();
@@ -6948,11 +6973,23 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
     const int64_t padded_embd = GGML_PAD(n_embd, MATRIX_ROW_PADDING);
     const int64_t padded_ff = GGML_PAD(n_ff, MATRIX_ROW_PADDING);
 
+    // the top-k of these ids, left to this kernel (ggml_cuda_topk_moe_defer)
+    auto & tp = ctx.topk_pending;
+    const bool tk = tp.logits && tp.ids_t == ids;
+    GGML_ASSERT(!tk || (tp.n_rows == n_tokens && tp.n_used == n_used && n_tokens * WARP_SIZE <= 256));
+    if (tp.logits && !tk) {
+        ggml_cuda_topk_moe_pending_flush(ctx);
+    }
+
     // activations and ids to the host, then the mailbox
     k_moe_hosted_enter<<<8, 256, 0, stream>>>((const float *) act->data, layer->m_act, layer->m_act8, (int64_t) n_tokens * n_embd,
-                                              (const int32_t *) ids->data, ids->nb[1], layer->m_ids, n_used, n_tokens,
+                                              tk ? tp.logits : nullptr, tk ? tp.weights : nullptr, tp.clamp, tp.scale,
+                                              (int32_t *) ids->data, ids->nb[1], layer->m_ids, n_used, n_tokens,
                                               st->d_seq, layer->d_expect, st->m_mail, (uint32_t) slot, layer->m_flags,
                                               layer->m_plan, layer->d_plan, 3 * rows);
+    if (tk) {
+        tp.logits = nullptr;
+    }
 
     // resident rows: activations quantized, up/gate/swiglu into the glu result (alive until down has
     // read it), its quantization, down into the block's output
