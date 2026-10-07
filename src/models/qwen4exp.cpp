@@ -1285,10 +1285,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     // the graph (one kernel for a backend), before the recurrent state's gather
     ggml_build_forward_expand(gf, conv_output_silu);
 
-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
-    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
-    cb(state, "state_predelta", il);
-
     ggml_tensor * conv_qkv_mix = conv_output_silu;
 
     int64_t nb1_qkv = ggml_row_size(conv_qkv_mix->type, conv_channels);
@@ -1329,7 +1325,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
                 qk_norm->nb[1], qk_norm->nb[2], qk_norm->nb[3], 0);
         k_conv = ggml_view_4d(ctx0, qk_norm, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
                 qk_norm->nb[1], qk_norm->nb[2], qk_norm->nb[3], num_k_heads * qk_norm->nb[1]);
+        // queued right after the convolution, before the recurrent state's gather: a backend can compute the
+        // norm inside the convolution's kernel
+        ggml_build_forward_expand(gf, qk_norm);
     }
+
+    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+    cb(state, "state_predelta", il);
 
     // repeat to match shapes when head keys != value keys; unneeded with the fused GDN
     if (num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch)) {

@@ -5092,12 +5092,14 @@ struct test_ssm_conv_cached : public test_case {
     const int64_t n_ch;
     const int64_t n_t;
     const int64_t n_slots;
+    const int64_t n_qk;   // > 0: the l2 norm of the first n_qk channels (heads of 128) right after, as qwen4exp's GDN
 
     std::string vars() override {
-        return VARS_TO_STR3(n_ch, n_t, n_slots);
+        return VARS_TO_STR4(n_ch, n_t, n_slots, n_qk);
     }
 
-    test_ssm_conv_cached(int64_t n_ch = 64, int64_t n_t = 1, int64_t n_slots = 1) : n_ch(n_ch), n_t(n_t), n_slots(n_slots) {}
+    test_ssm_conv_cached(int64_t n_ch = 64, int64_t n_t = 1, int64_t n_slots = 1, int64_t n_qk = 0)
+        : n_ch(n_ch), n_t(n_t), n_slots(n_slots), n_qk(n_qk) {}
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -5127,7 +5129,16 @@ struct test_ssm_conv_cached : public test_case {
         }
         ggml_tensor * out = ggml_silu(ctx, ggml_ssm_conv(ctx, win, w));
         ggml_build_forward_expand(gf, out);
+        ggml_tensor * qk_norm = nullptr;
+        if (n_qk > 0) {
+            ggml_tensor * qk = ggml_view_4d(ctx, out, 128, n_qk / 128, n_t, 1, 128 * sizeof(float), out->nb[1], out->nb[2], 0);
+            qk_norm = ggml_scale(ctx, ggml_rms_norm(ctx, qk, 1e-6f / 128), 1.0f / sqrtf(128.0f));
+            ggml_build_forward_expand(gf, qk_norm);
+        }
         out = ggml_reshape_1d(ctx, out, ggml_nelements(out));
+        if (qk_norm) {
+            out = ggml_concat(ctx, out, ggml_reshape_1d(ctx, qk_norm, ggml_nelements(qk_norm)), 0);
+        }
         for (ggml_tensor * c : copies) {
             out = ggml_concat(ctx, out, ggml_reshape_1d(ctx, c, ggml_nelements(c)), 0);
         }
@@ -12001,6 +12012,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_ssm_conv_cached(256, 1, 1));
     test_cases.emplace_back(new test_ssm_conv_cached(10240, 1, 1));
     test_cases.emplace_back(new test_ssm_conv_cached(256, 3, 3));
+    test_cases.emplace_back(new test_ssm_conv_cached(10240, 1, 1, 4096));
+    test_cases.emplace_back(new test_ssm_conv_cached(10240, 3, 3, 4096));
     test_cases.emplace_back(new test_mul_mat_multi(GGML_TYPE_Q8_0, 256, 1, {64, 48, 8, 0}));
     test_cases.emplace_back(new test_mul_mat_multi(GGML_TYPE_Q8_0, 2560, 3, {1024, 48, 48, 512}));
     test_cases.emplace_back(new test_mul_mat_multi(GGML_TYPE_Q4_K, 512, 2, {64, 40, 0, 0}));

@@ -3266,6 +3266,33 @@ static const ggml_tensor * ggml_cuda_view_root(const ggml_tensor * t) {
     return t;
 }
 
+// The gated delta net's l2 norm of q and k (rms_norm over heads of 128 of a view of the conv output's first
+// channels, then scale) right after the cached conv that produces them (views in between): the conv computes
+// it (ggml_cuda_op_ssm_conv_cached, qk_out). Returns the scale node's index, -1 if not.
+static int ggml_cuda_match_conv_l2_norm(const ggml_cgraph * cgraph, int last, const ggml_tensor * conv_out) {
+    int j = last + 1;
+    while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+        j++;
+    }
+    if (j + 1 >= cgraph->n_nodes) {
+        return -1;
+    }
+    const ggml_tensor * rms = cgraph->nodes[j];
+    const ggml_tensor * sc  = cgraph->nodes[j + 1];
+    if (rms->op != GGML_OP_RMS_NORM || sc->op != GGML_OP_SCALE || sc->src[0] != rms || ggml_get_op_params_f32(sc, 1) != 0.0f) {
+        return -1;
+    }
+    const ggml_tensor * v = rms->src[0];
+    if (v->view_src != conv_out || v->view_offs != 0 || v->type != GGML_TYPE_F32 || v->ne[0] != 128 ||
+            v->nb[0] != sizeof(float) || v->nb[1] != 128 * sizeof(float) || v->nb[2] != conv_out->nb[1] ||
+            v->ne[2] != conv_out->ne[1] || v->ne[3] != conv_out->ne[2] || (int64_t) v->ne[1] * 128 > conv_out->ne[0] ||
+            !ggml_is_contiguous(rms) || !ggml_is_contiguous(sc) || ggml_nelements(sc) != ggml_nelements(v)) {
+        return -1;
+    }
+    return j + 1;
+}
+
+
 // root_absorbed: the state's GET_ROWS is left to the kernel (ggml_cuda_conv_absorbs_gather), which then reads the
 // cache rows and never the gathered copy: that copy's memory, dead once the window is built, may hold the output
 static bool ggml_cuda_match_conv_cached(const ggml_cgraph * cgraph, int ci, ggml_cuda_conv_cached_match & m,
@@ -4277,6 +4304,36 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             const float *   st  = gathered ? (const float *) m.root->src[0]->data : (const float *) m.root->data;
             const int32_t * ids = gathered ? (const int32_t *) m.root->src[1]->data : nullptr;
             const int64_t   row = gathered ? (int64_t) (m.root->src[0]->nb[1] / sizeof(float)) : state->ne[0] * state->ne[1];
+            // the l2 norm of q and k after it, when its result overlaps nothing the conv reads or writes
+            const int sc_idx = ggml_cuda_match_conv_l2_norm(cgraph, m.last, m.out);
+            if (sc_idx > 0) {
+                ggml_tensor * sc = cgraph->nodes[sc_idx];
+                const ggml_tensor * rms = cgraph->nodes[sc_idx - 1];
+                const auto overlaps = [sc](const ggml_tensor * t) {
+                    if (t == nullptr || t->data == nullptr) {
+                        return false;
+                    }
+                    const char * a = (const char *) sc->data;
+                    const char * b = (const char *) t->data;
+                    return a < b + ggml_nbytes(t) && b < a + ggml_nbytes(sc);
+                };
+                // the state comes from the cache rows when the gather is skipped (its own memory is never used)
+                bool ok = !overlaps(m.x) && !overlaps(m.w) && !overlaps(m.out) &&
+                          (gathered ? !overlaps(m.root->src[0]) && !overlaps(m.root->src[1]) : !overlaps(m.root));
+                for (int k = 0; k < m.slots.n && ok; k++) {
+                    const char * a = (const char *) sc->data;
+                    ok = !(a < m.slots.dst[k] + m.slots.nb1[k] * state->ne[2] && m.slots.dst[k] < a + ggml_nbytes(sc));
+                }
+                if (ok) {
+                    float eps;
+                    memcpy(&eps, rms->op_params, sizeof(float));
+                    ggml_cuda_op_ssm_conv_cached(*cuda_ctx, st, ids, row, m.x, m.w, (float *) m.out->data,
+                                                 state->ne[1], m.x->ne[0], state->ne[2], m.silu, m.slots,
+                                                 (float *) sc->data, rms->src[0]->ne[0] * rms->src[0]->ne[1], eps,
+                                                 ggml_get_op_params_f32(sc, 0));
+                    return sc_idx - i;
+                }
+            }
             ggml_cuda_op_ssm_conv_cached(*cuda_ctx, st, ids, row, m.x, m.w, (float *) m.out->data,
                                          state->ne[1], m.x->ne[0], state->ne[2], m.silu, m.slots);
             return m.last - i;
@@ -5795,6 +5852,29 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             }
         }
         for (int i = 0; i < cgraph->n_nodes; ++i) {
+            // the l2 norm of q and k right after the cached conv (computed by the conv's kernel): the conv's inputs
+            // (window, new tokens) live until the norm's last node, which is never placed over them
+            if (cgraph->nodes[i]->op == GGML_OP_RMS_NORM && i + 1 < cgraph->n_nodes) {
+                const ggml_tensor * v = cgraph->nodes[i]->src[0];
+                const ggml_tensor * conv_out = v->view_src;
+                const ggml_tensor * ssm = conv_out && conv_out->op == GGML_OP_UNARY ? conv_out->src[0] : conv_out;
+                if (ssm && ssm->op == GGML_OP_SSM_CONV && cgraph->nodes[i + 1]->op == GGML_OP_SCALE &&
+                        cgraph->nodes[i + 1]->src[0] == cgraph->nodes[i]) {
+                    ggml_tensor * sc = cgraph->nodes[i + 1];
+                    for (int a = 0; a < GGML_MAX_SRC; a++) {
+                        ggml_tensor * in = ssm->src[a];
+                        if (!in) {
+                            continue;
+                        }
+                        params->add_alloc_dep(params->user_data, in, sc);
+                        for (int b = 0; b < GGML_MAX_SRC; b++) {
+                            if (in->src[b]) {
+                                params->add_alloc_dep(params->user_data, in->src[b], sc);
+                            }
+                        }
+                    }
+                }
+            }
             // the hyper-connection combine + norm (K1): its inputs live until its last node, so that its outputs are
             // never placed over them and its fusion never depends on the layout (an unrelated change of the layout
             // once left a layer's second boundary unfused: 6 kernels instead of 1)

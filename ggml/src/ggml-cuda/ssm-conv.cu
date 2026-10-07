@@ -215,12 +215,15 @@ template <int d_conv, int max_t>
 static __global__ void ssm_conv_cached_f32(const float * state, const int32_t * ids, const int64_t state_row,
         const char * x, const int64_t x_nb0, const int64_t x_nb1, const int64_t x_nb2,
         const float * w, const int64_t w_nb1, float * dst, const int64_t n_ch, const int64_t n_t, const bool apply_silu,
-        const ggml_cuda_ssm_conv_slots slots) {
+        const ggml_cuda_ssm_conv_slots slots, float * qk_out, const int64_t n_qk, const float qk_eps, const float qk_scale) {
     const int64_t c = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     const int64_t s = blockIdx.y;
+    // a block of the l2-normed channels is one head (blockDim.x == 128): every thread of it is a channel
+    const bool qk = qk_out != nullptr && (int64_t) blockIdx.x * blockDim.x < n_qk;
     if (c >= n_ch) {
         return;
     }
+    __shared__ float qk_sum[32];
     float win[d_conv - 1 + max_t];
     const float * st = state + (ids != nullptr ? (int64_t) ids[s] : s) * state_row + c * (d_conv - 1);
 #pragma unroll
@@ -242,7 +245,15 @@ static __global__ void ssm_conv_cached_f32(const float * state, const int32_t * 
             sumf += win[t + k] * wc[k];
         }
         sumf += 0.0f;   // the bias term of ssm_conv_f32, absent here: same rounding
-        dst[(s * n_t + t) * n_ch + c] = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
+        const float y = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
+        dst[(s * n_t + t) * n_ch + c] = y;
+        if (qk) {
+            // rms_norm_f32 with 256 threads per row of 128: these 4 warps' sums at the same lanes, the other 4 zero
+            float sq = block_reduce<block_reduce_method::SUM, 128>(y * y, qk_sum);
+            const float scale = rsqrtf(sq / blockDim.x + qk_eps);
+            qk_out[(s * n_t + t) * n_qk + c] = qk_scale * (scale * y);
+            __syncthreads();   // qk_sum is reused by the next token
+        }
     }
     for (int k = 0; k < slots.n; k++) {
         float * row = (float *) (slots.dst[k] + s * slots.nb1[k]) + c * (d_conv - 1);
@@ -254,11 +265,12 @@ static __global__ void ssm_conv_cached_f32(const float * state, const int32_t * 
 
 void ggml_cuda_op_ssm_conv_cached(ggml_backend_cuda_context & ctx, const float * state, const int32_t * ids, int64_t state_row,
         const ggml_tensor * x, const ggml_tensor * w, float * dst, int64_t n_ch, int64_t n_t, int64_t n_s, bool apply_silu,
-        const ggml_cuda_ssm_conv_slots & slots) {
+        const ggml_cuda_ssm_conv_slots & slots, float * qk_out, int64_t n_qk, float qk_eps, float qk_scale) {
     GGML_ASSERT(w->ne[0] == 4 && n_t <= GGML_CUDA_SSM_CONV_CACHED_MAX_T);
     const int threads = 128;
+    GGML_ASSERT(qk_out == nullptr || (n_qk % threads == 0 && n_qk <= n_ch));
     const dim3 grid((n_ch + threads - 1) / threads, n_s, 1);
     ssm_conv_cached_f32<4, GGML_CUDA_SSM_CONV_CACHED_MAX_T><<<grid, threads, 0, ctx.stream()>>>(
         state, ids, state_row, (const char *) x->data, x->nb[0], x->nb[1], x->nb[2],
-        (const float *) w->data, w->nb[1], dst, n_ch, n_t, apply_silu, slots);
+        (const float *) w->data, w->nb[1], dst, n_ch, n_t, apply_silu, slots, qk_out, n_qk, qk_eps, qk_scale);
 }
