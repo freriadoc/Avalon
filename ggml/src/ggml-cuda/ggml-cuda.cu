@@ -5383,8 +5383,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 // the CPU rows of a hosted MoE block, before a node (or a fusion starting here)
-                // reads the block's output
-                for (int k = i; k < std::min(i + 4, cgraph->n_nodes); k++) {
+                // reads the block's output. Only the weighting reads it; the fusions that contain it
+                // start at it or, with the shared expert's gate, two nodes earlier (sigmoid, gated
+                // product, weighting): a window of 3. A wider one would also hold a node that runs
+                // before such a fusion (the gate's product) behind the CPU rows.
+                constexpr int hosted_read_window = 3;
+                for (int k = i; k < std::min(i + hosted_read_window, cgraph->n_nodes); k++) {
                     ggml_cuda_moe_hosted_flush(*cuda_ctx, cgraph->nodes[k]);
                 }
 
