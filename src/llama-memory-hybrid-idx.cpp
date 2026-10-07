@@ -648,10 +648,6 @@ ggml_tensor * llama_memory_hybrid_idx_context::kpool_access::gather_key_gate(ggm
     return ggml_get_rows(ctx, key_gate, idxs);
 }
 
-ggml_tensor * llama_memory_hybrid_idx_context::kpool_access::scatter_key_gate(ggml_tensor * values, ggml_tensor * idxs) const {
-    return ggml_set_rows(ctx, key_gate, values, idxs);
-}
-
 ggml_tensor * llama_memory_hybrid_idx_context::kpool_access::scatter_pooled(ggml_tensor * values, ggml_tensor * idxs) const {
     return ggml_set_rows(ctx, pooled, values, idxs);
 }
@@ -692,8 +688,7 @@ llama_memory_hybrid_idx_context::kpool_state llama_memory_hybrid_idx_context::kp
 
 // Which pools this ubatch must re-pool.
 // Pool cache lifecycle:
-// 1. cpy_k writes each token's key | gate into its idx cache row, pooled slot are zeroed (qwen4exp writes the key alone,
-//    scatter_key_gate: a pooled slot is only read once step 3 has written it).
+// 1. cpy_k writes each token's key | gate into its idx cache row, pooled slot are zeroed.
 // 2. This marks the pools the ubatch touches or completes as new, during decode that's one pool every kpool tokens, zero elsewise.
 // 3. The graph pools only the new pools and set_rows each result into the pooled slot of the pool's last member row.
 // 4. All pools are gathered in one get_rows via pool_cells, fresh ones just written, older ones from whatever batch last wrote them.
