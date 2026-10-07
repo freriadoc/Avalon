@@ -695,3 +695,7 @@ int ggml_cuda_try_fuse_qwen4_hc(ggml_backend_cuda_context & ctx, ggml_cgraph * c
 
     return 0;
 }
+
+bool ggml_cuda_qwen4_hc_k1_at(const ggml_cgraph * cgraph, int i) {
+    return i + 5 < cgraph->n_nodes && cgraph->nodes[i]->op == GGML_OP_SCALE && qwen4_hc_match_k1(cgraph, i);
+}

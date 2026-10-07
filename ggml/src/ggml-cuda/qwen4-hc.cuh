@@ -19,3 +19,6 @@ void ggml_cuda_mul_mat_q8_0_f32(ggml_backend_cuda_context & ctx, const ggml_tens
 // computes the same way
 bool ggml_cuda_mul_mat_q8_0_f16_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
 void ggml_cuda_mul_mat_q8_0_f16(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+
+// Whether nodes i .. i + 5 are the combine + grouped norm run that ggml_cuda_try_fuse_qwen4_hc fuses (K1)
+bool ggml_cuda_qwen4_hc_k1_at(const ggml_cgraph * cgraph, int i);

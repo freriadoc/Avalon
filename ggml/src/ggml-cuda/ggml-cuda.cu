@@ -5795,6 +5795,16 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             }
         }
         for (int i = 0; i < cgraph->n_nodes; ++i) {
+            // the hyper-connection combine + norm (K1): its inputs live until its last node, so that its outputs are
+            // never placed over them and its fusion never depends on the layout (an unrelated change of the layout
+            // once left a layer's second boundary unfused: 6 kernels instead of 1)
+            if (ggml_cuda_qwen4_hc_k1_at(cgraph, i)) {
+                ggml_tensor * post = cgraph->nodes[i + 3];
+                ggml_tensor * mul  = cgraph->nodes[i + 5];
+                for (ggml_tensor * in : { cgraph->nodes[i]->src[0], post->src[0], post->src[1], mul->src[1] }) {
+                    params->add_alloc_dep(params->user_data, in, mul);
+                }
+            }
             ggml_cuda_moe_weighted_reduction_match match;
             if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
                 params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.experts), match.dst);
