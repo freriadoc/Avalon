@@ -160,6 +160,9 @@ struct moe_cache_pool {
     std::vector<moe_cache_slot> slots;
     std::vector<int> free_slots;
     std::unordered_map<moe_cache_key, int, moe_cache_key_hash> map;
+    // the map again, as an array per host tensor indexed by the expert (-1: no entry), kept with it
+    // (moe_cache_direct_set); the hosted plan reads it: one load per row instead of a hash chain
+    std::unordered_map<const void *, std::vector<int32_t>> direct;
     int lru_head = -1;
     int lru_tail = -1;
 
@@ -1335,11 +1338,20 @@ static void moe_cache_lru_push_front(moe_cache_pool & pool, int index) {
     pool.lru_head = index;
 }
 
+static void moe_cache_direct_set(moe_cache_pool & pool, const moe_cache_key & key, int index) {
+    std::vector<int32_t> & d = pool.direct[key.tensor];
+    if ((int) d.size() <= key.expert) {
+        d.resize(key.expert + 1, -1);
+    }
+    d[key.expert] = index;
+}
+
 static void moe_cache_map_erase(moe_cache_pool & pool, int index) {
     moe_cache_slot & slot = pool.slots[index];
     auto it = pool.map.find(slot.key);
     if (it != pool.map.end() && it->second == index) {
         pool.map.erase(it);
+        moe_cache_direct_set(pool, slot.key, -1);
     }
 }
 
@@ -3294,6 +3306,7 @@ static bool moe_cache_enqueue_locked(
             device.insert_skips++;
             return false;
         }
+        moe_cache_direct_set(pool, key, slot_index);
 
         const void * source =
             (const char *)host_base + (size_t)expert * expert_size;
@@ -5366,6 +5379,7 @@ static void moe_cache_evacuate(
         auto it = pool.map.find(dst.key);
         GGML_ASSERT(it != pool.map.end() && it->second == source);
         it->second = destination;
+        moe_cache_direct_set(pool, dst.key, destination);
 
         src.key = {};
         src.generation++;
@@ -6267,7 +6281,8 @@ static void moe_hosted_unpin_locked(moe_hosted_state & st) {
 // plan, so it is released (flag = seq) as soon as the resident rows are pinned and out is written;
 // what it does not need (LRU order of the hits, admissions, statistics) follows under the same lock,
 // in the same row order. The cache's structures are cold by then (the previous layer's CPU rows
-// evicted them): 12.5 us for the 30 rows of a 3-token pass, 2.6 of them in that bookkeeping.
+// evicted them): 12.5 us for the 30 rows of a 3-token pass, 2.6 of them in that bookkeeping. The
+// resident rows are found through the pools' direct index, not the hash map (no chain of dependent loads).
 static int moe_hosted_plan(moe_hosted_state & st, moe_hosted_layer & layer, const int32_t * ids, int rows,
                            int32_t * out, int32_t * cpu_rows, uint32_t * flag, uint32_t seq) {
     moe_cache_session & session = *st.session;
@@ -6293,6 +6308,16 @@ static int moe_hosted_plan(moe_hosted_state & st, moe_hosted_layer & layer, cons
         const void * base[3] = {layer.up_w->data, layer.gate_w->data, layer.down_w->data};
         moe_cache_pool * pools[3] = {pool, pool, down_pool};
         const int64_t n_expert = layer.gate_w->ne[2];
+        // each tensor's direct index once per layer, then one load per row (independent of the other rows)
+        const int32_t * direct[3] = {nullptr, nullptr, nullptr};
+        int n_direct[3] = {0, 0, 0};
+        for (int k = 0; k < 3 && pool; k++) {
+            const auto d = pools[k]->direct.find(base[k]);
+            if (d != pools[k]->direct.end()) {
+                direct[k] = d->second.data();
+                n_direct[k] = (int) d->second.size();
+            }
+        }
         int slots[moe_hosted_rows_max][3];
         for (int row = 0; row < rows; row++) {
             out[row] = out[rows + row] = out[2 * rows + row] = -1;
@@ -6302,9 +6327,9 @@ static int moe_hosted_plan(moe_hosted_state & st, moe_hosted_layer & layer, cons
                 continue;
             }
             for (int k = 0; k < 3; k++) {
-                const auto found = pools[k]->map.find({base[k], expert});
-                if (found != pools[k]->map.end() && pools[k]->slots[found->second].state == moe_cache_slot_state::valid) {
-                    slots[row][k] = found->second;
+                const int s = expert < n_direct[k] ? direct[k][expert] : -1;
+                if (s >= 0 && pools[k]->slots[s].state == moe_cache_slot_state::valid) {
+                    slots[row][k] = s;
                 }
             }
             if (slots[row][0] >= 0 && slots[row][1] >= 0 && slots[row][2] >= 0) {
