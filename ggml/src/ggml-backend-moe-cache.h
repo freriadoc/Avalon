@@ -170,8 +170,10 @@ struct ggml_moe_cache_api {
     // out[(t*k + i)*n_embd ...] = down(swiglu(gate, up)) of expert experts[t*k + i] on token t.
     // An expert several tokens use is read once. For the MoE block the GPU hosts (the cache plans
     // it and hands the missed experts to a host thread); never called from a graph compute thread.
+    // act_q8 (optional): the same activations already quantized as q8_0 blocks of 32 with the bytes of
+    // the GPU's q8_1, one row per token: the CPU then does not quantize them.
     void (*cpu_experts)(const struct ggml_tensor * gate_w, const struct ggml_tensor * up_w,
-                        const struct ggml_tensor * down_w, const float * act,
+                        const struct ggml_tensor * down_w, const float * act, const void * act_q8,
                         const int32_t * experts, int k, int n_tokens, float * out, int n_threads);
 };
 

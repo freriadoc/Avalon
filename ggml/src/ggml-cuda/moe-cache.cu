@@ -5905,6 +5905,7 @@ struct moe_hosted_layer {
     char * down_base = nullptr;
     // mapped host memory (host pointer, device pointer)
     float * h_act = nullptr;
+    block_q8_0 * h_act8 = nullptr;   // the same activations as q8_0 blocks, the bytes of the GPU's q8_1
     int32_t * h_ids = nullptr;
     int32_t * h_plan = nullptr;     // up ids, gate ids, down ids: rows each
     float * h_res = nullptr;        // rows x n_embd
@@ -5921,6 +5922,7 @@ struct moe_hosted_layer {
     int32_t * m_plan = nullptr;
     float * m_res = nullptr;
     float * m_act = nullptr;
+    block_q8_0 * m_act8 = nullptr;
     int32_t * m_ids = nullptr;
     uint32_t * m_flags = nullptr;
     // device memory
@@ -5955,6 +5957,7 @@ struct moe_hosted_state {
     uint32_t last_seq = 0;
     std::vector<int32_t> cpu_rows, experts;
     std::vector<float> out, act;
+    std::vector<uint8_t> act8;   // the CPU rows' activations as q8_0 blocks (from h_act8)
     int64_t st_n = 0, st_gap = 0, st_gaps = 0, st_plan = 0, st_cpu = 0, st_rows = 0, t_done = 0;
     // CPU rows by what they have resident: up+gate (not down), down only, up or gate only, nothing
     int64_t partial[4] = {0, 0, 0, 0};
@@ -6103,13 +6106,30 @@ static __global__ void k_pregate_topk(const float * logits, int n_expert, int n_
     }
 }
 
-static __global__ void k_moe_hosted_enter(const float * act, float * h_act, int64_t n_act,
+static __global__ void k_moe_hosted_enter(const float * act, float * h_act, block_q8_0 * h_act8, int64_t n_act,
                                           const int32_t * ids, int64_t ids_nb1, int32_t * h_ids, int n_used, int n_tokens,
                                           uint32_t * d_seq, uint32_t * d_expect, volatile moe_hosted_mailbox * mail,
                                           uint32_t slot, const volatile uint32_t * flag,
                                           const volatile int32_t * m_plan, int32_t * d_plan, int n_plan) {
     for (int64_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n_act; i += (int64_t) gridDim.x * blockDim.x) {
         h_act[i] = act[i];
+    }
+    // and quantized for the CPU's experts as quantize_q8_1 does (a group of 32 threads per block): the CPU starts
+    // from these bytes without quantizing them again
+    {
+        const int lane   = threadIdx.x % QK8_0;
+        const int group  = (blockIdx.x * blockDim.x + threadIdx.x) / QK8_0;
+        const int groups = gridDim.x * blockDim.x / QK8_0;
+        for (int64_t ib = group; ib < n_act / QK8_0; ib += groups) {
+            const float xi   = act[ib * QK8_0 + lane];
+            const float amax = warp_reduce_max<QK8_0>(fabsf(xi));
+            const float d    = amax / 127.0f;
+            const int8_t q   = amax == 0.0f ? 0 : roundf(xi / d);
+            h_act8[ib].qs[lane] = q;
+            if (lane == 0) {
+                h_act8[ib].d = __float2half(d);
+            }
+        }
     }
     const int n_ids = n_used * n_tokens;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_ids; i += gridDim.x * blockDim.x) {
@@ -6613,14 +6633,17 @@ static void moe_hosted_serve_one(moe_hosted_state * st, uint32_t seq) {
     if (n_cpu > 0) {
         ids.resize(n_cpu);
         act.resize((size_t) n_cpu * layer->n_embd);
+        const size_t q8_row = (size_t) (layer->n_embd / QK8_0) * sizeof(block_q8_0);
+        st->act8.resize((size_t) n_cpu * q8_row);
         for (int j = 0; j < n_cpu; j++) {
+            const int t = cpu_rows[j] / layer->n_used;
             ids[j] = layer->h_ids[cpu_rows[j]];
-            memcpy(act.data() + (size_t) j * layer->n_embd, layer->h_act + (size_t) (cpu_rows[j] / layer->n_used) * layer->n_embd,
-                   layer->n_embd * sizeof(float));
+            memcpy(act.data() + (size_t) j * layer->n_embd, layer->h_act + (size_t) t * layer->n_embd, layer->n_embd * sizeof(float));
+            memcpy(st->act8.data() + (size_t) j * q8_row, (const char *) layer->h_act8 + (size_t) t * q8_row, q8_row);
         }
         out.resize((size_t) n_cpu * layer->n_embd);
         g_session_suppressed++;
-        ggml_moe_cache.cpu_experts(layer->gate_w, layer->up_w, layer->down_w, act.data(), ids.data(), 1, n_cpu,
+        ggml_moe_cache.cpu_experts(layer->gate_w, layer->up_w, layer->down_w, act.data(), st->act8.data(), ids.data(), 1, n_cpu,
                                    out.data(), st->n_threads);
         g_session_suppressed--;
         for (int j = 0; j < n_cpu; j++) {
@@ -6775,7 +6798,7 @@ static void moe_hosted_shutdown(moe_cache_session * session) {
         g_hosted.erase(it);
     }
     for (auto & layer : st->layers) {
-        for (void * h : {(void *) layer->h_act, (void *) layer->h_ids, (void *) layer->h_plan, (void *) layer->h_res,
+        for (void * h : {(void *) layer->h_act, (void *) layer->h_act8, (void *) layer->h_ids, (void *) layer->h_plan, (void *) layer->h_res,
                          (void *) layer->h_flags}) {
             if (h) cudaFreeHost(h);
         }
@@ -6818,7 +6841,9 @@ static moe_hosted_layer * moe_hosted_register(moe_hosted_state & st, moe_cache_d
     }
     const int rows = moe_hosted_rows_max;
     const int tokens = rows / n_used;
+    GGML_ASSERT(layer->n_embd % QK8_0 == 0);
     bool ok = moe_hosted_host_alloc((void **) &layer->h_act, (size_t) tokens * layer->n_embd * sizeof(float)) &&
+              moe_hosted_host_alloc((void **) &layer->h_act8, (size_t) tokens * (layer->n_embd / QK8_0) * sizeof(block_q8_0)) &&
               moe_hosted_host_alloc((void **) &layer->h_ids, rows * sizeof(int32_t)) &&
               moe_hosted_host_alloc((void **) &layer->h_plan, 3 * rows * sizeof(int32_t)) &&
               moe_hosted_host_alloc((void **) &layer->h_res, (size_t) rows * layer->n_embd * sizeof(float)) &&
@@ -6826,7 +6851,8 @@ static moe_hosted_layer * moe_hosted_register(moe_hosted_state & st, moe_cache_d
               moe_hosted_host_alloc((void **) &layer->h_pred, (2 + rows) * sizeof(int32_t)) &&
               moe_hosted_host_alloc((void **) &layer->h_plan2, 3 * rows * sizeof(int32_t)) &&
               moe_hosted_host_alloc((void **) &layer->h_chk, (size_t) rows * layer->n_embd * sizeof(float));
-    ok = ok && (layer->m_act = moe_hosted_device_ptr(layer->h_act)) && (layer->m_ids = moe_hosted_device_ptr(layer->h_ids)) &&
+    ok = ok && (layer->m_act = moe_hosted_device_ptr(layer->h_act)) && (layer->m_act8 = (block_q8_0 *) moe_hosted_device_ptr(layer->h_act8)) &&
+         (layer->m_ids = moe_hosted_device_ptr(layer->h_ids)) &&
          (layer->m_plan = moe_hosted_device_ptr(layer->h_plan)) && (layer->m_res = moe_hosted_device_ptr(layer->h_res)) &&
          (layer->m_flags = moe_hosted_device_ptr(layer->h_flags)) && (layer->m_pred = moe_hosted_device_ptr(layer->h_pred)) &&
          (layer->m_plan2 = moe_hosted_device_ptr(layer->h_plan2)) && (layer->m_chk = moe_hosted_device_ptr(layer->h_chk));
@@ -6923,7 +6949,7 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
     const int64_t padded_ff = GGML_PAD(n_ff, MATRIX_ROW_PADDING);
 
     // activations and ids to the host, then the mailbox
-    k_moe_hosted_enter<<<8, 256, 0, stream>>>((const float *) act->data, layer->m_act, (int64_t) n_tokens * n_embd,
+    k_moe_hosted_enter<<<8, 256, 0, stream>>>((const float *) act->data, layer->m_act, layer->m_act8, (int64_t) n_tokens * n_embd,
                                               (const int32_t *) ids->data, ids->nb[1], layer->m_ids, n_used, n_tokens,
                                               st->d_seq, layer->d_expect, st->m_mail, (uint32_t) slot, layer->m_flags,
                                               layer->m_plan, layer->d_plan, 3 * rows);

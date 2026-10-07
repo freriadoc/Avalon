@@ -4517,7 +4517,7 @@ int ggml_cpu_has_sme2(void) {
 // not q8_K: the CPU and the GPU start from the same bytes (their results differ by 4e-4 instead of 1.5e-2) and the
 // CPU rounds closer to the exact product (-18 % error). False for other types or shapes (the graph computes them).
 static bool ggml_cpu_moe_experts_multi(const struct ggml_tensor * gate_w, const struct ggml_tensor * up_w,
-                                       const struct ggml_tensor * down_w, const float * act,
+                                       const struct ggml_tensor * down_w, const float * act, const void * act_q8,
                                        const int32_t * experts, int n, float * out, int n_threads) {
 #if defined(__AVX2__) && defined(GGML_USE_OPENMP)
     const enum ggml_type tk = gate_w->type;
@@ -4540,8 +4540,9 @@ static bool ggml_cpu_moe_experts_multi(const struct ggml_tensor * gate_w, const 
             return false;
         }
     }
-    uint8_t * a8 = buf;
-    uint8_t * h8 = a8 + (size_t) n * a_row;
+    // the activations quantized by the GPU, else here
+    uint8_t * a8 = act_q8 ? (uint8_t *) act_q8 : buf;
+    uint8_t * h8 = buf + (size_t) n * a_row;
     float   * g  = (float *) GGML_PAD((uintptr_t) (h8 + (size_t) n * h_row), 64);
     float   * u  = g + (size_t) n * n_ff;
     int32_t * uniq  = (int32_t *) (u + (size_t) n * n_ff);   // distinct experts
@@ -4575,11 +4576,14 @@ static bool ggml_cpu_moe_experts_multi(const struct ggml_tensor * gate_w, const 
         int          rs[8];
         float        res[8];
         // the activations, quantized as the GPU's q8_1 (blocks of 32, the same bytes: an expert computed by the CPU or
-        // by the GPU starts from the same activations), a block per item spread over the team
-        #pragma omp for
-        for (int it = 0; it < n * nb_a; it++) {
-            const int j = it / nb_a, b = it % nb_a;
-            quantize_row_q8_0_gpu(act + (size_t) j * n_embd + (size_t) b * QK8_0, a8 + (size_t) j * a_row + (size_t) b * sizeof(block_q8_0), QK8_0);
+        // by the GPU starts from the same activations), a block per item spread over the team; given by the GPU, no
+        // work and no barrier
+        if (!act_q8) {
+            #pragma omp for
+            for (int it = 0; it < n * nb_a; it++) {
+                const int j = it / nb_a, b = it % nb_a;
+                quantize_row_q8_0_gpu(act + (size_t) j * n_embd + (size_t) b * QK8_0, a8 + (size_t) j * a_row + (size_t) b * sizeof(block_q8_0), QK8_0);
+            }
         }
         // gate and up
         #pragma omp for schedule(dynamic, 1)
@@ -4639,7 +4643,7 @@ static bool ggml_cpu_moe_experts_multi(const struct ggml_tensor * gate_w, const 
     }
     return true;
 #else
-    GGML_UNUSED(gate_w); GGML_UNUSED(up_w); GGML_UNUSED(down_w); GGML_UNUSED(act);
+    GGML_UNUSED(gate_w); GGML_UNUSED(up_w); GGML_UNUSED(down_w); GGML_UNUSED(act); GGML_UNUSED(act_q8);
     GGML_UNUSED(experts); GGML_UNUSED(n); GGML_UNUSED(out); GGML_UNUSED(n_threads);
     return false;
 #endif
@@ -4650,7 +4654,7 @@ static bool ggml_cpu_moe_experts_multi(const struct ggml_tensor * gate_w, const 
 // tensors, computed by this thread and n_threads - 1 others. The thread that calls it has no MoE
 // cache session, so these MUL_MAT_ID go the plain CPU way.
 static void ggml_cpu_moe_experts(const struct ggml_tensor * gate_w, const struct ggml_tensor * up_w,
-                                 const struct ggml_tensor * down_w, const float * act,
+                                 const struct ggml_tensor * down_w, const float * act, const void * act_q8,
                                  const int32_t * experts, int k, int n_tokens, float * out, int n_threads) {
     const int n = k * n_tokens;
     const int64_t t_call = ggml_time_us();
@@ -4675,7 +4679,7 @@ static void ggml_cpu_moe_experts(const struct ggml_tensor * gate_w, const struct
             }
             dst = chk;
         }
-        if (dst && ggml_cpu_moe_experts_multi(gate_w, up_w, down_w, act, experts, n, dst, n_threads)) {
+        if (dst && ggml_cpu_moe_experts_multi(gate_w, up_w, down_w, act, act_q8, experts, n, dst, n_threads)) {
             if (!multi_check) {
                 return;
             }
