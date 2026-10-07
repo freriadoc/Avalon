@@ -144,6 +144,8 @@ llama_kv_cache::llama_kv_cache(
         v_cells[s].resize(kv_size);
     }
 
+    v_dirty.assign(n_stream, std::vector<uint8_t>(kv_size, 0));
+
     // by default, all sequence ids are mapped to the 0th stream
     seq_to_stream.resize(LLAMA_MAX_SEQ, 0);
 
@@ -375,6 +377,9 @@ void llama_kv_cache::clear(bool data) {
     if (data) {
         for (auto & [_, buf] : ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
+        }
+        for (auto & dirty : v_dirty) {
+            std::fill(dirty.begin(), dirty.end(), 0);
         }
     }
 }
@@ -1129,6 +1134,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             }
 
             cells.pos_set(idx, ubatch.pos[i]);
+            v_dirty[sinfo.strm[s]][idx] = 1;
 
             if (ubatch.is_pos_2d() || ubatch.token || hparams.ple_n_heads > 0) {
                 llama_kv_cell_ext ext;
@@ -1182,6 +1188,49 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
         auto & head = v_heads[sinfo.strm[s]];
 
         head = sinfo.idxs[s].back() + 1;
+    }
+
+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        zero_stale_v_tail(sinfo.strm[s]);
+    }
+}
+
+void llama_kv_cache::zero_stale_v_tail(uint32_t strm) {
+    // RDNA3's WMMA (V_WMMA_F16/F32_16X16X16_F16) does not ignore a product whose weight is zero: in a group of 16 cells
+    // where weights are both zero and non-zero, the sign of the V value of a masked cell can change the rounding of the
+    // sum (about 1 result in 10^4, whatever its magnitude; a group with only zero weights is not affected). Flash
+    // attention's K/V tiles start at multiples of 64 cells, so the only group that mixes the cells of the sequence with
+    // free cells is the one holding the end of the used cells: a free cell there that still holds an earlier request's
+    // V makes the result depend on that request. Those cells are zeroed (a zero V row has no effect).
+    constexpr uint32_t wmma_k = 16;
+
+    if (v_trans) {
+        return; // no flash attention
+    }
+
+    const auto & cells = v_cells[strm];
+    auto       & dirty = v_dirty[strm];
+
+    const uint32_t end = cells.used_max_p1();
+    const uint32_t top = std::min<uint32_t>(GGML_PAD(end, wmma_k), cells.size());
+
+    uint32_t first = top;
+    for (uint32_t i = end; i < top; ++i) {
+        if (dirty[i]) {
+            first = std::min(first, i);
+            dirty[i] = 0;
+        }
+    }
+    if (first == top) {
+        return;
+    }
+
+    for (const auto & layer : layers) {
+        ggml_tensor * v = layer.v_stream[strm];
+        if (v == nullptr) {
+            continue;
+        }
+        ggml_backend_tensor_memset(v, 0, size_t(first)*v->nb[1], size_t(top - first)*v->nb[1]);
     }
 }
 

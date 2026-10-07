@@ -218,6 +218,9 @@ public:
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
     void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
 
+    // zeroes the V rows of the free cells that hold earlier values in the group of 16 cells at the end of the used ones
+    void zero_stale_v_tail(uint32_t strm);
+
     //
     // input API
     //
@@ -308,6 +311,9 @@ private:
     std::shared_ptr<llama_kv_cells_vec> v_cells_impl;
 
     llama_kv_cells_vec & v_cells;
+
+    // per stream: cells whose V row may hold values written earlier (see zero_stale_v_tail)
+    std::vector<std::vector<uint8_t>> v_dirty;
 
     // maps from a sequence id to a stream id
     std::vector<uint32_t> seq_to_stream;
