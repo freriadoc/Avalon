@@ -6263,9 +6263,13 @@ static void moe_hosted_unpin_locked(moe_hosted_state & st) {
 
 // Plan a layer's rows under the session lock: resident rows (three tensors valid) are pinned and
 // touched, as moe_cache_fused_begin does; the others count toward admission. out: up, gate, down
-// gpu ids (-1 for a row the CPU computes). Returns the rows the CPU computes.
+// gpu ids (-1 for a row the CPU computes). Returns the rows the CPU computes. The GPU waits for the
+// plan, so it is released (flag = seq) as soon as the resident rows are pinned and out is written;
+// what it does not need (LRU order of the hits, admissions, statistics) follows under the same lock,
+// in the same row order. The cache's structures are cold by then (the previous layer's CPU rows
+// evicted them): 12.5 us for the 30 rows of a 3-token pass, 2.6 of them in that bookkeeping.
 static int moe_hosted_plan(moe_hosted_state & st, moe_hosted_layer & layer, const int32_t * ids, int rows,
-                           int32_t * out, int32_t * cpu_rows) {
+                           int32_t * out, int32_t * cpu_rows, uint32_t * flag, uint32_t seq) {
     moe_cache_session & session = *st.session;
     moe_cache_device & device = *st.device;
     int n_cpu = 0;
@@ -6286,35 +6290,50 @@ static int moe_hosted_plan(moe_hosted_state & st, moe_hosted_layer & layer, cons
                 pool = down_pool = nullptr;
             }
         }
+        const void * base[3] = {layer.up_w->data, layer.gate_w->data, layer.down_w->data};
+        moe_cache_pool * pools[3] = {pool, pool, down_pool};
+        const int64_t n_expert = layer.gate_w->ne[2];
+        int slots[moe_hosted_rows_max][3];
+        for (int row = 0; row < rows; row++) {
+            out[row] = out[rows + row] = out[2 * rows + row] = -1;
+            slots[row][0] = slots[row][1] = slots[row][2] = -1;
+            const int32_t expert = ids[row];
+            if (!pool || expert < 0 || expert >= n_expert) {
+                continue;
+            }
+            for (int k = 0; k < 3; k++) {
+                const auto found = pools[k]->map.find({base[k], expert});
+                if (found != pools[k]->map.end() && pools[k]->slots[found->second].state == moe_cache_slot_state::valid) {
+                    slots[row][k] = found->second;
+                }
+            }
+            if (slots[row][0] >= 0 && slots[row][1] >= 0 && slots[row][2] >= 0) {
+                for (int k = 0; k < 3; k++) {
+                    moe_cache_pool & p = *pools[k];
+                    p.slots[slots[row][k]].readers++;
+                    st.pins.push_back({pools[k], slots[row][k]});
+                    out[k * rows + row] = moe_cache_gpu_index(p, slots[row][k]);
+                }
+            }
+        }
+        __atomic_store_n(flag, seq, __ATOMIC_RELEASE);
+
         // an admission budget per pool, as the host-driven path had (a plan for the up/gate node, one
         // for the down node): one shared budget admitted half as many experts, and a cold cache
         // warmed twice as slowly
         int inserts_gate_up = session.config.inserts_per_plan;
         int inserts_down = session.config.inserts_per_plan;
         for (int row = 0; row < rows; row++) {
-            out[row] = out[rows + row] = out[2 * rows + row] = -1;
             const int32_t expert = ids[row];
-            if (!pool || expert < 0 || expert >= layer.gate_w->ne[2]) {
+            const int * slot = slots[row];
+            if (!pool || expert < 0 || expert >= n_expert) {
                 cpu_rows[n_cpu++] = row;
                 continue;
             }
-            int slot[3] = {-1, -1, -1};
-            const void * base[3] = {layer.up_w->data, layer.gate_w->data, layer.down_w->data};
-            moe_cache_pool * pools[3] = {pool, pool, down_pool};
-            for (int k = 0; k < 3; k++) {
-                const auto found = pools[k]->map.find({base[k], expert});
-                if (found != pools[k]->map.end() && pools[k]->slots[found->second].state == moe_cache_slot_state::valid) {
-                    slot[k] = found->second;
-                }
-            }
             if (slot[0] >= 0 && slot[1] >= 0 && slot[2] >= 0) {
                 for (int k = 0; k < 3; k++) {
-                    moe_cache_pool & p = *pools[k];
-                    p.slots[slot[k]].readers++;
-                    moe_cache_lru_remove(p, slot[k]);
-                    moe_cache_lru_push_back(p, slot[k]);
-                    st.pins.push_back({pools[k], slot[k]});
-                    out[k * rows + row] = moe_cache_gpu_index(p, slot[k]);
+                    moe_cache_lru_remove(*pools[k], slot[k]);
+                    moe_cache_lru_push_back(*pools[k], slot[k]);
                 }
                 device.hits += 3;
                 continue;
@@ -6647,8 +6666,7 @@ static void moe_hosted_serve_one(moe_hosted_state * st, uint32_t seq) {
     cpu_rows.resize(moe_hosted_rows_max);
     const int rows = layer->n_used * n_tokens;
     layer->last_tokens = n_tokens;
-    int n_cpu = moe_hosted_plan(*st, *layer, layer->h_ids, rows, layer->h_plan, cpu_rows.data());
-    __atomic_store_n(&layer->h_flags[0], seq, __ATOMIC_RELEASE);
+    int n_cpu = moe_hosted_plan(*st, *layer, layer->h_ids, rows, layer->h_plan, cpu_rows.data(), &layer->h_flags[0], seq);
     n_cpu = moe_hosted_split(st, layer, rows, n_tokens, seq, cpu_rows.data(), n_cpu);
     const int64_t t_plan = stats_every > 0 ? ggml_time_us() : 0;
 
