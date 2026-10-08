@@ -93,9 +93,12 @@ static __global__ void flash_attn_mask_to_sparse_indices(
         __syncthreads();
     }
 
+    // padding: the last selected index, complemented (negative): the K/V gather loads that row without a check
+    // (~index restores it), the mask load gives the slot -inf
     const int count = min(row_count, n_kv_max);
+    const int32_t pad = ~(count > 0 ? indices[count - 1] : 0);
     for (int i = count + tid; i < n_kv_max; i += blockDim.x) {
-        indices[i] = -1;
+        indices[i] = pad;
     }
     if (tid == 0) {
         counts_ptr[int64_t(sequence)*gridDim.x + group] = count;
@@ -151,13 +154,15 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
     const int64_t n_gather = (ncols1 == 1 ? std::min<int64_t>(Q->ne[1], 64/ncols2) : ncols1) * (int64_t) n_kv_max;
 
     // RDNA (the index compaction counts 32 lanes per ballot): the gather from the context on that is no shorter than its
-    // worst case, the union of the tile's selections (qwen4exp, 16 x 2051 = 32.8k cells; measured, the gather
-    // breaks even near 20k cells and is 12 % faster per batch at 41k, 53 % at 245k)
+    // worst case, the union of the tile's selections. The 16x4 prefill tile gathers as fast as it loads densely (the
+    // lists are padded to whole batches, no bound check): from 4096 on (qwen4exp, measured per batch of 8192: equal
+    // at 8k with the list covering the whole context, 4 % faster at 16k, 26 % at 57k)
     const bool rdna = GGML_CUDA_CC_IS_RDNA(cc) && amd_wmma_available(cc);
+    const int64_t n_kv_min = rdna && ncols1 == 16 ? 0 : (rdna ? 1 : 2)*n_gather;
     return ((GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc)) || rdna) &&
         mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
         mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
-        K->ne[1] >= std::max<int64_t>(4096, (rdna ? 1 : 2)*n_gather);
+        K->ne[1] >= std::max<int64_t>(4096, n_kv_min);
 #endif // defined(GGML_USE_MUSA)
 }
 

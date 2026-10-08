@@ -432,9 +432,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
 
                 int64_t i_KV;
                 if constexpr (use_sparse) {
-                    // padded slots gather row 0, the -inf mask removes their contribution
-                    const int32_t index = i < i_sup ? indices[k_VKQ_0 + i] : 0;
-                    i_KV = index >= 0 ? index : 0;
+                    // padded slots (complemented index) gather a valid row, the -inf mask removes their contribution
+                    const int32_t index = indices[k_VKQ_0 + i];
+                    i_KV = index ^ (index >> 31);
                 } else {
                     i_KV = k_VKQ_0 + i;
                 }
@@ -480,8 +480,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
 
                     const half2 * src;
                     if constexpr (use_sparse) {
-                        const int32_t index = i < i_sup ? indices[k_VKQ_0 + i] : -1;
-                        src = index >= 0 ? KV + int64_t(index)*stride_KV + k*h2_per_chunk : zero;
+                        // no check: padded slots (complemented index) load a valid row, masked to -inf
+                        const int32_t index = indices[k_VKQ_0 + i];
+                        src = KV + int64_t(index ^ (index >> 31))*stride_KV + k*h2_per_chunk;
                     } else {
                         src = !oob_check || i < i_sup ? KV + int64_t(k_VKQ_0 + i)*stride_KV + k*h2_per_chunk : zero;
                     }
@@ -543,7 +544,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_mask(
                 const int i = i0 + threadIdx.x;
 
                 if constexpr (use_sparse) {
-                    const int32_t index = i < i_sup ? indices[k_VKQ_0 + i] : -1;
+                    const int32_t index = indices[k_VKQ_0 + i];
                     tile_mask[j_sram*(nbatch_fa + 8) + i] = index >= 0 ? mask_h[int64_t(j_vram)*stride_mask + index] : half(-INFINITY);
                 } else {
                     tile_mask[j_sram*(nbatch_fa + 8) + i] = i < i_sup ? mask_h[int64_t(j_vram)*stride_mask + k_VKQ_0 + i] : half(0.0f);
@@ -1363,7 +1364,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     }
 
     // kb0_start is always < kb0_stop so the last iter can be executed unconditionally.
-    if constexpr (ncols2 == 1 || use_sparse) {
+    // sparse: the lists are padded to whole batches (launch_fattn), no batch is partial
+    if constexpr (ncols2 == 1 && !use_sparse) {
         constexpr bool oob_check = true;
         for (; kb0 < kb0_stop-1; ++kb0) {
             constexpr bool last_iter = false;

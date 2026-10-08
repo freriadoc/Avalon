@@ -1052,7 +1052,8 @@ void launch_fattn(
         GGML_ASSERT(mask != nullptr);
         const int32_t n_kv_max_query = ggml_get_op_params_i32(KQV, 4);
         GGML_ASSERT(n_kv_max_query > 0);
-        n_kv_max = std::min<int64_t>(K->ne[1], int64_t(ncols1)*n_kv_max_query);
+        // rounded up to whole K/V batches: the lists are padded with a valid index, the gather needs no bound check
+        n_kv_max = GGML_PAD(std::min<int64_t>(K->ne[1], int64_t(ncols1)*n_kv_max_query), nbatch_fa);
         n_lists  = size_t(ntiles_x) * mask->ne[3];
         KV_max_n = size_t(n_kv_max)*n_lists + n_lists;
     }
