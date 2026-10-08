@@ -122,20 +122,30 @@ static __global__ void top_k_radix_select(
     __shared__ int histogram[NBINS];
 
     int count = 0;
+#pragma unroll 8
     for (int row_block = 0; row_block < blocks_per_row; ++row_block) {
         const size_t offset = ((size_t) row * blocks_per_row + row_block) * NBINS;
         count += block_histograms[offset + tid];
     }
+    // the bin of the rank-th largest key, by a suffix sum over the bins (one thread walking the bins from
+    // the top took most of the kernel's time); the rank read before the barriers, the chosen thread rewrites it
+    const int rank = states[row].rank;
     histogram[tid] = count;
     __syncthreads();
-
-    if (tid == 0) {
+    for (int off = 1; off < NBINS; off <<= 1) {
+        const int add = tid + off < NBINS ? histogram[tid + off] : 0;
+        __syncthreads();
+        histogram[tid] += add;
+        __syncthreads();
+    }
+    // histogram[b]: the keys in bins >= b; the bin is the highest one whose suffix reaches the rank (bin 0
+    // if none does, as the walk ended)
+    const int suffix = histogram[tid];
+    const int above = tid + 1 < NBINS ? histogram[tid + 1] : 0;
+    if ((suffix >= rank || tid == 0) && above < rank) {
         top_k_radix_state state = states[row];
-        int bin = NBINS - 1;
-        while (bin > 0 && histogram[bin] < state.rank) {
-            state.rank -= histogram[bin--];
-        }
-        state.prefix |= (uint32_t) bin << shift;
+        state.rank -= above;
+        state.prefix |= (uint32_t) tid << shift;
         state.prefix_mask |= (uint32_t) (NBINS - 1) << shift;
         states[row] = state;
     }
