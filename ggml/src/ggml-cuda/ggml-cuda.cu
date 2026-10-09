@@ -2005,8 +2005,9 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     if (cc <= GGML_CUDA_CC_PASCAL) {
         return false;
     }
-    //we only support fusion for ncols_dst = 1
-    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
+    // up to MMVQ_MAX_BATCH_SIZE columns (the kernel fuses the gate and the GLU for each), as many as one matrix of
+    // a few tokens; not batched products
+    if (tensor->op == GGML_OP_MUL_MAT && (dst->ne[1] > MMVQ_MAX_BATCH_SIZE || dst->ne[2] != 1 || dst->ne[3] != 1)) {
         return false;
     }
 
