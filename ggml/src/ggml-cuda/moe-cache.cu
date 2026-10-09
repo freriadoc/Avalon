@@ -5962,6 +5962,7 @@ struct moe_hosted_state {
     std::unordered_map<uint32_t, int> pg_demand;             // PREGATE: predictions per (layer, expert)
     char * d_q8_act = nullptr;
     char * d_q8_mid = nullptr;
+    float * d_split_glu = nullptr;                           // SPLIT: the moved expert's up/gate/swiglu rows
     size_t q8_act_bytes = 0;
     size_t q8_mid_bytes = 0;
     int n_threads = 1;
@@ -5987,6 +5988,11 @@ struct moe_hosted_pending {
     const ggml_tensor * down = nullptr;
     int rows = 0;
     bool split = false;   // SPLIT: the merge skips the rows of the moved expert
+    // SPLIT: the moved expert's rows, queued with the merge (after the shared expert and the pregate, which run while
+    // its copy crosses PCIe); its quantized activations in st->d_q8_act
+    moe_hosted_state * st = nullptr;
+    const ggml_tensor * gate_w = nullptr;
+    int n_tokens = 0;
 };
 static thread_local moe_hosted_pending g_hosted_pending;
 
@@ -6878,6 +6884,7 @@ static void moe_hosted_shutdown(moe_cache_session * session) {
     if (st->d_seq) cudaFree(st->d_seq);
     if (st->d_q8_act) cudaFree(st->d_q8_act);
     if (st->d_q8_mid) cudaFree(st->d_q8_mid);
+    if (st->d_split_glu) cudaFree(st->d_split_glu);
     // the pins of the last plan go with the pools the session is about to free
 }
 
@@ -6945,7 +6952,8 @@ static moe_hosted_layer * moe_hosted_register(moe_hosted_state & st, moe_cache_d
         const size_t mid_bytes = (size_t) rows * (GGML_PAD(layer->n_ff, MATRIX_ROW_PADDING) / QK8_1) * sizeof(block_q8_1);
         if (!st.d_q8_act) {
             if (cudaMalloc((void **) &st.d_q8_act, act_bytes) != cudaSuccess ||
-                cudaMalloc((void **) &st.d_q8_mid, mid_bytes) != cudaSuccess) {
+                cudaMalloc((void **) &st.d_q8_mid, mid_bytes) != cudaSuccess ||
+                cudaMalloc((void **) &st.d_split_glu, (size_t) rows * layer->n_ff * sizeof(float)) != cudaSuccess) {
                 GGML_ABORT("MoE block hosted by the GPU: allocation failed");
             }
             st.q8_act_bytes = act_bytes;
@@ -7054,9 +7062,17 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
     (void) ggml_cuda_moe_cache_mmv(layer->down_base, down->src[0]->type, q8_mid, layer->d_plan + 2 * rows, nullptr,
                                    (float *) down->data, n_ff, n_embd, 0, (int64_t) down->src[0]->nb[2], rows, rows,
                                    true, stream);
-    // SPLIT: the rows of the expert moved to the GPU, once it arrived; the kernels skip every other row
+    // SPLIT: the rows of the expert moved to the GPU, once it arrived; the kernels skip every other row. Queued with
+    // the merge (ggml_cuda_moe_hosted_flush): the shared expert and the pregate run while its copy crosses PCIe (the GPU
+    // ends the window in about half the verification layers); GGML_CUDA_MOE_SPLIT_LATE=0 queues them here
     const bool split_on = moe_split_enabled() && n_tokens >= 2;
-    if (split_on) {
+    static const bool split_late = !getenv("GGML_CUDA_MOE_SPLIT_LATE") || atoi(getenv("GGML_CUDA_MOE_SPLIT_LATE")) != 0;
+    if (split_on && split_late && q8_act != st->d_q8_act) {
+        // the reuse buffer may hold another activation by then
+        quantize_row_q8_1_cuda((const float *) act->data, nullptr, st->d_q8_act, wtype, n_embd, n_embd, n_tokens * n_embd,
+                               n_tokens * n_embd, padded_embd, n_tokens, 1, 1, stream);
+    }
+    if (split_on && !split_late) {
         k_moe_split_wait<<<1, 256, 0, stream>>>(layer->d_expect, layer->m_flags + 24, layer->m_plan2, layer->d_plan2, 3 * rows);
         ggml_cuda_moe_cache_mmv_fused(layer->base, layer->base, wtype, q8_act, layer->d_plan2, layer->d_plan2 + rows,
                                       layer->d_act_ids, (float *) glu->data, n_embd, n_ff, (int64_t) gate->src[0]->nb[2],
@@ -7109,7 +7125,7 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
     // the CPU rows are copied in when a node first reads the block's output (the shared expert,
     // queued in between, runs while the CPU computes them)
     CUDA_CHECK(cudaGetLastError());
-    g_hosted_pending = {layer, down, rows, split_on};
+    g_hosted_pending = {layer, down, rows, split_on, split_on && split_late ? st : nullptr, gate->src[0], (int) n_tokens};
     return 3;
 }
 
@@ -7129,6 +7145,29 @@ void ggml_cuda_moe_hosted_flush(ggml_backend_cuda_context & ctx, const ggml_tens
         }
     }
     ggml_cuda_q8_1_reuse_written(ctx, p.down);
+    if (p.st) {
+        moe_hosted_layer * layer = p.layer;
+        const ggml_tensor * down_w = p.down->src[0];
+        const int rows = p.rows;
+        const int64_t n_embd = layer->n_embd, n_ff = layer->n_ff;
+        const ggml_type wtype = p.gate_w->type;
+        const int64_t padded_ff = GGML_PAD(n_ff, MATRIX_ROW_PADDING);
+        cudaStream_t stream = ctx.stream();
+        k_moe_split_wait<<<1, 256, 0, stream>>>(layer->d_expect, layer->m_flags + 24, layer->m_plan2, layer->d_plan2, 3 * rows);
+        ggml_cuda_moe_cache_mmv_fused(layer->base, layer->base, wtype, p.st->d_q8_act, layer->d_plan2, layer->d_plan2 + rows,
+                                      layer->d_act_ids, p.st->d_split_glu, n_embd, n_ff, (int64_t) p.gate_w->nb[2],
+                                      rows, p.n_tokens, -INFINITY, INFINITY, -INFINITY, INFINITY, stream);
+        quantize_row_q8_1_cuda(p.st->d_split_glu, nullptr, p.st->d_q8_mid, wtype, n_ff, n_ff, (int64_t) rows * n_ff,
+                               (int64_t) rows * n_ff, padded_ff, rows, 1, 1, stream);
+        (void) ggml_cuda_moe_cache_mmv(layer->down_base, down_w->type, p.st->d_q8_mid, layer->d_plan2 + 2 * rows, nullptr,
+                                       (float *) p.down->data, n_ff, n_embd, 0, (int64_t) down_w->nb[2], rows, rows,
+                                       true, stream);
+        static const bool verify = getenv("GGML_CUDA_MOE_SPLIT_VERIFY") && atoi(getenv("GGML_CUDA_MOE_SPLIT_VERIFY")) > 0;
+        if (verify) {
+            k_moe_split_check<<<1, 256, 0, stream>>>(layer->d_expect, layer->d_plan2 + 2 * rows, (const float *) p.down->data,
+                                                     layer->m_chk, layer->m_flags + 28, (int) n_embd, rows);
+        }
+    }
     k_moe_hosted_merge<<<p.rows, 256, 0, ctx.stream()>>>(p.layer->d_expect, p.layer->m_flags + 16,
                                                           p.layer->d_plan + 2 * p.rows, p.split ? p.layer->d_plan2 + 2 * p.rows : nullptr,
                                                           p.layer->m_res,
