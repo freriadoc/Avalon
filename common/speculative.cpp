@@ -1422,6 +1422,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<std::vector<float>> verify_h;
     std::vector<int32_t> verify_h_rows;
 
+    // catch-up rows of small batches (a verification) not decoded yet, per seq: each token with the hidden row it
+    // pairs with. accept() drops the rejected ones and the next draft() decodes the rest in its first pass, one
+    // graph instead of two; any other process() call decodes them first
+    std::vector<std::vector<llama_token>> defer_tok;
+    std::vector<std::vector<llama_pos>>   defer_pos;
+    std::vector<std::vector<float>>       defer_h;
+    int32_t n_defer_max = 0;
+
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
@@ -1502,6 +1510,33 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
+
+        defer_tok.assign(n_seq, {});
+        defer_pos.assign(n_seq, {});
+        defer_h.assign(n_seq, {});
+        n_defer_max = (int32_t) n_seq * (this->params.n_max + 1);
+    }
+
+    int32_t n_deferred() const {
+        int32_t n = 0;
+        for (const auto & t : defer_tok) {
+            n += (int32_t) t.size();
+        }
+        return n;
+    }
+
+    void defer_clear(llama_seq_id seq_id) {
+        defer_tok[seq_id].clear();
+        defer_pos[seq_id].clear();
+        defer_h[seq_id].clear();
+    }
+
+    // add the deferred rows of a seq to the batch (no output)
+    void defer_add(llama_seq_id seq_id) {
+        for (size_t r = 0; r < defer_tok[seq_id].size(); ++r) {
+            const int32_t idx = batch.add(defer_tok[seq_id][r], defer_pos[seq_id][r], seq_id, false);
+            batch.set_embd(idx, { defer_h[seq_id].data() + r * n_embd, 1, (size_t) n_embd });
+        }
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -1580,12 +1615,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 auto * mem_dft = llama_get_memory(ctx_dft);
                 for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                     if (i_batch_beg[seq_id] >= 0) {
-                        llama_memory_seq_rm(mem_dft, seq_id, batch_in.tokens[i_batch_beg[seq_id]].pos[0], -1);
+                        const llama_pos pos_beg = batch_in.tokens[i_batch_beg[seq_id]].pos[0];
+                        llama_memory_seq_rm(mem_dft, seq_id, pos_beg, -1);
+                        // so is a deferred row there
+                        while (!defer_pos[seq_id].empty() && defer_pos[seq_id].back() >= pos_beg) {
+                            defer_tok[seq_id].pop_back();
+                            defer_pos[seq_id].pop_back();
+                            defer_h[seq_id].resize(defer_h[seq_id].size() - n_embd);
+                        }
                     }
                 }
             }
-
-            batch.clear();
 
             // pair each token with the tgt embedding shifted right by one position, and
             // the first token of each sequence with the pending embedding from a previous run
@@ -1595,47 +1635,72 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // TODO:this is generally true, but would be nice to assert it
             const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
 
-            for (int k = 0; k < n_tokens; ++k) {
-                const llama_seq_id seq_id = batch_in.tokens[k].seq_id;
+            // a small batch (a verification) is decoded with the next draft's first pass
+            if (!chain_heads && n_deferred() + n_tokens <= n_defer_max) {
+                for (int k = 0; k < n_tokens; ++k) {
+                    const llama_seq_id seq_id = batch_in.tokens[k].seq_id;
 
-                const int32_t idx = batch.add(batch_in.tokens[k].id, batch_in.tokens[k].pos[0], seq_id, false);
+                    const float * h_row = k == i_batch_beg[seq_id]
+                        ? pending_h[seq_id].data()
+                        : h_tgt + (size_t) (k - 1) * n_embd;
 
-                const float * h_row = k == i_batch_beg[seq_id]
-                    ? pending_h[seq_id].data()
-                    : h_tgt + (size_t) (k - 1) * n_embd;
+                    defer_tok[seq_id].push_back(batch_in.tokens[k].id);
+                    defer_pos[seq_id].push_back(batch_in.tokens[k].pos[0]);
+                    defer_h[seq_id].insert(defer_h[seq_id].end(), h_row, h_row + n_embd);
+                }
+            } else {
+                batch.clear();
 
-                batch.set_embd(idx, { h_row, 1, (size_t) n_embd });
-            }
+                // deferred rows first, they precede this batch
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    defer_add(seq_id);
+                }
 
-            auto * mem_dft = llama_get_memory(ctx_dft);
+                for (int k = 0; k < n_tokens; ++k) {
+                    const llama_seq_id seq_id = batch_in.tokens[k].seq_id;
 
-            bool ok = true;
-            for (int head = 0; head < n_mtp_layers; ++head) {
-                if (chain_heads) {
-                    // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
-                    for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                        if (i_batch_beg[seq_id] < 0) {
-                            continue;
+                    const int32_t idx = batch.add(batch_in.tokens[k].id, batch_in.tokens[k].pos[0], seq_id, false);
+
+                    const float * h_row = k == i_batch_beg[seq_id]
+                        ? pending_h[seq_id].data()
+                        : h_tgt + (size_t) (k - 1) * n_embd;
+
+                    batch.set_embd(idx, { h_row, 1, (size_t) n_embd });
+                }
+
+                auto * mem_dft = llama_get_memory(ctx_dft);
+
+                bool ok = true;
+                for (int head = 0; head < n_mtp_layers; ++head) {
+                    if (chain_heads) {
+                        // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
+                        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                            if (i_batch_beg[seq_id] < 0) {
+                                continue;
+                            }
+                            llama_memory_seq_rm(mem_dft, seq_id, batch_in.tokens[i_batch_beg[seq_id]].pos[0], -1);
                         }
-                        llama_memory_seq_rm(mem_dft, seq_id, batch_in.tokens[i_batch_beg[seq_id]].pos[0], -1);
+                        llama_set_nextn_layer_offset(ctx_dft, head);
                     }
-                    llama_set_nextn_layer_offset(ctx_dft, head);
+
+                    const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+                    if (rc != 0) {
+                        SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
+                                head, (int) rc, (int) batch_in.tokens[0].pos[0]);
+                        ok = false;
+                        break;
+                    }
                 }
 
-                const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
-                if (rc != 0) {
-                    SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
-                            head, (int) rc, (int) batch_in.tokens[0].pos[0]);
-                    ok = false;
-                    break;
+                if (chain_heads) {
+                    llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
                 }
-            }
-
-            if (chain_heads) {
-                llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
-            }
-            if (!ok) {
-                return false;
+                if (!ok) {
+                    return false;
+                }
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    defer_clear(seq_id);
+                }
             }
         }
 
@@ -1693,6 +1758,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 common_sampler_reset(smpls[seq_id].get());
             }
 
+            // the catch-up rows process() deferred, in the same pass
+            while (!defer_pos[seq_id].empty() && defer_pos[seq_id].back() >= dp.pos0) {
+                defer_tok[seq_id].pop_back();
+                defer_pos[seq_id].pop_back();
+                defer_h[seq_id].resize(defer_h[seq_id].size() - n_embd);
+            }
+            defer_add(seq_id);
+
             const int32_t idx = batch.add(dp.id_last, dp.pos0, seq_id, true);
             batch.set_embd(idx, { pending_h[seq_id].data(), 1, (size_t) n_embd });
 
@@ -1726,6 +1799,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (ret != 0) {
                 SPC_ERR("llama_process[%d] returned %d\n", i, ret);
                 break;
+            }
+
+            if (i == 0) {
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    if (drafting[seq_id]) {
+                        defer_clear(seq_id);
+                    }
+                }
             }
 
             // rebuild the batch for the next step: the growing-KV paths re-add only the
@@ -1839,6 +1920,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+
+        // the deferred rows of the rejected draft tokens (the last rows of the verification) are never decoded
+        const size_t n_keep = defer_tok[seq_id].size() - std::min<size_t>(defer_tok[seq_id].size(), n_rows - 1 - i_h);
+        defer_tok[seq_id].resize(n_keep);
+        defer_pos[seq_id].resize(n_keep);
+        defer_h[seq_id].resize(n_keep * n_embd);
     }
 };
 
