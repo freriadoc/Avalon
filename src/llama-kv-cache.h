@@ -292,6 +292,15 @@ private:
     // pre-computed hadamard martrices
     std::unordered_map<int64_t, std::vector<float>> attn_rot_hadamard;
 
+    // the rotation matrices the graphs use, uploaded once to the buffer type of the K cache: as graph inputs they
+    // were copied from the host at every graph (272 KiB, and a wait on the copy before the graph could start)
+    ggml_tensor * rot_k = nullptr;
+    ggml_tensor * rot_v = nullptr;
+    ggml_context_ptr        rot_ctx;
+    ggml_backend_buffer_ptr rot_buf;
+
+    int64_t n_rot_k() const;
+
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
 
