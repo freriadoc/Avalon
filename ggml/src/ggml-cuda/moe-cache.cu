@@ -5975,6 +5975,12 @@ struct moe_hosted_state {
     std::vector<float> out, act;
     std::vector<uint8_t> act8;   // the CPU rows' activations as q8_0 blocks (from h_act8)
     int64_t st_n = 0, st_gap = 0, st_gaps = 0, st_plan = 0, st_cpu = 0, st_rows = 0, t_done = 0;
+    // DIAGNOSTIC (GGML_CUDA_MOE_TIMELINE): host times per layer (seq % MOE_TL_RING): publication seen, plan flag
+    // written, CPU rows' flag written (ns); sums of the derived intervals; the host's stream queries
+    std::vector<int64_t> tl_host;
+    double tl_sum[20] = {0};
+    int64_t tl_n = 0, tl_nw = 0, tl_q_n = 0, tl_q_ns = 0;
+    double tl_tick_ns = 0;
     // CPU rows by what they have resident: up+gate (not down), down only, up or gate only, nothing
     int64_t partial[4] = {0, 0, 0, 0};
 };
@@ -6014,6 +6020,27 @@ template <typename T>
 static T * moe_hosted_device_ptr(T * host) {
     void * dev = nullptr;
     return cudaHostGetDevicePointer(&dev, host, 0) == cudaSuccess ? (T *) dev : nullptr;
+}
+
+// DIAGNOSTIC (GGML_CUDA_MOE_TIMELINE=N, HIP): a timeline of the hosted layers without a profiler, every N layers. The
+// GPU writes its wall clock to mapped host memory, per layer (seq % MOE_TL_RING): [0] publication, [1] plan seen,
+// [2] the CPU rows' flag seen by the merge (0: no CPU row). The host keeps its own times: publication seen, plan
+// flag written, CPU rows' flag written. No clock synchronization: the relays (GPU -> host -> GPU) come out of
+// differences of durations measured on one side each.
+#define MOE_TL_RING 1024
+static unsigned long long * g_tl_h = nullptr;   // host view
+static unsigned long long * g_tl_m = nullptr;   // device view of the same memory
+static int64_t moe_tl_now_ns() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t) ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
+static __device__ __forceinline__ unsigned long long moe_tl_clock() {
+#if defined(GGML_USE_HIP)
+    return wall_clock64();
+#else
+    return 0;
+#endif
 }
 
 static __device__ __forceinline__ void moe_hosted_pause() {
@@ -6132,7 +6159,8 @@ static __global__ void k_moe_hosted_enter(const float * act, float * h_act, bloc
                                           int32_t * ids, int64_t ids_nb1, int32_t * h_ids, int n_used, int n_tokens,
                                           uint32_t * d_seq, uint32_t * d_expect, volatile moe_hosted_mailbox * mail,
                                           uint32_t slot, const volatile uint32_t * flag,
-                                          const volatile int32_t * m_plan, int32_t * d_plan, int n_plan) {
+                                          const volatile int32_t * m_plan, int32_t * d_plan, int n_plan,
+                                          volatile unsigned long long * tl) {
     for (int64_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n_act; i += (int64_t) gridDim.x * blockDim.x) {
         h_act[i] = act[i];
     }
@@ -6200,6 +6228,11 @@ static __global__ void k_moe_hosted_enter(const float * act, float * h_act, bloc
         *d_expect = value;
         mail->slot     = slot;
         mail->n_tokens = (uint32_t) n_tokens;
+        if (tl) {
+            tl[(value % MOE_TL_RING) * 8 + 2] = 0;
+            tl[(value % MOE_TL_RING) * 8 + 3] = 0;
+            tl[(value % MOE_TL_RING) * 8 + 0] = moe_tl_clock();
+        }
         __threadfence_system();
         mail->seq = value;
         __threadfence_system();
@@ -6207,6 +6240,9 @@ static __global__ void k_moe_hosted_enter(const float * act, float * h_act, bloc
             moe_hosted_pause();
         }
         __threadfence_system();
+        if (tl) {
+            tl[(value % MOE_TL_RING) * 8 + 1] = moe_tl_clock();
+        }
     }
     __syncthreads();
     for (int i = threadIdx.x; i < n_plan; i += blockDim.x) {
@@ -6217,13 +6253,18 @@ static __global__ void k_moe_hosted_enter(const float * act, float * h_act, bloc
 // a block per row: the rows the CPU computed (down id -1) are copied in once they are ready
 // SPLIT: the moved expert arrived (or none was moved): its plan to the device
 static __global__ void k_moe_split_wait(const uint32_t * d_expect, const volatile uint32_t * flag,
-                                        const volatile int32_t * m_plan2, int32_t * d_plan2, int n_plan) {
+                                        const volatile int32_t * m_plan2, int32_t * d_plan2, int n_plan,
+                                        volatile unsigned long long * tl) {
     if (threadIdx.x == 0) {
         const uint32_t expect = *d_expect;
+        const unsigned long long t0 = tl ? moe_tl_clock() : 0;
         while ((int32_t) (*flag - expect) < 0) {
             moe_hosted_pause();
         }
         __threadfence_system();
+        if (tl) {
+            tl[(expect % MOE_TL_RING) * 8 + 3] = moe_tl_clock() - t0;   // the wait for the moved expert
+        }
     }
     __syncthreads();
     for (int i = threadIdx.x; i < n_plan; i += blockDim.x) {
@@ -6252,7 +6293,8 @@ static __global__ void k_moe_split_check(const uint32_t * d_expect, const int32_
 
 static __global__ void k_moe_hosted_merge(const uint32_t * d_expect, const volatile uint32_t * flag,
                                           const int32_t * d_down_ids, const int32_t * d_moved_down_ids,
-                                          const volatile float * m_res, float * dst, int n_embd) {
+                                          const volatile float * m_res, float * dst, int n_embd,
+                                          volatile unsigned long long * tl) {
     const int row = blockIdx.x;
     if (d_down_ids[row] >= 0 || (d_moved_down_ids && d_moved_down_ids[row] >= 0)) {
         return;   // resident, or moved to the GPU (SPLIT)
@@ -6260,10 +6302,15 @@ static __global__ void k_moe_hosted_merge(const uint32_t * d_expect, const volat
     __shared__ uint32_t expect;
     if (threadIdx.x == 0) {
         expect = *d_expect;
+        const unsigned long long t0 = tl ? moe_tl_clock() : 0;
         while ((int32_t) (*flag - expect) < 0) {
             moe_hosted_pause();
         }
         __threadfence_system();
+        if (tl) {
+            tl[(expect % MOE_TL_RING) * 8 + 4] = t0;   // the merge reached (one of its waiting blocks)
+            tl[(expect % MOE_TL_RING) * 8 + 2] = moe_tl_clock();
+        }
     }
     __syncthreads();
     for (int i = threadIdx.x; i < n_embd; i += blockDim.x) {
@@ -6348,6 +6395,9 @@ static int moe_hosted_plan(moe_hosted_state & st, moe_hosted_layer & layer, cons
             }
         }
         __atomic_store_n(flag, seq, __ATOMIC_RELEASE);
+        if (!st.tl_host.empty()) {
+            st.tl_host[(seq % MOE_TL_RING) * 3 + 1] = moe_tl_now_ns();
+        }
 
         // an admission budget per pool, as the host-driven path had (a plan for the up/gate node, one
         // for the down node): one shared budget admitted half as many experts, and a cold cache
@@ -6663,12 +6713,82 @@ static void moe_hosted_pregate(moe_hosted_state * st, uint32_t slot, moe_hosted_
     session.cv.notify_all();
 }
 
+// DIAGNOSTIC (GGML_CUDA_MOE_TIMELINE): called once the layer seq's CPU rows are handed back; accounts the layer
+// seq - 1 (its merge is done: the GPU published seq after it) with the publication of seq
+static void moe_tl_account(moe_hosted_state * st, uint32_t seq) {
+    static const int every = atoi(getenv("GGML_CUDA_MOE_TIMELINE"));
+    const uint32_t p = seq - 1;
+    int64_t * h  = st->tl_host.data();
+    int64_t * hp = h + (p % MOE_TL_RING) * 3, * hs = h + (seq % MOE_TL_RING) * 3;
+    hs[2] = moe_tl_now_ns();
+    const volatile unsigned long long * gp = g_tl_h + (p % MOE_TL_RING) * 8, * gs = g_tl_h + (seq % MOE_TL_RING) * 8;
+    const double k = st->tl_tick_ns;
+    const unsigned long long ge1 = gp[0], ge2 = gp[1], gm = gp[2], gs1 = gs[0];
+    const int64_t gap_host = hs[0] - hp[2];
+    if (hp[0] == 0 || hp[1] == 0 || hp[2] == 0 || ge1 == 0 || ge2 < ge1 || gap_host <= 0 || gap_host > 2000000) {
+        return;
+    }
+    const double plan_rt   = (double) (ge2 - ge1) * k;       // GPU: publication -> plan seen
+    const double plan_host = (double) (hp[1] - hp[0]);       // host: publication seen -> plan flag
+    st->tl_sum[0] += plan_rt;
+    st->tl_sum[1] += plan_host;
+    st->tl_n++;
+    if (gm != 0 && gm >= ge2 && gs1 >= gm) {
+        const double win_gpu  = (double) (gm - ge2) * k;     // GPU: plan seen -> CPU rows' flag seen
+        const double win_host = (double) (hp[2] - hp[1]);    // host: plan flag -> CPU rows' flag
+        const double seg_gpu  = (double) (gs1 - gm) * k;     // GPU: CPU rows' flag seen -> next publication
+        st->tl_sum[2] += win_gpu;
+        st->tl_sum[3] += win_host;
+        st->tl_sum[4] += seg_gpu;
+        st->tl_sum[5] += (double) gap_host;                  // host: CPU rows' flag -> next publication seen
+        st->tl_nw++;
+        // the GPU later than the CPU at the merge (relays included): waiting for the moved expert's copy, or not
+        const double late = win_gpu - win_host;
+        const double copy_wait = (double) gp[3] * k;
+        if (late > 10e3) {
+            const int c = copy_wait > 5e3 ? 0 : 1;
+            // the GPU's work in the window: plan seen -> merge reached, without the wait for the moved expert
+            const double gpu_work = (double) (gp[4] - ge2) * k - copy_wait;
+            st->tl_sum[14 + c] += gpu_work;
+            st->tl_sum[6 + c] += 1;
+            st->tl_sum[8 + c] += late;
+            st->tl_sum[10 + c] += copy_wait;
+        }
+        st->tl_sum[12] += late > 0 ? late : 0;
+        st->tl_sum[13] += copy_wait;
+        st->tl_sum[16] += (double) (gp[4] - ge2) * k - copy_wait;
+        st->tl_sum[17] += win_host;
+    }
+    if (st->tl_n % every == 0) {
+        const double n = (double) st->tl_n, nw = std::max<double>(1, (double) st->tl_nw);
+        const double plan_rt = st->tl_sum[0] / n, plan_host = st->tl_sum[1] / n;
+        const double win_gpu = st->tl_sum[2] / nw, win_host = st->tl_sum[3] / nw, seg = st->tl_sum[4] / nw, gap = st->tl_sum[5] / nw;
+        GGML_LOG_INFO("moe timeline: %lld layers (%lld with CPU rows), us per layer: plan round trip GPU %.1f, plan host %.1f "
+                "-> relays publication + plan %.1f; window GPU %.1f, CPU host %.1f -> relay rows - relay plan %.1f; "
+                "GPU segment %.1f, host gap %.1f -> relays rows + publication %.1f; stream query %.2f us (%lld)\n",
+                (long long) st->tl_n, (long long) st->tl_nw, plan_rt / 1e3, plan_host / 1e3, (plan_rt - plan_host) / 1e3,
+                win_gpu / 1e3, win_host / 1e3, (win_gpu - win_host) / 1e3, seg / 1e3, gap / 1e3, (gap - seg) / 1e3,
+                st->tl_q_n ? (double) st->tl_q_ns / st->tl_q_n / 1e3 : 0.0, (long long) st->tl_q_n);
+        const double * a = st->tl_sum;
+        GGML_LOG_INFO("moe timeline: GPU late at the merge %.1f us per layer, moved expert wait %.1f us per layer; layers late "
+                "> 10 us: waiting for the moved expert %.1f %% (late %.1f us, copy wait %.1f us), otherwise %.1f %% (late %.1f us)\n",
+                a[12] / nw / 1e3, a[13] / nw / 1e3, 100 * a[6] / nw, a[6] ? a[8] / a[6] / 1e3 : 0.0, a[6] ? a[10] / a[6] / 1e3 : 0.0,
+                100 * a[7] / nw, a[7] ? a[9] / a[7] / 1e3 : 0.0);
+        GGML_LOG_INFO("moe timeline: GPU work in the window (plan seen -> merge, without the moved expert wait) %.1f us, "
+                "CPU window %.1f us; in the late layers without copy wait: GPU work %.1f us\n",
+                a[16] / nw / 1e3, a[17] / nw / 1e3, a[7] ? a[15] / a[7] / 1e3 : 0.0);
+    }
+}
+
 static void moe_hosted_serve_one(moe_hosted_state * st, uint32_t seq) {
     // DIAGNOSTIC (GGML_CUDA_MOE_HOSTED_STATS=N): every N layers, per layer: the GPU's time between the
     // CPU rows handed back and the next publication (merge + the next layer's GPU work; long gaps,
     // between graphs, left out), the plan, the CPU rows, the CPU rows per layer
     static const int stats_every = getenv("GGML_CUDA_MOE_HOSTED_STATS") ? atoi(getenv("GGML_CUDA_MOE_HOSTED_STATS")) : 0;
     const int64_t t_arrive = stats_every > 0 ? ggml_time_us() : 0;
+    if (!st->tl_host.empty()) {
+        st->tl_host[(seq % MOE_TL_RING) * 3 + 0] = moe_tl_now_ns();
+    }
     if (stats_every > 0 && st->t_done > 0 && t_arrive - st->t_done < 2000) {
         st->st_gap += t_arrive - st->t_done;
         st->st_gaps++;
@@ -6726,6 +6846,9 @@ static void moe_hosted_serve_one(moe_hosted_state * st, uint32_t seq) {
         }
     }
     __atomic_store_n(&layer->h_flags[16], seq, __ATOMIC_RELEASE);
+    if (!st->tl_host.empty()) {
+        moe_tl_account(st, seq);
+    }
 {
         // DIAGNOSTIC (GGML_CUDA_MOE_SPLIT_VERIFY=1): the moved rows, CPU against GPU (relative L2 error per row)
         static const bool verify = getenv("GGML_CUDA_MOE_SPLIT_VERIFY") && atoi(getenv("GGML_CUDA_MOE_SPLIT_VERIFY")) > 0;
@@ -6809,8 +6932,14 @@ bool ggml_cuda_moe_hosted_wait(void * stream_ptr, void * event_ptr) {
         st = g_hosted.begin()->second.get();
     }
     std::unique_lock<std::mutex> serving(st->serve_mu, std::try_to_lock);
+    const bool tl_on = !st->tl_host.empty();
     for (;;) {
+        const int64_t tq = tl_on ? moe_tl_now_ns() : 0;
         const cudaError_t done = event ? cudaEventQuery(event) : cudaStreamQuery(stream);
+        if (tl_on) {
+            st->tl_q_ns += moe_tl_now_ns() - tq;
+            st->tl_q_n++;
+        }
         if (done != cudaErrorNotReady) {
             CUDA_CHECK(done);
             if (!event) {
@@ -6855,6 +6984,18 @@ static moe_hosted_state * moe_hosted_state_for(moe_cache_session & session, moe_
         cudaMemset(st->d_seq, 0, 2 * sizeof(uint32_t)) != cudaSuccess) {
         (void) cudaGetLastError();
         return nullptr;
+    }
+    if (getenv("GGML_CUDA_MOE_TIMELINE") && atoi(getenv("GGML_CUDA_MOE_TIMELINE")) > 0) {
+        int rate_khz = 0;
+#if defined(GGML_USE_HIP)
+        (void) hipDeviceGetAttribute(&rate_khz, hipDeviceAttributeWallClockRate, device.logical);
+#endif
+        if (rate_khz > 0 && (g_tl_h || moe_hosted_host_alloc((void **) &g_tl_h, MOE_TL_RING * 8 * sizeof(unsigned long long)))) {
+            g_tl_m = moe_hosted_device_ptr(g_tl_h);
+            st->tl_tick_ns = 1e6 / rate_khz;
+            st->tl_host.assign(MOE_TL_RING * 3, 0);
+            GGML_LOG_INFO("moe timeline: GPU wall clock %d kHz\n", rate_khz);
+        }
     }
     entry = std::move(st);
     return entry.get();
@@ -7037,7 +7178,7 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
                                               tk ? tp.logits : nullptr, tk ? tp.weights : nullptr, tp.clamp, tp.scale,
                                               (int32_t *) ids->data, ids->nb[1], layer->m_ids, n_used, n_tokens,
                                               st->d_seq, layer->d_expect, st->m_mail, (uint32_t) slot, layer->m_flags,
-                                              layer->m_plan, layer->d_plan, 3 * rows);
+                                              layer->m_plan, layer->d_plan, 3 * rows, g_tl_m);
     if (tk) {
         tp.logits = nullptr;
     }
@@ -7073,7 +7214,7 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
                                n_tokens * n_embd, padded_embd, n_tokens, 1, 1, stream);
     }
     if (split_on && !split_late) {
-        k_moe_split_wait<<<1, 256, 0, stream>>>(layer->d_expect, layer->m_flags + 24, layer->m_plan2, layer->d_plan2, 3 * rows);
+        k_moe_split_wait<<<1, 256, 0, stream>>>(layer->d_expect, layer->m_flags + 24, layer->m_plan2, layer->d_plan2, 3 * rows, g_tl_m);
         ggml_cuda_moe_cache_mmv_fused(layer->base, layer->base, wtype, q8_act, layer->d_plan2, layer->d_plan2 + rows,
                                       layer->d_act_ids, (float *) glu->data, n_embd, n_ff, (int64_t) gate->src[0]->nb[2],
                                       rows, n_tokens, -INFINITY, INFINITY, -INFINITY, INFINITY, stream);
@@ -7153,7 +7294,7 @@ void ggml_cuda_moe_hosted_flush(ggml_backend_cuda_context & ctx, const ggml_tens
         const ggml_type wtype = p.gate_w->type;
         const int64_t padded_ff = GGML_PAD(n_ff, MATRIX_ROW_PADDING);
         cudaStream_t stream = ctx.stream();
-        k_moe_split_wait<<<1, 256, 0, stream>>>(layer->d_expect, layer->m_flags + 24, layer->m_plan2, layer->d_plan2, 3 * rows);
+        k_moe_split_wait<<<1, 256, 0, stream>>>(layer->d_expect, layer->m_flags + 24, layer->m_plan2, layer->d_plan2, 3 * rows, g_tl_m);
         ggml_cuda_moe_cache_mmv_fused(layer->base, layer->base, wtype, p.st->d_q8_act, layer->d_plan2, layer->d_plan2 + rows,
                                       layer->d_act_ids, p.st->d_split_glu, n_embd, n_ff, (int64_t) p.gate_w->nb[2],
                                       rows, p.n_tokens, -INFINITY, INFINITY, -INFINITY, INFINITY, stream);
@@ -7171,7 +7312,7 @@ void ggml_cuda_moe_hosted_flush(ggml_backend_cuda_context & ctx, const ggml_tens
     k_moe_hosted_merge<<<p.rows, 256, 0, ctx.stream()>>>(p.layer->d_expect, p.layer->m_flags + 16,
                                                           p.layer->d_plan + 2 * p.rows, p.split ? p.layer->d_plan2 + 2 * p.rows : nullptr,
                                                           p.layer->m_res,
-                                                          (float *) p.down->data, (int) p.layer->n_embd);
+                                                          (float *) p.down->data, (int) p.layer->n_embd, g_tl_m);
     CUDA_CHECK(cudaGetLastError());
     p = {};
 }
