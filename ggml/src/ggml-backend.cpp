@@ -2170,22 +2170,28 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
-    // DIAGNOSTIC (GGML_SCHED_TRACE_INPUTS=N): log every input copy of graph number N
+    // DIAGNOSTIC (GGML_SCHED_TRACE_INPUTS=N): log every input copy of graphs N to N+29 (all schedulers counted together;
+    // each line names its scheduler and its number of splits)
     static const int trace_graph = getenv("GGML_SCHED_TRACE_INPUTS") ? atoi(getenv("GGML_SCHED_TRACE_INPUTS")) : -1;
     static int trace_counter = 0;
-    const bool trace_on = trace_graph >= 0 && trace_counter++ == trace_graph;
+    const int trace_c = trace_counter++;
+    const bool trace_on = trace_graph >= 0 && trace_c >= trace_graph && trace_c < trace_graph + 30;
     struct trace_input_log {
-        bool on; int split; const char * dst; const ggml_tensor * t; const char * src; int64_t t0;
+        bool on; int split; const char * dst; const ggml_tensor * t; const char * src; int64_t t0; const void * sp = nullptr; int ns = 0;
         ~trace_input_log() {
             if (on) {
-                GGML_LOG_INFO("trace input: split %3d %-6s <- %-6s %-40s %8zu B %s %6lld us\n", split, dst, src, t->name,
+                GGML_LOG_INFO("trace input %p/%d: split %3d %-6s <- %-6s %-40s %8zu B %s %6lld us\n", sp, ns, split, dst, src, t->name,
                         ggml_nbytes(t), ggml_is_contiguous(t) ? "cont" : "NONCONT", (long long) (ggml_time_us() - t0));
             }
         }
     };
-    // DIAGNOSTIC (GGML_SCHED_TIME=1): host time per backend in input copies/syncs and in compute
+    // DIAGNOSTIC (GGML_SCHED_TIME=1): host time per backend in input copies/syncs and in compute, per scheduler
     static const bool sched_time = getenv("GGML_SCHED_TIME") && atoi(getenv("GGML_SCHED_TIME"));
-    static int64_t st_in[GGML_SCHED_MAX_BACKENDS], st_cp[GGML_SCHED_MAX_BACKENDS], st_n[GGML_SCHED_MAX_BACKENDS], st_calls, st_total;
+    struct st_stats { int64_t in[GGML_SCHED_MAX_BACKENDS], cp[GGML_SCHED_MAX_BACKENDS], n[GGML_SCHED_MAX_BACKENDS], calls, total; };
+    static std::unordered_map<const void *, st_stats> st_map;
+    static st_stats st_unused;
+    st_stats & st_s = sched_time ? st_map[sched] : st_unused;
+    int64_t * st_in = st_s.in; int64_t * st_cp = st_s.cp; int64_t * st_n = st_s.n; int64_t & st_calls = st_s.calls; int64_t & st_total = st_s.total;
     const int64_t st_t_graph = sched_time ? ggml_time_us() : 0;
     int64_t st_t0 = 0;
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
@@ -2201,6 +2207,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
         ggml_backend_t copies_backend = NULL;
         bool user_inputs_queued = false;
+        // the split backend was synchronized in this split: the previous users of its input copies are done, and
+        // every copy queued afterwards on its stream is ordered behind that point
+        bool dst_synced = false;
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -2218,15 +2227,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
             trace_input_log trace_log{trace_on, split_id, ggml_backend_name(split_backend), input,
-                ggml_backend_name(input_backend), trace_on ? ggml_time_us() : 0};
+                ggml_backend_name(input_backend), trace_on ? ggml_time_us() : 0, sched, sched->n_splits};
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
-                if (!user_inputs_queued) {
+                if (!user_inputs_queued && !dst_synced) {
                     if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                         ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                     } else {
                         ggml_backend_synchronize(split_backend);
+                        dst_synced = true;
                     }
                 }
                 // from host memory to a backend that copies asynchronously: queued, one synchronization
@@ -2300,8 +2310,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
-                } else {
+                } else if (!dst_synced) {
                     ggml_backend_synchronize(split_backend);
+                    dst_synced = true;
                 }
 
                 // an input a CPU split takes from a GPU is queued as an asynchronous copy into
@@ -2504,10 +2515,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         static const int st_every = getenv("GGML_SCHED_TIME_EVERY") ? atoi(getenv("GGML_SCHED_TIME_EVERY")) : 250;
         if (++st_calls % st_every == 0) {
             for (int b = 0; b < sched->n_backends; b++) {
-                GGML_LOG_INFO("sched time: %d graphs, backend %s: %lld splits, inputs %.3f s, compute %.3f s (graphs total %.3f s)\n",
-                        (int) st_calls, ggml_backend_name(sched->backends[b]), (long long) st_n[b],
-                        st_in[b] / 1e6, st_cp[b] / 1e6, st_total / 1e6);
+                GGML_LOG_INFO("sched time %p: %d graphs, backend %s: %.2f splits, inputs %.1f us, compute %.1f us per graph (graph %.1f us)\n",
+                        (void *) sched, st_every, ggml_backend_name(sched->backends[b]), (double) st_n[b] / st_every,
+                        (double) st_in[b] / st_every, (double) st_cp[b] / st_every, (double) st_total / st_every);
             }
+            memset(&st_s, 0, sizeof(st_s));
         }
     }
 
