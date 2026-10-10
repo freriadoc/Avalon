@@ -1541,10 +1541,15 @@ static bool moe_cache_enqueue_locked(
 static void moe_cache_rewarm_stop_locked(moe_cache_device & device);
 
 // PREGATE: experts predicted per token for the next layer of a hosted pass of at least 2 tokens (MTP
-// verification); GGML_CUDA_MOE_PREGATE=k, 0 disables. Top-6 with 2 predictions required: 32k MTP
-// +5 %, 256k +5 % (short prompt); top-4 and a threshold of 1 measured below it
+// verification); GGML_CUDA_MOE_PREGATE=k enables it, top-k predictions (6 was the best: top-4 and 8, a threshold of
+// 1 or 3 predictions, all the layers, measured below it). Off by default: it gained 3 - 5 % on 4 Oct.; since then
+// (larger cache with the KV tail lent, faster GPU kernels, the dispatcher, whole-expert entries) it costs 1.7 % at
+// 32k and 4 - 5 % at 251k (replay bench, 3-token passes), whatever was tried: its router on a side stream (6 of its
+// ~18 us of GPU work off the critical path), its experts at the cold end of the LRU (worse), without the dispatcher
+// (still -2.5 %). Not explained: perhaps its copies taking RAM bandwidth from the CPU rows (IQ2_S experts on 8 threads
+// are bound by it). To be measured again with PCIe 4.0 and faster RAM.
 static int moe_pregate_k() {
-    static const int k = getenv("GGML_CUDA_MOE_PREGATE") ? atoi(getenv("GGML_CUDA_MOE_PREGATE")) : 6;
+    static const int k = getenv("GGML_CUDA_MOE_PREGATE") ? atoi(getenv("GGML_CUDA_MOE_PREGATE")) : 0;
     return k;
 }
 
