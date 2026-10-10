@@ -7561,6 +7561,8 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
     // SPLIT: the rows of the expert moved to the GPU, once it arrived; the kernels skip every other row
     const bool split_on = moe_split_enabled() && n_tokens >= 2;
     if (split_on) {
+        ctx.split_wait_queued = true;
+        ctx.split_wait_captured = true;
         k_moe_split_wait<<<1, 256, 0, stream>>>(layer->d_expect, layer->m_flags + 24, layer->m_plan2, layer->d_plan2, 3 * rows, g_tl_m);
         ggml_cuda_moe_cache_mmv_fused(wtype, q8_act, layer->d_plan2, layer->d_plan2 + rows,
                                       layer->d_act_ids, (float *) glu->data, n_embd, n_ff,

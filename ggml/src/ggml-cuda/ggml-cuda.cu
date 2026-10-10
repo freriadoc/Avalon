@@ -2759,12 +2759,75 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
     delete backend;
 }
 
+#if defined(GGML_USE_HIP)
+// While a graph that waits for a fill of the MoE cache is queued on a compute stream (k_moe_split_wait: the hosted MoE
+// dispatcher moves an expert to the GPU and the graph waits for its copy, ggml_backend_cuda_context::split_wait_queued),
+// the stream's asynchronous copies to and from pinned host memory are made by a kernel on that stream, not by an SDMA
+// engine. ROCr has one command ring per engine for the whole process (amd_gpu_agent.cpp) and a copy that depends on
+// earlier work waits in it (a POLL_REGMEM packet, amd_blit_sdma.cpp), holding back every copy behind it. The outputs of
+// a graph (logits, MTP hidden states, sampled tokens) are queued right after it, so they wait for its end; the fill it
+// waits for could queue behind them in the same ring: a deadlock (seen with the logits, 970 KiB a token, ahead of a fill
+// that found no free engine and fell back to engine 0). The kernel runs alone on its stream; reading or writing host
+// memory from a kernel slows the kernels of other queues running meanwhile (tests/tlbbench: 3.6 -> 9.3 us), which is
+// why the prefill's copies (MTP hidden states, 320 MiB a batch, while the draft computes) keep the engines: made by a
+// kernel, the prefill with MTP fell from 1066 to 830 t/s. Up to 16 KiB ROCm uses a kernel already
+// (GPU_FORCE_BLIT_COPY_SIZE).
+static constexpr size_t ggml_cuda_host_copy_kernel_min = 16 << 10;
+static constexpr int    ggml_cuda_host_copy_kernel_blocks = 16;
+static __global__ void k_ggml_cuda_host_copy(const char * __restrict__ src, char * __restrict__ dst, size_t n) {
+    const size_t stride = (size_t) gridDim.x * blockDim.x;
+    const size_t t = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    size_t done = 0;
+    if ((((uintptr_t) src | (uintptr_t) dst) & 15) == 0) {
+        for (size_t i = t; i < n / 16; i += stride) {
+            ((int4 *) dst)[i] = ((const int4 *) src)[i];
+        }
+        done = n / 16 * 16;
+    }
+    for (size_t i = done + t; i < n; i += stride) {
+        dst[i] = src[i];
+    }
+}
+// the device address of pinned host memory, or nullptr (pageable memory: left to cudaMemcpyAsync)
+static void * ggml_cuda_pinned_device_ptr(const void * host) {
+    hipPointerAttribute_t attr;
+    if (hipPointerGetAttributes(&attr, host) != hipSuccess) {
+        (void) hipGetLastError();
+        return nullptr;
+    }
+    if (attr.type != hipMemoryTypeHost || !attr.devicePointer) {
+        return nullptr;
+    }
+    return (char *) attr.devicePointer + ((const char *) host - (const char *) attr.hostPointer);
+}
+// true when the copy was queued; to_host: dst is the host side, else src
+static bool ggml_cuda_host_copy_by_kernel(void * dst, const void * src, size_t size, bool to_host, cudaStream_t stream) {
+    if (size <= ggml_cuda_host_copy_kernel_min) {
+        return false;
+    }
+    void * dev = ggml_cuda_pinned_device_ptr(to_host ? dst : src);
+    if (!dev) {
+        return false;
+    }
+    k_ggml_cuda_host_copy<<<ggml_cuda_host_copy_kernel_blocks, 256, 0, stream>>>(
+        to_host ? (const char *) src : (const char *) dev, to_host ? (char *) dev : (char *) dst, size);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+#endif
+
 static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+#if defined(GGML_USE_HIP)
+    if (cuda_ctx->split_wait_queued &&
+        ggml_cuda_host_copy_by_kernel((char *) tensor->data + offset, data, size, false, cuda_ctx->stream())) {
+        return;
+    }
+#endif
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
 
@@ -2774,6 +2837,12 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+#if defined(GGML_USE_HIP)
+    if (cuda_ctx->split_wait_queued &&
+        ggml_cuda_host_copy_by_kernel(data, (const char *) tensor->data + offset, size, true, cuda_ctx->stream())) {
+        return;
+    }
+#endif
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
 
@@ -2816,6 +2885,10 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
             return false;
         }
         ggml_cuda_set_device(cuda_ctx_dst->device);
+#if defined(GGML_USE_HIP)
+        if (!cuda_ctx_dst->split_wait_queued ||
+            !ggml_cuda_host_copy_by_kernel(dst->data, src->data, ggml_nbytes(dst), false, cuda_ctx_dst->stream()))
+#endif
         CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyHostToDevice, cuda_ctx_dst->stream()));
         return true;
     }
@@ -2882,6 +2955,7 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     if (!ggml_cuda_moe_hosted_wait((void *) cuda_ctx->stream(), nullptr)) {
         CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
     }
+    cuda_ctx->split_wait_queued = false;
 
     GGML_UNUSED(backend);
 }
@@ -5299,6 +5373,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
+    cuda_ctx->split_wait_captured = false;
 
     // flag used to determine whether it is an integrated_gpu
     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
@@ -5553,6 +5628,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
 
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
+            graph->split_wait = cuda_ctx->split_wait_captured;
             graph_evaluated_or_captured = true; // CUDA graph has been captured
 
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
@@ -5574,6 +5650,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
         // Launch graph
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+        cuda_ctx->split_wait_queued |= graph->split_wait;
 #else
         GGML_UNUSED(graph_key);
         graph_evaluated_or_captured = true;

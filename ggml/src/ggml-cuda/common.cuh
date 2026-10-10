@@ -1283,6 +1283,7 @@ struct ggml_cuda_graph {
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
     bool warmup_complete = false;
+    bool split_wait = false;   // captured with a k_moe_split_wait (ggml_backend_cuda_context::split_wait_queued)
     uint64_t uid = 0;
     int64_t last_used_time = 0;
     struct node_properties {
@@ -1506,6 +1507,12 @@ struct ggml_backend_cuda_context {
         float clamp = -INFINITY;
         float scale = 1.0f;
     } topk_pending;
+
+    // a graph queued on the stream waits for a fill of the MoE cache (k_moe_split_wait, the hosted MoE dispatcher):
+    // until the stream is synchronized, its copies to and from pinned host memory are made by a kernel
+    // (ggml_cuda_host_copy_by_kernel); split_wait_captured: the graph being captured holds one
+    bool split_wait_queued = false;
+    bool split_wait_captured = false;
 
     // GET_ROWS left to the node that reads the gathered rows, which reads the source rows itself: a recurrent state
     // (gated delta net, cached ssm_conv: ggml_cuda_gdn_state_gather_of), the pooled keys of the lightning indexer
