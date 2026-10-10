@@ -312,9 +312,13 @@ struct moe_cache_config {
     bool min_expert_explicit = false;
     int max_batch = moe_cache_batch_max;
     bool max_batch_explicit = false;
+    // the admission rate, measured with whole-expert entries (replay bench, 3-token passes, 32k and 251k): the experts a
+    // plan may admit (inserts_per_plan / 2) on a plateau from 2 to 16; demands before a free entry takes an expert 3
+    // (-0.4 % at 32k, -0.2 % at 251k against 2: an admission is three copies now), before it evicts the coldest 8
+    // (4: -0.5 % at 32k, +0.9 % at 251k; 2 and 16 worse)
     int inserts_per_plan = 8;
     bool inserts_per_plan_explicit = false;
-    int admit_after = 2;
+    int admit_after = 3;
     bool admit_after_explicit = false;
     int readmit_after = 8;
     bool readmit_after_explicit = false;
