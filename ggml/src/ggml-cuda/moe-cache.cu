@@ -5421,15 +5421,17 @@ static void moe_cache_evacuate(
 }
 
 // ---------------------------------------------------------------------------
-// The end of the KV cache lent to the pools (GGML_CUDA_MOE_CACHE_KV_LEND=1). The KV tensors are allocated for the
-// whole context, but attention only reads the n_kv cells in use: the rows past the step above them hold experts. Each
-// KV tensor's tail is attached once to a pool when the pools are built, before any graph captures the virtual base;
-// taking rows back is the zone evacuation on a run of logical slots, giving them back puts free slots back. Bench:
-// tests/kvlendtest (the same functions on host memory, ASan + UBSan, random operations, invariants and bytes).
+// The end of the KV cache lent to the pools (by default; GGML_CUDA_MOE_CACHE_KV_LEND=0 disables it). The KV tensors are
+// allocated for the whole context, but attention only reads the n_kv cells in use: the rows past the step above them
+// hold experts. Each KV tensor's tail is attached once to a pool when the pools are built, before any graph captures
+// the virtual base; taking rows back is the zone evacuation on a run of logical slots, giving them back puts free
+// slots back. Bench: tests/kvlendtest (the same functions on host memory, ASan + UBSan, random operations, invariants
+// and bytes).
 // ---------------------------------------------------------------------------
 
+// on by default; GGML_CUDA_MOE_CACHE_KV_LEND=0 keeps the whole KV cache out of the expert cache
 static bool moe_cache_kv_lend_enabled() {
-    static const bool enabled = getenv("GGML_CUDA_MOE_CACHE_KV_LEND") && atoi(getenv("GGML_CUDA_MOE_CACHE_KV_LEND")) != 0;
+    static const bool enabled = !getenv("GGML_CUDA_MOE_CACHE_KV_LEND") || atoi(getenv("GGML_CUDA_MOE_CACHE_KV_LEND")) != 0;
     return enabled;
 }
 
