@@ -6226,6 +6226,7 @@ struct moe_hosted_state {
     size_t q8_act_bytes = 0;
     size_t q8_mid_bytes = 0;
     int n_threads = 1;
+    double pcie_bytes_per_us = 13600.0;                      // SPLIT: host -> device copy rate (moe_cache_pcie_bytes_per_us)
     std::vector<moe_cache_pin> pins;                         // held by the last plan
     int64_t split_moved = 0;                                 // SPLIT: experts moved to the GPU
     // served by the thread that waits for the stream (ggml_cuda_moe_hosted_wait)
@@ -6708,11 +6709,27 @@ static int moe_hosted_plan(moe_hosted_state & st, moe_hosted_layer & layer, cons
 }
 
 // SPLIT (GGML_CUDA_MOE_SPLIT=0 disables): in a pass of 2 tokens or more, one or two experts of the CPU rows are moved to
-// the GPU when they can arrive and be computed before the CPU finishes the others. Their missing tensors take cache
-// entries (an admission) and go to the front of the fill queue; the last one to arrive raises the layer's flag,
-// which a kernel queued after the resident rows waits for. Costs (us, measured on this machine): CPU rows
-// 7 + 45 per distinct expert + 35 per row; a copy 5 + bytes / 11.5 GB/s, after a fill already copying (60);
-// the moved rows on the GPU 20; the CPU slowed by each copy (RAM shared) 22. Returns the CPU rows left.
+// the GPU when that ends the MoE window sooner. Their missing tensors take cache entries (an admission) and go to the
+// front of the fill queue; the last one to arrive raises the layer's flag, which a kernel queued after the resident rows
+// waits for. The window ends with the later of the CPU rows and the GPU's work: the resident rows, the wait for the
+// moved experts, then the work queued behind it; costs: see moe_split_cpu_fixed_us. Returns the CPU rows left.
+// SPLIT: the dispatcher's model of a 2 - 8 token hosted layer, fitted on ~15 000 layers of 3-token MTP verifications in a
+// serving process (replay bench, 32k context; the residual standard deviation of each fit in brackets):
+// - CPU time of the missed rows: 2.0 + 55.8 per distinct expert + 14.5 per row + 5.2 per tensor copied meanwhile (the
+//   copy reads the same RAM) [21.6 us];
+// - arrival of the moved experts' tensors (one copy at a time): 9.1 + per tensor 11.4 + bytes / the link's copy rate
+//   [16.6 us]; the rate is the link's (moe_cache_pcie_bytes_per_us) times 86 % (13.6 GB/s on PCIe 3.0 x16);
+// - GPU work of the window: before the wait for the moved experts (the resident rows) 23.3 + 2.97 per resident row, and
+//   after it (the moved rows, the pregate and the shared expert, queued behind the wait) 66.4 + 1.5 per moved row
+//   [3.4 us]; in all 89.7 + 2.97 per resident row + 3.46 per moved row [9.5 us].
+// Copies of expert tensors alone, for comparison (tests/pciebench): 6.2 us + bytes / 14.1 GB/s.
+static constexpr double moe_split_cpu_fixed_us = 2.0, moe_split_cpu_expert_us = 55.8, moe_split_cpu_row_us = 14.5;
+static constexpr double moe_split_cpu_copy_us = 5.2;
+static constexpr double moe_split_copy_start_us = 9.1, moe_split_copy_tensor_us = 11.4;
+static constexpr double moe_cache_pcie_copy_efficiency = 13.6 / (8.0 * 16 * 128.0 / 130.0 / 8.0);
+static constexpr double moe_split_gpu_before_us = 23.3, moe_split_gpu_row_us = 2.97;
+static constexpr double moe_split_gpu_after_us = 66.4, moe_split_gpu_moved_row_us = 1.5;
+
 static bool moe_split_enabled() {
     static const bool enabled = !getenv("GGML_CUDA_MOE_SPLIT") || atoi(getenv("GGML_CUDA_MOE_SPLIT")) != 0;
     return enabled;
@@ -6742,7 +6759,9 @@ static int moe_hosted_split(moe_hosted_state * st, moe_hosted_layer * layer, int
             const int idx[3] = {layer->pool_index, layer->pool_index, layer->down_pool_index};
             const size_t tsz[3] = {ggml_nbytes(layer->up_w) / layer->up_w->ne[2], ggml_nbytes(layer->gate_w) / layer->gate_w->ne[2],
                                    ggml_nbytes(layer->down_w) / layer->down_w->ne[2]};
-            struct cand { int32_t e; int rows; int slot[3]; bool valid[3]; double arrival; };
+            const double rate = st->pcie_bytes_per_us;   // bytes per microsecond
+            // copies: the time of the candidate's missing tensors, one after another, and their count
+            struct cand { int32_t e; int rows; int slot[3]; bool valid[3]; double copies; int tensors; };
             std::vector<cand> c;
             for (int j = 0; j < n_cpu; j++) {
                 const int32_t e = layer->h_ids[cpu_rows[j]];
@@ -6751,7 +6770,7 @@ static int moe_hosted_split(moe_hosted_state * st, moe_hosted_layer * layer, int
                     if (x.e == e) { x.rows++; seen = true; }
                 }
                 if (!seen) {
-                    c.push_back({e, 1, {-1, -1, -1}, {false, false, false}, 60.0});
+                    c.push_back({e, 1, {-1, -1, -1}, {false, false, false}, 0.0, 0});
                 }
             }
             for (auto & x : c) {
@@ -6762,20 +6781,30 @@ static int moe_hosted_split(moe_hosted_state * st, moe_hosted_layer * layer, int
                         x.valid[k] = pools[k]->slots[f->second].state == moe_cache_slot_state::valid;
                     }
                     if (!x.valid[k]) {
-                        x.arrival += 5.0 + tsz[k] / 11500.0;
+                        x.copies += moe_split_copy_tensor_us + tsz[k] / rate;
+                        x.tensors++;
                     }
                 }
             }
-            const auto cpu_cost = [](int d, int r) { return d > 0 ? 7.0 + 45.0 * d + 35.0 * r : 0.0; };
+            // the window's end: the later of the CPU rows and the GPU's work (the resident rows, the wait for the moved
+            // experts, then the work queued behind it)
+            const auto cpu_time = [](int d, int r, int tensors) {
+                return d > 0 ? moe_split_cpu_fixed_us + moe_split_cpu_expert_us * d + moe_split_cpu_row_us * r +
+                               moe_split_cpu_copy_us * tensors : 0.0;
+            };
+            const double gpu_before = moe_split_gpu_before_us + moe_split_gpu_row_us * (rows - n_cpu);
+            const auto window = [&](int d, int r, int moved_rows, int tensors, double copies) {
+                const double arrival = tensors > 0 ? moe_split_copy_start_us + copies : 0.0;
+                const double gpu_after = moe_split_gpu_after_us + moe_split_gpu_moved_row_us * moved_rows;
+                return std::max(cpu_time(d, r, tensors), std::max(gpu_before, arrival) + gpu_after);
+            };
             const int D = (int) c.size();
-            const double all = cpu_cost(D, n_cpu);
-            // the best single expert or pair (copies one after another, one GPU pass, the CPU slowed by each
-            // copy). Measured with pairs: arrival after the CPU finished in 1.0 % of the layers moving one
-            // expert (85 us late on average) and 1.6 % of those moving two (226 us), ~0.7 us per layer in all
+            const double all = window(D, n_cpu, 0, 0, 0.0);
+            // the best single expert or pair, if it ends the window sooner
             std::vector<int> best;
             double best_gain = 0.0;
             for (int i = 0; i < D; i++) {
-                const double crit = std::max(cpu_cost(D - 1, n_cpu - c[i].rows) + 22.0, c[i].arrival + 20.0);
+                const double crit = window(D - 1, n_cpu - c[i].rows, c[i].rows, c[i].tensors, c[i].copies);
                 if (all - crit > best_gain) {
                     best_gain = all - crit;
                     best = {i};
@@ -6783,8 +6812,8 @@ static int moe_hosted_split(moe_hosted_state * st, moe_hosted_layer * layer, int
             }
             for (int i = 0; i < D; i++) {
                 for (int j = i + 1; j < D; j++) {
-                    const double crit = std::max(cpu_cost(D - 2, n_cpu - c[i].rows - c[j].rows) + 44.0,
-                                                 c[i].arrival + c[j].arrival - 60.0 + 20.0);
+                    const double crit = window(D - 2, n_cpu - c[i].rows - c[j].rows, c[i].rows + c[j].rows,
+                                               c[i].tensors + c[j].tensors, c[i].copies + c[j].copies);
                     if (all - crit > best_gain) {
                         best_gain = all - crit;
                         best = {i, j};
@@ -7230,6 +7259,60 @@ bool ggml_cuda_moe_hosted_wait(void * stream_ptr, void * event_ptr) {
     }
 }
 
+// SPLIT: the host -> device bytes per microsecond a copy of an expert gets. The link's rate is the smallest of the maximum
+// link capabilities on the path from the device to the root port: the current ones drop while the link idles, and a
+// Radeon's own link to the switch inside the card reads 16 GT/s x16 in any slot. Times the encoding (8b/10b up to
+// 5 GT/s, 128b/130b above), times the share a copy gets (moe_cache_pcie_copy_efficiency). 0 if the path cannot be read.
+static double moe_cache_pcie_bytes_per_us(int physical, std::string & desc) {
+    char bus[32] = {};
+    if (cudaDeviceGetPCIBusId(bus, sizeof(bus), physical) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return 0.0;
+    }
+    std::string id(bus);
+    for (char & c : id) {
+        c = (char) tolower((unsigned char) c);
+    }
+    char real[PATH_MAX];
+    if (!realpath(("/sys/bus/pci/devices/" + id).c_str(), real)) {
+        return 0.0;
+    }
+    double best = 0.0, best_gt = 0.0;
+    int best_width = 0;
+    for (std::string p = real; p.size() > 1; p = p.substr(0, p.rfind('/'))) {
+        double gt = 0.0;
+        int width = 0;
+        FILE * f = fopen((p + "/max_link_speed").c_str(), "r");
+        if (!f) {
+            break;   // above the root port
+        }
+        const bool ok_speed = fscanf(f, "%lf", &gt) == 1;
+        fclose(f);
+        f = fopen((p + "/max_link_width").c_str(), "r");
+        const bool ok_width = f && fscanf(f, "%d", &width) == 1;
+        if (f) {
+            fclose(f);
+        }
+        if (!ok_speed || !ok_width || gt <= 0.0 || width <= 0) {
+            continue;
+        }
+        const double gbs = gt * width * (gt >= 8.0 ? 128.0 / 130.0 : 8.0 / 10.0) / 8.0;
+        if (best == 0.0 || gbs < best) {
+            best = gbs;
+            best_gt = gt;
+            best_width = width;
+        }
+    }
+    if (best == 0.0) {
+        return 0.0;
+    }
+    char text[128];
+    snprintf(text, sizeof(text), "%.1f GT/s x%d on the path: %.2f GB/s, %.2f GB/s for a copy", best_gt, best_width, best,
+             best * moe_cache_pcie_copy_efficiency);
+    desc = text;
+    return best * moe_cache_pcie_copy_efficiency * 1000.0;   // 1 GB/s = 1000 bytes per microsecond
+}
+
 static moe_hosted_state * moe_hosted_state_for(moe_cache_session & session, moe_cache_device & device) {
     std::lock_guard<std::mutex> lock(g_hosted_mu);
     auto & entry = g_hosted[&session];
@@ -7242,6 +7325,17 @@ static moe_hosted_state * moe_hosted_state_for(moe_cache_session & session, moe_
     const char * threads = getenv("GGML_CUDA_MOE_HOSTED_THREADS");
     const int hw = (int) std::thread::hardware_concurrency();
     st->n_threads = threads ? std::max(1, atoi(threads)) : std::max(1, hw / 2);
+    {
+        std::string desc;
+        const double rate = moe_cache_pcie_bytes_per_us(device.physical, desc);
+        if (rate > 0.0) {
+            st->pcie_bytes_per_us = rate;
+            MOE_CACHE_LOG("[moe-cache] CUDA%d PCIe: %s\n", device.physical, desc.c_str());
+        } else {
+            MOE_CACHE_LOG("[moe-cache] CUDA%d PCIe: link not readable, %.1f GB/s assumed for a copy\n", device.physical,
+                    st->pcie_bytes_per_us / 1000.0);
+        }
+    }
     if (!moe_hosted_host_alloc((void **) &st->h_mail, sizeof(moe_hosted_mailbox)) ||
         !(st->m_mail = moe_hosted_device_ptr(st->h_mail)) ||
         cudaMalloc((void **) &st->d_seq, 2 * sizeof(uint32_t)) != cudaSuccess ||   // [0] seq, [1] blocks done (stage)
