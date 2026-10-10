@@ -43,13 +43,24 @@ constexpr int HTTP_POLLING_SECONDS = 1;
 // work inside yield_to_queue, the yield handoff around it, and the rest of the step
 struct spec_timing {
     bool on = getenv("LLAMA_SPEC_TIMING") != nullptr;
+    // a step's phases are counted with its length at the next step's start, and dropped when the slot is released
+    // (the time to the next request is not a step)
     int64_t work[3] = {}, yield[3] = {}, step = 0, t_last = 0; int n = 0;
+    int64_t pw[3] = {}, py[3] = {};
     void add(int k, int64_t t0, int64_t w0, int64_t w1) {
-        work[k] += w1 - w0; yield[k] += ggml_time_us() - t0 - (w1 - w0);
+        pw[k] += w1 - w0; py[k] += ggml_time_us() - t0 - (w1 - w0);
+    }
+    void release() {
+        t_last = 0;
+        for (int k = 0; k < 3; k++) { pw[k] = py[k] = 0; }
     }
     void step_start() {
         const int64_t t = ggml_time_us();
-        if (t_last) { step += t - t_last; n++; }
+        if (t_last) {
+            step += t - t_last; n++;
+            for (int k = 0; k < 3; k++) { work[k] += pw[k]; yield[k] += py[k]; }
+        }
+        for (int k = 0; k < 3; k++) { pw[k] = py[k] = 0; }
         t_last = t;
         if (n && n % 200 == 0) {
             const double f = 1e-3 / n;
@@ -585,6 +596,7 @@ struct server_slot {
     }
 
     void release() {
+        if (g_spec_timing.on) g_spec_timing.release();
         if (is_processing()) {
             GGML_ASSERT(task);
 
@@ -4159,7 +4171,11 @@ private:
 
             // verify and try to accept the draft
             {
-                common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
+                // the sampler is restored only with the target's checkpoint, which a draft no longer than the recurrent
+                // states the context keeps does not take; the clone copies the candidates of the whole vocabulary
+                const bool may_restore = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft > llama_n_rs_seq(ctx_tgt));
+                common_sampler_ptr smpl_save(may_restore ? common_sampler_clone(slot.smpl.get()) : nullptr);
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 GGML_ASSERT(slot.spec_draft_q.empty() || (slot.spec_draft_q.size() == slot.spec_draft.size()));
@@ -4215,6 +4231,7 @@ private:
                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
+                        GGML_ASSERT(smpl_save);   // n_rollback <= n_draft
                         common_sampler_copy(smpl_save.get(), slot.smpl.get());
 
                         return;
