@@ -1,6 +1,5 @@
 #include "mmvq.cuh"
 #include "ggml-backend-impl.h"
-#include "moe-cache-mmv-tuning.h"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -888,8 +887,21 @@ static __global__ void mul_mat_vec_q(
 // Grid: (ceil(nrows_x / c_rows_per_block), nchannels_dst)
 // Block: (warp_size, ncols_dst) - each warp handles one token independently.
 // No shared memory reduction needed since each warp works alone.
-template <ggml_type type, int c_rows_per_block, bool has_fusion, bool has_clamp, bool flat_hits = false>
-__launch_bounds__((flat_hits ? 2 : get_mmvq_mmid_max_batch_for_device<type>())*ggml_cuda_get_physical_warp_size(), 1)
+// An address read from memory, declared global: a pointer of unknown address space makes the compiler use slower flat
+// loads for everything read through it.
+static __device__ __forceinline__ const void * mmvq_global_ptr(uint64_t addr) {
+#if defined(GGML_USE_HIP)
+    return (const void *) (const __attribute__((address_space(1))) char *) (uintptr_t) addr;
+#else
+    return (const void *) (uintptr_t) addr;
+#endif
+}
+
+// entry_ptrs (the MoE cache): ids and gate_ids hold each routed row's entry address (64 bits, 0 for a row the cache does
+// not hold) instead of a matrix index, one row per block: the address is read by a scalar load and the blocks inside
+// the entry are counted in 32 bits, wherever the cache's ranges lie (the slab, memory lent by the KV cache).
+template <ggml_type type, int c_rows_per_block, bool has_fusion, bool has_clamp, bool flat_hits = false, bool entry_ptrs = false>
+__launch_bounds__((flat_hits ? 2 : entry_ptrs ? 1 : get_mmvq_mmid_max_batch_for_device<type>())*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_moe(
         const void * vx_ptr, const void * vy_ptr,
         const int32_t * ids_ptr, const int32_t * act_ids_ptr,
@@ -933,6 +945,10 @@ static __global__ void mul_mat_vec_q_moe(
         if (route_idx >= ncols_dst) {
             return;
         }
+    } else if constexpr (entry_ptrs) {
+        token_idx = 0;
+        route_idx = blockIdx.y;
+        channel_dst = route_idx;
     } else {
         token_idx = threadIdx.y;
         channel_dst = shared_expert ? 0 : blockIdx.y;
@@ -943,7 +959,7 @@ static __global__ void mul_mat_vec_q_moe(
     }
 
     // fuse gate, bias, scales, and glu_op into the up projection
-    const bool   use_cache_gate = gate_ptr != nullptr;
+    const bool   use_cache_gate = entry_ptrs ? gate_ids_ptr != nullptr : gate_ptr != nullptr;
     bool         use_gate    = use_cache_gate;
     const void  * vgate      = gate_ptr;
     const float * x_bias     = nullptr;
@@ -972,11 +988,26 @@ static __global__ void mul_mat_vec_q_moe(
     constexpr int  blocks_per_iter  = vdr * warp_size / qi;
 
     ggml_cuda_pdl_sync();
-    const uint32_t channel_x = shared_expert ? 0 : ids[route_idx];
-    if ((int32_t) channel_x < 0) {
-        return; // expert on another device (expert-parallel window): the row is zeroed by the caller
+    uint32_t channel_x;
+    uint32_t channel_gate;
+    if constexpr (entry_ptrs) {
+        const uint64_t up_entry = ((const uint64_t * GGML_CUDA_RESTRICT) ids_ptr)[route_idx];
+        if (up_entry == 0) {
+            return; // a row the cache does not hold: computed elsewhere
+        }
+        vx = mmvq_global_ptr(up_entry);
+        if (use_cache_gate) {
+            vgate = mmvq_global_ptr(((const uint64_t * GGML_CUDA_RESTRICT) gate_ids_ptr)[route_idx]);
+        }
+        channel_x    = 0;
+        channel_gate = 0;
+    } else {
+        channel_x = shared_expert ? 0 : ids[route_idx];
+        if ((int32_t) channel_x < 0) {
+            return; // expert on another device (expert-parallel window): the row is zeroed by the caller
+        }
+        channel_gate = shared_expert ? 0 : (gate_ids ? gate_ids[route_idx] : channel_x);
     }
-    const uint32_t channel_gate = shared_expert ? 0 : (gate_ids ? gate_ids[route_idx] : channel_x);
     const uint32_t channel_y = act_ids && !shared_expert
         ? act_ids[route_idx]
         : fastmodulo(channel_dst, nchannels_y);
@@ -1134,33 +1165,6 @@ static bool mmvq_has_existing_fusion(const ggml_cuda_mm_fusion_args_device & fus
            fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
 }
 
-#ifdef GGML_CUDA_MOE_CACHE_FLAT_HITS_TEST_INSTRUMENTATION
-static std::atomic<uint64_t> g_moe_cache_flat_hits_factor_1{0};
-static std::atomic<uint64_t> g_moe_cache_flat_hits_factor_2{0};
-
-void ggml_cuda_moe_cache_flat_hits_test_stats_reset() {
-    g_moe_cache_flat_hits_factor_1.store(0, std::memory_order_relaxed);
-    g_moe_cache_flat_hits_factor_2.store(0, std::memory_order_relaxed);
-}
-
-void ggml_cuda_moe_cache_flat_hits_test_stats_get(uint64_t * factor_1, uint64_t * factor_2) {
-    *factor_1 = g_moe_cache_flat_hits_factor_1.load(std::memory_order_relaxed);
-    *factor_2 = g_moe_cache_flat_hits_factor_2.load(std::memory_order_relaxed);
-}
-#endif
-
-static void ggml_cuda_moe_cache_flat_hits_record(ggml_cuda_moe_cache_flat_hits_path path) {
-#ifdef GGML_CUDA_MOE_CACHE_FLAT_HITS_TEST_INSTRUMENTATION
-    switch (path) {
-        case ggml_cuda_moe_cache_flat_hits_path::factor_1:
-            g_moe_cache_flat_hits_factor_1.fetch_add(1, std::memory_order_relaxed); break;
-        case ggml_cuda_moe_cache_flat_hits_path::factor_2:
-            g_moe_cache_flat_hits_factor_2.fetch_add(1, std::memory_order_relaxed); break;
-    }
-#else
-    GGML_UNUSED(path);
-#endif
-}
 
 template <ggml_type type, bool has_fusion = false, bool has_clamp = false>
 static void mul_mat_vec_q_moe_launch(
@@ -1198,40 +1202,23 @@ static void mul_mat_vec_q_moe_launch(
     }
 }
 
-template <ggml_type type, bool has_fusion = false, bool has_clamp = false>
-static void mul_mat_vec_q_moe_cache_launch(
-        const void * vx, const void * vy, const int32_t * ids,
-        const int32_t * act_ids, const void * gate,
-        const int32_t * gate_ids, float * dst,
-        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
-        const uint32_t stride_row_x,
-        const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
+// MoE cache entries addressed directly (entry_ptrs): one routed row per block
+template <ggml_type type, bool has_gate, bool has_clamp>
+static void mul_mat_vec_q_moe_entries_launch(
+        const uint64_t * up_entries, const uint64_t * gate_entries, const void * vy, const int32_t * act_ids,
+        float * dst, const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
+        const uint32_t stride_row_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
         const uint32_t n_hits, const int warp_size,
-        const float up_min, const float up_max, const float gate_min,
-        const float gate_max, cudaStream_t stream) {
-
+        const float up_min, const float up_max, const float gate_min, const float gate_max, cudaStream_t stream) {
     constexpr int rows_per_block = 2;
-    const int device = ggml_cuda_get_device();
-    const auto flat_hits = ggml_cuda_select_moe_cache_flat_hits(
-        ggml_cuda_info().devices[device].cc, type, n_hits);
-    if (flat_hits.path == ggml_cuda_moe_cache_flat_hits_path::factor_1) {
-        mul_mat_vec_q_moe_launch<type, has_fusion, has_clamp>(
-            vx, vy, ids, act_ids, gate, gate_ids, {}, dst, ncols_x, nchannels_y, nrows_x,
-            stride_row_x, 0, 0, stride_channel_x, stride_channel_y, stride_channel_dst,
-            1, n_hits, warp_size, n_hits, up_min, up_max, gate_min, gate_max, stream);
-        ggml_cuda_moe_cache_flat_hits_record(flat_hits.path);
-        return;
-    }
-    const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
-    const dim3 block_nums(nblocks_rows, (n_hits + flat_hits.factor - 1) / flat_hits.factor);
-    const dim3 block_dims(warp_size, flat_hits.factor);
+    const dim3 block_nums((nrows_x + rows_per_block - 1) / rows_per_block, n_hits);
+    const dim3 block_dims(warp_size, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
-
-    ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, has_fusion, has_clamp, true>, launch_params,
-        vx, vy, ids, act_ids, gate, gate_ids, ggml_cuda_mm_fusion_args_device{}, dst, ncols_x, nchannels_y, nrows_x,
-        stride_row_x, 0, 0, stride_channel_x, stride_channel_y, stride_channel_dst,
-        n_hits, n_hits, up_min, up_max, gate_min, gate_max);
-    ggml_cuda_moe_cache_flat_hits_record(flat_hits.path);
+    ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, has_gate, has_clamp, false, true>, launch_params,
+        nullptr, vy, (const int32_t *) up_entries, act_ids, nullptr, (const int32_t *) gate_entries,
+        ggml_cuda_mm_fusion_args_device{}, dst, ncols_x, nchannels_y, nrows_x,
+        stride_row_x, 0, 0, 0, stride_channel_y, stride_channel_dst,
+        1, n_hits, up_min, up_max, gate_min, gate_max);
 }
 
 template <ggml_type type, bool nt_w = false>
@@ -1817,106 +1804,25 @@ void ggml_cuda_op_mul_mat_vec_q(
 
 template <ggml_type type>
 static void ggml_cuda_moe_cache_mmv_t(
-        const void * pool, const char * act_q8,
-        const int32_t * ids_dev, const int32_t * act_ids_dev,
-        float * dst_dev, int64_t n_in, int64_t n_out, int64_t n_slots,
-        int64_t slot_stride_bytes, int64_t n_hits, int64_t act_rows,
-        cudaStream_t stream) {
+        const char * act_q8, const uint64_t * entries_dev, const int32_t * act_ids_dev, float * dst_dev,
+        int64_t n_in, int64_t n_out, int64_t n_hits, int64_t act_rows, cudaStream_t stream) {
     const int64_t ts0 = ggml_type_size(type);
     const int64_t ne10_padded = GGML_PAD(n_in, MATRIX_ROW_PADDING);
     const int64_t s01 = ggml_row_size(type, n_in) / ts0;
-    const int64_t s02 = slot_stride_bytes / ts0;
     const int64_t s11 = ne10_padded / QK8_1;
-
-    const int device = ggml_cuda_get_device();
-    const int warp_size = ggml_cuda_info().devices[device].warp_size;
-    mul_mat_vec_q_moe_cache_launch<type>(
-        pool, act_q8, ids_dev, act_ids_dev, nullptr, nullptr, dst_dev, n_in,
-        init_fastdiv_values(act_rows), n_out,
-        s01, s02, s11, n_out,
-        n_hits, warp_size,
-        0.0f, 0.0f, 0.0f, 0.0f, stream);
-
-    GGML_UNUSED(n_slots);
+    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+    mul_mat_vec_q_moe_entries_launch<type, false, false>(
+        entries_dev, nullptr, act_q8, act_ids_dev, dst_dev, n_in, init_fastdiv_values(act_rows), n_out,
+        s01, s11, n_out, n_hits, warp_size, 0.0f, 0.0f, 0.0f, 0.0f, stream);
 }
 
-// Share of the threads that hold a block of a row of n_in values: the generic kernel gives a whole
-// thread block (nwarps warps) to one row, the dedicated MoE kernel one warp; a row of few blocks
-// (down: 640 values, 20 IQ4_NL blocks) leaves most of the generic block idle.
-template <ggml_type type>
-static bool ggml_cuda_moe_cache_dedicated_fills_better(int64_t n_in) {
-    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
-    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
-    constexpr int vdr = get_vdr_mmvq(type);
-    const int device    = ggml_cuda_get_device();
-    const int warp_size = ggml_cuda_info().devices[device].warp_size;
-    const int nwarps    = calc_nwarps(type, 1, get_device_table_id(ggml_cuda_info().devices[device].cc));
-    const int64_t blocks = n_in / qk;
-    const auto fill = [blocks](int64_t per_iter) {
-        return (double) blocks / (double) (((blocks + per_iter - 1) / per_iter) * per_iter);
-    };
-    return fill(vdr * warp_size / qi) > fill(vdr * nwarps * warp_size / qi);
-}
-
-static bool ggml_cuda_moe_cache_prefer_dedicated(ggml_type type, int64_t n_in) {
-    switch (type) {
-#define MOE_CACHE_FILL_CASE(t) case t: return ggml_cuda_moe_cache_dedicated_fills_better<t>(n_in)
-        MOE_CACHE_FILL_CASE(GGML_TYPE_Q4_0);
-        MOE_CACHE_FILL_CASE(GGML_TYPE_Q4_1);
-        MOE_CACHE_FILL_CASE(GGML_TYPE_Q5_0);
-        MOE_CACHE_FILL_CASE(GGML_TYPE_Q5_1);
-        MOE_CACHE_FILL_CASE(GGML_TYPE_Q8_0);
-        MOE_CACHE_FILL_CASE(GGML_TYPE_Q2_K);
-        MOE_CACHE_FILL_CASE(GGML_TYPE_Q3_K);
-        MOE_CACHE_FILL_CASE(GGML_TYPE_Q4_K);
-        MOE_CACHE_FILL_CASE(GGML_TYPE_Q5_K);
-        MOE_CACHE_FILL_CASE(GGML_TYPE_Q6_K);
-        MOE_CACHE_FILL_CASE(GGML_TYPE_IQ2_XXS);
-        MOE_CACHE_FILL_CASE(GGML_TYPE_IQ2_XS);
-        MOE_CACHE_FILL_CASE(GGML_TYPE_IQ2_S);
-        MOE_CACHE_FILL_CASE(GGML_TYPE_IQ3_XXS);
-        MOE_CACHE_FILL_CASE(GGML_TYPE_IQ3_S);
-        MOE_CACHE_FILL_CASE(GGML_TYPE_IQ3_K);
-        MOE_CACHE_FILL_CASE(GGML_TYPE_IQ4_NL);
-        MOE_CACHE_FILL_CASE(GGML_TYPE_IQ4_XS);
-#undef MOE_CACHE_FILL_CASE
-        default:
-            return false;
-    }
-}
-
-ggml_cuda_moe_cache_mmv_path ggml_cuda_moe_cache_mmv(
-    const void * pool, ggml_type type0, const char * act_q8,
-    const int32_t * ids_dev, const int32_t * act_ids_dev,
-    float * dst_dev, int64_t n_in, int64_t n_out, int64_t n_slots,
-    int64_t slot_stride_bytes, int64_t n_hits, int64_t act_rows,
-    bool force_dedicated, cudaStream_t stream) {
-
-    const int64_t ts0 = ggml_type_size(type0);
-    GGML_ASSERT(slot_stride_bytes % ts0 == 0);
-
-    // IQ4_NL down on RDNA3: 16 % of the generic block's threads hold a block, 62 % of the
-    // dedicated warp's; measured: collect 49 -> 34 us per node, generation +3 %
-    if (!act_ids_dev && !force_dedicated && !ggml_cuda_moe_cache_prefer_dedicated(type0, n_in)) {
-        const int64_t ne10_padded = GGML_PAD(n_in, MATRIX_ROW_PADDING);
-        const int64_t s01 = ggml_row_size(type0, n_in) / ts0;
-        const int64_t s02 = slot_stride_bytes / ts0;
-        const int64_t s11 = ne10_padded / QK8_1;
-        const int64_t s12 = act_rows * s11;
-        ggml_cuda_mm_fusion_args_device fusion_local{};
-        mul_mat_vec_q_switch_type(
-            pool, type0, act_q8, ids_dev, fusion_local, dst_dev, n_in,
-            n_out, 1, s01, s12, n_out,
-            n_slots, act_rows, n_hits, s02, s11, n_out,
-            1, 1, s02*n_slots, s12, n_out*n_hits, n_hits, stream);
-        return ggml_cuda_moe_cache_mmv_path::generic;
-    }
-
+void ggml_cuda_moe_cache_mmv(
+    ggml_type type0, const char * act_q8, const uint64_t * entries_dev, const int32_t * act_ids_dev,
+    float * dst_dev, int64_t n_in, int64_t n_out, int64_t n_hits, int64_t act_rows, cudaStream_t stream) {
 #define MOE_CACHE_MMV_CASE(type_name) \
         case type_name: \
-            ggml_cuda_moe_cache_mmv_t<type_name>( \
-                pool, act_q8, ids_dev, act_ids_dev, dst_dev, n_in, n_out, \
-                n_slots, slot_stride_bytes, n_hits, act_rows, stream); \
+            ggml_cuda_moe_cache_mmv_t<type_name>(act_q8, entries_dev, act_ids_dev, dst_dev, n_in, n_out, \
+                n_hits, act_rows, stream); \
             break
     switch (type0) {
         MOE_CACHE_MMV_CASE(GGML_TYPE_Q1_0);
@@ -1947,64 +1853,41 @@ ggml_cuda_moe_cache_mmv_path ggml_cuda_moe_cache_mmv(
             GGML_ABORT("unsupported MoE cache type");
     }
 #undef MOE_CACHE_MMV_CASE
-    return ggml_cuda_moe_cache_mmv_path::dedicated;
 }
 
 template <ggml_type type>
 static void ggml_cuda_moe_cache_mmv_fused_t(
-        const void * up_pool, const void * gate_pool, const char * act_q8,
-        const int32_t * up_ids_dev, const int32_t * gate_ids_dev,
-        const int32_t * act_ids_dev, float * dst_dev,
-        int64_t n_in, int64_t n_out, int64_t slot_stride_bytes,
+        const char * act_q8, const uint64_t * up_entries_dev, const uint64_t * gate_entries_dev,
+        const int32_t * act_ids_dev, float * dst_dev, int64_t n_in, int64_t n_out,
         int64_t n_hits, int64_t act_rows, float up_min, float up_max,
         float gate_min, float gate_max, cudaStream_t stream) {
     const int64_t ts0 = ggml_type_size(type);
     const int64_t ne10_padded = GGML_PAD(n_in, MATRIX_ROW_PADDING);
     const int64_t s01 = ggml_row_size(type, n_in) / ts0;
-    const int64_t s02 = slot_stride_bytes / ts0;
     const int64_t s11 = ne10_padded / QK8_1;
-
-    const int device = ggml_cuda_get_device();
-    const int warp_size = ggml_cuda_info().devices[device].warp_size;
+    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const float inf = std::numeric_limits<float>::infinity();
-    if (up_min == -inf && up_max == inf &&
-        gate_min == -inf && gate_max == inf) {
-        mul_mat_vec_q_moe_cache_launch<type, true, false>(
-            up_pool, act_q8, up_ids_dev, act_ids_dev,
-            gate_pool, gate_ids_dev, dst_dev, n_in,
-            init_fastdiv_values(act_rows), n_out,
-            s01, s02, s11, n_out,
-            n_hits, warp_size,
-            up_min, up_max, gate_min, gate_max, stream);
+    if (up_min == -inf && up_max == inf && gate_min == -inf && gate_max == inf) {
+        mul_mat_vec_q_moe_entries_launch<type, true, false>(
+            up_entries_dev, gate_entries_dev, act_q8, act_ids_dev, dst_dev, n_in, init_fastdiv_values(act_rows), n_out,
+            s01, s11, n_out, n_hits, warp_size, up_min, up_max, gate_min, gate_max, stream);
     } else {
-        mul_mat_vec_q_moe_cache_launch<type, true, true>(
-            up_pool, act_q8, up_ids_dev, act_ids_dev,
-            gate_pool, gate_ids_dev, dst_dev, n_in,
-            init_fastdiv_values(act_rows), n_out,
-            s01, s02, s11, n_out,
-            n_hits, warp_size,
-            up_min, up_max, gate_min, gate_max, stream);
+        mul_mat_vec_q_moe_entries_launch<type, true, true>(
+            up_entries_dev, gate_entries_dev, act_q8, act_ids_dev, dst_dev, n_in, init_fastdiv_values(act_rows), n_out,
+            s01, s11, n_out, n_hits, warp_size, up_min, up_max, gate_min, gate_max, stream);
     }
 }
 
 void ggml_cuda_moe_cache_mmv_fused(
-        const void * up_pool, const void * gate_pool, ggml_type type0,
-        const char * act_q8, const int32_t * up_ids_dev,
-        const int32_t * gate_ids_dev, const int32_t * act_ids_dev,
-        float * dst_dev, int64_t n_in, int64_t n_out,
-        int64_t slot_stride_bytes, int64_t n_hits, int64_t act_rows,
+        ggml_type type0, const char * act_q8, const uint64_t * up_entries_dev,
+        const uint64_t * gate_entries_dev, const int32_t * act_ids_dev,
+        float * dst_dev, int64_t n_in, int64_t n_out, int64_t n_hits, int64_t act_rows,
         float up_min, float up_max, float gate_min, float gate_max,
         cudaStream_t stream) {
-    const int64_t ts0 = ggml_type_size(type0);
-    GGML_ASSERT(slot_stride_bytes % ts0 == 0);
-
 #define MOE_CACHE_MMV_FUSED_CASE(type_name) \
         case type_name: \
-            ggml_cuda_moe_cache_mmv_fused_t<type_name>( \
-                up_pool, gate_pool, act_q8, up_ids_dev, gate_ids_dev, \
-                act_ids_dev, dst_dev, n_in, n_out, slot_stride_bytes, \
-                n_hits, act_rows, up_min, up_max, gate_min, gate_max, \
-                stream); \
+            ggml_cuda_moe_cache_mmv_fused_t<type_name>(act_q8, up_entries_dev, gate_entries_dev, act_ids_dev, \
+                dst_dev, n_in, n_out, n_hits, act_rows, up_min, up_max, gate_min, gate_max, stream); \
             break
     switch (type0) {
         MOE_CACHE_MMV_FUSED_CASE(GGML_TYPE_Q1_0);

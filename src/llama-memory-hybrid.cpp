@@ -282,6 +282,18 @@ const llama_ubatch & llama_memory_hybrid_context::get_ubatch() const {
     return ubatches[i_next];
 }
 
+void llama_memory_hybrid::get_lendable_kv(std::vector<std::pair<const ggml_tensor *, size_t>> & out) const {
+    mem_attn->get_lendable_kv(out);
+}
+
+void llama_memory_hybrid::set_kv_lent_from(uint32_t rows) {
+    mem_attn->set_kv_lent_from(rows);
+}
+
+uint32_t llama_memory_hybrid_context::get_kv_rows() const {
+    return ctx_attn ? ctx_attn->get_kv_rows() : 0;
+}
+
 const llama_kv_cache_context * llama_memory_hybrid_context::get_attn() const {
     return static_cast<const llama_kv_cache_context *>(ctx_attn.get());
 }

@@ -757,6 +757,19 @@ void llama_context::sched_reserve() {
                 cparams.moe_cache_expert_parallel,
                 cparams.moe_cache_cpu_overlap,
                 cparams.moe_cache_profile_path.empty() ? nullptr : cparams.moe_cache_profile_path.c_str());
+        // the end of the KV cache lent to the new session (GGML_CUDA_MOE_CACHE_KV_LEND=1): its tensors registered
+        // before the pools are built; a tensor shared by two caches once
+        if (memory) {
+            std::vector<std::pair<const ggml_tensor *, size_t>> kv;
+            memory->get_lendable_kv(kv);
+            std::vector<const void *> seen;
+            for (const auto & [t, row_bytes] : kv) {
+                if (std::find(seen.begin(), seen.end(), t->data) == seen.end()) {
+                    seen.push_back(t->data);
+                    ggml_backend_sched_moe_cache_kv_register(sched.get(), t, row_bytes);
+                }
+            }
+        }
     };
 
     // a scheduler of the same size is kept: its compute buffers are reused if the new worst case fits (a new one
@@ -909,6 +922,8 @@ void llama_context::sched_reserve() {
                 val(n_inputs_pp, n_inputs_tg).c_str(),
                 val(n_input_tensors_pp, n_input_tensors_tg).c_str());
     }
+
+    kv_lent_from_update();
 
     const int64_t t_end_us = ggml_time_us();
 
@@ -1549,12 +1564,21 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+// the row from which the KV cache's tensors are lent to the MoE expert cache, once the pools exist: the cache's own
+// writes (clear, shift) stop below it
+void llama_context::kv_lent_from_update() {
+    if (memory && sched) {
+        memory->set_kv_lent_from((uint32_t) ggml_backend_sched_moe_cache_kv_first_lent_row(sched.get()));
+    }
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
+
 
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
@@ -1610,6 +1634,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->set_inputs(&ubatch);
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+    }
+
+    // the KV rows this graph reads leave the MoE expert cache first (only when a step boundary is crossed; the cache
+    // zeroes them), the rows past the step above them go back to it. After the allocation: the pools may have been
+    // built by it, with the KV tail lent from the first step
+    if (mctx && mctx->get_kv_rows() > 0) {
+        kv_lent_from_update();
+        ggml_backend_sched_moe_cache_kv_set_rows(sched.get(), mctx->get_kv_rows());
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
@@ -3572,6 +3604,10 @@ size_t llama_context::state_write_data(llama_io_write_i & io) {
 size_t llama_context::state_read_data(llama_io_read_i & io) {
     LLAMA_LOG_DEBUG("%s: reading state\n", __func__);
 
+    // the restored cells may sit anywhere in the KV cache: the whole of it taken back from the MoE expert cache first
+    // (the next ubatch gives back what it does not read)
+    ggml_backend_sched_moe_cache_kv_set_rows(sched.get(), INT64_MAX / 2);
+
     // read model info
     {
         LLAMA_LOG_DEBUG("%s: - reading model info\n", __func__);
@@ -3604,6 +3640,7 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
 }
 
 size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    ggml_backend_sched_moe_cache_kv_set_rows(sched.get(), INT64_MAX / 2);   // see state_read_data
     if (memory) {
         memory->state_read(io, seq_id, flags);
     }

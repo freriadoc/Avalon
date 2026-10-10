@@ -2692,6 +2692,30 @@ void ggml_backend_sched_set_moe_cache(
     rebuild_bufts();
 }
 
+void ggml_backend_sched_moe_cache_kv_register(ggml_backend_sched_t sched, const struct ggml_tensor * tensor, size_t row_bytes) {
+    if (sched && sched->moe_cache_session && ggml_moe_cache.kv_register) {
+        ggml_moe_cache.kv_register(sched->moe_cache_session, tensor, row_bytes);
+    }
+}
+
+void ggml_backend_sched_moe_cache_kv_set_rows(ggml_backend_sched_t sched, int64_t rows) {
+    if (!sched || !sched->moe_cache_session || !ggml_moe_cache.kv_needs_set_rows ||
+        !ggml_moe_cache.kv_needs_set_rows(sched->moe_cache_session, rows)) {
+        return;   // the step boundary stays: nothing moves (almost every ubatch)
+    }
+    // entries are about to move: no kernel may still read them, and the hosted MoE unpins its rows once its
+    // stream is done
+    ggml_backend_sched_synchronize(sched);
+    ggml_moe_cache.kv_set_rows(sched->moe_cache_session, rows);
+}
+
+int64_t ggml_backend_sched_moe_cache_kv_first_lent_row(ggml_backend_sched_t sched) {
+    if (!sched || !sched->moe_cache_session || !ggml_moe_cache.kv_first_lent_row) {
+        return 0;
+    }
+    return ggml_moe_cache.kv_first_lent_row(sched->moe_cache_session);
+}
+
 void * ggml_backend_sched_detach_moe_cache(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     ggml_backend_sched_prefetch_restore(sched);

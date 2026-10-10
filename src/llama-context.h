@@ -134,6 +134,9 @@ struct llama_context {
                 int32_t   il_start,
                 int32_t   il_end);
 
+    // the row from which the KV cache is lent to the MoE expert cache, given to the memory module
+    void kv_lent_from_update();
+
     // process a single ubatch with a specific graph type
     // if memory_context is provided, it will be applied first to the context's memory
     // ret contains the status of the graph computation

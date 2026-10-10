@@ -621,6 +621,24 @@ bool llama_memory_hybrid_idx_context::kpool_track() const {
     return mem != nullptr && mem->get_mem_idx() != nullptr && mem->get_kpool() > 0 && !ns_ubatch.empty();
 }
 
+void llama_memory_hybrid_idx::get_lendable_kv(std::vector<std::pair<const ggml_tensor *, size_t>> & out) const {
+    llama_memory_hybrid::get_lendable_kv(out);
+    if (mem_idx) {
+        mem_idx->get_lendable_kv(out);
+    }
+}
+
+void llama_memory_hybrid_idx::set_kv_lent_from(uint32_t rows) {
+    llama_memory_hybrid::set_kv_lent_from(rows);
+    if (mem_idx) {
+        mem_idx->set_kv_lent_from(rows);
+    }
+}
+
+uint32_t llama_memory_hybrid_idx_context::get_kv_rows() const {
+    return std::max(llama_memory_hybrid_context::get_kv_rows(), ctx_idx ? ctx_idx->get_kv_rows() : 0u);
+}
+
 const llama_kv_cache_context * llama_memory_hybrid_idx_context::get_idx() const {
     return static_cast<const llama_kv_cache_context *>(ctx_idx.get());
 }

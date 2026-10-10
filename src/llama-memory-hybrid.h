@@ -60,6 +60,9 @@ public:
 
     void clear(bool data) override;
 
+    void get_lendable_kv(std::vector<std::pair<const ggml_tensor *, size_t>> & out) const override;
+    void set_kv_lent_from(uint32_t rows) override;
+
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
@@ -119,6 +122,8 @@ public:
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
+
+    uint32_t get_kv_rows() const override;
 
     //
     // llama_memory_hybrid_context

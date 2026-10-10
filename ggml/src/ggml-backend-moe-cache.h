@@ -14,14 +14,12 @@ static inline size_t ggml_moe_cache_effective_min_expert_bytes(
     return default_minimum;
 }
 
-// Slot IDs remain int32, and kernels index quant blocks with int32.
+// Slot IDs remain int32; the kernels take each entry's address (64 bits), not an index from the pool's base.
 static inline size_t ggml_moe_cache_max_pool_slots(int wtype, size_t expert_size) {
     const size_t type_size = ggml_type_size((enum ggml_type)wtype);
     if (!type_size || !expert_size || expert_size % type_size != 0) return 0;
     size_t slots = SIZE_MAX / expert_size;
     if (slots > INT_MAX) slots = INT_MAX;
-    const size_t indexed_slots = INT_MAX / (expert_size / type_size);
-    if (slots > indexed_slots) slots = indexed_slots;
     return slots;
 }
 
@@ -165,6 +163,18 @@ struct ggml_moe_cache_api {
     // them when a graph needs less, so that the cache gets the memory back
     bool (*borrows)(ggml_backend_buffer_type_t buft);
 
+    // The end of the KV cache lent to the expert cache. A KV tensor whose rows are cells (one row per cell, the
+    // cells in order) is registered once, before the pools are built: the rows past the first step are lent to the
+    // pools, which take them as ranges when they are built (before any graph: their virtual base never moves again).
+    // kv_set_rows: the KV now uses its first 'rows' rows (n_kv): the lent rows below the step boundary above them go
+    // back to the KV (their entries evacuated, the memory zeroed), those past it come back to the cache. The caller
+    // has synchronized the device; it returns at once when the step boundary does not change. kv_first_lent_row: the
+    // first row that may be lent (0: none), for the KV's own writes past its used cells (clear, shift).
+    void (*kv_register)(void * session, const struct ggml_tensor * tensor, size_t row_bytes);
+    bool (*kv_needs_set_rows)(void * session, int64_t rows);
+    void (*kv_set_rows)(void * session, int64_t rows);
+    int64_t (*kv_first_lent_row)(void * session);
+
     // Whole experts computed on the CPU, registered by ggml-cpu: for n_tokens tokens with
     // activations act [n_embd, n_tokens] and k experts each, experts [k, n_tokens],
     // out[(t*k + i)*n_embd ...] = down(swiglu(gate, up)) of expert experts[t*k + i] on token t.
@@ -186,6 +196,10 @@ GGML_API void ggml_backend_sched_set_moe_cache(
 // the cache session outlives a scheduler rebuilt by a new reserve: detach it from the old one
 // (lent zones and borrowed compute buffers go back to it first), attach it to the new one
 GGML_API void * ggml_backend_sched_detach_moe_cache(ggml_backend_sched_t sched);
+// the end of the KV cache lent to the expert cache (ggml_moe_cache.kv_*); no-ops without a session
+GGML_API void    ggml_backend_sched_moe_cache_kv_register(ggml_backend_sched_t sched, const struct ggml_tensor * tensor, size_t row_bytes);
+GGML_API void    ggml_backend_sched_moe_cache_kv_set_rows(ggml_backend_sched_t sched, int64_t rows);
+GGML_API int64_t ggml_backend_sched_moe_cache_kv_first_lent_row(ggml_backend_sched_t sched);
 GGML_API void   ggml_backend_sched_attach_moe_cache(ggml_backend_sched_t sched, void * session);
 
 #ifdef __cplusplus

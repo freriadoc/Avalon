@@ -150,6 +150,19 @@ struct moe_cache_range {
     int64_t gpu_offset = 0;   // gpu index of slot 'first'
 };
 
+// KV: the tail of one KV tensor attached to a pool (moe_cache_kv_attach). Logical slots [first, first + count) in
+// address order from 'start'; the first 'taken' of them are used by the KV (free, out of the free list, the LRU and
+// the map), the others belong to the cache.
+struct moe_cache_kv_range {
+    const char * tensor = nullptr;   // the KV tensor's data
+    size_t bytes = 0;                // its size
+    size_t row_bytes = 0;            // bytes per cell
+    char * start = nullptr;          // first entry boundary in it
+    int first = 0;
+    int count = 0;
+    int taken = 0;
+};
+
 struct moe_cache_pool {
     size_t expert_size = 0;
     int wtype = -1;
@@ -191,6 +204,8 @@ struct moe_cache_pool {
     std::vector<moe_cache_range> ranges;
     char * gpu_base = nullptr;
     int64_t gpu_extent = 0;     // largest gpu index + 1, passed to kernels as a bound
+
+    std::vector<moe_cache_kv_range> kv;   // KV tails lent to this pool
 };
 
 static inline int32_t moe_cache_gpu_index(const moe_cache_pool & pool, int index) {
@@ -204,6 +219,12 @@ static inline int32_t moe_cache_gpu_index(const moe_cache_pool & pool, int index
 
 static inline char * moe_cache_slot_ptr(const moe_cache_pool & pool, int index) {
     return pool.gpu_base + (size_t)moe_cache_gpu_index(pool, index) * pool.expert_size;
+}
+
+// the device address of an entry, as the kernels take it (ggml_cuda_moe_cache_mmv*: one address per routed row, 0 for a
+// row the cache does not hold)
+static inline uint64_t moe_cache_entry_addr(const moe_cache_pool & pool, int index) {
+    return (uint64_t) (uintptr_t) moe_cache_slot_ptr(pool, index);
 }
 
 static inline bool moe_cache_pool_has_zone(const moe_cache_pool & pool) {
@@ -326,6 +347,13 @@ struct moe_cache_device {
 
     int logical;
     int physical;
+    // KV: the end of the KV tensors lent to the pools, attached once when they are built (moe_cache_attach_kv)
+    bool kv_attached = false;
+    int64_t kv_step_rows = 0;    // rows per step (a multiple of 256), 0: nothing lent
+    int64_t kv_end_rows = 0;     // the KV's rows now, rounded up to a step (at least one step)
+    int64_t kv_max_rows = 0;     // rows of the longest KV tensor (cells)
+    int64_t kv_takes = 0, kv_gives = 0, kv_moves = 0, kv_evictions = 0;
+    double kv_ms = 0;
     std::atomic<bool> dead{false};
     std::mutex dispatch_mu;
 
@@ -446,6 +474,9 @@ struct moe_cache_session {
     std::vector<std::unique_ptr<moe_cache_device>> devices;
     std::unordered_map<int, int> layer_devices;
     std::unordered_map<const void *, int> tensor_devices;
+    // KV: tensors of the KV cache whose end may be lent (moe_cache_kv_register), attached when the pools are built
+    struct kv_tensor { const char * data; size_t bytes; size_t row_bytes; int logical; };
+    std::vector<kv_tensor> kv_tensors;
     std::unordered_map<moe_cache_profile_key, uint32_t,
         moe_cache_profile_key_hash> profile_heat;
     uint64_t profile_generation = 0;
@@ -1458,7 +1489,7 @@ static bool moe_cache_scratch_requirements(
         return false;
     }
 
-    const size_t ids_bytes = 4 * max_rows * sizeof(int32_t);
+    const size_t ids_bytes = max_rows * (3 * sizeof(uint64_t) + sizeof(int32_t));   // up, gate, down entries; activation map
     const size_t act_bytes = max_rows * (size_t)n_in * sizeof(float);
     if (ids_bytes > SIZE_MAX - act_bytes) {
         return false;
@@ -2221,6 +2252,7 @@ static bool moe_cache_allocate_pool(
 static size_t moe_cache_zone_bytes(const moe_cache_session & session);
 static void moe_cache_setup_zone(moe_cache_device & device, size_t zone_bytes, int n_zones);
 static void moe_cache_attach_test_region(moe_cache_device & device);
+static void moe_cache_attach_kv(moe_cache_session & session, moe_cache_device & device);
 
 // Every expert tensor registered in place (hipHostRegister, read-only; GGML_CUDA_MOE_PIN=0 disables), once the
 // tensors are known and before any graph runs:
@@ -2341,6 +2373,7 @@ static void moe_cache_build_pending(
 
     moe_cache_setup_zone(device, moe_cache_zone_bytes(session), session.lend_zones);
     moe_cache_attach_test_region(device);
+    moe_cache_attach_kv(session, device);
 }
 
 static int moe_cache_discover_pool(
@@ -3653,9 +3686,8 @@ static int moe_cache_dispatch_internal(
     }
     const bool use_activation_map =
         session.config.force_dedicated_mmv || !modulo_activation;
-    const size_t id_arrays = 1 + (fused ? 1 : 0) + (full ? 1 : 0) +
-        (use_activation_map ? 1 : 0);
-    const size_t ids_bytes = (size_t)n_hits * sizeof(int32_t) * id_arrays;
+    const size_t entry_arrays = 1 + (fused ? 1 : 0) + (full ? 1 : 0);
+    const size_t ids_bytes = (size_t)n_hits * (sizeof(uint64_t) * entry_arrays + (use_activation_map ? sizeof(int32_t) : 0));
     const size_t act_bytes = (size_t)activation_rows * n_in * sizeof(float);
     if (ids_bytes > SIZE_MAX - act_bytes) {
         return 0;
@@ -3710,22 +3742,23 @@ static int moe_cache_dispatch_internal(
         return 0;
     }
 
-    int32_t * h_ids = (int32_t *)device.h_input;
+    // the entries' addresses (up, then gate, then down), then the activation map
+    uint64_t * h_entries = (uint64_t *)device.h_input;
+    int32_t * h_act_ids = (int32_t *)(h_entries + entry_arrays * n_hits);
     float * h_act = (float *)(device.h_input + ids_bytes);
-    int32_t * d_ids = (int32_t *)device.d_input;
+    const uint64_t * d_entries = (const uint64_t *)device.d_input;
+    const int32_t * d_act_ids = (const int32_t *)(d_entries + entry_arrays * n_hits);
     float * d_act = (float *)(device.d_input + ids_bytes);
-    // kernels address entries as base + index * expert_size: hand them gpu indices
     for (int index = 0; index < n_hits; index++) {
-        h_ids[index] = moe_cache_gpu_index(pool, slot_indices[index]);
+        h_entries[index] = moe_cache_entry_addr(pool, slot_indices[index]);
         if (fused) {
-            h_ids[n_hits + index] = moe_cache_gpu_index(*gate_pool, gate_slot_indices[index]);
+            h_entries[n_hits + index] = moe_cache_entry_addr(*gate_pool, gate_slot_indices[index]);
         }
         if (full) {
-            h_ids[2 * n_hits + index] = moe_cache_gpu_index(*down_pool, down_slot_indices[index]);
+            h_entries[(fused ? 2 : 1) * n_hits + index] = moe_cache_entry_addr(*down_pool, down_slot_indices[index]);
         }
         if (use_activation_map) {
-            h_ids[(full ? 3 : fused ? 2 : 1) * n_hits + index] =
-                activation_indices[index];
+            h_act_ids[index] = activation_indices[index];
         }
     }
     for (int index = 0; index < activation_rows; index++) {
@@ -3750,22 +3783,18 @@ static int moe_cache_dispatch_internal(
     if (ok) {
         if (fused) {
             ggml_cuda_moe_cache_mmv_fused(
-                    pool.gpu_base, gate_pool->gpu_base, (ggml_type)wtype,
-                    (const char *)device.d_act_q8,
-                    d_ids, d_ids + n_hits,
-                    use_activation_map ? d_ids + (full ? 3 : 2) * n_hits : nullptr,
-                    device.d_out, n_in, n_out,
-                    (int64_t)pool.expert_size, n_hits, activation_rows,
+                    (ggml_type)wtype, (const char *)device.d_act_q8,
+                    d_entries, d_entries + n_hits,
+                    use_activation_map ? d_act_ids : nullptr,
+                    device.d_out, n_in, n_out, n_hits, activation_rows,
                     up_min, up_max, gate_min, gate_max,
                     device.compute_stream);
         } else {
-            (void)ggml_cuda_moe_cache_mmv(
-                    pool.gpu_base, (ggml_type)wtype,
-                    (const char *)device.d_act_q8, d_ids,
-                    use_activation_map ? d_ids + n_hits : nullptr,
-                    device.d_out, n_in, n_out, pool.gpu_extent,
-                    (int64_t)pool.expert_size, n_hits, activation_rows,
-                    false, device.compute_stream);
+            ggml_cuda_moe_cache_mmv(
+                    (ggml_type)wtype, (const char *)device.d_act_q8, d_entries,
+                    use_activation_map ? d_act_ids : nullptr,
+                    device.d_out, n_in, n_out, n_hits, activation_rows,
+                    device.compute_stream);
         }
         ok = moe_cache_cuda_ok(
                 device, cudaPeekAtLastError(), "expert matvec launch", true);
@@ -3779,15 +3808,11 @@ static int moe_cache_dispatch_internal(
         ok = moe_cache_cuda_ok(
                 device, cudaPeekAtLastError(), "intermediate activation quantization", true);
     }
-    ggml_cuda_moe_cache_mmv_path down_mmv_path =
-        ggml_cuda_moe_cache_mmv_path::generic;
     if (ok && full) {
-        down_mmv_path = ggml_cuda_moe_cache_mmv(
-                down_pool->gpu_base, (ggml_type)down_pool->wtype,
-                (const char *)device.d_act_q8, d_ids + 2 * n_hits,
-                nullptr, device.d_out, n_out, node->n_out,
-                down_pool->gpu_extent, (int64_t)down_pool->expert_size,
-                n_hits, n_hits, session.config.force_dedicated_down_mmv,
+        ggml_cuda_moe_cache_mmv(
+                (ggml_type)down_pool->wtype, (const char *)device.d_act_q8,
+                d_entries + (fused ? 2 : 1) * n_hits,
+                nullptr, device.d_out, n_out, node->n_out, n_hits, n_hits,
                 device.compute_stream);
         ok = moe_cache_cuda_ok(
                 device, cudaPeekAtLastError(), "down expert matvec launch", true);
@@ -3801,7 +3826,7 @@ static int moe_cache_dispatch_internal(
     }
 
     device.activation_dedup += n_hits - activation_rows;
-    if (full && down_mmv_path == ggml_cuda_moe_cache_mmv_path::dedicated) {
+    if (full) {
         device.dedicated_down_mmv_dispatches++;
     }
     node->dispatched = true;
@@ -5395,6 +5420,240 @@ static void moe_cache_evacuate(
     pool.free_slots.swap(holes);
 }
 
+// ---------------------------------------------------------------------------
+// The end of the KV cache lent to the pools (GGML_CUDA_MOE_CACHE_KV_LEND=1). The KV tensors are allocated for the
+// whole context, but attention only reads the n_kv cells in use: the rows past the step above them hold experts. Each
+// KV tensor's tail is attached once to a pool when the pools are built, before any graph captures the virtual base;
+// taking rows back is the zone evacuation on a run of logical slots, giving them back puts free slots back. Bench:
+// tests/kvlendtest (the same functions on host memory, ASan + UBSan, random operations, invariants and bytes).
+// ---------------------------------------------------------------------------
+
+static bool moe_cache_kv_lend_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_MOE_CACHE_KV_LEND") && atoi(getenv("GGML_CUDA_MOE_CACHE_KV_LEND")) != 0;
+    return enabled;
+}
+
+// the tail of a KV tensor, from byte 'from' to its end, as a range of the pool, lent to it whole. Returns the bytes.
+static size_t moe_cache_kv_attach(moe_cache_pool & pool, const char * tensor, size_t bytes, size_t row_bytes, size_t from) {
+    if (from >= bytes) {
+        return 0;
+    }
+    const int first = pool.n_slots;
+    const size_t got = moe_cache_pool_attach_range(pool, (char *) tensor + from, bytes - from);
+    if (!got) {
+        return 0;
+    }
+    const moe_cache_range & r = pool.ranges.back();
+    pool.kv.push_back({tensor, bytes, row_bytes, r.base, first, r.count, 0});
+    return got;
+}
+
+// The KV uses its tensor up to byte 'end': the entries that start before 'end' leave the cache (from the lowest; their
+// memory zeroed: attention reads masked cells up to n_kv, and a NaN in them would come through the WMMA's zero
+// weights), those at or after 'end' come back. Preconditions of moe_cache_evacuate. Copies and memsets on the zone
+// stream, waited for by the caller.
+static void moe_cache_kv_set_end(moe_cache_device & device, moe_cache_pool & pool, moe_cache_kv_range & kv, size_t end,
+                                 std::vector<int> & moved) {
+    int want = 0;
+    if (kv.tensor + end > kv.start) {
+        const size_t over = (size_t) (kv.tensor + end - kv.start);
+        want = (int) std::min<size_t>((over + pool.expert_size - 1) / pool.expert_size, (size_t) kv.count);
+    }
+    if (want > kv.taken) {
+        moe_cache_evacuate(device, pool, kv.first + kv.taken, kv.first + want, moved);
+        cudaMemsetAsync(moe_cache_slot_ptr(pool, kv.first + kv.taken), 0, (size_t) (want - kv.taken) * pool.expert_size,
+                        moe_cache_zone_stream);
+        kv.taken = want;
+    } else if (want < kv.taken) {
+        for (int i = kv.first + kv.taken - 1; i >= kv.first + want; i--) {
+            GGML_ASSERT(pool.slots[i].state == moe_cache_slot_state::free);
+            pool.free_slots.push_back(i);
+        }
+        kv.taken = want;
+    }
+}
+
+// Once per device, when its pools are built: the step (rows) is the smallest multiple of 256 (the padding of n_kv)
+// in which the KV tensor with the fewest bytes per row holds the largest expert; the first step is never lent. Each
+// tensor goes to the pool whose share of KV bytes (against its slab) is smallest, the largest tensors first, so that
+// no expert type alone carries the loan. The kernels take each entry's address: a range may lie anywhere.
+static void moe_cache_attach_kv(moe_cache_session & session, moe_cache_device & device) {
+    if (device.kv_attached || !moe_cache_kv_lend_enabled()) {
+        return;
+    }
+    device.kv_attached = true;   // once: a pool rebuilt later (trim) never takes the KV again, its base is captured
+    std::vector<moe_cache_session::kv_tensor> mine;
+    size_t min_row = SIZE_MAX, max_es = 0;
+    for (const auto & t : session.kv_tensors) {
+        if (t.logical == device.logical && t.row_bytes > 0) {
+            mine.push_back(t);
+            min_row = std::min(min_row, t.row_bytes);
+        }
+    }
+    std::vector<moe_cache_pool *> pools;
+    for (auto & p : device.pools) {
+        if (p->slab && !ggml_type_is_exl3((ggml_type) p->wtype)) {
+            pools.push_back(p.get());
+            max_es = std::max(max_es, p->expert_size);
+        }
+    }
+    if (mine.empty() || pools.empty()) {
+        return;
+    }
+    const int64_t step = GGML_PAD((int64_t) ((max_es + min_row - 1) / min_row), 256);
+    std::sort(mine.begin(), mine.end(), [](const auto & a, const auto & b) { return a.bytes > b.bytes; });
+    std::vector<double> kv_bytes(pools.size(), 0.0);
+    size_t attached = 0;
+    int n_ranges = 0;
+    for (const auto & t : mine) {
+        size_t best = 0;
+        double best_share = 1e300;
+        for (size_t i = 0; i < pools.size(); i++) {
+            const double share = (kv_bytes[i] + (double) t.bytes) / ((double) pools[i]->n_slots * pools[i]->expert_size);
+            if (share < best_share) {
+                best_share = share;
+                best = i;
+            }
+        }
+        const size_t got = moe_cache_kv_attach(*pools[best], t.data, t.bytes, t.row_bytes, (size_t) step * t.row_bytes);
+        if (got) {
+            kv_bytes[best] += (double) got;
+            attached += got;
+            n_ranges++;
+        } else {
+            MOE_CACHE_LOG("[moe-cache] CUDA%d KV tensor of %zu MiB not lent (tail of %zu KiB, under one entry)\n",
+                    device.physical, t.bytes >> 20, (t.bytes - std::min(t.bytes, (size_t) step * t.row_bytes)) >> 10);
+        }
+    }
+    if (!attached) {
+        return;
+    }
+    device.kv_step_rows = step;
+    device.kv_end_rows = step;
+    for (const auto & t : mine) {
+        device.kv_max_rows = std::max<int64_t>(device.kv_max_rows, (int64_t) (t.bytes / t.row_bytes));
+    }
+    MOE_CACHE_LOG("[moe-cache] CUDA%d KV lent: %d of %zu tensors, %zu MiB past the first %lld rows (step %lld rows)\n",
+            device.physical, n_ranges, mine.size(), attached >> 20, (long long) step, (long long) step);
+}
+
+static void moe_cache_kv_register(void * opaque, const struct ggml_tensor * tensor, size_t row_bytes) {
+    moe_cache_session * session = (moe_cache_session *) opaque;
+    if (!session || !tensor || !tensor->data || !moe_cache_kv_lend_enabled()) {
+        return;
+    }
+    // the device holding it (a KV tensor in host memory is not lent)
+#if defined(GGML_USE_HIP)
+    hipPointerAttribute_t attr = {};
+    if (hipPointerGetAttributes(&attr, tensor->data) != hipSuccess || attr.type != hipMemoryTypeDevice) {
+#else
+    cudaPointerAttributes attr = {};
+    if (cudaPointerGetAttributes(&attr, tensor->data) != cudaSuccess || attr.type != cudaMemoryTypeDevice) {
+#endif
+        (void) cudaGetLastError();
+        return;
+    }
+    std::lock_guard<std::mutex> lock(session->mu);
+    session->kv_tensors.push_back({(const char *) tensor->data, ggml_nbytes(tensor), row_bytes, attr.device});
+}
+
+static int64_t moe_cache_kv_end_rows(const moe_cache_device & device, int64_t rows) {
+    const int64_t s = device.kv_step_rows;
+    rows = std::min(rows, device.kv_max_rows);   // "everything" (a state restore) is the whole tensor
+    return std::max<int64_t>(s, (rows + s - 1) / s * s);
+}
+
+static bool moe_cache_kv_needs_set_rows(void * opaque, int64_t rows) {
+    moe_cache_session * session = (moe_cache_session *) opaque;
+    if (!session) {
+        return false;
+    }
+    for (auto & device_ptr : session->devices) {
+        const moe_cache_device & d = *device_ptr;
+        if (d.kv_step_rows > 0 && !d.dead.load() && moe_cache_kv_end_rows(d, rows) != d.kv_end_rows) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void moe_hosted_unpin_session(moe_cache_session & session);
+
+static void moe_cache_kv_set_rows(void * opaque, int64_t rows) {
+    moe_cache_session * session = (moe_cache_session *) opaque;
+    if (!session) {
+        return;
+    }
+    std::unique_lock<std::mutex> lock(session->mu);
+    for (auto & device_ptr : session->devices) {
+        moe_cache_device & device = *device_ptr;
+        if (device.kv_step_rows <= 0 || device.dead.load()) {
+            continue;
+        }
+        const int64_t end_rows = moe_cache_kv_end_rows(device, rows);
+        if (end_rows == device.kv_end_rows) {
+            continue;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool take = end_rows > device.kv_end_rows;
+        if (take) {
+            // as for a zone loan: no prefetch, fill or restoration may be copying an entry meanwhile, and no row pinned
+            device.pregate_window = false;
+            device.pg_cands.clear();
+            device.pg_next = 0;
+            session->idle_cv.wait(lock, [&] { return !device.pg_busy; });
+            session->idle_cv.wait(lock, [&] { return device.queue.empty() && !device.inflight; });
+            moe_cache_rewarm_stop_locked(device);
+            moe_hosted_unpin_session(*session);
+        }
+        ggml_cuda_set_device(device.logical);
+        const int64_t ev0 = device.zone_evictions, mv0 = device.zone_moves;
+        std::vector<int> moved;
+        for (auto & pool_ptr : device.pools) {
+            moe_cache_pool & pool = *pool_ptr;
+            for (moe_cache_kv_range & kv : pool.kv) {
+                const size_t end = std::min(kv.bytes, (size_t) end_rows * kv.row_bytes);
+                moe_cache_kv_set_end(device, pool, kv, end, moved);
+            }
+        }
+        if (take) {
+            const cudaError_t error = cudaStreamSynchronize(moe_cache_zone_stream);
+            if (error != cudaSuccess) {
+                moe_cache_cuda_ok(device, error, "KV evacuation", true);   // the bookkeeping points at the copies
+            }
+            device.kv_takes++;
+        } else {
+            device.kv_gives++;
+        }
+        device.kv_moves += device.zone_moves - mv0;
+        device.kv_evictions += device.zone_evictions - ev0;
+        device.zone_moves = mv0;          // not counted as prefetch zone traffic
+        device.zone_evictions = ev0;
+        device.kv_end_rows = end_rows;
+        device.kv_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        static const bool log_each = getenv("GGML_CUDA_MOE_CACHE_KV_LOG") != nullptr;
+        if (log_each) {
+            MOE_CACHE_LOG("[moe-cache] CUDA%d KV %s to %lld rows: %zu moved, %lld evicted, total %.1f ms (%lld takes, %lld gives)\n",
+                    device.physical, take ? "grows" : "shrinks", (long long) end_rows, moved.size(),
+                    (long long) (device.kv_evictions), device.kv_ms, (long long) device.kv_takes, (long long) device.kv_gives);
+        }
+    }
+}
+
+static int64_t moe_cache_kv_first_lent_row(void * opaque) {
+    moe_cache_session * session = (moe_cache_session *) opaque;
+    if (!session) {
+        return 0;
+    }
+    int64_t first = 0;
+    for (auto & device_ptr : session->devices) {
+        if (device_ptr->kv_step_rows > 0) {
+            first = first ? std::min(first, device_ptr->kv_step_rows) : device_ptr->kv_step_rows;
+        }
+    }
+    return first;
+}
+
 static moe_cache_device * moe_cache_device_for_backend(
         moe_cache_session & session, void * backend_ptr) {
     ggml_backend_t backend = (ggml_backend_t)backend_ptr;
@@ -5922,26 +6181,26 @@ struct moe_hosted_layer {
     float * h_act = nullptr;
     block_q8_0 * h_act8 = nullptr;   // the same activations as q8_0 blocks, the bytes of the GPU's q8_1
     int32_t * h_ids = nullptr;
-    int32_t * h_plan = nullptr;     // up ids, gate ids, down ids: rows each
+    uint64_t * h_plan = nullptr;    // up, gate, down entry addresses (0: a CPU row): rows each
     float * h_res = nullptr;        // rows x n_embd
     uint32_t * h_flags = nullptr;   // [0] plan ready, [16] CPU rows ready, [24] moved expert ready (SPLIT)
-    int32_t * h_plan2 = nullptr;    // SPLIT: the moved expert's rows (up, gate, down ids; -1 elsewhere)
-    int32_t * m_plan2 = nullptr;
-    int32_t * d_plan2 = nullptr;
+    uint64_t * h_plan2 = nullptr;   // SPLIT: the moved expert's rows (up, gate, down entry addresses; 0 elsewhere)
+    uint64_t * m_plan2 = nullptr;
+    uint64_t * d_plan2 = nullptr;
     int split_pending = 0;          // SPLIT: its tensors still copying (session lock)
     float * h_chk = nullptr;        // DIAGNOSTIC (GGML_CUDA_MOE_SPLIT_VERIFY=1): the GPU results of the moved rows (rows x n_embd)
     float * m_chk = nullptr;
     int32_t * h_pred = nullptr;     // PREGATE: [0] stamp (publication it belongs to), [1] count, then expert ids
     int last_tokens = 1;            // PREGATE: tokens of the last publication (read by the serving thread)
     int32_t * m_pred = nullptr;
-    int32_t * m_plan = nullptr;
+    uint64_t * m_plan = nullptr;
     float * m_res = nullptr;
     float * m_act = nullptr;
     block_q8_0 * m_act8 = nullptr;
     int32_t * m_ids = nullptr;
     uint32_t * m_flags = nullptr;
     // device memory
-    int32_t * d_plan = nullptr;
+    uint64_t * d_plan = nullptr;
     int32_t * d_act_ids = nullptr;  // row -> token
     uint32_t * d_expect = nullptr;  // sequence number of the layer's last publication
 };
@@ -6153,7 +6412,7 @@ static __global__ void k_moe_hosted_enter(const float * act, float * h_act, bloc
                                           int32_t * ids, int64_t ids_nb1, int32_t * h_ids, int n_used, int n_tokens,
                                           uint32_t * d_seq, uint32_t * d_expect, volatile moe_hosted_mailbox * mail,
                                           uint32_t slot, const volatile uint32_t * flag,
-                                          const volatile int32_t * m_plan, int32_t * d_plan, int n_plan,
+                                          const volatile uint64_t * m_plan, uint64_t * d_plan, int n_plan,
                                           volatile unsigned long long * tl) {
     for (int64_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n_act; i += (int64_t) gridDim.x * blockDim.x) {
         h_act[i] = act[i];
@@ -6247,7 +6506,7 @@ static __global__ void k_moe_hosted_enter(const float * act, float * h_act, bloc
 // a block per row: the rows the CPU computed (down id -1) are copied in once they are ready
 // SPLIT: the moved expert arrived (or none was moved): its plan to the device
 static __global__ void k_moe_split_wait(const uint32_t * d_expect, const volatile uint32_t * flag,
-                                        const volatile int32_t * m_plan2, int32_t * d_plan2, int n_plan,
+                                        const volatile uint64_t * m_plan2, uint64_t * d_plan2, int n_plan,
                                         volatile unsigned long long * tl) {
     if (threadIdx.x == 0) {
         const uint32_t expect = *d_expect;
@@ -6267,10 +6526,10 @@ static __global__ void k_moe_split_wait(const uint32_t * d_expect, const volatil
 }
 
 // DIAGNOSTIC (GGML_CUDA_MOE_SPLIT_VERIFY=1): the moved rows as the GPU computed them, to the host; then flag [28]
-static __global__ void k_moe_split_check(const uint32_t * d_expect, const int32_t * d_moved_down_ids, const float * dst,
+static __global__ void k_moe_split_check(const uint32_t * d_expect, const uint64_t * d_moved_down_ids, const float * dst,
                                          float * m_chk, uint32_t * flag, int n_embd, int rows) {
     for (int row = 0; row < rows; row++) {
-        if (d_moved_down_ids[row] < 0) {
+        if (d_moved_down_ids[row] == 0) {
             continue;
         }
         for (int i = threadIdx.x; i < n_embd; i += blockDim.x) {
@@ -6286,11 +6545,11 @@ static __global__ void k_moe_split_check(const uint32_t * d_expect, const int32_
 }
 
 static __global__ void k_moe_hosted_merge(const uint32_t * d_expect, const volatile uint32_t * flag,
-                                          const int32_t * d_down_ids, const int32_t * d_moved_down_ids,
+                                          const uint64_t * d_down_ids, const uint64_t * d_moved_down_ids,
                                           const volatile float * m_res, float * dst, int n_embd,
                                           volatile unsigned long long * tl) {
     const int row = blockIdx.x;
-    if (d_down_ids[row] >= 0 || (d_moved_down_ids && d_moved_down_ids[row] >= 0)) {
+    if (d_down_ids[row] != 0 || (d_moved_down_ids && d_moved_down_ids[row] != 0)) {
         return;   // resident, or moved to the GPU (SPLIT)
     }
     __shared__ uint32_t expect;
@@ -6322,6 +6581,15 @@ static void moe_hosted_unpin_locked(moe_hosted_state & st) {
     st.pins.clear();
 }
 
+// KV: the rows the hosted plan pinned for the session's last layer, unpinned (its stream is done: the caller synchronized)
+static void moe_hosted_unpin_session(moe_cache_session & session) {
+    std::lock_guard<std::mutex> lock(g_hosted_mu);
+    auto it = g_hosted.find(&session);
+    if (it != g_hosted.end() && it->second) {
+        moe_hosted_unpin_locked(*it->second);
+    }
+}
+
 // Plan a layer's rows under the session lock: resident rows (three tensors valid) are pinned and
 // touched, as moe_cache_fused_begin does; the others count toward admission. out: up, gate, down
 // gpu ids (-1 for a row the CPU computes). Returns the rows the CPU computes. The GPU waits for the
@@ -6331,7 +6599,7 @@ static void moe_hosted_unpin_locked(moe_hosted_state & st) {
 // evicted them): 12.5 us for the 30 rows of a 3-token pass, 2.6 of them in that bookkeeping. The
 // resident rows are found through the pools' direct index, not the hash map (no chain of dependent loads).
 static int moe_hosted_plan(moe_hosted_state & st, moe_hosted_layer & layer, const int32_t * ids, int rows,
-                           int32_t * out, int32_t * cpu_rows, uint32_t * flag, uint32_t seq) {
+                           uint64_t * out, int32_t * cpu_rows, uint32_t * flag, uint32_t seq) {
     moe_cache_session & session = *st.session;
     moe_cache_device & device = *st.device;
     int n_cpu = 0;
@@ -6367,7 +6635,7 @@ static int moe_hosted_plan(moe_hosted_state & st, moe_hosted_layer & layer, cons
         }
         int slots[moe_hosted_rows_max][3];
         for (int row = 0; row < rows; row++) {
-            out[row] = out[rows + row] = out[2 * rows + row] = -1;
+            out[row] = out[rows + row] = out[2 * rows + row] = 0;
             slots[row][0] = slots[row][1] = slots[row][2] = -1;
             const int32_t expert = ids[row];
             if (!pool || expert < 0 || expert >= n_expert) {
@@ -6384,7 +6652,7 @@ static int moe_hosted_plan(moe_hosted_state & st, moe_hosted_layer & layer, cons
                     moe_cache_pool & p = *pools[k];
                     p.slots[slots[row][k]].readers++;
                     st.pins.push_back({pools[k], slots[row][k]});
-                    out[k * rows + row] = moe_cache_gpu_index(p, slots[row][k]);
+                    out[k * rows + row] = moe_cache_entry_addr(p, slots[row][k]);
                 }
             }
         }
@@ -6453,9 +6721,9 @@ static int moe_hosted_split(moe_hosted_state * st, moe_hosted_layer * layer, int
     if (!moe_split_enabled() || n_tokens < 2) {
         return n_cpu;
     }
-    int32_t * plan2 = layer->h_plan2;
+    uint64_t * plan2 = layer->h_plan2;
     for (int i = 0; i < 3 * rows; i++) {
-        plan2[i] = -1;
+        plan2[i] = 0;
     }
     int jobs = 0;
     if (n_cpu > 0) {
@@ -6595,7 +6863,7 @@ static int moe_hosted_split(moe_hosted_state * st, moe_hosted_layer * layer, int
                     const int row = cpu_rows[j];
                     if (layer->h_ids[row] == x.e) {
                         for (int k = 0; k < 3; k++) {
-                            plan2[k * rows + row] = moe_cache_gpu_index(*pools[k], x.slot[k]);
+                            plan2[k * rows + row] = moe_cache_entry_addr(*pools[k], x.slot[k]);
                         }
                     }
                 }
@@ -6850,7 +7118,7 @@ static void moe_hosted_serve_one(moe_hosted_state * st, uint32_t seq) {
         static double vsum = 0, vmax = 0;
         if (verify && n_tokens >= 2) {
             bool any = false;
-            for (int r = 0; r < rows; r++) any |= layer->h_plan2[2 * rows + r] >= 0;
+            for (int r = 0; r < rows; r++) any |= layer->h_plan2[2 * rows + r] != 0;
             if (any) {
                 while ((int32_t) (__atomic_load_n(&layer->h_flags[28], __ATOMIC_ACQUIRE) - seq) < 0) {
 #if defined(__x86_64__)
@@ -6858,7 +7126,7 @@ static void moe_hosted_serve_one(moe_hosted_state * st, uint32_t seq) {
 #endif
                 }
                 for (int r = 0; r < rows; r++) {
-                    if (layer->h_plan2[2 * rows + r] < 0) continue;
+                    if (layer->h_plan2[2 * rows + r] == 0) continue;
                     double d2 = 0, n2 = 0;
                     for (int i = 0; i < layer->n_embd; i++) {
                         const double a = layer->h_res[(size_t) r * layer->n_embd + i], b = layer->h_chk[(size_t) r * layer->n_embd + i];
@@ -7054,19 +7322,19 @@ static moe_hosted_layer * moe_hosted_register(moe_hosted_state & st, moe_cache_d
     bool ok = moe_hosted_host_alloc((void **) &layer->h_act, (size_t) tokens * layer->n_embd * sizeof(float)) &&
               moe_hosted_host_alloc((void **) &layer->h_act8, (size_t) tokens * (layer->n_embd / QK8_0) * sizeof(block_q8_0)) &&
               moe_hosted_host_alloc((void **) &layer->h_ids, rows * sizeof(int32_t)) &&
-              moe_hosted_host_alloc((void **) &layer->h_plan, 3 * rows * sizeof(int32_t)) &&
+              moe_hosted_host_alloc((void **) &layer->h_plan, 3 * rows * sizeof(uint64_t)) &&
               moe_hosted_host_alloc((void **) &layer->h_res, (size_t) rows * layer->n_embd * sizeof(float)) &&
               moe_hosted_host_alloc((void **) &layer->h_flags, 128) &&
               moe_hosted_host_alloc((void **) &layer->h_pred, (2 + rows) * sizeof(int32_t)) &&
-              moe_hosted_host_alloc((void **) &layer->h_plan2, 3 * rows * sizeof(int32_t)) &&
+              moe_hosted_host_alloc((void **) &layer->h_plan2, 3 * rows * sizeof(uint64_t)) &&
               moe_hosted_host_alloc((void **) &layer->h_chk, (size_t) rows * layer->n_embd * sizeof(float));
     ok = ok && (layer->m_act = moe_hosted_device_ptr(layer->h_act)) && (layer->m_act8 = (block_q8_0 *) moe_hosted_device_ptr(layer->h_act8)) &&
          (layer->m_ids = moe_hosted_device_ptr(layer->h_ids)) &&
          (layer->m_plan = moe_hosted_device_ptr(layer->h_plan)) && (layer->m_res = moe_hosted_device_ptr(layer->h_res)) &&
          (layer->m_flags = moe_hosted_device_ptr(layer->h_flags)) && (layer->m_pred = moe_hosted_device_ptr(layer->h_pred)) &&
          (layer->m_plan2 = moe_hosted_device_ptr(layer->h_plan2)) && (layer->m_chk = moe_hosted_device_ptr(layer->h_chk));
-    ok = ok && cudaMalloc((void **) &layer->d_plan, 3 * rows * sizeof(int32_t)) == cudaSuccess &&
-         cudaMalloc((void **) &layer->d_plan2, 3 * rows * sizeof(int32_t)) == cudaSuccess &&
+    ok = ok && cudaMalloc((void **) &layer->d_plan, 3 * rows * sizeof(uint64_t)) == cudaSuccess &&
+         cudaMalloc((void **) &layer->d_plan2, 3 * rows * sizeof(uint64_t)) == cudaSuccess &&
          cudaMalloc((void **) &layer->d_act_ids, rows * sizeof(int32_t)) == cudaSuccess &&
          cudaMalloc((void **) &layer->d_expect, sizeof(uint32_t)) == cudaSuccess;
     if (ok) {
@@ -7187,26 +7455,24 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
         q8_act = st->d_q8_act;
     }
     char * q8_mid = st->d_q8_mid;
-    ggml_cuda_moe_cache_mmv_fused(layer->base, layer->base, wtype, q8_act, layer->d_plan, layer->d_plan + rows,
-                                  layer->d_act_ids, (float *) glu->data, n_embd, n_ff, (int64_t) gate->src[0]->nb[2],
+    ggml_cuda_moe_cache_mmv_fused(wtype, q8_act, layer->d_plan, layer->d_plan + rows,
+                                  layer->d_act_ids, (float *) glu->data, n_embd, n_ff,
                                   rows, n_tokens, -INFINITY, INFINITY, -INFINITY, INFINITY, stream);
     quantize_row_q8_1_cuda((const float *) glu->data, nullptr, q8_mid, wtype, n_ff, n_ff, (int64_t) rows * n_ff,
                            (int64_t) rows * n_ff, padded_ff, rows, 1, 1, stream);
-    (void) ggml_cuda_moe_cache_mmv(layer->down_base, down->src[0]->type, q8_mid, layer->d_plan + 2 * rows, nullptr,
-                                   (float *) down->data, n_ff, n_embd, 0, (int64_t) down->src[0]->nb[2], rows, rows,
-                                   true, stream);
+    ggml_cuda_moe_cache_mmv(down->src[0]->type, q8_mid, layer->d_plan + 2 * rows, nullptr,
+                            (float *) down->data, n_ff, n_embd, rows, rows, stream);
     // SPLIT: the rows of the expert moved to the GPU, once it arrived; the kernels skip every other row
     const bool split_on = moe_split_enabled() && n_tokens >= 2;
     if (split_on) {
         k_moe_split_wait<<<1, 256, 0, stream>>>(layer->d_expect, layer->m_flags + 24, layer->m_plan2, layer->d_plan2, 3 * rows, g_tl_m);
-        ggml_cuda_moe_cache_mmv_fused(layer->base, layer->base, wtype, q8_act, layer->d_plan2, layer->d_plan2 + rows,
-                                      layer->d_act_ids, (float *) glu->data, n_embd, n_ff, (int64_t) gate->src[0]->nb[2],
+        ggml_cuda_moe_cache_mmv_fused(wtype, q8_act, layer->d_plan2, layer->d_plan2 + rows,
+                                      layer->d_act_ids, (float *) glu->data, n_embd, n_ff,
                                       rows, n_tokens, -INFINITY, INFINITY, -INFINITY, INFINITY, stream);
         quantize_row_q8_1_cuda((const float *) glu->data, nullptr, q8_mid, wtype, n_ff, n_ff, (int64_t) rows * n_ff,
                                (int64_t) rows * n_ff, padded_ff, rows, 1, 1, stream);
-        (void) ggml_cuda_moe_cache_mmv(layer->down_base, down->src[0]->type, q8_mid, layer->d_plan2 + 2 * rows, nullptr,
-                                       (float *) down->data, n_ff, n_embd, 0, (int64_t) down->src[0]->nb[2], rows, rows,
-                                       true, stream);
+        ggml_cuda_moe_cache_mmv(down->src[0]->type, q8_mid, layer->d_plan2 + 2 * rows, nullptr,
+                                (float *) down->data, n_ff, n_embd, rows, rows, stream);
         static const bool verify = getenv("GGML_CUDA_MOE_SPLIT_VERIFY") && atoi(getenv("GGML_CUDA_MOE_SPLIT_VERIFY")) > 0;
         if (verify) {
             k_moe_split_check<<<1, 256, 0, stream>>>(layer->d_expect, layer->d_plan2 + 2 * rows, (const float *) down->data,
@@ -7289,6 +7555,10 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.session_create = moe_cache_session_create;
     ggml_moe_cache.session_destroy = moe_cache_session_destroy;
     ggml_moe_cache.session_enter = moe_cache_session_enter;
+    ggml_moe_cache.kv_register = moe_cache_kv_register;
+    ggml_moe_cache.kv_needs_set_rows = moe_cache_kv_needs_set_rows;
+    ggml_moe_cache.kv_set_rows = moe_cache_kv_set_rows;
+    ggml_moe_cache.kv_first_lent_row = moe_cache_kv_first_lent_row;
     ggml_moe_cache.session_leave = moe_cache_session_leave;
     ggml_moe_cache.begin = moe_cache_begin;
     ggml_moe_cache.plan = moe_cache_plan;

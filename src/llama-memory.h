@@ -4,6 +4,8 @@
 #include "llama-graph.h"
 
 #include <map>
+#include <utility>
+#include <vector>
 #include <memory>
 #include <functional>
 
@@ -62,6 +64,10 @@ struct llama_memory_context_i {
     // get the current ubatch
     virtual const llama_ubatch & get_ubatch() const = 0;
 
+    // the rows of the attention caches this ubatch reads (n_kv), 0 without one: the rows past them may be lent to the
+    // MoE expert cache
+    virtual uint32_t get_kv_rows() const { return 0; }
+
     // get the status of the memory context - used for error handling and checking if any updates would be applied
     virtual llama_memory_status get_status() const = 0;
 };
@@ -106,6 +112,11 @@ struct llama_memory_i {
 
     // if data == true, the data buffers will also be cleared together with the metadata
     virtual void clear(bool data) = 0;
+
+    // the end of the KV cache lent to the MoE expert cache: the tensors whose rows are cells, with their bytes per row,
+    // and the row from which they may be lent (0: none), past which the cache's own writes (clear, shift) must stop
+    virtual void get_lendable_kv(std::vector<std::pair<const ggml_tensor *, size_t>> & out) const { (void) out; }
+    virtual void set_kv_lent_from(uint32_t rows) { (void) rows; }
 
     virtual bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) = 0;
     virtual void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) = 0;
