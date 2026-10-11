@@ -2143,11 +2143,12 @@ static bool moe_cache_prepare_budget(
     }
 
 #if defined(GGML_USE_HIP)
-    // GGML_CUDA_MOE_CACHE_FREE_SOURCE=sysfs sizes the cache from the driver counters
-    // instead of hipMemGetInfo; falls back to the HIP figure if they cannot be read
+    // the cache is sized from the amdgpu driver counters (sysfs), which hipMemGetInfo underestimates (+1.8 GiB of cache
+    // on a 20 GiB card); falls back to the HIP figure if they cannot be read. GGML_CUDA_MOE_CACHE_FREE_SOURCE=hip keeps
+    // the HIP figure
     {
         const char * source = getenv("GGML_CUDA_MOE_CACHE_FREE_SOURCE");
-        if (source && strcmp(source, "sysfs") == 0) {
+        if (!source || strcmp(source, "hip") != 0) {
             size_t sysfs_free  = 0;
             size_t sysfs_total = 0;
             if (moe_cache_sysfs_free(device.physical, sysfs_free, sysfs_total)) {

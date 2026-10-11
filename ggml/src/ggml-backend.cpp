@@ -2538,8 +2538,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 // idle (during prefill) instead of allocating them next to it.
 static void ggml_backend_sched_use_borrowed_compute(ggml_backend_sched_t sched) {
     static const bool enabled = [] {
+        // on by default: the compute buffers live in the MoE cache's memory; GGML_SCHED_BORROW_COMPUTE=0 turns it off
         const char * text = getenv("GGML_SCHED_BORROW_COMPUTE");
-        return text && text[0] && text[0] != '0';
+        return !text || (text[0] && text[0] != '0');
     }();
     // a borrowed type points at the session: without one, back to the plain types
     for (int b = 0; b < sched->n_backends; b++) {
@@ -2638,8 +2639,10 @@ ggml_backend_sched_t ggml_backend_sched_new(
     // GGML_SCHED_PREFETCH_EXPERTS=1 enables the default slot count, higher values set it
     // directly; more slots let uploads run further ahead of compute at the cost of one
     // max-sized expert tensor of device memory per slot
+    // on by default with 3 slots (one per expert tensor of a layer: the PCIe link then stays busy through the prefill,
+    // +20 % against 2); GGML_SCHED_PREFETCH_EXPERTS=0 turns it off
     const char * GGML_SCHED_PREFETCH_EXPERTS = getenv("GGML_SCHED_PREFETCH_EXPERTS");
-    const int prefetch_n_slots = GGML_SCHED_PREFETCH_EXPERTS ? atoi(GGML_SCHED_PREFETCH_EXPERTS) : 0;
+    const int prefetch_n_slots = GGML_SCHED_PREFETCH_EXPERTS ? atoi(GGML_SCHED_PREFETCH_EXPERTS) : 3;
     sched->prefetch_experts = op_offload && prefetch_n_slots > 0;
     // default of 3 covers the gate/up/down expert tensors of one MoE layer
     sched->prefetch_n_slots = prefetch_n_slots <= 1 ? 3 : std::min(prefetch_n_slots, GGML_SCHED_MAX_PREFETCH_SLOTS);
