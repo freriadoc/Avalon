@@ -61,6 +61,22 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     qwen4exp_require_nonzero(ml, LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k);
     ml.get_key_or_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, hparams.dsv4_compress_ratios, hparams.n_layer_all, false);
 
+    // the MTP block is a QSA layer like the last trunk one, but some MTP files (Unsloth's) give it no compress ratio:
+    // it takes the last QSA layer's, as in ik_llama.cpp (#2369); with 0, its indexer input would be built but unused
+    const uint32_t n_trunk = hparams.n_layer_all - hparams.n_layer_nextn;
+    for (uint32_t il = n_trunk; il < hparams.n_layer_all; ++il) {
+        if (hparams.dsv4_compress_ratios[il] != 0) {
+            continue;
+        }
+        for (uint32_t j = n_trunk; j-- > 0;) {
+            if (hparams.dsv4_compress_ratios[j] != 0) {
+                hparams.dsv4_compress_ratios[il] = hparams.dsv4_compress_ratios[j];
+                LLAMA_LOG_INFO("%s: MTP layer %u takes the compress ratio %u of layer %u\n", __func__, il, hparams.dsv4_compress_ratios[j], j);
+                break;
+            }
+        }
+    }
+
     // QSA pools the indexer keys of blocks of compress_ratio cells, one block size for the whole model
     hparams.indexer_kpool = 0;
     for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
