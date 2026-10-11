@@ -398,7 +398,7 @@ static __global__ void lightning_indexer_kernel_tile(
         size_t nbk1, size_t nbk2, size_t nbk3,
         size_t nbw1, size_t nbw2, size_t nbw3,
         size_t nbm1, size_t nbm2, size_t nbm3,
-        int64_t nem3
+        int64_t nem3, const int32_t * __restrict__ k_idx
     ) {
 
     constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * WARP_SIZE;
@@ -430,7 +430,7 @@ static __global__ void lightning_indexer_kernel_tile(
         half2 lo = make_half2(0.0f, 0.0f);
         half2 hi = lo;
         if (start_kv + r < n_kv) {
-            const char * k_row = K + (start_kv + r)*nbk2 + i_stream*nbk3;
+            const char * k_row = K + (k_idx ? (int64_t) k_idx[start_kv + r] : (int64_t) (start_kv + r))*nbk2 + i_stream*nbk3;
             if constexpr (TYPE_K == GGML_TYPE_F16) {
                 lo = ((const half2 *) k_row)[2*c4 + 0];
                 hi = ((const half2 *) k_row)[2*c4 + 1];
