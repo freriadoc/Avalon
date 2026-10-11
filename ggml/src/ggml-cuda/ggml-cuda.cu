@@ -78,6 +78,7 @@
 
 #include <algorithm>
 #include <array>
+#include <utility>
 #include <atomic>
 #include <charconv>
 #include <cinttypes>
@@ -739,7 +740,86 @@ static std::mutex ggml_cuda_lock;
 static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
 
+static std::mutex g_cuda_contexts_mutex;
+static std::vector<ggml_backend_cuda_context *> g_cuda_contexts;
+
+void ggml_cuda_register_context(ggml_backend_cuda_context * ctx) {
+    std::lock_guard<std::mutex> lock(g_cuda_contexts_mutex);
+    g_cuda_contexts.push_back(ctx);
+}
+
+void ggml_cuda_unregister_context(ggml_backend_cuda_context * ctx) {
+    std::lock_guard<std::mutex> lock(g_cuda_contexts_mutex);
+    g_cuda_contexts.erase(std::remove(g_cuda_contexts.begin(), g_cuda_contexts.end(), ctx), g_cuda_contexts.end());
+}
+
+static __global__ void k_queue_prime() {}
+
+// N bytes of private memory per thread (the compiler adds a little): the volatile array stays in scratch
+template <int N>
+static __global__ void k_scratch_prime(int * out, int sel) {
+    volatile int buf[N/4];
+    for (int i = 0; i < N/4; ++i) {
+        buf[i] = i*sel + (int) threadIdx.x;
+    }
+    if (sel == 0x7fffffff) {
+        out[threadIdx.x] = buf[(sel + threadIdx.x) % (N/4)];
+    }
+}
+
+typedef void (*scratch_prime_t)(int *, int);
+template <size_t... I>
+static std::array<scratch_prime_t, sizeof...(I)> ggml_cuda_scratch_primes(std::index_sequence<I...>) {
+    return {{ k_scratch_prime<16*(I + 1)>... }};
+}
+
+// the prime kernel with the least private memory that covers `bytes` (steps of 16 B up to 2 KiB), or nullptr
+static scratch_prime_t ggml_cuda_pick_scratch_prime(size_t bytes, size_t & got) {
+    static const auto kernels = ggml_cuda_scratch_primes(std::make_index_sequence<128>{});
+    static std::vector<size_t> sizes;
+    if (sizes.empty()) {
+        for (scratch_prime_t k : kernels) {
+            cudaFuncAttributes attr = {};
+            sizes.push_back(cudaFuncGetAttributes(&attr, (const void *) k) == cudaSuccess ? attr.localSizeBytes : 0);
+        }
+    }
+    for (size_t i = 0; i < kernels.size(); ++i) {
+        if (sizes[i] >= bytes) {
+            got = sizes[i];
+            return kernels[i];
+        }
+    }
+    return nullptr;
+}
+
+void ggml_cuda_prime_queues(int device) {
+    std::lock_guard<std::mutex> lock(g_cuda_contexts_mutex);
+    for (ggml_backend_cuda_context * ctx : g_cuda_contexts) {
+        if (ctx->device != device) {
+            continue;
+        }
+        cudaStream_t stream = ctx->stream();
+        if (!ctx->primed) {
+            k_queue_prime<<<1, 1, 0, stream>>>();
+            ctx->primed = true;
+        }
+        if (ctx->fattn_private > ctx->primed_private) {
+            size_t got = 0;
+            scratch_prime_t k = ggml_cuda_pick_scratch_prime(ctx->fattn_private, got);
+            if (k) {
+                k<<<1, WARP_SIZE, 0, stream>>>(nullptr, 0);
+                GGML_LOG_INFO("%s: %s: queue scratch for %zu B of private memory per thread (prime kernel %zu B)\n",
+                        __func__, ctx->name.c_str(), ctx->fattn_private, got);
+                ctx->primed_private = got;
+            }
+        }
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+}
+
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+    ggml_cuda_unregister_context(this);
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 

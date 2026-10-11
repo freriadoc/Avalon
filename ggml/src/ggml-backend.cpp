@@ -2048,28 +2048,36 @@ static size_t ggml_backend_sched_prefetch_max_size(ggml_backend_sched_t sched, g
     return max_size;
 }
 
-static bool ggml_backend_sched_prefetch_init(ggml_backend_sched_t sched, ggml_backend_t split_backend, size_t size) {
+// the prefetch's own backend (its stream) and events, on the device of the split it serves
+static bool ggml_backend_sched_prefetch_backend_init(ggml_backend_sched_t sched, ggml_backend_dev_t dev) {
+    if (sched->prefetch_backend != NULL) {
+        return true;
+    }
+    ggml_backend_dev_props props;
+    ggml_backend_dev_get_props(dev, &props);
+    if (!props.caps.async || !props.caps.events) {
+        sched->prefetch_experts = false;
+        return false;
+    }
+    sched->prefetch_backend = ggml_backend_dev_init(dev, NULL);
     if (sched->prefetch_backend == NULL) {
-        ggml_backend_dev_t dev = split_backend->device;
-        ggml_backend_dev_props props;
-        ggml_backend_dev_get_props(dev, &props);
-        if (!props.caps.async || !props.caps.events) {
+        sched->prefetch_experts = false;
+        return false;
+    }
+    for (int i = 0; i < sched->prefetch_n_slots; i++) {
+        sched->prefetch_ready[i] = ggml_backend_event_new(dev);
+        sched->prefetch_free[i]  = ggml_backend_event_new(dev);
+        if (sched->prefetch_ready[i] == NULL || sched->prefetch_free[i] == NULL) {
             sched->prefetch_experts = false;
             return false;
         }
-        sched->prefetch_backend = ggml_backend_dev_init(dev, NULL);
-        if (sched->prefetch_backend == NULL) {
-            sched->prefetch_experts = false;
-            return false;
-        }
-        for (int i = 0; i < sched->prefetch_n_slots; i++) {
-            sched->prefetch_ready[i] = ggml_backend_event_new(dev);
-            sched->prefetch_free[i]  = ggml_backend_event_new(dev);
-            if (sched->prefetch_ready[i] == NULL || sched->prefetch_free[i] == NULL) {
-                sched->prefetch_experts = false;
-                return false;
-            }
-        }
+    }
+    return true;
+}
+
+static bool ggml_backend_sched_prefetch_init(ggml_backend_sched_t sched, ggml_backend_t split_backend, size_t size) {
+    if (!ggml_backend_sched_prefetch_backend_init(sched, split_backend->device)) {
+        return false;
     }
 
     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(split_backend);
@@ -2879,6 +2887,15 @@ static void ggml_backend_sched_prime_moe_cache(ggml_backend_sched_t sched, struc
             __func__, graph->n_nodes, n_mmid, experts.size(), slot_bytes >> 20);
     if (experts.empty()) {
         return;
+    }
+
+    // the prefetch's backend now rather than at the first large prefill: its queue then exists when the cache
+    // measures the free memory (prepare_queues)
+    if (sched->prefetch_experts) {
+        ggml_backend_sched_prefetch_backend_init(sched, sched->backends[0]->device);
+    }
+    if (ggml_moe_cache.prepare_queues) {
+        ggml_moe_cache.prepare_queues(sched->moe_cache_session, graph);
     }
 
     if (sched->prefetch_experts && slot_bytes && ggml_moe_cache.set_lend_size) {

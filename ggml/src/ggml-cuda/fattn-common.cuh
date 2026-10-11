@@ -1160,6 +1160,10 @@ void launch_fattn(
     const fattn_scratch_layout scratch_l = fattn_scratch_get_layout(KV_max_n, dst_tmp_n, dst_tmp_meta_n);
     if (g_fattn_scratch_query != nullptr) {
         *g_fattn_scratch_query = scratch_l.size;
+        cudaFuncAttributes attr = {};
+        if (cudaFuncGetAttributes(&attr, (const void *) fattn_kernel) == cudaSuccess) {
+            ctx.fattn_private = std::max(ctx.fattn_private, (size_t) attr.localSizeBytes);
+        }
         return;
     }
     const ggml_tensor * scratch_t = dst->src[GGML_SCHED_SCRATCH_SRC];

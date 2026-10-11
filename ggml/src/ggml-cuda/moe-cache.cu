@@ -35,6 +35,7 @@ bool ggml_cuda_moe_hosted_wait(void * stream, void * event) {
 #include "topk-moe.cuh"
 #include "mmvq.cuh"
 #include "quantize.cuh"
+#include "fattn.cuh"
 #include "ggml-backend-impl.h"
 #include "ggml-cuda.h"
 #include "../ggml-backend-moe-cache.h"
@@ -441,6 +442,8 @@ struct moe_cache_device {
     std::thread worker;
 
     cudaStream_t compute_stream = nullptr;
+    ggml_backend_cuda_context * backend_ctx = nullptr; // the context of the scheduler that created the session
+    cudaStream_t fill_stream = nullptr;                // the fill worker's stream, created and dispatched before sizing
     std::vector<char *> owned_regions;    // extra regions this device allocated itself (tests)
 
     // seating of the chunks ggml-alloc announced (moe_cache_plan_borrows): the pool of each
@@ -1579,6 +1582,47 @@ static int moe_pregate_k() {
     return k;
 }
 
+static __global__ void k_moe_cache_queue_prime() {}
+
+// before the cache sizes itself (ggml_backend_sched_prime_moe_cache): the queues and scratch the later work needs are
+// created now (ggml_cuda_prime_queues), so that the free memory it measures has them already. The target's flash
+// attention kernels, picked from its reserve graph, set the private memory of its queue; the fill worker's stream is
+// created and dispatched here.
+static void moe_cache_prepare_queues(void * opaque, const struct ggml_cgraph * graph) {
+    moe_cache_session * session = (moe_cache_session *) opaque;
+    if (!session) {
+        return;
+    }
+    for (auto & device_ptr : session->devices) {
+        moe_cache_device & device = *device_ptr;
+        if (device.budget_ready) {
+            continue;
+        }
+        if (device.backend_ctx && graph) {
+            for (int i = 0; i < graph->n_nodes; ++i) {
+                ggml_tensor * node = graph->nodes[i];
+                if (node->op == GGML_OP_FLASH_ATTN_EXT && ggml_cuda_flash_attn_ext_supported(device.logical, node)) {
+                    ggml_cuda_flash_attn_ext_scratch_size(*device.backend_ctx, node);
+                }
+            }
+        }
+        ggml_cuda_set_device(device.logical);
+        if (!device.fill_stream) {
+            int least_priority = 0;
+            int greatest_priority = 0;
+            if (cudaDeviceGetStreamPriorityRange(&least_priority, &greatest_priority) != cudaSuccess ||
+                    cudaStreamCreateWithPriority(&device.fill_stream, cudaStreamNonBlocking, least_priority) != cudaSuccess) {
+                (void) cudaGetLastError();
+                device.fill_stream = nullptr;
+            } else {
+                k_moe_cache_queue_prime<<<1, 1, 0, device.fill_stream>>>();
+                (void) cudaStreamSynchronize(device.fill_stream);
+            }
+        }
+        ggml_cuda_prime_queues(device.logical);
+    }
+}
+
 static void moe_cache_worker(moe_cache_session * session, moe_cache_device * device) {
     char * stage = nullptr;
     size_t stage_capacity = 0;
@@ -1812,6 +1856,9 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
 
         if (device->dead.load() || moe_cache_fail(*session, "insert")) {
             error = cudaErrorUnknown;
+        }
+        if (error == cudaSuccess && !stream && device->fill_stream) {
+            stream = device->fill_stream; // created by moe_cache_prepare_queues, the worker owns it from here
         }
         if (error == cudaSuccess && !stream) {
             int least_priority = 0;
@@ -2581,6 +2628,7 @@ static void * moe_cache_session_create(
                     moe_cache_default_min_expert_bytes(capability));
             minimum_capability = std::min(minimum_capability, capability);
             session->devices.emplace_back(new moe_cache_device(logical, physical));
+            session->devices.back()->backend_ctx = context;
             session->devices.back()->automatic_reserve_bytes =
                 moe_cache_recommended_reserve_bytes(info.devices[logical].total_vram);
         };
@@ -5836,6 +5884,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.kv_first_lent_row = moe_cache_kv_first_lent_row;
     ggml_moe_cache.session_leave = moe_cache_session_leave;
     ggml_moe_cache.begin = moe_cache_begin;
+    ggml_moe_cache.prepare_queues = moe_cache_prepare_queues;
     ggml_moe_cache.plan = nullptr;   // nodes are served by the hosted MoE only (moe_cache_begin)
     ggml_moe_cache.dispatch = nullptr;   // nodes are served by the hosted MoE only (moe_cache_begin)
     ggml_moe_cache.collect = nullptr;   // nodes are served by the hosted MoE only (moe_cache_begin)

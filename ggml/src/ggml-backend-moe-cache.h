@@ -185,6 +185,8 @@ struct ggml_moe_cache_api {
     void (*cpu_experts)(const struct ggml_tensor * gate_w, const struct ggml_tensor * up_w,
                         const struct ggml_tensor * down_w, const float * act, const void * act_q8,
                         const int32_t * experts, int k, int n_tokens, float * out, int n_threads);
+    // before the cache sizes itself on the free memory: create the queues and scratch later work needs
+    void (*prepare_queues)(void * session, const struct ggml_cgraph * graph);
 };
 
 GGML_API struct ggml_moe_cache_api ggml_moe_cache;

@@ -123,6 +123,8 @@
 #define cudaDevAttrCooperativeLaunch musaDevAttrCooperativeLaunch
 #define cudaFuncAttributeMaxDynamicSharedMemorySize musaFuncAttributeMaxDynamicSharedMemorySize
 #define cudaFuncSetAttribute musaFuncSetAttribute
+#define cudaFuncGetAttributes musaFuncGetAttributes
+#define cudaFuncAttributes musaFuncAttributes
 #define cudaMemcpy3DPeerParms musaMemcpy3DPeerParms
 #define make_cudaExtent make_musaExtent
 #define make_cudaPitchedPtr make_musaPitchedPtr

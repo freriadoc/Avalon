@@ -1457,6 +1457,16 @@ struct ggml_cuda_stream_context {
 // capacity of the q8_1 reuse buffer (ggml_cuda_q8_1_reuse): larger activations are quantized elsewhere
 #define GGML_CUDA_Q8_1_REUSE_BYTES (1u << 20)
 
+struct ggml_backend_cuda_context;
+// live backend contexts, for ggml_cuda_prime_queues
+void ggml_cuda_register_context(ggml_backend_cuda_context * ctx);
+void ggml_cuda_unregister_context(ggml_backend_cuda_context * ctx);
+// before the MoE cache sizes itself on the free device memory: every live context's stream dispatches once (ROCm
+// creates its hardware queue, and the queue's context save area, at the first dispatch) and, when its graphs need
+// private memory, a kernel with as much (the queue's scratch, sized at the first dispatch that needs it for the whole
+// device whatever the grid), so that neither is allocated later, past the cache's reserve
+void ggml_cuda_prime_queues(int device);
+
 struct ggml_backend_cuda_context {
     int device;
     // the weights are read once per token (a model's large matrices while decoding, not an MTP draft's, which
@@ -1571,9 +1581,16 @@ struct ggml_backend_cuda_context {
     }
 #endif // USE_CUDA_GRAPH
 
+    // private memory per thread of the largest flash attention kernel its graphs pick (seen when the compute buffer
+    // is sized: ggml_cuda_flash_attn_ext_scratch_size), and what its stream's queue already has (ggml_cuda_prime_queues)
+    size_t fattn_private = 0;
+    size_t primed_private = 0;
+    bool   primed = false;
+
     explicit ggml_backend_cuda_context(int device) :
         device(device),
         name(GGML_CUDA_NAME + std::to_string(device)) {
+        ggml_cuda_register_context(this);
     }
 
     ggml_cuda_stream_context concurrent_stream_context;

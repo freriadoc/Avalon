@@ -2075,6 +2075,17 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
         constexpr bool use_logit_softcap = false;
 #if !defined(GGML_USE_MUSA)
         if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, ncols1, ncols2)) {
+            if (g_fattn_scratch_query != nullptr) {
+                // the sparse and the dense variant both may run on this queue (the choice follows the mask of each
+                // batch): its scratch must fit the larger (ggml_cuda_prime_queues); launch_fattn notes the picked one
+                cudaFuncAttributes attr = {};
+                if (cudaFuncGetAttributes(&attr, (const void *) flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, false>) == cudaSuccess) {
+                    ctx.fattn_private = std::max(ctx.fattn_private, (size_t) attr.localSizeBytes);
+                }
+                if (cudaFuncGetAttributes(&attr, (const void *) flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, true>) == cudaSuccess) {
+                    ctx.fattn_private = std::max(ctx.fattn_private, (size_t) attr.localSizeBytes);
+                }
+            }
             if (ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, ncols1, ncols2)) {
                 constexpr bool use_sparse_kernel = true;
                 fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, use_sparse_kernel>;
