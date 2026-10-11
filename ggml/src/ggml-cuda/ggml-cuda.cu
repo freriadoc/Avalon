@@ -794,6 +794,18 @@ static scratch_prime_t ggml_cuda_pick_scratch_prime(size_t bytes, size_t & got) 
 
 void ggml_cuda_prime_queues(int device) {
     std::lock_guard<std::mutex> lock(g_cuda_contexts_mutex);
+    // the null stream too: the hosted MoE's first memset runs there, and since the buffer-init padding memsets moved to
+    // the per-thread stream (#28782) nothing else dispatched on it before the cache was sized (a 38.4 MiB save area)
+    {
+        static bool null_primed[GGML_CUDA_MAX_DEVICES] = {};
+        if (!null_primed[device]) {
+            ggml_cuda_set_device(device);
+            k_queue_prime<<<1, 1, 0, 0>>>();
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaStreamSynchronize(0));
+            null_primed[device] = true;
+        }
+    }
     for (ggml_backend_cuda_context * ctx : g_cuda_contexts) {
         if (ctx->device != device) {
             continue;
