@@ -196,7 +196,8 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     const int  trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
     const int  mtp_flags   = ml.load_mtp ? 0 : TENSOR_SKIP;
 
-    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
+    // a "shared" MTP-only file may lack the embeddings and the LM head: it takes the target's (llama_model_share_mtp_io)
+    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, mtp_only ? TENSOR_NOT_REQUIRED : 0);
 
     // there is no output_norm: the final hyper-connection mixer carries it
     // the gammas load as [n_embd, hc] so the grouped norm multiplies them without a graph reshape
@@ -214,7 +215,8 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     }
 
     output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab_out }, d2t ? 0 : TENSOR_NOT_REQUIRED);
-    if (output == NULL) {
+    // the LM head is not tied to the embeddings: an MTP-only file without one takes the target's, not its embeddings
+    if (output == NULL && !mtp_only) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
     }
 

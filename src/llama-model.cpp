@@ -2958,6 +2958,26 @@ void llama_model_free(llama_model * model) {
     delete model;
 }
 
+bool llama_model_share_mtp_io(llama_model * draft, const llama_model * target) {
+    const int64_t n_embd  = draft->hparams.n_embd;
+    const int64_t n_vocab = draft->vocab.n_tokens();
+
+    const auto take = [&](ggml_tensor *& dst, ggml_tensor * src, const char * name) {
+        if (dst != nullptr) {
+            return true;
+        }
+        if (src == nullptr || src->ne[0] != n_embd || src->ne[1] != n_vocab) {
+            LLAMA_LOG_ERROR("llama_model_share_mtp_io: the draft has no %s and the target's cannot be shared\n", name);
+            return false;
+        }
+        dst = src;
+        LLAMA_LOG_INFO("llama_model_share_mtp_io: the draft uses the target's %s\n", name);
+        return true;
+    };
+
+    return take(draft->tok_embd, target->tok_embd, "token embeddings") && take(draft->output, target->output, "LM head");
+}
+
 int32_t llama_model_n_ctx_train(const llama_model * model) {
     return model->hparams.n_ctx_train;
 }

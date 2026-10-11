@@ -562,6 +562,11 @@ extern "C" {
 
     LLAMA_API void llama_model_free(struct llama_model * model);
 
+    // An MTP draft head shipped without the token embeddings or the LM head (a "shared" sidecar) takes the target's:
+    // shared tensors, owned by the target, which must outlive the draft. Returns false when a missing tensor cannot be
+    // taken (no target tensor, other shape); true when nothing is missing.
+    LLAMA_API bool llama_model_share_mtp_io(struct llama_model * draft, const struct llama_model * target);
+
     LLAMA_API struct llama_context * llama_init_from_model(
                      struct llama_model * model,
             struct llama_context_params   params);
