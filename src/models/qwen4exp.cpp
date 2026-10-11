@@ -194,6 +194,8 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     const auto nf = nextn_flags(ml, LLM_TENSOR_HC_ATTN_NORM);
     const int trunk_flags = nf.trunk;
     const int mtp_flags   = nf.mtp;
+    // an MTP-only file carries the MTP block, and maybe the embeddings and the LM head, but no trunk
+    const bool mtp_only   = nf.trunk == TENSOR_NOT_REQUIRED;
 
     // a "shared" MTP-only file may lack the embeddings and the LM head: it takes the target's (llama_model_share_mtp_io)
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, mtp_only ? TENSOR_NOT_REQUIRED : 0);
