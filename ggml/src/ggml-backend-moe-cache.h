@@ -189,9 +189,10 @@ struct ggml_moe_cache_api {
 
 GGML_API struct ggml_moe_cache_api ggml_moe_cache;
 GGML_API void ggml_moe_cache_unregister(const void * owner);
+// reserve_mib: device memory kept out of the cache, 0 = the provider's (an explicit GGML_CUDA_MOE_CACHE_RESERVE_MB wins)
 GGML_API void ggml_backend_sched_set_moe_cache(
         ggml_backend_sched_t sched, enum ggml_moe_cache_mode mode,
-        size_t budget_mib, int expert_parallel, int cpu_overlap, const char * profile_path);
+        size_t budget_mib, size_t reserve_mib, int expert_parallel, int cpu_overlap, const char * profile_path);
 
 // the cache session outlives a scheduler rebuilt by a new reserve: detach it from the old one
 // (lent zones and borrowed compute buffers go back to it first), attach it to the new one

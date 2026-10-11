@@ -951,6 +951,13 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         params.tensor_buft_overrides.push_back({nullptr, nullptr});
     }
 
+    // with the MoE expert cache the device memory serves the target's experts: a draft model's experts stay in system
+    // memory unless the user placed its tensors (as -cmoed)
+    if (params.speculative.has_dft() && params.moe_cache.mode != COMMON_MOE_CACHE_MODE_OFF &&
+            params.speculative.draft.tensor_buft_overrides.empty()) {
+        params.speculative.draft.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
+    }
+
     if (!params.speculative.draft.tensor_buft_overrides.empty()) {
         params.speculative.draft.tensor_buft_overrides.push_back({nullptr, nullptr});
     }

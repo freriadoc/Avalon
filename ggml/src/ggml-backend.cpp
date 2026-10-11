@@ -2643,10 +2643,11 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
 void ggml_backend_sched_set_moe_cache(
         ggml_backend_sched_t sched, enum ggml_moe_cache_mode mode,
-        size_t budget_mib, int expert_parallel, int cpu_overlap, const char * profile_path) {
+        size_t budget_mib, size_t reserve_mib, int expert_parallel, int cpu_overlap, const char * profile_path) {
     GGML_ASSERT(sched);
     GGML_ASSERT(cpu_overlap >= -2 && cpu_overlap <= 8);
-    if (mode == GGML_MOE_CACHE_MODE_UNSPECIFIED && cpu_overlap == -2) {
+    // left to the provider (it creates the session at the first reserve), unless the context sets a reserve
+    if (mode == GGML_MOE_CACHE_MODE_UNSPECIFIED && cpu_overlap == -2 && reserve_mib == 0) {
         return;
     }
 
@@ -2682,6 +2683,10 @@ void ggml_backend_sched_set_moe_cache(
         config.profile_path = profile_path;
     }
     if (cpu_overlap != -2) config.overlap_cpu_rows = cpu_overlap;
+    if (reserve_mib > 0 && !config.reserve_explicit) {
+        config.reserve_bytes    = reserve_mib << 20;
+        config.reserve_explicit = 1;
+    }
 
     void * cache_backends[GGML_SCHED_MAX_BACKENDS];
     for (int index = 0; index < sched->n_backends; index++) {

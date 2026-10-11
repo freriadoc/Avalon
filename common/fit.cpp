@@ -639,6 +639,15 @@ static void common_params_fit_impl(
                 __func__, -global_surplus_cpu_moe/MiB);
         }
 
+        // with the MoE expert cache, the dense weights go to the devices and the experts stay in system memory: the
+        // device memory left after the dense weights is the cache's (it serves the experts better than whole expert
+        // layers would), so no MoE layer is moved to a device
+        if (global_surplus_cpu_moe > 0 && cparams->moe_cache_mode != LLAMA_MOE_CACHE_MODE_OFF) {
+            mparams->n_gpu_layers = hp_ngl + 1; // the repeating layers and the output layer
+            LOG_INF("%s: MoE expert cache: all %" PRIu32 " layers on the devices, the experts in system memory\n", __func__, hp_ngl + 1);
+            return;
+        }
+
         // reset
         tensor_buft_overrides[0] = {nullptr, nullptr};
         mparams->tensor_buft_overrides = tensor_buft_overrides;

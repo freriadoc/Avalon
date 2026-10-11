@@ -330,6 +330,7 @@ static ggml_cuda_device_info ggml_cuda_init() {
         const size_t device_vram_mib = device_vram / (1024 * 1024);
 
         info.default_tensor_split[id] = total_vram;
+        info.devices[id].total_vram   = device_vram; // the MoE cache's automatic reserve is bounded by it
         total_vram += device_vram;
         info.devices[id].integrated = false; // Temporarily disabled due to issues with corrupted output (e.g. #15034)
         info.devices[id].nsm        = prop.multiProcessorCount;

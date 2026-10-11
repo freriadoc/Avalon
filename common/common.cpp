@@ -1727,6 +1727,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
         }
     }
     cparams.moe_cache_budget_mib      = params.moe_cache.budget_mib;
+    // with --fit, the margin it keeps free on the device is the memory kept out of the cache
+    cparams.moe_cache_reserve_mib     = params.fit_params ? params.fit_params_target[0] / (1024*1024) : 0;
     cparams.moe_cache_expert_parallel = params.moe_cache.expert_parallel;
     cparams.moe_cache_cpu_overlap     = params.moe_cache.cpu_overlap;
     cparams.moe_cache_profile_path    = nullptr;

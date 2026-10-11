@@ -24,6 +24,7 @@ struct llama_cparams {
 
     enum llama_moe_cache_mode moe_cache_mode;
     size_t moe_cache_budget_mib;
+    size_t moe_cache_reserve_mib;
     int32_t moe_cache_expert_parallel;
     int32_t moe_cache_cpu_overlap;
     std::string moe_cache_profile_path;

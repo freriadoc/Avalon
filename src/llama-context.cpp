@@ -132,6 +132,7 @@ llama_context::llama_context(
 
     cparams.moe_cache_mode            = params.moe_cache_mode;
     cparams.moe_cache_budget_mib      = params.moe_cache_budget_mib;
+    cparams.moe_cache_reserve_mib     = params.moe_cache_reserve_mib;
     cparams.moe_cache_expert_parallel = params.moe_cache_expert_parallel;
     cparams.moe_cache_cpu_overlap     = params.moe_cache_cpu_overlap;
     cparams.moe_cache_profile_path    = params.moe_cache_profile_path ? params.moe_cache_profile_path : "";
@@ -475,8 +476,9 @@ llama_context::llama_context(
         }
 
         // deferred: the first decode reserves (sched_need_reserve is still set); the flash
-        // attention check below needs an explicit choice, which auto FA only makes at reserve
-        if (!params.defer_reserve || cparams.auto_fa) {
+        // attention check below needs an explicit choice, which auto FA only makes at reserve.
+        // A measuring context (no_alloc, --fit) reserves now: it reports its compute buffer sizes and creates no cache
+        if (!params.defer_reserve || cparams.auto_fa || model.hparams.no_alloc) {
             sched_reserve();
         } else {
             LLAMA_LOG_INFO("%s: graph reserve deferred to the first decode\n", __func__);
@@ -747,13 +749,14 @@ void llama_context::sched_reserve() {
         case LLAMA_MOE_CACHE_MODE_ON:   moe_cache_requested = "on";   break;
         case LLAMA_MOE_CACHE_MODE_UNSPECIFIED: break;
     }
-    LLAMA_LOG_INFO("%s: MoE cache requested=%s resolved=%s\n",
-            __func__, moe_cache_requested, moe_cache_eligible ? moe_cache_requested : "off");
+    LLAMA_LOG_INFO("%s: MoE cache requested=%s resolved=%s reserve=%zu MiB\n",
+            __func__, moe_cache_requested, moe_cache_eligible ? moe_cache_requested : "off", cparams.moe_cache_reserve_mib);
 
     const auto set_moe_cache = [&]() {
         ggml_backend_sched_set_moe_cache(
                 sched.get(), moe_cache_mode,
                 cparams.moe_cache_budget_mib,
+                cparams.moe_cache_reserve_mib,
                 cparams.moe_cache_expert_parallel,
                 cparams.moe_cache_cpu_overlap,
                 cparams.moe_cache_profile_path.empty() ? nullptr : cparams.moe_cache_profile_path.c_str());
@@ -3973,6 +3976,7 @@ llama_context_params llama_context_default_params() {
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.moe_cache_mode              =*/ LLAMA_MOE_CACHE_MODE_UNSPECIFIED,
         /*.moe_cache_budget_mib        =*/ 0,
+        /*.moe_cache_reserve_mib       =*/ 0,
         /*.moe_cache_expert_parallel   =*/ 0,
         /*.moe_cache_cpu_overlap       =*/ -2,
         /*.moe_cache_profile_path      =*/ nullptr,

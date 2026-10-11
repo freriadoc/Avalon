@@ -2666,7 +2666,8 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.defer_reserve = false;
     // one MoE cache per device: a draft session would size itself on the free memory first
     // (the target reserve is deferred) and leave the target's cache nothing
-    result.moe_cache.mode = COMMON_MOE_CACHE_MODE_OFF;
+    result.moe_cache.mode          = COMMON_MOE_CACHE_MODE_OFF;
+    result.moe_cache.mode_explicit = true; // otherwise left to the provider, which would give the draft a session too
     result.n_outputs_max = params.n_parallel;
     result.n_outputs_max_per_seq = 1;
 
