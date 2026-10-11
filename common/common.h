@@ -499,7 +499,7 @@ struct common_params {
 
     // margin per device in bytes for fitting parameters to free memory:
     // (also the device memory kept out of the MoE expert cache, see moe_cache_recommended_reserve_bytes)
-    std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), 700 * 1024*1024);
+    std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), 500 * 1024*1024);
 
     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
     enum llama_load_mode  load_mode  = LLAMA_LOAD_MODE_AUTO; // how to load the model

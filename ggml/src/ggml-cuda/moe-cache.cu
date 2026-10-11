@@ -898,16 +898,14 @@ static moe_cache_config moe_cache_read_config() {
 }
 
 // device memory kept out of the cache: what is allocated after it is sized, which depends on the model and the batch,
-// not on the card's size (the cache itself takes the free memory minus this). Measured (11 Oct., Qwen3.8-Flash-Next,
-// 256k, MTP, 8192-token ubatches, LD_PRELOAD tools/kfdalloc): ~340 MiB at the peak, of which the flash attention
-// scratch of two queues (2 x 44.6 MiB, the D=256 prefill kernel spills on RDNA3), the CWSR areas of two queues created
-// later (2 x 38.4), rocBLAS (12.7), kernel code (~20), ~140 outside the KFD allocations (rings, page tables); the
-// ggml-cuda pool no longer grows (temporaries in the compute buffer). Peak at 824: 19.435 GiB, at 600: 19.652, the limit
-// before spilling to GTT 19.91 on a 20 GiB card: 700 keeps ~360 MiB of margin. Also the default margin of --fit, which
-// sets the reserve when it runs.
+// not on the card's size (the cache itself takes the free memory minus this). The queues and their scratch are created
+// before (moe_cache_prepare_queues); measured after (11 Oct., Qwen3.8-Flash-Next, 256k, MTP, 8192-token ubatches,
+// LD_PRELOAD tools/kfdalloc): ~170 MiB at the peak, of which rocBLAS and graph buffers ~25, ~145 outside the KFD
+// allocations (queue rings, page tables). 500 covers it about three times. Also the default margin of --fit, which sets
+// the reserve when it runs.
 static size_t moe_cache_recommended_reserve_bytes(size_t total_vram) {
     constexpr size_t MiB = 1024 * 1024;
-    return std::min<size_t>(700 * MiB, total_vram / 4);
+    return std::min<size_t>(500 * MiB, total_vram / 4);
 }
 
 static bool moe_cache_fail(const moe_cache_session & session, const char * stage) {
