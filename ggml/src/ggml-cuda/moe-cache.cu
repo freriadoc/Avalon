@@ -144,6 +144,7 @@ struct moe_cache_slot {
     int prev = -1;
     int next = -1;
     int readers = 0;
+    uint16_t freq = 0;   // LFU: aged demand count while resident
     moe_cache_slot_state state = moe_cache_slot_state::free;
 };
 
@@ -322,6 +323,12 @@ struct moe_cache_config {
     bool admit_after_explicit = false;
     int readmit_after = 8;
     bool readmit_after_explicit = false;
+    // LFU (buun, 766fa07b2): a full pool admits an expert only when its aged demand beats the least recently used
+    // entry's; every count halves each lfu_window x entries demands, and is capped at lfu_cap.
+    // GGML_CUDA_MOE_CACHE_LFU=0: readmit_after demands, counts never age
+    int lfu = 1;
+    int lfu_window = 5;
+    int lfu_cap = 15;
     int queue_max = 128;
     size_t queue_mb = 512;
     int stats_every = 0;
@@ -397,6 +404,8 @@ struct moe_cache_device {
     // weights by the SDMA engine, without the memcpy to the stage
     std::vector<std::pair<uintptr_t, uintptr_t>> pinned;
     std::unordered_map<moe_cache_key, moe_cache_demand, moe_cache_key_hash> demand_count;
+    uint64_t freq_demands = 0;   // LFU: demands since the last aging
+    double freq_period = 0;      // LFU: demands between agings, fixed when first needed (a lent KV tail adds entries later)
     size_t visits_since_new_tensor = 0;
     bool budget_ready = false;
     bool budget_registered = false;
@@ -835,6 +844,15 @@ static moe_cache_config moe_cache_read_config() {
     if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_THROTTLE", 1, 1024, value)) {
         config.readmit_after = (int)value;
         config.readmit_after_explicit = true;
+    }
+    if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_LFU", 0, 1, value)) {
+        config.lfu = (int) value;
+    }
+    if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_LFU_WINDOW", 1, 1000, value)) {
+        config.lfu_window = (int)value;
+    }
+    if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_LFU_CAP", 2, 65535, value)) {
+        config.lfu_cap = (int)value;
     }
     if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_QUEUE", 1, 65536, value)) {
         config.queue_max = (int)value;
@@ -1332,6 +1350,7 @@ static void moe_cache_slot_reset(moe_cache_pool & pool, int index, bool add_to_f
     slot.key = {};
     slot.generation++;
     slot.readers = 0;
+    slot.freq = 0;
     slot.state = moe_cache_slot_state::free;
     slot.prev = -1;
     slot.next = -1;
@@ -1541,7 +1560,7 @@ static bool moe_cache_enqueue_locked(
         moe_cache_session & session, moe_cache_device & device,
         moe_cache_pool & pool, int pool_index, const void * host_base,
         int32_t expert, size_t expert_size, int & inserts_left,
-        bool & wake_worker, bool allow_eviction, bool rewarm, bool pregate);
+        bool & wake_worker, bool allow_eviction, bool rewarm, bool pregate, uint16_t freq = 0, bool contest = false);
 static void moe_cache_rewarm_stop_locked(moe_cache_device & device);
 
 // PREGATE: experts predicted per token for the next layer of a hosted pass of at least 2 tokens (MTP
@@ -2719,6 +2738,7 @@ static void moe_cache_free_device(moe_cache_device & device) {
     }
     device.owned_regions.clear();
     device.pools.clear();
+    device.freq_period = 0;
     device.allocated_bytes = 0;
     device.d_input_cap = 0;
     device.act_q8_cap = 0;
@@ -2931,7 +2951,7 @@ static bool moe_cache_enqueue_locked(
         moe_cache_session & session, moe_cache_device & device,
         moe_cache_pool & pool, int pool_index, const void * host_base,
         int32_t expert, size_t expert_size, int & inserts_left,
-        bool & wake_worker, bool allow_eviction, bool rewarm, bool pregate) {
+        bool & wake_worker, bool allow_eviction, bool rewarm, bool pregate, uint16_t freq, bool contest) {
     GGML_UNUSED(expert_size);   // the entry: pool.expert_size
     const moe_cache_key key{host_base, expert};
     const moe_cache_layer * layer = moe_cache_layer_of(device, host_base);
@@ -2956,9 +2976,21 @@ static bool moe_cache_enqueue_locked(
             device.insert_skips++;
             return false;
         }
+        const uint16_t victim_freq = pool.slots[candidate].freq;
+        if (contest && victim_freq >= freq) {
+            device.admission_skips++;
+            return false;
+        }
+        const moe_cache_key victim = pool.slots[candidate].key;
         slot_index = candidate;
         moe_cache_slot_reset(pool, slot_index, false);
         device.evictions++;
+        if (session.config.lfu && victim_freq > 0) {
+            try {
+                device.demand_count[victim] = {victim_freq, pool.expert_size};   // its history follows it out
+            } catch (...) {
+            }
+        }
     } else {
         return false;
     }
@@ -2967,6 +2999,7 @@ static bool moe_cache_enqueue_locked(
     slot.key = key;
     slot.generation++;
     slot.readers = 0;
+    slot.freq = freq;
     slot.state = moe_cache_slot_state::copying;
     try {
         const auto inserted = pool.map.emplace(key, slot_index);
@@ -3058,9 +3091,12 @@ static int moe_cache_lookup_or_queue_locked(
         bool & wake_worker) {
     const moe_cache_key key{host_base, expert};
     auto found = pool.map.find(key);
+    device.freq_demands++;
+    const uint16_t freq_cap = session.config.lfu ? (uint16_t) session.config.lfu_cap : std::numeric_limits<uint16_t>::max();
     if (found != pool.map.end()) {
-        return pool.slots[found->second].state == moe_cache_slot_state::valid
-            ? found->second : -1;
+        moe_cache_slot & slot = pool.slots[found->second];
+        slot.freq += slot.freq < freq_cap;
+        return slot.state == moe_cache_slot_state::valid ? found->second : -1;
     }
 
     moe_cache_demand * demand = nullptr;
@@ -3071,23 +3107,52 @@ static int moe_cache_lookup_or_queue_locked(
         return -1;
     }
     demand->expert_size = expert_size;
-    if (demand->count < std::numeric_limits<uint16_t>::max()) {
-        demand->count++;
-    }
+    demand->count += demand->count < freq_cap;
     const int initial_admit_after =
         pool.covers_all_entries && !session.config.admit_after_explicit
             ? 1 : session.config.admit_after;
-    const int admit_after = pool.free_slots.empty()
+    const bool contest = session.config.lfu && pool.free_slots.empty();
+    const int admit_after = pool.free_slots.empty() && !contest
         ? std::max(initial_admit_after, session.config.readmit_after)
         : initial_admit_after;
     if (demand->count < admit_after) {
         device.admission_skips++;
         return -1;
     }
-    (void) moe_cache_enqueue_locked(
-            session, device, pool, pool_index, host_base, expert,
-            expert_size, inserts_left, wake_worker, true, false, false);
+    // the entry carries the count from here (enqueue may rehash demand_count)
+    if (moe_cache_enqueue_locked(session, device, pool, pool_index, host_base, expert, expert_size, inserts_left,
+                                 wake_worker, true, false, false, demand->count, contest) &&
+        session.config.lfu) {
+        device.demand_count.erase(key);
+    }
     return -1;
+}
+
+// LFU aging: every count halves once per lfu_window x entries demands, so recent demand outweighs history
+static void moe_cache_freq_age_locked(const moe_cache_session & session, moe_cache_device & device) {
+    if (!session.config.lfu) {
+        return;
+    }
+    if (device.freq_period <= 0) {
+        size_t entries = 0;
+        for (const auto & pool : device.pools) {
+            entries += pool->n_slots;
+        }
+        device.freq_period = (double) session.config.lfu_window * (double) std::max<size_t>(entries, 1);
+    }
+    if ((double) device.freq_demands < device.freq_period) {
+        return;
+    }
+    device.freq_demands = 0;
+    for (auto & pool : device.pools) {
+        for (auto & slot : pool->slots) {
+            slot.freq >>= 1;
+        }
+    }
+    for (auto it = device.demand_count.begin(); it != device.demand_count.end();) {
+        it->second.count >>= 1;
+        it = it->second.count ? std::next(it) : device.demand_count.erase(it);
+    }
 }
 
 
@@ -4835,9 +4900,12 @@ static int moe_hosted_plan(moe_hosted_state & st, moe_hosted_layer & layer, cons
                 continue;
             }
             if (slots[row] >= 0) {
+                device.hits++;
+                device.freq_demands++;
+                moe_cache_slot & slot = pool->slots[slots[row]];
+                slot.freq += slot.freq < (session.config.lfu ? session.config.lfu_cap : std::numeric_limits<uint16_t>::max());
                 moe_cache_lru_remove(*pool, slots[row]);
                 moe_cache_lru_push_back(*pool, slots[row]);
-                device.hits++;
                 continue;
             }
             cpu_rows[n_cpu++] = row;
@@ -4849,6 +4917,7 @@ static int moe_hosted_plan(moe_hosted_state & st, moe_hosted_layer & layer, cons
             }
         }
         device.nodes++;
+        moe_cache_freq_age_locked(session, device);
     }
     if (wake_worker) {
         session.cv.notify_all();
