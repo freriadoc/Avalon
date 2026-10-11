@@ -11785,6 +11785,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // asymmetric head_dim (hsk != hsv) with one or both sides not 64-aligned
+    // qwen4exp QSA: 2 K/V heads x GQA 12, D 256 (the vec kernel groups the 12 heads); gathered cells: 2051, not a
+    // multiple of the K/V tile
+    for (int64_t kv : { 256, 2048, 2051 }) {
+        for (int64_t nb : { 1, 3 }) {
+            for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+                if (kv % 256 != 0 && t != GGML_TYPE_F16) {
+                    continue;
+                }
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32,
+                                                                t, t == GGML_TYPE_Q8_0 ? GGML_TYPE_Q4_0 : t));
+            }
+        }
+    }
     test_cases.emplace_back(new test_flash_attn_ext(72, 64, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 72, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 113, 75, true, true, 8.0f, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
@@ -12127,6 +12140,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // qwen4exp QSA attention while decoding / verifying: 2 KV heads x GQA 12, D 256; dense scan (quantized KV, 256
+    // cells) and gathered cells (f16, 2051)
+    for (int64_t nb : { 1, 3 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 256,  nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 2048, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 2051, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 2304, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16));
+    }
 
     // qwen4exp hyper-connection boundary while decoding (1 token) and verifying an MTP draft (3 tokens)
     for (int64_t n_tokens : { 1, 3 }) {

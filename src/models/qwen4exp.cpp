@@ -794,7 +794,12 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
     inp->k_idxs     = mctx_idx->build_input_k_idxs(ctx0, ubatch);
     inp->pool_cells = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_pool);
     inp->pool_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool, n_pool);
-    inp->tail_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool - 1, n_tokens);
+    // the top blocks plus the tail, padded to the K/V tile of the flash attention (256 cells): a gathered
+    // attention over a multiple of it may group the heads of a K/V head (2051 -> 2304 cells, the extra slots
+    // empty: RDNA3 tile kernel 28.8 -> 16.9 us per QSA layer while decoding)
+    const uint32_t n_sel_live = kpool*std::min<uint32_t>(n_pool, hparams.indexer_top_k / kpool) + kpool - 1;
+    inp->n_sel      = GGML_PAD(n_sel_live, 256);
+    inp->tail_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool - 1 + (inp->n_sel - n_sel_live), n_tokens);
     ggml_set_input(inp->pool_cells);
     ggml_set_input(inp->pool_idxs);
     ggml_set_input(inp->tail_idxs);
@@ -826,8 +831,6 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
     inp->n_kv       = mctx_idx->get_n_kv();
     inp->n_new      = mctx_hyb->get_n_kpool_new();
     inp->cache_safe = mctx_hyb->get_kpool_cache_safe();
-    // the top blocks plus the tail
-    inp->n_sel      = kpool*std::min<uint32_t>(n_pool, hparams.indexer_top_k / kpool) + kpool - 1;
 
     inp->new_pool_idxs = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool, inp->n_new);
     ggml_set_input(inp->new_pool_idxs);
@@ -960,7 +963,7 @@ llama_model_qwen4exp::graph::qsa_sel llama_model_qwen4exp::graph::build_qsa_sel(
         cb(top_k, "indexer_top_k", il);
 
         ggml_tensor * tail = n_t == n_tokens ? inp_kpool->tail_idxs :
-            ggml_view_2d(ctx0, inp_kpool->tail_idxs, kpool - 1, n_t, inp_kpool->tail_idxs->nb[1], t0*inp_kpool->tail_idxs->nb[1]);
+            ggml_view_2d(ctx0, inp_kpool->tail_idxs, inp_kpool->tail_idxs->ne[0], n_t, inp_kpool->tail_idxs->nb[1], t0*inp_kpool->tail_idxs->nb[1]);
         ggml_tensor * sel_idx = ggml_get_rows(ctx0, inp_kpool->pool_idxs,
                 ggml_reshape_1d(ctx0, top_k, n_top_pool*n_t)); // [kpool, n_top_pool*n_t]
         sel_idx = ggml_reshape_2d(ctx0, sel_idx, kpool*n_top_pool, n_t);

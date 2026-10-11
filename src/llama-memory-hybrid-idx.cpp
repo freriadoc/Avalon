@@ -850,7 +850,9 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     GGML_ASSERT(n_pool == kpool_pad(st.n_pool_real));
     GGML_ASSERT(st.is_new.size() == st.n_pool_real);
     GGML_ASSERT(pool_mask == nullptr || (pool_mask->ne[0] == (int64_t) n_pool && pool_mask->ne[1] == (int64_t) n_tokens));
-    GGML_ASSERT(tail_idxs->ne[0] == (int64_t) kpool - 1 && tail_idxs->ne[1] == (int64_t) n_tokens);
+    // the tail may be wider than kpool - 1: the extra slots pad the selection and stay empty (sentinel)
+    GGML_ASSERT(tail_idxs->ne[0] >= (int64_t) kpool - 1 && tail_idxs->ne[1] == (int64_t) n_tokens);
+    const uint32_t n_tail_slots = (uint32_t) tail_idxs->ne[0];
     GGML_ASSERT(pool_idxs->ne[0] == (int64_t) kpool && pool_idxs->ne[1] == (int64_t) n_pool);
     GGML_ASSERT(st.cache_safe == (new_pool_rep != nullptr));
     GGML_ASSERT(ggml_backend_buffer_is_host(new_pool_idxs->buffer));
@@ -1082,7 +1084,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
             (uint32_t) ((rank[i] + 1) % kpool) :
             (uint32_t) ((p - sq.pos_min + 1) % (llama_pos) kpool);
 
-        for (uint32_t k = 0; k < kpool - 1; ++k) {
+        for (uint32_t k = 0; k < n_tail_slots; ++k) {
             int32_t cell = sentinel;
             bool    real = false;
             if (k < n_tail && by_order) {
@@ -1097,9 +1099,9 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
                     real = true;
                 }
             }
-            tidx[(size_t) i*(kpool - 1) + k] = cell;
+            tidx[(size_t) i*n_tail_slots + k] = cell;
 
-            if (gm != nullptr && n_sel % kpool != 0) {
+            if (gm != nullptr && n_sel % kpool != 0 && k < kpool - 1) {
                 gm[(size_t) i*n_sel + (size_t) n_top*kpool + k] = real ? 0.0f : -INFINITY;
             }
         }
