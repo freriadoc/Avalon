@@ -15,6 +15,7 @@
 
 #include "../ggml/src/ggml-backend-moe-cache.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
