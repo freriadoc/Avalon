@@ -107,10 +107,63 @@ static const ggml_tensor * qwen4_hc_view_base(const ggml_tensor * t) {
 // the new residual, or xn, the old residual's memory); any other overlap refuses the fusion, since
 // the block output and the inject are shared by the streams of a token.
 static constexpr int QWEN4_HC_K1_THREADS = 1024;
-static constexpr int QWEN4_HC_K1_PER_THREAD = 4; // n_embd <= 4096
+static constexpr int QWEN4_HC_K1_PER_THREAD = 4; // n_embd <= 4096, 4 contiguous values per thread
+
+// The block output is either read (block) or computed here (red.experts): the weighted reduction of the routed
+// experts plus the gated shared expert, the arithmetic of moe_weighted_reduction_f32 in the same order (same bits),
+// redone by each stream of a token.
+struct qwen4_hc_reduction {
+    const float * experts = nullptr;       // rows (token, expert) x n_embd
+    const float * expert_scale = nullptr;  // per row, or nullptr
+    const float * weights = nullptr;       // per row
+    const float * sh = nullptr;            // shared expert, token x n_embd, or nullptr
+    const float * sh_logit = nullptr;      // its gate's logit, per token
+    int n_used = 0;
+};
+
+static constexpr int QWEN4_HC_RED_MAX_EXPERTS = 16;
+
+// 4 contiguous values per thread, read and written 16 bytes at a time (n_embd % 4 == 0, 16-byte aligned rows): with
+// the reduction computed here, one workgroup per (stream, token) reads ~11 rows of the embedding, and scalar loads
+// made the fused kernel 6.6 us against 3.3 + 2.4 for K1 and the reduction (issue-bound on one CU).
+static __device__ __forceinline__ float4 qwen4_hc_ld4(const float * p) { return *(const float4 *) p; }
+
+// every load issued before the sum, then the arithmetic of moe_weighted_reduction_f32 in its order (same bits)
+static __device__ __forceinline__ float4 qwen4_hc_block_value(const qwen4_hc_reduction & red, int t, int e, int n_embd) {
+    const uint64_t first_row = (uint64_t) t * red.n_used;
+    float4 v[QWEN4_HC_RED_MAX_EXPERTS];
+#pragma unroll
+    for (int expert = 0; expert < QWEN4_HC_RED_MAX_EXPERTS; ++expert) {
+        v[expert] = expert < red.n_used ? qwen4_hc_ld4(red.experts + (first_row + expert) * n_embd + e) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+    const float4 sh = red.sh != nullptr ? qwen4_hc_ld4(red.sh + (size_t) t * n_embd + e) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    const float s0 = red.expert_scale != nullptr ? red.expert_scale[first_row] : 1.0f;
+    const float w0 = red.weights[first_row];
+    float4 sum = make_float4((v[0].x * s0) * w0, (v[0].y * s0) * w0, (v[0].z * s0) * w0, (v[0].w * s0) * w0);
+#pragma unroll
+    for (int expert = 1; expert < QWEN4_HC_RED_MAX_EXPERTS; ++expert) {
+        if (expert < red.n_used) {
+            const uint64_t row = first_row + expert;
+            const float sc = red.expert_scale != nullptr ? red.expert_scale[row] : 1.0f;
+            const float w = red.weights[row];
+            sum.x += (v[expert].x * sc) * w;
+            sum.y += (v[expert].y * sc) * w;
+            sum.z += (v[expert].z * sc) * w;
+            sum.w += (v[expert].w * sc) * w;
+        }
+    }
+    if (red.sh != nullptr) {
+        const float g = 1.0f + expf(-red.sh_logit[t]);
+        sum.x += sh.x / g;
+        sum.y += sh.y / g;
+        sum.z += sh.z / g;
+        sum.w += sh.w / g;
+    }
+    return sum;
+}
 
 static __global__ void qwen4_hc_combine_norm_f32(
-        const float * residual, const float * block, const float * inject, const float * gamma,
+        const float * residual, const float * block, const qwen4_hc_reduction red, const float * inject, const float * gamma,
         float * res_out, float * xn, half * xh,
         int n_embd, int hc, float s1, float b1, float s2, float b2, float eps) {
     const int c = blockIdx.x;
@@ -119,17 +172,17 @@ static __global__ void qwen4_hc_combine_norm_f32(
     const float v = inject[c + t*hc] * s1 + b1;
     const float w = (1.0f / (1.0f + expf(-v))) * s2 + b2;
 
-    const float * r_in = residual + ((size_t) t*hc + c)*n_embd;
-    const float * b_in = block + (size_t) t*n_embd;
+    const size_t row = ((size_t) t*hc + c)*n_embd;
+    const int e = 4*threadIdx.x;
+    const bool active = e < n_embd;
 
-    float r[QWEN4_HC_K1_PER_THREAD];
-    float ss = 0.0f;
-#pragma unroll
-    for (int k = 0; k < QWEN4_HC_K1_PER_THREAD; ++k) {
-        const int e = threadIdx.x + k*QWEN4_HC_K1_THREADS;
-        r[k] = e < n_embd ? r_in[e] + b_in[e] * w : 0.0f;
-        ss += r[k] * r[k];
+    float4 r = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (active) {
+        const float4 bv = block ? qwen4_hc_ld4(block + (size_t) t*n_embd + e) : qwen4_hc_block_value(red, t, e, n_embd);
+        const float4 ri = qwen4_hc_ld4(residual + row + e);
+        r = make_float4(ri.x + bv.x * w, ri.y + bv.y * w, ri.z + bv.z * w, ri.w + bv.w * w);
     }
+    float ss = r.x * r.x + r.y * r.y + r.z * r.z + r.w * r.w;
 
     __shared__ float partial[QWEN4_HC_K1_THREADS / 32];
     const int warp = threadIdx.x / WARP_SIZE;
@@ -143,19 +196,16 @@ static __global__ void qwen4_hc_combine_norm_f32(
     sum = warp_reduce_sum(sum);
     const float scale = rsqrtf(sum / n_embd + eps);
 
-    float * r_out = res_out + ((size_t) t*hc + c)*n_embd;
-    float * x_out = xn + ((size_t) t*hc + c)*n_embd;
-    const float * g = gamma + (size_t) c*n_embd;
-#pragma unroll
-    for (int k = 0; k < QWEN4_HC_K1_PER_THREAD; ++k) {
-        const int e = threadIdx.x + k*QWEN4_HC_K1_THREADS;
-        if (e < n_embd) {
-            r_out[e] = r[k];
-            const float xv = r[k] * scale * g[e];
-            x_out[e] = xv;
-            if (xh) {
-                xh[((size_t) t*hc + c)*n_embd + e] = __float2half(xv);   // for K2, the same layout as xn
-            }
+    if (active) {
+        const float4 g = qwen4_hc_ld4(gamma + (size_t) c*n_embd + e);
+        const float4 xv = make_float4(r.x * scale * g.x, r.y * scale * g.y, r.z * scale * g.z, r.w * scale * g.w);
+        *(float4 *) (res_out + row + e) = r;
+        *(float4 *) (xn + row + e) = xv;
+        if (xh) {
+            // for K2, the same layout as xn
+            half2 * h = (half2 *) (xh + row + e);
+            h[0] = __floats2half2_rn(xv.x, xv.y);
+            h[1] = __floats2half2_rn(xv.z, xv.w);
         }
     }
 }
@@ -580,6 +630,79 @@ static void qwen4_hc_k2_launch(const ggml_cgraph * cgraph, const qwen4_hc_span &
             (int) x->ne[1], ggml_get_op_params_f32(sc, 0), ggml_get_op_params_f32(sc, 1), stream);
 }
 
+// K1 at nodes i .. i + 5 (and K2 right after it when it matches). red: the block output is computed by K1 from the
+// weighted reduction that produces it (its tensors given in red_ins, checked like the other inputs), nullptr: read.
+// A workgroup per (stream, token) reads all of its stream's inputs before writing its stream's outputs: an output may
+// alias the residual exactly (same layout: ggml-alloc gives the new residual the previous one's memory), whatever the
+// number of tokens. Any other overlap refuses the fusion (the block output and the inject have another per-token
+// layout, gamma is shared). Returns the nodes to skip after i, 0 if refused.
+static int qwen4_hc_fuse_k1(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i,
+        bool (*check_ranges)(const ggml_cgraph *, int, int, const int *, int),
+        const qwen4_hc_reduction * red, const ggml_tensor * const * red_ins = nullptr, int n_red_ins = 0) {
+    cudaStream_t stream = ctx.stream();
+    const ggml_tensor * post_n = cgraph->nodes[i + 3];
+    const ggml_tensor * mul_n  = cgraph->nodes[i + 5];
+    std::vector<const ggml_tensor *> ins = { cgraph->nodes[i]->src[0], mul_n->src[1] };
+    if (red) {
+        ins.insert(ins.end(), red_ins, red_ins + n_red_ins);
+    } else {
+        ins.push_back(post_n->src[0]);
+    }
+    const ggml_tensor * res    = post_n->src[1];
+    const ggml_tensor * outs[2] = { post_n, mul_n };
+    bool ok = !qwen4_hc_overlap(post_n, mul_n);
+    for (const ggml_tensor * o : outs) {
+        for (const ggml_tensor * in : ins) {
+            ok = ok && (in == nullptr || !qwen4_hc_overlap(o, in));
+        }
+        ok = ok && (!qwen4_hc_overlap(o, res) ||
+                    (o->data == res->data && ggml_nbytes(o) == ggml_nbytes(res) && ggml_is_contiguous(res) && ggml_is_contiguous(o)));
+    }
+    // 16-byte rows (qwen4_hc_ld4); the xh scratch comes from the pool, aligned
+    const auto al16 = [](const void * p) { return ((uintptr_t) p & 15) == 0; };
+    ok = ok && post_n->src[1]->ne[0] % 4 == 0 && al16(post_n->data) && al16(mul_n->data) && al16(post_n->src[1]->data) &&
+         al16(mul_n->src[1]->data) && (red ? al16(red->experts) && (!red->sh || al16(red->sh)) : al16(post_n->src[0]->data));
+    if (!ok) {
+        return 0;
+    }
+    const ggml_tensor * sc1  = cgraph->nodes[i];
+    const ggml_tensor * sc2  = cgraph->nodes[i + 2];
+    ggml_tensor *       post = cgraph->nodes[i + 3];
+    const ggml_tensor * rms  = cgraph->nodes[i + 4];
+    ggml_tensor *       mul  = cgraph->nodes[i + 5];
+    const ggml_tensor * residual = post->src[1];
+    const int n_embd = (int) residual->ne[0];
+    const int hc     = (int) residual->ne[1];
+    const int T      = (int) residual->ne[2];
+    float eps;
+    memcpy(&eps, rms->op_params, sizeof(float));
+
+    // K2 right after (views in between) on this xn: K1 also writes xn in f16 for it, no conversion launch
+    int j = i + 6;
+    while (j < cgraph->n_nodes && qwen4_hc_is_view(cgraph->nodes[j])) {
+        ++j;
+    }
+    qwen4_hc_span span2;
+    const bool with_k2 = j < cgraph->n_nodes && cgraph->nodes[j]->op == GGML_OP_MUL_MAT &&
+        qwen4_hc_match_k2(cgraph, j, span2) && qwen4_hc_view_base(cgraph->nodes[span2.idx[0]]->src[1]) == mul &&
+        qwen4_hc_k2_ranges_ok(cgraph, j, span2, check_ranges);
+    ggml_cuda_pool_alloc<half> xh(ctx.pool());
+    if (with_k2) {
+        xh.alloc((size_t) T * hc * n_embd);
+    }
+    qwen4_hc_combine_norm_f32<<<dim3(hc, T), QWEN4_HC_K1_THREADS, 0, stream>>>(
+            (const float *) residual->data, red ? nullptr : (const float *) post->src[0]->data, red ? *red : qwen4_hc_reduction(),
+            (const float *) sc1->src[0]->data, (const float *) mul->src[1]->data,
+            (float *) post->data, (float *) mul->data, with_k2 ? xh.get() : nullptr, n_embd, hc,
+            ggml_get_op_params_f32(sc1, 0), ggml_get_op_params_f32(sc1, 1),
+            ggml_get_op_params_f32(sc2, 0), ggml_get_op_params_f32(sc2, 1), eps);
+    if (!with_k2) {
+        return 5;
+    }
+    qwen4_hc_k2_launch(cgraph, span2, xh.get(), stream);
+    return (j - i) + span2.n_all - 1;
+}
+
 int ggml_cuda_try_fuse_qwen4_hc(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i,
         bool (*check_ranges)(const ggml_cgraph *, int, int, const int *, int)) {
     static const bool disabled = getenv("GGML_CUDA_DISABLE_QWEN4_HC") != nullptr; // A/B against the unfused ops
@@ -590,62 +713,7 @@ int ggml_cuda_try_fuse_qwen4_hc(ggml_backend_cuda_context & ctx, ggml_cgraph * c
     cudaStream_t stream = ctx.stream();
 
     if (node->op == GGML_OP_SCALE && qwen4_hc_match_k1(cgraph, i)) {
-        // A workgroup per (stream, token) reads all of its stream's inputs before writing its stream's
-        // outputs: an output may alias the residual exactly (same layout: ggml-alloc gives the new
-        // residual the previous one's memory), whatever the number of tokens. Any other overlap refuses the fusion
-        // (the block output and the inject have another per-token layout, gamma is shared).
-        const ggml_tensor * post_n = cgraph->nodes[i + 3];
-        const ggml_tensor * mul_n  = cgraph->nodes[i + 5];
-        const ggml_tensor * ins[3] = { post_n->src[0], cgraph->nodes[i]->src[0], mul_n->src[1] };
-        const ggml_tensor * res    = post_n->src[1];
-        const ggml_tensor * outs[2] = { post_n, mul_n };
-        bool ok = !qwen4_hc_overlap(post_n, mul_n);
-        for (const ggml_tensor * o : outs) {
-            for (const ggml_tensor * in : ins) {
-                ok = ok && !qwen4_hc_overlap(o, in);
-            }
-            ok = ok && (!qwen4_hc_overlap(o, res) ||
-                        (o->data == res->data && ggml_nbytes(o) == ggml_nbytes(res) && ggml_is_contiguous(res) && ggml_is_contiguous(o)));
-        }
-        if (!ok) {
-            return 0;
-        }
-        const ggml_tensor * sc1  = cgraph->nodes[i];
-        const ggml_tensor * sc2  = cgraph->nodes[i + 2];
-        ggml_tensor *       post = cgraph->nodes[i + 3];
-        const ggml_tensor * rms  = cgraph->nodes[i + 4];
-        ggml_tensor *       mul  = cgraph->nodes[i + 5];
-        const ggml_tensor * residual = post->src[1];
-        const int n_embd = (int) residual->ne[0];
-        const int hc     = (int) residual->ne[1];
-        const int T      = (int) residual->ne[2];
-        float eps;
-        memcpy(&eps, rms->op_params, sizeof(float));
-
-        // K2 right after (views in between) on this xn: K1 also writes xn in f16 for it, no conversion launch
-        int j = i + 6;
-        while (j < cgraph->n_nodes && qwen4_hc_is_view(cgraph->nodes[j])) {
-            ++j;
-        }
-        qwen4_hc_span span2;
-        const bool with_k2 = j < cgraph->n_nodes && cgraph->nodes[j]->op == GGML_OP_MUL_MAT &&
-            qwen4_hc_match_k2(cgraph, j, span2) && qwen4_hc_view_base(cgraph->nodes[span2.idx[0]]->src[1]) == mul &&
-            qwen4_hc_k2_ranges_ok(cgraph, j, span2, check_ranges);
-        ggml_cuda_pool_alloc<half> xh(ctx.pool());
-        if (with_k2) {
-            xh.alloc((size_t) T * hc * n_embd);
-        }
-        qwen4_hc_combine_norm_f32<<<dim3(hc, T), QWEN4_HC_K1_THREADS, 0, stream>>>(
-                (const float *) residual->data, (const float *) post->src[0]->data,
-                (const float *) sc1->src[0]->data, (const float *) mul->src[1]->data,
-                (float *) post->data, (float *) mul->data, with_k2 ? xh.get() : nullptr, n_embd, hc,
-                ggml_get_op_params_f32(sc1, 0), ggml_get_op_params_f32(sc1, 1),
-                ggml_get_op_params_f32(sc2, 0), ggml_get_op_params_f32(sc2, 1), eps);
-        if (!with_k2) {
-            return 5;
-        }
-        qwen4_hc_k2_launch(cgraph, span2, xh.get(), stream);
-        return (j - i) + span2.n_all - 1;
+        return qwen4_hc_fuse_k1(ctx, cgraph, i, check_ranges, nullptr);
     }
 
     qwen4_hc_span span2;
@@ -698,4 +766,42 @@ int ggml_cuda_try_fuse_qwen4_hc(ggml_backend_cuda_context & ctx, ggml_cgraph * c
 
 bool ggml_cuda_qwen4_hc_k1_at(const ggml_cgraph * cgraph, int i) {
     return i + 5 < cgraph->n_nodes && cgraph->nodes[i]->op == GGML_OP_SCALE && qwen4_hc_match_k1(cgraph, i);
+}
+
+int ggml_cuda_qwen4_hc_fuse_reduction_k1(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int start, int k1,
+        bool (*check_ranges)(const ggml_cgraph *, int, int, const int *, int),
+        const ggml_tensor * experts, const ggml_tensor * expert_scale, const ggml_tensor * weights,
+        const ggml_tensor * sh, const ggml_tensor * sh_logit) {
+    static const bool disabled = getenv("GGML_CUDA_DISABLE_QWEN4_HC") != nullptr || getenv("GGML_CUDA_DISABLE_REDUCE_K1") != nullptr;
+    if (disabled || experts->ne[1] > QWEN4_HC_RED_MAX_EXPERTS || !ggml_cuda_qwen4_hc_k1_at(cgraph, k1) ||
+            cgraph->nodes[k1 + 3]->src[0] != cgraph->nodes[k1 - 1]) {
+        return 0;
+    }
+    const ggml_tensor * block = cgraph->nodes[k1 - 1];
+    if (experts->ne[0] != block->ne[0] || experts->ne[2] * experts->ne[3] != cgraph->nodes[k1 + 3]->ne[2]) {
+        return 0;
+    }
+    // the block output is used by K1 only: nothing but K1's two outputs leaves the span
+    const int count = k1 + 6 - start;
+    if (count > 32) {
+        return 0;
+    }
+    enum ggml_op ops[32];
+    for (int k = 0; k < count; k++) {
+        ops[k] = cgraph->nodes[start + k]->op;
+    }
+    const int outputs[2] = { k1 + 3, k1 + 5 };
+    if (!ggml_can_fuse_subgraph(cgraph, start, count, ops, outputs, 2)) {
+        return 0;
+    }
+    qwen4_hc_reduction red;
+    red.experts = (const float *) experts->data;
+    red.expert_scale = expert_scale ? (const float *) expert_scale->data : nullptr;
+    red.weights = (const float *) weights->data;
+    red.sh = sh ? (const float *) sh->data : nullptr;
+    red.sh_logit = sh_logit ? (const float *) sh_logit->data : nullptr;
+    red.n_used = (int) experts->ne[1];
+    const ggml_tensor * red_ins[5] = { experts, expert_scale, weights, sh, sh_logit };
+    const int skip = qwen4_hc_fuse_k1(ctx, cgraph, k1, check_ranges, &red, red_ins, 5);
+    return skip > 0 ? (k1 - start) + skip : 0;
 }

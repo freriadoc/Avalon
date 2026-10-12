@@ -4511,6 +4511,66 @@ struct test_qwen4_hc_combine_norm : public test_dsv4_hc {
     }
 };
 
+// the weighted reduction of a MoE block with its gated shared expert, then K1 on that block output: ggml-cuda computes
+// the reduction inside K1 (one kernel)
+struct test_qwen4_hc_reduce_norm : public test_dsv4_hc {
+    const int64_t n_embd;
+    const int64_t n_tokens;
+    const int64_t n_used;
+    ggml_tensor * post_node = nullptr;
+    ggml_tensor * xn_node   = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "QWEN4_HC_REDUCE_NORM"; }
+    std::string vars() override { return VARS_TO_STR3(n_embd, n_tokens, n_used); }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { post_node, xn_node }; }
+    double max_nmse_err() override { return 1e-9; }
+
+    test_qwen4_hc_reduce_norm(int64_t n_embd = 2560, int64_t n_tokens = 1, int64_t n_used = 10)
+        : n_embd(n_embd), n_tokens(n_tokens), n_used(n_used) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // the order of qwen4exp's graph: gated shared expert, weighting, one view per expert, their sum, + shared
+        ggml_tensor * logit   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_tokens);
+        ggml_set_name(logit, "gate");
+        ggml_tensor * sh      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(sh, "x");
+        ggml_tensor * experts = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_used, n_tokens);
+        ggml_set_name(experts, "x");
+        ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n_tokens);
+        ggml_set_name(weights, "weights");
+        ggml_tensor * gated = ggml_mul(ctx, sh, ggml_sigmoid(ctx, logit));
+        ggml_build_forward_expand(gf, gated);
+        ggml_tensor * weighted = ggml_mul(ctx, experts, weights);
+        ggml_build_forward_expand(gf, weighted);
+        std::vector<ggml_tensor *> views;
+        for (int64_t k = 0; k < n_used; ++k) {
+            views.push_back(ggml_view_2d(ctx, weighted, n_embd, n_tokens, weighted->nb[2], k*weighted->nb[1]));
+            ggml_build_forward_expand(gf, views.back());
+        }
+        ggml_tensor * moe = views[0];
+        for (int64_t k = 1; k < n_used; ++k) {
+            moe = ggml_add(ctx, moe, views[k]);
+            ggml_build_forward_expand(gf, moe);
+        }
+        ggml_tensor * block = ggml_add(ctx, moe, gated);
+
+        ggml_tensor * inject   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+        ggml_set_name(inject, "gate");
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(residual, "residual");
+        ggml_tensor * gamma    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, hc);
+        ggml_set_name(gamma, "post");
+
+        ggml_tensor * w = ggml_sigmoid(ctx, ggml_scale(ctx, inject, 1.0f/hc));
+        w = ggml_scale(ctx, w, 2.0f);
+        post_node = ggml_dsv4_hc_post(ctx, block, residual, w, nullptr);
+        xn_node = ggml_mul(ctx, ggml_rms_norm(ctx, post_node, 1e-6f), gamma);
+        out = ggml_add(ctx, ggml_sum(ctx, xn_node), ggml_sum(ctx, post_node));
+        return out;
+    }
+};
+
 // K1 followed by K2 on its xn: ggml-cuda runs them together (K1 also writes xn in f16 for K2)
 struct test_qwen4_hc_combine_down : public test_dsv4_hc {
     const int64_t n_embd;
@@ -10330,6 +10390,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_pre(4096, 4, 21, true));
     for (int64_t n_tokens : { 1, 3, 8, 9 }) {
         test_cases.emplace_back(new test_qwen4_hc_combine_norm(2560, n_tokens));
+        test_cases.emplace_back(new test_qwen4_hc_reduce_norm(2560, n_tokens));
         test_cases.emplace_back(new test_qwen4_hc_down_inject(2560, 320, n_tokens));
         test_cases.emplace_back(new test_qwen4_hc_combine_down(2560, 320, n_tokens));
         test_cases.emplace_back(new test_qwen4_hc_up_pre(2560, 320, n_tokens));
@@ -12682,6 +12743,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // qwen4exp hyper-connection boundary while decoding (1 token) and verifying an MTP draft (3 tokens)
     for (int64_t n_tokens : { 1, 3 }) {
         test_cases.emplace_back(new test_qwen4_hc_combine_norm(2560, n_tokens));
+        test_cases.emplace_back(new test_qwen4_hc_reduce_norm(2560, n_tokens));
         test_cases.emplace_back(new test_qwen4_hc_down_inject(2560, 320, n_tokens));
         test_cases.emplace_back(new test_qwen4_hc_combine_down(2560, 320, n_tokens));
         test_cases.emplace_back(new test_qwen4_hc_up_pre(2560, 320, n_tokens));

@@ -22,3 +22,10 @@ void ggml_cuda_mul_mat_q8_0_f16(ggml_backend_cuda_context & ctx, const ggml_tens
 
 // Whether nodes i .. i + 5 are the combine + grouped norm run that ggml_cuda_try_fuse_qwen4_hc fuses (K1)
 bool ggml_cuda_qwen4_hc_k1_at(const ggml_cgraph * cgraph, int i);
+
+// The weighted reduction of a MoE block (nodes start .. k1 - 1, its last node the block output) computed by the K1
+// that reads it at k1: one kernel. Returns the nodes to skip after start, 0 if not fused.
+int ggml_cuda_qwen4_hc_fuse_reduction_k1(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int start, int k1,
+        bool (*check_ranges)(const ggml_cgraph *, int, int, const int *, int),
+        const ggml_tensor * experts, const ggml_tensor * expert_scale, const ggml_tensor * weights,
+        const ggml_tensor * sh, const ggml_tensor * sh_logit);

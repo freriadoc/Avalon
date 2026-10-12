@@ -4553,6 +4553,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             if (add->op == GGML_OP_ADD && ggml_is_contiguous(add) && add->type == GGML_TYPE_F32 && count < 32 &&
                     ((add->src[0] == match.dst && add->src[1] == gated) || (add->src[0] == gated && add->src[1] == match.dst)) &&
                     ggml_are_same_shape(add, match.dst) && ggml_are_same_shape(sh, match.dst)) {
+                // the hyper-connection combine + norm that reads the block output computes it (qwen4exp)
+                const int with_k1 = ggml_cuda_qwen4_hc_fuse_reduction_k1(*cuda_ctx, cgraph, i, add_idx + 1,
+                    [](const ggml_cgraph * g, int idx, int n, const int * outs, int n_outs) {
+                        return ggml_cuda_check_fusion_memory_ranges(g, idx, n, outs, n_outs);
+                    }, match.experts, match.expert_scale, match.weights, sh, logit);
+                if (with_k1 > 0) {
+                    return with_k1;
+                }
                 enum ggml_op ops[32];
                 for (int k = 0; k < count; k++) {
                     ops[k] = cgraph->nodes[i + k]->op;
@@ -6176,11 +6184,32 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             }
             ggml_cuda_moe_weighted_reduction_match match;
             if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
-                params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.experts), match.dst);
-                params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.weights), match.dst);
+                // with the gated shared expert added next and the hyper-connection K1 reading that sum, K1 computes
+                // the reduction (ggml_cuda_qwen4_hc_fuse_reduction_k1): its inputs live until K1's last node, so that
+                // K1's outputs are never placed over them
+                ggml_tensor * until = match.dst;
+                const int last = i + match.node_count - 1;
+                if (last + 7 < cgraph->n_nodes) {
+                    ggml_tensor * add = cgraph->nodes[last + 1];
+                    if (add->op == GGML_OP_ADD && (add->src[0] == match.dst || add->src[1] == match.dst) &&
+                            ggml_cuda_qwen4_hc_k1_at(cgraph, last + 2) && cgraph->nodes[last + 2 + 3]->src[0] == add) {
+                        until = cgraph->nodes[last + 2 + 5];
+                        ggml_tensor * gated = add->src[0] == match.dst ? add->src[1] : add->src[0];
+                        if (gated->op == GGML_OP_MUL) {
+                            for (ggml_tensor * in : { gated->src[0], gated->src[1] }) {
+                                params->add_alloc_dep(params->user_data, in, until);
+                                if (in->op == GGML_OP_UNARY && in->src[0]) {
+                                    params->add_alloc_dep(params->user_data, in->src[0], until);   // the gate's logit
+                                }
+                            }
+                        }
+                    }
+                }
+                params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.experts), until);
+                params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.weights), until);
                 if (match.expert_scale != nullptr) {
                     params->add_alloc_dep(
-                        params->user_data, const_cast<ggml_tensor *>(match.expert_scale), match.dst);
+                        params->user_data, const_cast<ggml_tensor *>(match.expert_scale), until);
                 }
                 i += match.node_count - 1;
             }
