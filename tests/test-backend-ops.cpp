@@ -5894,6 +5894,62 @@ struct test_mul_mat_hadamard : public test_mul_mat {
     }
 };
 
+// qwen4exp's gated attention output: the attention rotated back by 64-wide rows (Hadamard), times the sigmoid of the
+// gate (a strided view of the Q projection, made contiguous), then the output projection. ggml-cuda runs the first
+// four in one kernel that also writes the q8_1 the projection reads.
+struct test_fwht_gate : public test_case {
+    const int64_t n_tokens;
+    ggml_tensor * gated = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "FWHT_GATE"; }
+    std::string vars() override { return VARS_TO_STR1(n_tokens); }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { gated, out_node }; }
+    double max_nmse_err() override { return 5e-4; }
+
+    ggml_tensor * out_node = nullptr;
+
+    test_fwht_gate(int64_t n_tokens = 1) : n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t d = 256, n_head = 24, n = d * n_head;
+        ggml_tensor * rot = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
+        ggml_set_name(rot, "a");
+        ggml_tensor * attn = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, n_head, n_tokens);
+        ggml_set_name(attn, "attn");
+        ggml_tensor * q_full = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2 * n, n_tokens);
+        ggml_set_name(q_full, "q_full");
+        ggml_tensor * wo = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n, 256);
+        ggml_set_name(wo, "wo");
+
+        ggml_tensor * cur = ggml_mul_mat(ctx, rot, ggml_reshape_2d(ctx, attn, 64, ggml_nelements(attn) / 64));
+        ggml_mul_mat_set_hint(cur, GGML_HINT_SRC0_IS_HADAMARD);
+        cur = ggml_reshape_2d(ctx, cur, n, n_tokens);
+        ggml_tensor * gate = ggml_view_3d(ctx, q_full, d, n_head, n_tokens, q_full->nb[0] * d * 2, q_full->nb[0] * d * 2 * n_head,
+                                          q_full->nb[0] * d);
+        gate = ggml_cont_2d(ctx, gate, n, n_tokens);
+        gated = ggml_mul(ctx, cur, ggml_sigmoid(ctx, gate));
+        out_node = ggml_mul_mat(ctx, wo, gated);
+        return out_node;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "a") == 0) {
+                std::vector<float> data(64 * 64);
+                for (int64_t r = 0; r < 64; r++) {
+                    for (int64_t i = 0; i < 64; i++) {
+                        data[r * 64 + i] = (__builtin_popcountll(r & i) % 2 == 0 ? 1.0f : -1.0f) / 8.0f;
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // FP4 W4A8 path (GGML_PREC_Q8 on src1 disallows 4-bit activations)
 struct test_mul_mat_w4a8 : public test_mul_mat {
     test_mul_mat_w4a8(ggml_type type_a = GGML_TYPE_NVFP4, ggml_type type_b = GGML_TYPE_F32,
@@ -10391,6 +10447,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t n_tokens : { 1, 3, 8, 9 }) {
         test_cases.emplace_back(new test_qwen4_hc_combine_norm(2560, n_tokens));
         test_cases.emplace_back(new test_qwen4_hc_reduce_norm(2560, n_tokens));
+        test_cases.emplace_back(new test_fwht_gate(n_tokens));
         test_cases.emplace_back(new test_qwen4_hc_down_inject(2560, 320, n_tokens));
         test_cases.emplace_back(new test_qwen4_hc_combine_down(2560, 320, n_tokens));
         test_cases.emplace_back(new test_qwen4_hc_up_pre(2560, 320, n_tokens));
@@ -12744,6 +12801,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int64_t n_tokens : { 1, 3 }) {
         test_cases.emplace_back(new test_qwen4_hc_combine_norm(2560, n_tokens));
         test_cases.emplace_back(new test_qwen4_hc_reduce_norm(2560, n_tokens));
+        test_cases.emplace_back(new test_fwht_gate(n_tokens));
         test_cases.emplace_back(new test_qwen4_hc_down_inject(2560, 320, n_tokens));
         test_cases.emplace_back(new test_qwen4_hc_combine_down(2560, 320, n_tokens));
         test_cases.emplace_back(new test_qwen4_hc_up_pre(2560, 320, n_tokens));

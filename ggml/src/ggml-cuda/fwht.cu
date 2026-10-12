@@ -1,6 +1,9 @@
 #include "common.cuh"
 #include "convert.cuh"
 #include "fwht.cuh"
+#include "quantize.cuh"
+
+#include <vector>
 
 // wide FWHT blocks use one row per thread block with this many threads
 #define GGML_CUDA_FWHT_BLOCK_NT 256
@@ -239,4 +242,185 @@ bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src,
         default:
             return false;
     }
+}
+
+// ---------------------------------------------------------------- rotation back x sigmoid(gate), with its q8_1
+
+// One warp per row of N values: the transform of fwht_cuda<N, float> (same arithmetic), then each value times the
+// sigmoid of its gate (unary_gated_op_kernel's op_sigmoid(g) * x), and the q8_1 blocks of the product as
+// quantize_q8_1 writes them (N % 32 == 0: a register index of the warp is a block).
+template <int N>
+__launch_bounds__(4*ggml_cuda_get_physical_warp_size(), 1)
+__global__ void fwht_gate_cuda(const float * src, const char * gate, const int64_t g_ne0, const int64_t g_ne1,
+        const int64_t g_ne2, const size_t g_nb0, const size_t g_nb1, const size_t g_nb2, const size_t g_nb3,
+        float * dst, block_q8_1 * dst_q8_1, const int64_t n_rows, const float scale) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    static_assert(warp_size == QK8_1, "a q8_1 block per register index");
+
+    const int64_t r = (int64_t) blockIdx.x * blockDim.y + threadIdx.y;
+    if (r >= n_rows) {
+        return;
+    }
+    src += r * N;
+
+    static constexpr int el_w = N / warp_size;
+    float     reg[el_w];
+    const int lane = threadIdx.x;
+
+#pragma unroll
+    for (int i = 0; i < el_w; ++i) {
+        reg[i] = src[i * warp_size + lane] * scale;
+    }
+#pragma unroll
+    for (int h = 1; h < warp_size; h *= 2) {
+#pragma unroll
+        for (int j = 0; j < el_w; j++) {
+            const float val  = reg[j];
+            const float val2 = __shfl_xor_sync(0xFFFFFFFF, val, h, warp_size);
+            reg[j] = (lane & h) == 0 ? val + val2 : val2 - val;
+        }
+    }
+#pragma unroll
+    for (int h = warp_size; h < N; h *= 2) {
+        const int step = h / warp_size;
+#pragma unroll
+        for (int j = 0; j < el_w; j += 2 * step) {
+#pragma unroll
+            for (int k = 0; k < step; k++) {
+                const float x = reg[j + k];
+                const float y = reg[j + k + step];
+                reg[j + k]        = x + y;
+                reg[j + k + step] = x - y;
+            }
+        }
+    }
+
+#pragma unroll
+    for (int i = 0; i < el_w; ++i) {
+        const int64_t e = r * N + i * warp_size + lane;
+        int64_t t = e;
+        const int64_t i0 = t % g_ne0; t /= g_ne0;
+        const int64_t i1 = t % g_ne1; t /= g_ne1;
+        const int64_t i2 = t % g_ne2; t /= g_ne2;
+        const float g = *(const float *) (gate + i0*g_nb0 + i1*g_nb1 + i2*g_nb2 + t*g_nb3);
+        const float v = (1.0f / (1.0f + expf(-g))) * reg[i];
+        dst[e] = v;
+        if (dst_q8_1) {
+            const float amax = warp_reduce_max<QK8_1>(fabsf(v));
+            const float sum  = warp_reduce_sum<QK8_1>(v);
+            const float d    = amax / 127.0f;
+            dst_q8_1[e / QK8_1].qs[e % QK8_1] = amax == 0.0f ? 0 : roundf(v / d);
+            if (lane == 0) {
+                dst_q8_1[e / QK8_1].ds = make_half2(d, sum);
+            }
+        }
+    }
+}
+
+static bool fwht_gate_is_view(const ggml_tensor * t) {
+    return ggml_is_empty(t) || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_TRANSPOSE ||
+           t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_NONE;
+}
+
+static const ggml_tensor * fwht_gate_root(const ggml_tensor * t) {
+    while (t && t->op == GGML_OP_RESHAPE) {
+        t = t->src[0];
+    }
+    return t;
+}
+
+// nodes i (fwht), cont, sigmoid, mul; views and reshapes may sit in between
+static bool fwht_gate_match(const ggml_cgraph * cgraph, int i, int idx[4]) {
+    const ggml_tensor * mm = cgraph->nodes[i];
+    if (!ggml_cuda_op_mul_mat_use_fwht(mm) || mm->ne[0] != 64 || mm->src[1]->type != GGML_TYPE_F32) {
+        return false;
+    }
+    idx[0] = i;
+    int k = i + 1;
+    for (int j = 1; j < 4; j++) {
+        while (k < cgraph->n_nodes && fwht_gate_is_view(cgraph->nodes[k])) {
+            k++;
+        }
+        if (k >= cgraph->n_nodes) {
+            return false;
+        }
+        idx[j] = k++;
+    }
+    const ggml_tensor * cont = cgraph->nodes[idx[1]];
+    const ggml_tensor * sig  = cgraph->nodes[idx[2]];
+    const ggml_tensor * mul  = cgraph->nodes[idx[3]];
+    if (cont->op != GGML_OP_CONT || sig->op != GGML_OP_UNARY || ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID ||
+        mul->op != GGML_OP_MUL || fwht_gate_root(sig->src[0]) != cont) {
+        return false;
+    }
+    const ggml_tensor * other = mul->src[0] == sig ? mul->src[1] : mul->src[1] == sig ? mul->src[0] : nullptr;
+    const ggml_tensor * gate  = cont->src[0];
+    const int64_t n = ggml_nelements(mm);
+    return other && fwht_gate_root(other) == mm && cont->type == GGML_TYPE_F32 && gate->type == GGML_TYPE_F32 &&
+        sig->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 && ggml_is_contiguous(mul) && ggml_is_contiguous(cont) &&
+        ggml_nelements(cont) == n && ggml_nelements(sig) == n && ggml_nelements(mul) == n && ggml_nelements(gate) == n &&
+        ggml_are_same_shape(mul, sig);   // cont: the gate view in its row-major order (CONT_2D of a 3D view)
+}
+
+ggml_tensor * ggml_cuda_match_fwht_gate(const ggml_cgraph * cgraph, int i, ggml_tensor ** rows, ggml_tensor ** gate_src) {
+    int idx[4];
+    if (!fwht_gate_match(cgraph, i, idx)) {
+        return nullptr;
+    }
+    *rows     = cgraph->nodes[i]->src[1];
+    *gate_src = cgraph->nodes[idx[1]]->src[0];
+    return cgraph->nodes[idx[3]];
+}
+
+int ggml_cuda_try_fuse_fwht_gate(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
+    static const bool disabled = getenv("GGML_CUDA_DISABLE_FWHT_GATE") != nullptr;
+    int idx[4];
+    if (disabled || !fwht_gate_match(cgraph, i, idx)) {
+        return 0;
+    }
+    // the nodes of the group: the four computing ones and the views of them in between (a view of a tensor computed
+    // before the group, the gate's, stays out: it is an input)
+    std::vector<int> nodes;
+    std::vector<ggml_op> ops;
+    for (int k = i; k <= idx[3]; k++) {
+        const ggml_tensor * n = cgraph->nodes[k];
+        bool in = k == idx[0] || k == idx[1] || k == idx[2] || k == idx[3];
+        if (!in && fwht_gate_is_view(n)) {
+            for (const ggml_tensor * v = n->view_src ? n->view_src : n->src[0]; v && !in; v = v->view_src) {
+                for (int j : nodes) {
+                    in = in || cgraph->nodes[j] == v;
+                }
+            }
+        }
+        if (in) {
+            nodes.push_back(k);
+            ops.push_back(n->op);
+        }
+    }
+    const int out_idx = idx[3];
+    if (!ggml_can_fuse_subgraph_ext(cgraph, nodes.data(), (int) nodes.size(), ops.data(), &out_idx, 1)) {
+        return 0;
+    }
+    const ggml_tensor * mm   = cgraph->nodes[i];
+    const ggml_tensor * rows = mm->src[1];
+    const ggml_tensor * gate = cgraph->nodes[idx[1]]->src[0];
+    ggml_tensor *       mul  = cgraph->nodes[idx[3]];
+    // a warp reads its row and the gate values of its row, other warps write theirs: no overlap at all
+    const auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * al = (const char *) a->data, * ah = al + ggml_nbytes(a);
+        const char * bl = (const char *) b->data, * bh = bl + ggml_nbytes(b);
+        return al < bh && bl < ah;
+    };
+    if (!ggml_is_contiguous(rows) || overlap(mul, rows) || overlap(mul, gate)) {
+        return 0;
+    }
+    const int64_t n_rows = ggml_nelements(mm) / 64;
+    block_q8_1 * q8_1 = (block_q8_1 *) ggml_cuda_q8_1_produce(ctx, cgraph, idx[3]);
+    const int rows_per_block = 4;
+    const dim3 grid((n_rows + rows_per_block - 1) / rows_per_block, 1, 1);
+    const dim3 block(ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size, rows_per_block, 1);
+    fwht_gate_cuda<64><<<grid, block, 0, ctx.stream()>>>((const float *) rows->data, (const char *) gate->data,
+            gate->ne[0], gate->ne[1], gate->ne[2], gate->nb[0], gate->nb[1], gate->nb[2], gate->nb[3],
+            (float *) mul->data, q8_1, n_rows, 1.0f / sqrtf(64.0f));
+    return idx[3] - i;
 }

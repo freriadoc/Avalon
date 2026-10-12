@@ -4524,6 +4524,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    if (node->op == GGML_OP_MUL_MAT) {
+        const int skip = ggml_cuda_try_fuse_fwht_gate(*cuda_ctx, cgraph, i);
+        if (skip > 0) {
+            return skip;
+        }
+    }
+
     if (node->op == GGML_OP_SCALE || node->op == GGML_OP_MUL_MAT) {
         const int skip = ggml_cuda_try_fuse_qwen4_hc(*cuda_ctx, cgraph, i,
             [](const ggml_cgraph * g, int idx, int count, const int * outs, int n_outs) {
@@ -6170,6 +6177,15 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                             }
                         }
                     }
+                }
+            }
+            // the rotation back x sigmoid(gate) (ggml_cuda_try_fuse_fwht_gate): the rotated rows and the gate's source
+            // live until the product, never placed over them
+            {
+                ggml_tensor * rows = nullptr, * gate_src = nullptr;
+                if (ggml_tensor * mul = ggml_cuda_match_fwht_gate(cgraph, i, &rows, &gate_src)) {
+                    params->add_alloc_dep(params->user_data, rows, mul);
+                    params->add_alloc_dep(params->user_data, gate_src->view_src ? gate_src->view_src : gate_src, mul);
                 }
             }
             // the hyper-connection combine + norm (K1): its inputs live until its last node, so that its outputs are
