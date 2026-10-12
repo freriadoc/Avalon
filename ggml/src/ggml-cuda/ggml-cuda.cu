@@ -5516,6 +5516,37 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE }, {})) {
+        // the rotation of the rope's rows that follows (MUL_MAT by a 256-wide Hadamard matrix, its reshapes in between):
+        // computed by the same kernel (qwen4exp's Q and K before attention)
+        static const bool no_rope_fwht = getenv("GGML_CUDA_DISABLE_ROPE_FWHT") != nullptr;
+        ggml_tensor * rope = cgraph->nodes[i + 2];
+        int nodes[8] = { i, i + 1, i + 2 };
+        ggml_op ops[8] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE };
+        int n = 3;
+        int k = i + 3;
+        while (k < cgraph->n_nodes && n < 7 && ggml_cuda_is_view_or_noop(cgraph->nodes[k]) &&
+               cgraph->nodes[k]->view_src == rope && cgraph->nodes[k]->view_offs == 0) {
+            nodes[n] = k;
+            ops[n++] = cgraph->nodes[k]->op;
+            k++;
+        }
+        ggml_tensor * mm = k < cgraph->n_nodes ? cgraph->nodes[k] : nullptr;
+        if (!no_rope_fwht && mm && ggml_cuda_op_mul_mat_use_fwht(mm) && mm->ne[0] == 256 && rope->ne[0] == 256 &&
+                (mm->src[1] == rope || (mm->src[1]->view_src == rope && mm->src[1]->view_offs == 0)) &&
+                rope->type == GGML_TYPE_F32 && ggml_is_contiguous(rope) && ggml_is_contiguous(mm) &&
+                ggml_nelements(mm) == ggml_nelements(rope)) {
+            nodes[n] = k;
+            ops[n++] = GGML_OP_MUL_MAT;
+            // a row of x is read whole (norm) before the row of the rotation is written; rows of x are views of the
+            // projection, other rows of the output may be written meanwhile: no overlap at all
+            const ggml_tensor * x = node->src[0];
+            const char * xl = (const char *) x->data, * xh = xl + ggml_nbytes(x);
+            const char * ol = (const char *) mm->data, * oh = ol + ggml_nbytes(mm);
+            if (ggml_can_fuse_subgraph_ext(cgraph, nodes, n, ops, &k, 1) && !(xl < oh && ol < xh)) {
+                ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], rope, nullptr, mm);
+                return k - i;
+            }
+        }
         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], nullptr);
         return 2;
     }
@@ -6213,6 +6244,20 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                             }
                         }
                     }
+                }
+            }
+            // rms_norm * w, rope and the rotation of its rows in one kernel: the norm's input lives until the rotation,
+            // never placed over it
+            if (cgraph->nodes[i]->op == GGML_OP_RMS_NORM && i + 3 < cgraph->n_nodes && cgraph->nodes[i + 2]->op == GGML_OP_ROPE) {
+                ggml_tensor * rope = cgraph->nodes[i + 2];
+                int k = i + 3;
+                while (k < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[k]) && cgraph->nodes[k]->view_src == rope) {
+                    k++;
+                }
+                if (k < cgraph->n_nodes && ggml_cuda_op_mul_mat_use_fwht(cgraph->nodes[k]) &&
+                        (cgraph->nodes[k]->src[1] == rope || cgraph->nodes[k]->src[1]->view_src == rope)) {
+                    ggml_tensor * x = cgraph->nodes[i]->src[0];
+                    params->add_alloc_dep(params->user_data, x->view_src ? x->view_src : x, cgraph->nodes[k]);
                 }
             }
             // the rotation back x sigmoid(gate) (ggml_cuda_try_fuse_fwht_gate): the rotated rows and the gate's source

@@ -2856,6 +2856,64 @@ struct test_rms_norm_mul_rope : public test_case {
     }
 };
 
+// rms_norm * w, rope, then the rotation of each 256-wide row (MUL_MAT by a Hadamard matrix): qwen4exp's Q and K before
+// attention; ggml-cuda computes the rotation in the rope's kernel
+struct test_rms_norm_rope_fwht : public test_case {
+    const std::array<int64_t, 4> ne;
+    const int mode;
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "RMS_NORM_ROPE_FWHT"; }
+    bool run_whole_graph() override { return true; }
+    std::string vars() override { return VARS_TO_STR2(ne, mode); }
+
+    test_rms_norm_rope_fwht(std::array<int64_t, 4> ne = { 256, 24, 1, 1 }, int mode = GGML_ROPE_TYPE_IMROPE)
+        : ne(ne), mode(mode) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]);
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        ggml_tensor * rot = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[0]);
+        ggml_set_name(rot, "hadamard");
+        ggml_tensor * a = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
+        const bool is_mrope = mode & GGML_ROPE_TYPE_MROPE;
+        ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, ne[2] * (is_mrope ? 4 : 1));
+        if (is_mrope) {
+            int sections[4] = { 11, 11, 10, 0 };
+            a = ggml_rope_multi(ctx, a, pos, nullptr, 64, sections, mode, 0, 10000000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        } else {
+            a = ggml_rope(ctx, a, pos, 64, mode);
+        }
+        a = ggml_mul_mat(ctx, rot, ggml_reshape_2d(ctx, a, ne[0], ggml_nelements(a) / ne[0]));
+        ggml_mul_mat_set_hint(a, GGML_HINT_SRC0_IS_HADAMARD);
+        a = ggml_reshape_4d(ctx, a, ne[0], ne[1], ne[2], ne[3]);
+        ggml_set_name(a, "out");
+        return a;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "hadamard") == 0) {
+                const int64_t n = t->ne[0];
+                std::vector<float> data(n * n);
+                for (int64_t r = 0; r < n; r++) {
+                    for (int64_t i = 0; i < n; i++) {
+                        data[r * n + i] = (__builtin_popcountll(r & i) % 2 == 0 ? 1.0f : -1.0f) / sqrtf((float) n);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (int32_t & value : data) {
+                    value = rand() % 512;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_ARGMAX
 struct test_argmax : public test_case {
     const ggml_type type;
@@ -10490,6 +10548,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_qwen4_hc_reduce_norm(2560, n_tokens));
         test_cases.emplace_back(new test_fwht_gate(n_tokens));
         test_cases.emplace_back(new test_set_rows_padded(n_tokens));
+        test_cases.emplace_back(new test_rms_norm_rope_fwht({ 256, 24, n_tokens, 1 }));
+        test_cases.emplace_back(new test_rms_norm_rope_fwht({ 256, 2, n_tokens, 1 }, GGML_ROPE_TYPE_NEOX));
         test_cases.emplace_back(new test_qwen4_hc_down_inject(2560, 320, n_tokens));
         test_cases.emplace_back(new test_qwen4_hc_combine_down(2560, 320, n_tokens));
         test_cases.emplace_back(new test_qwen4_hc_up_pre(2560, 320, n_tokens));
@@ -12845,6 +12905,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_qwen4_hc_reduce_norm(2560, n_tokens));
         test_cases.emplace_back(new test_fwht_gate(n_tokens));
         test_cases.emplace_back(new test_set_rows_padded(n_tokens));
+        test_cases.emplace_back(new test_rms_norm_rope_fwht({ 256, 24, n_tokens, 1 }));
+        test_cases.emplace_back(new test_rms_norm_rope_fwht({ 256, 2, n_tokens, 1 }, GGML_ROPE_TYPE_NEOX));
         test_cases.emplace_back(new test_qwen4_hc_down_inject(2560, 320, n_tokens));
         test_cases.emplace_back(new test_qwen4_hc_combine_down(2560, 320, n_tokens));
         test_cases.emplace_back(new test_qwen4_hc_up_pre(2560, 320, n_tokens));
