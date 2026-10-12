@@ -144,6 +144,16 @@ struct ggml_moe_cache_api {
     // that device back. Both are called between graphs, never concurrently with
     // plan/dispatch on the same session.
     void (*set_lend_size)(void * session, size_t bytes, int n_zones);
+    // Prefill: the experts of a prefetched MUL_MAT_ID weight (host tensor w, for node) that the cache holds are read
+    // in place, the prefetch copies only the others. prefill_residents writes the device address of w's part of each
+    // resident expert's entry into addrs[e] (0 for the others), pins those entries and returns how many; -1 when the
+    // node does not take a table of addresses (then nothing is pinned and the whole tensor is copied). prefill_table
+    // registers the table the node reads (device memory, n_expert addresses) until it is called with NULL;
+    // prefill_unpin releases the pins once the device is done with them (before any lend, borrow or KV move).
+    int  (*prefill_residents)(void * session, void * backend, const struct ggml_tensor * node,
+                              const struct ggml_tensor * w, uint64_t * addrs);
+    void (*prefill_table)(const void * w_data, const uint64_t * table);
+    void (*prefill_unpin)(void * session);
     int  (*lend)(void * session, void * backend, size_t bytes, void ** zones, int n_zones);
     void (*restore)(void * session, void * backend);
 

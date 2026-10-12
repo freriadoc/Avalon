@@ -2340,6 +2340,22 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     return true;
 }
 
+// the path ggml_cuda_mul_mat_id takes for this node is MMQ (keep in line with it)
+bool ggml_cuda_mul_mat_id_uses_mmq(const ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (dst->ne[2] <= MMVQ_MAX_BATCH_SIZE) {
+        if (ggml_is_quantized(src0->type) ? dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc) : GGML_CUDA_CC_IS_AMD(cc)) {
+            return false;
+        }
+    }
+    return ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], /*n_experts=*/src0->ne[2]);
+}
+
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -2347,6 +2363,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+    // a prefill reading experts in place: only MMQ reads the table of their addresses (ggml_cuda_moe_prefill_table)
+    GGML_ASSERT(!ggml_cuda_moe_prefill_table(src0->data) || ggml_cuda_mul_mat_id_uses_mmq(dst));
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
