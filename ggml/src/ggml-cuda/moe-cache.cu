@@ -2320,6 +2320,7 @@ static size_t moe_cache_zone_bytes(const moe_cache_session & session);
 static void moe_cache_setup_zone(moe_cache_device & device, size_t zone_bytes, int n_zones);
 static void moe_cache_attach_test_region(moe_cache_device & device);
 static void moe_cache_attach_kv(moe_cache_session & session, moe_cache_device & device);
+static void moe_cache_preload(moe_cache_device & device);
 
 // Every expert tensor registered in place (hipHostRegister, read-only; GGML_CUDA_MOE_PIN=0 disables), once the
 // tensors are known and before any graph runs:
@@ -2463,6 +2464,7 @@ static void moe_cache_build_pending(
     moe_cache_setup_zone(device, moe_cache_zone_bytes(session), session.lend_zones);
     moe_cache_attach_test_region(device);
     moe_cache_attach_kv(session, device);
+    moe_cache_preload(device);
 }
 
 // An expert tensor shown to the cache (moe_cache_begin): recorded in its layer (number and role read from its name).
@@ -3833,6 +3835,107 @@ static void moe_cache_kv_set_end(moe_cache_device & device, moe_cache_pool & poo
 // in which the KV tensor with the fewest bytes per row holds the largest expert; the first step is never lent. Each
 // tensor goes to the pool whose share of KV bytes (against its slab) is smallest, the largest tensors first, so that
 // no expert type alone carries the loan. The kernels take each entry's address: a range may lie anywhere.
+// GGML_CUDA_MOE_CACHE_PRELOAD=FILE: the pools are filled before the first graph from a ranking of the experts, hottest
+// first, in Strata's format (data/expert-profile.bin: "STRP", version 1, layers, experts, slots, pairs, then the pairs
+// as (layer, expert) uint16). Nothing runs yet: each pair takes a free entry of its layer's pool and is copied in
+// place, without the admission and the fill thread; the LRU follows the ranking (the coldest are evicted first, by the
+// prefill's loans too). Without it the cache starts empty and fills during generation: the first prompt read
+// everything over PCIe.
+static void moe_cache_preload(moe_cache_device & device) {
+    const char * path = getenv("GGML_CUDA_MOE_CACHE_PRELOAD");
+    if (!path || !*path) {
+        return;
+    }
+    std::FILE * f = std::fopen(path, "rb");
+    char magic[4] = {};
+    uint32_t hdr[5] = {};
+    if (!f || std::fread(magic, 1, 4, f) != 4 || std::fread(hdr, 4, 5, f) != 5 || memcmp(magic, "STRP", 4) != 0 || hdr[0] != 1) {
+        MOE_CACHE_LOG("[moe-cache] CUDA%d preload: %s is not a version 1 expert ranking\n", device.physical, path);
+        if (f) std::fclose(f);
+        return;
+    }
+    const uint32_t n_ranked = hdr[4];
+    std::vector<uint16_t> pairs((size_t) n_ranked * 2);
+    const bool complete = std::fread(pairs.data(), 2, pairs.size(), f) == pairs.size();
+    std::fclose(f);
+    if (!complete) {
+        MOE_CACHE_LOG("[moe-cache] CUDA%d preload: %s is truncated\n", device.physical, path);
+        return;
+    }
+    ggml_cuda_set_device(device.logical);
+    const int64_t t0 = ggml_time_us();
+    size_t loaded = 0, bytes = 0, skipped = 0;
+    std::vector<int> installed;   // (pool, slot) in ranking order, pushed to the LRU's cold end at the end
+    std::vector<moe_cache_pool *> installed_pool;
+    cudaError_t err = cudaSuccess;
+    for (uint32_t i = 0; i < n_ranked && err == cudaSuccess; i++) {
+        const int layer_number = pairs[2 * i], expert = pairs[2 * i + 1];
+        const auto l = device.layers.find(layer_number);
+        if (l == device.layers.end() || l->second.shape < 0 || expert >= l->second.n_expert) {
+            skipped++;
+            continue;
+        }
+        const moe_cache_layer & layer = l->second;
+        const int pool_index = device.shapes[layer.shape].pool;
+        if (pool_index < 0 || pool_index >= (int) device.pools.size()) {
+            skipped++;
+            continue;
+        }
+        moe_cache_pool & pool = *device.pools[pool_index];
+        const moe_cache_key key{layer.tensor[MOE_ROLE_GATE], expert};
+        if (pool.free_slots.empty() || pool.map.count(key)) {
+            continue;
+        }
+        const int s = pool.free_slots.back();
+        pool.free_slots.pop_back();
+        char * dst = moe_cache_slot_ptr(pool, s);
+        for (int r = 0; r < MOE_ROLES && err == cudaSuccess; r++) {
+            const char * src = (const char *) layer.tensor[r] + (size_t) expert * layer.bytes[r];
+            const bool follows = expert + 1 < layer.n_expert;
+            err = cudaMemcpyAsync(dst + pool.role_offset[r], src, pool.role_bytes[r] + (follows ? pool.role_pad[r] : 0),
+                                  cudaMemcpyHostToDevice, moe_cache_zone_stream);
+            if (err == cudaSuccess && pool.role_pad[r] && !follows) {
+                err = cudaMemcpyAsync(dst + pool.role_offset[r] + pool.role_bytes[r], src, pool.role_pad[r],
+                                      cudaMemcpyHostToDevice, moe_cache_zone_stream);
+            }
+        }
+        moe_cache_slot & slot = pool.slots[s];
+        slot.key = key;
+        slot.generation++;
+        slot.readers = 0;
+        slot.freq = 0;
+        slot.state = moe_cache_slot_state::valid;
+        pool.map.emplace(key, s);
+        moe_cache_direct_set(pool, key, s);
+        installed.push_back(s);
+        installed_pool.push_back(&pool);
+        loaded++;
+        bytes += pool.expert_size;
+    }
+    if (err == cudaSuccess) {
+        err = cudaStreamSynchronize(moe_cache_zone_stream);
+    }
+    // hottest first in the list: each pushed to the front ends up hotter than the ones pushed after it
+    for (size_t k = 0; k < installed.size(); k++) {
+        moe_cache_pool & pool = *installed_pool[k];
+        if (err == cudaSuccess) {
+            moe_cache_lru_push_front(pool, installed[k]);
+        } else {
+            pool.slots[installed[k]].state = moe_cache_slot_state::free;   // reset below puts it back
+            moe_cache_map_erase(pool, installed[k]);
+            pool.slots[installed[k]].key = {};
+            pool.free_slots.push_back(installed[k]);
+        }
+    }
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        MOE_CACHE_LOG("[moe-cache] CUDA%d preload failed: %s\n", device.physical, cudaGetErrorString(err));
+        return;
+    }
+    MOE_CACHE_LOG("[moe-cache] CUDA%d preload: %zu experts (%.2f GiB) from %s in %.2f s, %zu of %u pairs outside the model\n",
+            device.physical, loaded, bytes / 1073741824.0, path, (ggml_time_us() - t0) / 1e6, skipped, n_ranked);
+}
+
 static void moe_cache_attach_kv(moe_cache_session & session, moe_cache_device & device) {
     if (device.kv_attached || !moe_cache_kv_lend_enabled()) {
         return;
