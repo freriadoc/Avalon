@@ -2641,13 +2641,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
     // GGML_SCHED_PREFETCH_EXPERTS=1 enables the default slot count, higher values set it
     // directly; more slots let uploads run further ahead of compute at the cost of one
     // max-sized expert tensor of device memory per slot
-    // on by default with 3 slots (one per expert tensor of a layer: the PCIe link then stays busy through the prefill,
-    // +20 % against 2); GGML_SCHED_PREFETCH_EXPERTS=0 turns it off
+    // on by default with 4 slots: one per expert tensor of a layer (gate/up/down), plus one so that the copy of the next
+    // tensor never waits for the multiplication of the tensor whose slot it takes. With 3 the link idled while a
+    // layer's experts were multiplied (19k prefill: 3 slots 1 353, 4 slots 1 446, 5-6 the same: the link is then the
+    // limit). GGML_SCHED_PREFETCH_EXPERTS=0 turns it off
     const char * GGML_SCHED_PREFETCH_EXPERTS = getenv("GGML_SCHED_PREFETCH_EXPERTS");
-    const int prefetch_n_slots = GGML_SCHED_PREFETCH_EXPERTS ? atoi(GGML_SCHED_PREFETCH_EXPERTS) : 3;
+    const int prefetch_n_slots = GGML_SCHED_PREFETCH_EXPERTS ? atoi(GGML_SCHED_PREFETCH_EXPERTS) : 4;
     sched->prefetch_experts = op_offload && prefetch_n_slots > 0;
-    // default of 3 covers the gate/up/down expert tensors of one MoE layer
-    sched->prefetch_n_slots = prefetch_n_slots <= 1 ? 3 : std::min(prefetch_n_slots, GGML_SCHED_MAX_PREFETCH_SLOTS);
+    sched->prefetch_n_slots = prefetch_n_slots <= 1 ? 4 : std::min(prefetch_n_slots, GGML_SCHED_MAX_PREFETCH_SLOTS);
 
     ggml_backend_sched_reset(sched);
 
