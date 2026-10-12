@@ -100,6 +100,11 @@ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value
 // the HIP runtime synchronize every stream of the device). Returns the outputs reserved, 0 on failure.
 LLAMA_API int32_t llama_output_reserve(struct llama_context * ctx, int32_t n_outputs);
 
+// The MoE expert cache of owner shared with ctx (the MTP draft): ctx's MoE blocks whose experts are in host memory are
+// hosted by the GPU, their experts cached in owner's pools, owner's reserve done first if it was deferred. owner must
+// outlive ctx. Returns false if owner has no cache.
+LLAMA_API bool llama_share_moe_cache(struct llama_context * ctx, struct llama_context * owner);
+
 // Select which appended NextN block the DECODER_MTP graph runs (offset past
 // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
 // chain multiple trained NextN heads. Default 0 (first head).

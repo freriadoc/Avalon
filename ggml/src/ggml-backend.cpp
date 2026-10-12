@@ -1035,6 +1035,8 @@ struct ggml_backend_sched {
 
     struct ggml_context * ctx;
     void * moe_cache_session;
+    // the session belongs to another scheduler (ggml_backend_sched_share_moe_cache)
+    bool moe_cache_guest;
     // MUL_MAT_ID nodes of the MoE blocks left on the GPU with their weights in host memory
     // (unless GGML_MOE_GPU=0), found again by every split_graph
     std::unordered_set<const struct ggml_tensor *> * moe_hosted;
@@ -2150,9 +2152,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         void * session;
         void (*leave)(void *);
 
-        explicit moe_cache_scope(void * session)
+        moe_cache_scope(void * session, bool guest)
             : session(session), leave(ggml_moe_cache.session_leave) {
-            auto enter = ggml_moe_cache.session_enter;
+            auto enter = guest ? ggml_moe_cache.session_enter_guest : ggml_moe_cache.session_enter;
             if (enter && leave) {
                 enter(session);
             } else {
@@ -2165,7 +2167,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 leave(session);
             }
         }
-    } cache_scope(sched->moe_cache_session);
+    } cache_scope(sched->moe_cache_session, sched->moe_cache_guest);
 
     // Zones lent for the previous graph go back to the cache. A prefill graph borrows
     // them again at its first prefetched split; between two prefill graphs that is
@@ -2546,7 +2548,7 @@ static void ggml_backend_sched_use_borrowed_compute(ggml_backend_sched_t sched) 
     for (int b = 0; b < sched->n_backends; b++) {
         sched->bufts[b] = sched->bufts_plain[b];
     }
-    if (!enabled || !sched->moe_cache_session || !ggml_moe_cache.compute_buffer_type) {
+    if (!enabled || !sched->moe_cache_session || sched->moe_cache_guest || !ggml_moe_cache.compute_buffer_type) {
         return;
     }
     for (int b = 0; b < sched->n_backends; b++) {
@@ -2652,6 +2654,15 @@ ggml_backend_sched_t ggml_backend_sched_new(
     return sched;
 }
 
+// the scheduler lets go of its session: destroyed if it is its own, left to its owner otherwise
+static void ggml_backend_sched_drop_moe_cache(ggml_backend_sched_t sched) {
+    if (sched->moe_cache_session && !sched->moe_cache_guest && ggml_moe_cache.session_destroy) {
+        ggml_moe_cache.session_destroy(sched->moe_cache_session);
+    }
+    sched->moe_cache_session = nullptr;
+    sched->moe_cache_guest = false;
+}
+
 void ggml_backend_sched_set_moe_cache(
         ggml_backend_sched_t sched, enum ggml_moe_cache_mode mode,
         size_t budget_mib, size_t reserve_mib, int expert_parallel, int cpu_overlap, const char * profile_path) {
@@ -2667,10 +2678,7 @@ void ggml_backend_sched_set_moe_cache(
     // go back to it before it is destroyed (this runs before any graph is reserved)
     ggml_gallocr_free(sched->galloc);
     sched->galloc = NULL;
-    if (sched->moe_cache_session && ggml_moe_cache.session_destroy) {
-        ggml_moe_cache.session_destroy(sched->moe_cache_session);
-    }
-    sched->moe_cache_session = nullptr;
+    ggml_backend_sched_drop_moe_cache(sched);
 
     auto rebuild_bufts = [sched]() {
         ggml_backend_sched_use_borrowed_compute(sched);
@@ -2709,13 +2717,13 @@ void ggml_backend_sched_set_moe_cache(
 }
 
 void ggml_backend_sched_moe_cache_kv_register(ggml_backend_sched_t sched, const struct ggml_tensor * tensor, size_t row_bytes) {
-    if (sched && sched->moe_cache_session && ggml_moe_cache.kv_register) {
+    if (sched && sched->moe_cache_session && !sched->moe_cache_guest && ggml_moe_cache.kv_register) {
         ggml_moe_cache.kv_register(sched->moe_cache_session, tensor, row_bytes);
     }
 }
 
 void ggml_backend_sched_moe_cache_kv_set_rows(ggml_backend_sched_t sched, int64_t rows) {
-    if (!sched || !sched->moe_cache_session || !ggml_moe_cache.kv_needs_set_rows ||
+    if (!sched || !sched->moe_cache_session || sched->moe_cache_guest || !ggml_moe_cache.kv_needs_set_rows ||
         !ggml_moe_cache.kv_needs_set_rows(sched->moe_cache_session, rows)) {
         return;   // the step boundary stays: nothing moves (almost every ubatch)
     }
@@ -2726,7 +2734,7 @@ void ggml_backend_sched_moe_cache_kv_set_rows(ggml_backend_sched_t sched, int64_
 }
 
 int64_t ggml_backend_sched_moe_cache_kv_first_lent_row(ggml_backend_sched_t sched) {
-    if (!sched || !sched->moe_cache_session || !ggml_moe_cache.kv_first_lent_row) {
+    if (!sched || !sched->moe_cache_session || sched->moe_cache_guest || !ggml_moe_cache.kv_first_lent_row) {
         return 0;
     }
     return ggml_moe_cache.kv_first_lent_row(sched->moe_cache_session);
@@ -2739,6 +2747,7 @@ void * ggml_backend_sched_detach_moe_cache(ggml_backend_sched_t sched) {
     ggml_gallocr_free(sched->galloc);
     void * session = sched->moe_cache_session;
     sched->moe_cache_session = nullptr;
+    sched->moe_cache_guest = false;
     ggml_backend_sched_use_borrowed_compute(sched);
     sched->galloc = ggml_gallocr_new_n(sched->bufts, sched->n_backends);
     return session;
@@ -2748,10 +2757,27 @@ void ggml_backend_sched_attach_moe_cache(ggml_backend_sched_t sched, void * sess
     GGML_ASSERT(sched);
     ggml_gallocr_free(sched->galloc);
     // the default session of a new scheduler gives way to the kept one
-    if (sched->moe_cache_session && ggml_moe_cache.session_destroy) {
-        ggml_moe_cache.session_destroy(sched->moe_cache_session);
-    }
+    ggml_backend_sched_drop_moe_cache(sched);
     sched->moe_cache_session = session;
+    ggml_backend_sched_use_borrowed_compute(sched);
+    sched->galloc = ggml_gallocr_new_n(sched->bufts, sched->n_backends);
+}
+
+void * ggml_backend_sched_get_moe_cache(ggml_backend_sched_t sched) {
+    return sched ? sched->moe_cache_session : nullptr;
+}
+
+void ggml_backend_sched_share_moe_cache(ggml_backend_sched_t sched, void * session) {
+    GGML_ASSERT(sched);
+    ggml_backend_sched_prefetch_restore(sched);
+    ggml_gallocr_free(sched->galloc);
+    ggml_backend_sched_drop_moe_cache(sched);
+    sched->moe_cache_session = session;
+    sched->moe_cache_guest = session != nullptr;
+    // the zones the prefetch borrows are the owner's
+    sched->prefetch_experts = sched->prefetch_experts && !sched->moe_cache_guest;
+    // primed again: its expert tensors are shown to the cache, which takes them in the pools of their shapes
+    sched->moe_cache_primed = false;
     ggml_backend_sched_use_borrowed_compute(sched);
     sched->galloc = ggml_gallocr_new_n(sched->bufts, sched->n_backends);
 }
@@ -2765,10 +2791,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     // session still exists
     ggml_gallocr_free(sched->galloc);
     sched->galloc = NULL;
-    if (sched->moe_cache_session && ggml_moe_cache.session_destroy) {
-        ggml_moe_cache.session_destroy(sched->moe_cache_session);
-        sched->moe_cache_session = NULL;
-    }
+    ggml_backend_sched_drop_moe_cache(sched);
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
@@ -2897,7 +2920,8 @@ static void ggml_backend_sched_prime_moe_cache(ggml_backend_sched_t sched, struc
     if (sched->prefetch_experts) {
         ggml_backend_sched_prefetch_backend_init(sched, sched->backends[0]->device);
     }
-    if (ggml_moe_cache.prepare_queues) {
+    // a guest's queues were created with the owner's, before the cache was sized
+    if (ggml_moe_cache.prepare_queues && !sched->moe_cache_guest) {
         ggml_moe_cache.prepare_queues(sched->moe_cache_session, graph);
     }
 
@@ -2906,7 +2930,8 @@ static void ggml_backend_sched_prime_moe_cache(ggml_backend_sched_t sched, struc
     }
 
     int accepted[2] = {0, 0};
-    ggml_moe_cache.session_enter(sched->moe_cache_session);
+    (sched->moe_cache_guest && ggml_moe_cache.session_enter_guest ? ggml_moe_cache.session_enter_guest
+                                                                  : ggml_moe_cache.session_enter)(sched->moe_cache_session);
     for (int pass = 0; pass < 2; pass++) {
         for (const ggml_tensor * node : experts) {
             const ggml_tensor * w   = node->src[0];

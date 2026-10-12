@@ -789,7 +789,9 @@ void llama_context::sched_reserve() {
         void * moe_cache_kept = sched ? ggml_backend_sched_detach_moe_cache(sched.get()) : nullptr;
         sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
         sched_max_nodes = max_nodes;
-        if (moe_cache_kept) {
+        if (moe_cache_shared) {
+            ggml_backend_sched_share_moe_cache(sched.get(), moe_cache_shared);
+        } else if (moe_cache_kept) {
             ggml_backend_sched_attach_moe_cache(sched.get(), moe_cache_kept);
         } else {
             set_moe_cache();
@@ -4232,6 +4234,27 @@ void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
 
 int32_t llama_output_reserve(llama_context * ctx, int32_t n_outputs) {
     return (int32_t) ctx->reserve_outputs(n_outputs);
+}
+
+bool llama_context::share_moe_cache(llama_context & owner) {
+    // a deferred reserve of the owner creates its cache now
+    owner.sched_reserve();
+    void * session = ggml_backend_sched_get_moe_cache(owner.sched.get());
+    if (!session) {
+        return false;
+    }
+    moe_cache_shared = session;
+    ggml_backend_sched_share_moe_cache(sched.get(), session);
+    // reserved again with the session: the scheduler shows its expert tensors to the cache (registered in place
+    // before any graph of this context runs) and its MoE blocks go to the GPU
+    sched_need_reserve = true;
+    sched_reserve();
+    LLAMA_LOG_INFO("%s: MoE cache shared with the context %p\n", __func__, (void *) &owner);
+    return true;
+}
+
+bool llama_share_moe_cache(llama_context * ctx, llama_context * owner) {
+    return ctx && owner && ctx->share_moe_cache(*owner);
 }
 
 void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {

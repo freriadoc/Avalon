@@ -118,6 +118,7 @@ struct llama_context {
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
     uint32_t reserve_outputs(int32_t n_outputs) { return output_reserve(n_outputs); }   // llama_output_reserve
+    bool share_moe_cache(llama_context & owner);                                            // llama_share_moe_cache
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
@@ -359,6 +360,7 @@ private:
     ggml_backend_sched_ptr sched;
 
     size_t sched_max_nodes = 0; // the size of sched, see sched_reserve
+    void * moe_cache_shared = nullptr; // the MoE cache session of another context, see share_moe_cache
 
     bool sched_need_reserve = true;
 

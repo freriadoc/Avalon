@@ -100,6 +100,9 @@ struct ggml_moe_cache_api {
     // NULL and dormant sessions still create a suppressing thread-local scope.
     void   (*session_enter)(void * session);
     void   (*session_leave)(void * session);
+    // the same scope for a scheduler sharing another's session (ggml_backend_sched_share_moe_cache): its graphs do
+    // not count for the session's own phases (restoration after a prefill)
+    void   (*session_enter_guest)(void * session);
 
     // Begin one CPU MUL_MAT_ID node. Returns an opaque plan, or NULL when the stock CPU path should handle the complete node.
     void * (*begin)(const char * tensor_name, const void * host_base, size_t expert_size,
@@ -204,6 +207,13 @@ GGML_API void    ggml_backend_sched_moe_cache_kv_register(ggml_backend_sched_t s
 GGML_API void    ggml_backend_sched_moe_cache_kv_set_rows(ggml_backend_sched_t sched, int64_t rows);
 GGML_API int64_t ggml_backend_sched_moe_cache_kv_first_lent_row(ggml_backend_sched_t sched);
 GGML_API void   ggml_backend_sched_attach_moe_cache(ggml_backend_sched_t sched, void * session);
+// the session of a scheduler (NULL without one), to share it with another
+GGML_API void * ggml_backend_sched_get_moe_cache(ggml_backend_sched_t sched);
+// a scheduler of the same device uses another's session without owning it (the MTP draft, whose expert weights are in
+// host memory: its MoE blocks are hosted by the GPU and their experts cached with the main model's). It never destroys
+// it, does not prefetch, borrows no compute buffer and lends no KV; the owner must outlive it. Replaces (and destroys)
+// the scheduler's own session; NULL detaches.
+GGML_API void   ggml_backend_sched_share_moe_cache(ggml_backend_sched_t sched, void * session);
 
 #ifdef __cplusplus
 }

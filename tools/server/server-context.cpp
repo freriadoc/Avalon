@@ -9,6 +9,7 @@
 #include "server-stream.h"
 
 #include "build-info.h"
+#include "../../src/llama-ext.h" // llama_share_moe_cache
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
@@ -1307,6 +1308,15 @@ private:
             // deferred target reserve: the warmup's reserve sizes the MoE cache on what is left
             if (params_base.warmup) {
                 llama_init->warmup(params_base);
+            }
+
+            // the draft's experts in host memory are cached with the target's (GGML_MOE_SHARE_DRAFT=0 keeps them on
+            // the CPU)
+            {
+                const char * share = getenv("GGML_MOE_SHARE_DRAFT");
+                if ((!share || atoi(share) != 0) && llama_share_moe_cache(ctx_dft, ctx_tgt)) {
+                    SRV_INF("%s", "MoE expert cache shared with the draft context\n");
+                }
             }
         }
 

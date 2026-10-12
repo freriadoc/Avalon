@@ -2298,25 +2298,34 @@ static void moe_cache_attach_kv(moe_cache_session & session, moe_cache_device & 
 //   (~2 MiB per GiB, ~94 MiB here) come after the budget was fixed: out of the reserve.
 // Measured (32k MTP, 3 pairs): fills 115 -> 61 us, CPU per hosted layer -4 to -6 %, generation ~+1.6 %,
 // prefill unchanged.
-static void moe_cache_pin_experts(moe_cache_device & device) {
+static bool moe_cache_pin_enabled() {
     static const bool enabled = !getenv("GGML_CUDA_MOE_PIN") || atoi(getenv("GGML_CUDA_MOE_PIN")) != 0;
-    if (!enabled || !device.pinned.empty()) {
+    return enabled;
+}
+
+// one expert tensor registered in place (its range rounded outwards to pages), false if ROCm refuses it
+static bool moe_cache_pin_tensor(moe_cache_device & device, const void * base, const moe_cache_seen_tensor & t, size_t & bytes) {
+    const uintptr_t b = (uintptr_t) base;
+    const uintptr_t ib = b & ~(uintptr_t) 4095;
+    const uintptr_t ie = GGML_PAD(b + (size_t) t.n_expert * t.expert_size, 4096);
+    if (cudaHostRegister((void *) ib, ie - ib, cudaHostRegisterReadOnly) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    device.pinned.push_back({ib, ie});
+    bytes += ie - ib;
+    return true;
+}
+
+static void moe_cache_pin_experts(moe_cache_device & device) {
+    if (!moe_cache_pin_enabled() || !device.pinned.empty()) {
         return;
     }
     const int64_t t0 = ggml_time_us();
     ggml_cuda_set_device(device.logical);
     size_t bytes = 0, fail = 0;
     for (const auto & t : device.seen_tensors) {
-        const uintptr_t b = (uintptr_t) t.first;
-        const uintptr_t ib = b & ~(uintptr_t) 4095;
-        const uintptr_t ie = GGML_PAD(b + (size_t) t.second.n_expert * t.second.expert_size, 4096);
-        if (cudaHostRegister((void *) ib, ie - ib, cudaHostRegisterReadOnly) == cudaSuccess) {
-            device.pinned.push_back({ib, ie});
-            bytes += ie - ib;
-        } else {
-            (void) cudaGetLastError();
-            fail++;
-        }
+        fail += !moe_cache_pin_tensor(device, t.first, t.second, bytes);
     }
     std::sort(device.pinned.begin(), device.pinned.end());
     MOE_CACHE_LOG("[moe-cache] CUDA%d pin: %zu expert tensors registered (%zu MiB) in %.1f s, %zu failed\n",
@@ -2444,6 +2453,16 @@ static int moe_cache_discover_pool(
         layer.n_expert = layer.n_expert ? std::min(layer.n_expert, n_expert) : n_expert;
         device.layer_of[host_base] = layer_number;
         device.visits_since_new_tensor = 0;
+        if (device.pools_built && !device.pinned.empty()) {
+            // a tensor of a scheduler sharing the session (MTP draft), shown after the pools were built: registered
+            // like the others, still before its first graph (registering synchronizes every stream)
+            size_t bytes = 0;
+            ggml_cuda_set_device(device.logical);
+            if (moe_cache_pin_tensor(device, host_base, device.seen_tensors.at(host_base), bytes)) {
+                std::sort(device.pinned.begin(), device.pinned.end());
+                MOE_CACHE_LOG("[moe-cache] CUDA%d pin: %s registered late (%zu MiB)\n", device.physical, name, bytes >> 20);
+            }
+        }
     } else if (device.visits_since_new_tensor < SIZE_MAX) {
         device.visits_since_new_tensor++;
     }
@@ -2849,7 +2868,9 @@ static void moe_cache_session_destroy(void * opaque) {
     delete session;
 }
 
-static void moe_cache_session_enter(void * opaque) {
+// guest: a scheduler sharing the session of another (the MTP draft's, ggml_backend_sched_share_moe_cache); its graphs
+// do not count for the restoration after a prefill (a draft graph runs between two prefill ubatches of the main model)
+static void moe_cache_session_enter_impl(void * opaque, bool guest) {
     if (g_session_suppressed > 0) {
         g_session_suppressed++;
         return;
@@ -2896,7 +2917,7 @@ static void moe_cache_session_enter(void * opaque) {
         g_session_suppressed++;
         return;
     }
-    if (session->active_scopes == 0) {
+    if (session->active_scopes == 0 && !guest) {
         // a graph starts: after prefill graphs (they lend), the first one that did not lend
         // means generation has started
         if (session->lent_in_last_graph) {
@@ -2921,6 +2942,14 @@ static void moe_cache_session_enter(void * opaque) {
         session->lent_in_last_graph = false;
     }
     session->active_scopes++;
+}
+
+static void moe_cache_session_enter(void * opaque) {
+    moe_cache_session_enter_impl(opaque, false);
+}
+
+static void moe_cache_session_enter_guest(void * opaque) {
+    moe_cache_session_enter_impl(opaque, true);
 }
 
 static void moe_cache_session_leave(void * opaque) {
@@ -5877,6 +5906,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.session_create = moe_cache_session_create;
     ggml_moe_cache.session_destroy = moe_cache_session_destroy;
     ggml_moe_cache.session_enter = moe_cache_session_enter;
+    ggml_moe_cache.session_enter_guest = moe_cache_session_enter_guest;
     ggml_moe_cache.kv_register = moe_cache_kv_register;
     ggml_moe_cache.kv_needs_set_rows = moe_cache_kv_needs_set_rows;
     ggml_moe_cache.kv_set_rows = moe_cache_kv_set_rows;
