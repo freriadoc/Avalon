@@ -418,17 +418,19 @@ static constexpr int QWEN4_HC_K3_MAX_LO  = 512;
 // 8 lanes: lane k takes the k-th int (4 weights) of every block and the group reduces. x is [T][nb*32] (shared
 // memory). Used both by the fused up/pre kernel and by the unfused product whose src[1] may not be
 // converted below F32 (ggml_prec_set_src, ggml_cuda_mul_mat_q8_0_f32): the two paths compute the same numbers.
-template <int T>
+// NB > 0: nb known at compile time, the loop unrolled whole (every weight load issued at once; with a bound known at
+// run time the compiler waits for each pair of blocks). Faster for one token, slower for three (9.60 -> 10.36 us).
+template <int T, int NB = 0>
 static __device__ __forceinline__ void qwen4_hc_row_q8_0_f32(
-        const block_q8_0 * wr, int nb, const float * x, int k, float * acc) {
+        const block_q8_0 * wr, int nb_rt, const float * x, int k, float * acc) {
+    const int nb = NB > 0 ? NB : nb_rt;
     const float4 * x4 = (const float4 *) x;   // lane k reads the k-th float4 of a block: no bank conflict
     const int n4 = nb*QK8_0/4;
 #pragma unroll
     for (int t = 0; t < T; ++t) {
         acc[t] = 0.0f;
     }
-#pragma unroll 2
-    for (int ib = 0; ib < nb; ++ib) {
+    const auto block = [&](const int ib) {
         const float dw = __half2float(wr[ib].d);
         const int   wi = get_int_b2(wr[ib].qs, k);
         const float w0 = (float) (int8_t) (wi      );
@@ -439,6 +441,17 @@ static __device__ __forceinline__ void qwen4_hc_row_q8_0_f32(
         for (int t = 0; t < T; ++t) {
             const float4 xv = x4[t*n4 + ib*(QK8_0/4) + k];
             acc[t] += dw * (w0*xv.x + w1*xv.y + w2*xv.z + w3*xv.w);
+        }
+    };
+    if constexpr (NB > 0) {
+#pragma unroll
+        for (int ib = 0; ib < NB; ++ib) {
+            block(ib);
+        }
+    } else {
+#pragma unroll 2
+        for (int ib = 0; ib < nb; ++ib) {
+            block(ib);
         }
     }
 #pragma unroll
@@ -469,7 +482,7 @@ static __device__ __forceinline__ void qwen4_hc_load_shared(const float * x, int
 
 // mixed_q8_1 (null: none): the q8_1 of mixed as quantize_q8_1 writes it, for the product that reads it; then a
 // workgroup has QK8_1 warps (n_embd % QK8_1 == 0): its outputs are one q8_1 block per token
-template <int T>
+template <int T, int NB = 0>
 static __global__ void qwen4_hc_up_pre_q8_0(
         const block_q8_0 * w, const float * lo, const float * xn, float * mixed,
         int n_lo, int n_embd, int hc, float scale, block_q8_1 * mixed_q8_1) {
@@ -487,7 +500,7 @@ static __global__ void qwen4_hc_up_pre_q8_0(
     const int k = lane & 7;
 
     float acc[T];
-    qwen4_hc_row_q8_0_f32<T>(w + ((size_t) (e + min(c, hc - 1)*n_embd)) * nb, nb, qwen4_hc_k3_smem, k, acc);
+    qwen4_hc_row_q8_0_f32<T, NB>(w + ((size_t) (e + min(c, hc - 1)*n_embd)) * nb, nb, qwen4_hc_k3_smem, k, acc);
 #pragma unroll
     for (int t = 0; t < T; ++t) {
         float m = (c < hc && k == 0) ? xn[((size_t) t*hc + c) * n_embd + e] / (1.0f + expf(-acc[t])) : 0.0f;
@@ -581,6 +594,24 @@ static void qwen4_hc_up_pre_launch(int grid, int block, size_t smem, cudaStream_
         }
     }
     qwen4_hc_up_pre_q8_0<T><<<grid, block, smem, stream>>>(w, lo, xn, mixed, n_lo, n_embd, hc, scale, mixed_q8_1);
+}
+
+// one token: the kernel with nb = n_lo / QK8_0 known at compile time (NB down to 1), the generic one past the bound
+template <int NB>
+static void qwen4_hc_up_pre_launch_1(int grid, int block, size_t smem, cudaStream_t stream,
+        const block_q8_0 * w, const float * lo, const float * xn, float * mixed,
+        int n_lo, int n_embd, int hc, float scale, block_q8_1 * mixed_q8_1) {
+    if constexpr (NB > 1) {
+        if (n_lo / QK8_0 < NB) {
+            qwen4_hc_up_pre_launch_1<NB - 1>(grid, block, smem, stream, w, lo, xn, mixed, n_lo, n_embd, hc, scale, mixed_q8_1);
+            return;
+        }
+    }
+    if (n_lo / QK8_0 == NB) {
+        qwen4_hc_up_pre_q8_0<1, NB><<<grid, block, smem, stream>>>(w, lo, xn, mixed, n_lo, n_embd, hc, scale, mixed_q8_1);
+    } else {
+        qwen4_hc_up_pre_q8_0<1><<<grid, block, smem, stream>>>(w, lo, xn, mixed, n_lo, n_embd, hc, scale, mixed_q8_1);
+    }
 }
 
 static bool qwen4_hc_match_k3(const ggml_cgraph * cgraph, int i, qwen4_hc_span & span) {
@@ -755,9 +786,15 @@ int ggml_cuda_try_fuse_qwen4_hc(ggml_backend_cuda_context & ctx, ggml_cgraph * c
         block_q8_1 * q8_1 = n_embd % QK8_1 == 0 ? (block_q8_1 *) ggml_cuda_q8_1_produce(ctx, cgraph, span3.idx[1]) : nullptr;
         const int warps = q8_1 ? QK8_1 : QWEN4_HC_K3_THREADS / WARP_SIZE;
         const size_t smem = (size_t) T * (n_lo + (q8_1 ? QK8_1 : 0)) * sizeof(float);
-        qwen4_hc_up_pre_launch<QWEN4_HC_MAX_TOKENS>((n_embd + warps - 1) / warps, warps*WARP_SIZE, smem, stream,
-                (const block_q8_0 *) mm->src[0]->data, lo_d, (const float *) xn->data,
-                (float *) pre->data, n_lo, n_embd, hc, T, ggml_get_op_params_f32(pre, 0), q8_1);
+        if (T == 1) {
+            qwen4_hc_up_pre_launch_1<QWEN4_HC_K3_MAX_LO / QK8_0>((n_embd + warps - 1) / warps, warps*WARP_SIZE, smem, stream,
+                    (const block_q8_0 *) mm->src[0]->data, lo_d, (const float *) xn->data,
+                    (float *) pre->data, n_lo, n_embd, hc, ggml_get_op_params_f32(pre, 0), q8_1);
+        } else {
+            qwen4_hc_up_pre_launch<QWEN4_HC_MAX_TOKENS>((n_embd + warps - 1) / warps, warps*WARP_SIZE, smem, stream,
+                    (const block_q8_0 *) mm->src[0]->data, lo_d, (const float *) xn->data,
+                    (float *) pre->data, n_lo, n_embd, hc, T, ggml_get_op_params_f32(pre, 0), q8_1);
+        }
         return span3.n_all - 1;
     }
 
