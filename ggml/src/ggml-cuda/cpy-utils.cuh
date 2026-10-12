@@ -153,6 +153,68 @@ static __device__ void quantize_f32_q8_0_block(const float * __restrict__ x, blo
     }
 }
 
+// One block per warp (32 lanes, lane j holds value j), the same bytes as quantize_f32_q8_0_block / _q4_0_block: for
+// a kernel whose warp holds a register index per block (rows rotated by a fast Walsh-Hadamard transform).
+// Q8_0: N blocks at once (lane j holds value j of each, blocks i >= n not written), the N reductions interleaved
+template <int N>
+static __device__ __forceinline__ void quantize_warp_q8_0_n(const float * v, block_q8_0 * __restrict__ y, const int lane,
+        const int n) {
+    static_assert(QK8_0 == WARP_SIZE, "a lane per value");
+    float amax[N];
+#pragma unroll
+    for (int i = 0; i < N; ++i) {
+        amax[i] = fabsf(v[i]);
+    }
+#pragma unroll
+    for (int o = WARP_SIZE/2; o > 0; o >>= 1) {
+#pragma unroll
+        for (int i = 0; i < N; ++i) {
+            amax[i] = fmaxf(amax[i], __shfl_xor_sync(0xffffffff, amax[i], o, WARP_SIZE));
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < N; ++i) {
+        if (i < n) {
+            const float d  = amax[i] / ((1 << 7) - 1);
+            const float id = d ? 1.0f/d : 0.0f;
+            y[i].qs[lane] = roundf(v[i]*id);
+            if (lane == 0) {
+                y[i].d = d;
+            }
+        }
+    }
+}
+
+static __device__ __forceinline__ void quantize_warp_q4_0(const float v, block_q4_0 * __restrict__ y, const int lane) {
+    static_assert(QK4_0 == WARP_SIZE, "a lane per value");
+    // the value of largest magnitude, the first one on a tie (the block version's strict <), +0 if all are zero
+    float a  = fabsf(v);
+    float vm = v;
+    int   j  = lane;
+#pragma unroll
+    for (int o = WARP_SIZE/2; o > 0; o >>= 1) {
+        const float a2 = __shfl_xor_sync(0xffffffff, a,  o, WARP_SIZE);
+        const float v2 = __shfl_xor_sync(0xffffffff, vm, o, WARP_SIZE);
+        const int   j2 = __shfl_xor_sync(0xffffffff, j,  o, WARP_SIZE);
+        if (a2 > a || (a2 == a && j2 < j)) {
+            a  = a2;
+            vm = v2;
+            j  = j2;
+        }
+    }
+    const float vmax = a > 0.0f ? vm : 0.0f;
+    const float d  = vmax / -8;
+    const float id = d ? 1.0f/d : 0.0f;
+    const int xi  = min(15, (int8_t)(v*id + 8.5f));
+    const int xi1 = __shfl_sync(0xffffffff, xi, (lane + QK4_0/2) % WARP_SIZE, WARP_SIZE);
+    if (lane < QK4_0/2) {
+        y->qs[lane] = (uint8_t) xi | ((uint8_t) xi1 << 4);
+    }
+    if (lane == 0) {
+        y->d = d;
+    }
+}
+
 static __device__ void quantize_f32_iq4_nl_block(const float * __restrict__ x, block_iq4_nl * __restrict__ y) {
     float amax = 0.0f;
     float vmax = 0.0f;

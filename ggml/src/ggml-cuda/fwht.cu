@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "convert.cuh"
+#include "cpy-utils.cuh"
 #include "fwht.cuh"
 #include "quantize.cuh"
 
@@ -423,4 +424,141 @@ int ggml_cuda_try_fuse_fwht_gate(ggml_backend_cuda_context & ctx, ggml_cgraph * 
             gate->ne[0], gate->ne[1], gate->ne[2], gate->nb[0], gate->nb[1], gate->nb[2], gate->nb[3],
             (float *) mul->data, q8_1, n_rows, 1.0f / sqrtf(64.0f));
     return idx[3] - i;
+}
+
+// ---------------------------------------------------------------- rotation written into a quantized cache
+
+// One warp per row of N values: the transform of fwht_cuda<N, float> (same arithmetic), then the row quantized into
+// the set_rows destination as k_set_rows_quant writes it (a register index of the warp is a block). Row r is part
+// rr = r % rows_per_set of the set_rows row r / rows_per_set, which goes to destination row idx[r / rows_per_set].
+template <int N, typename B>
+__launch_bounds__(4*ggml_cuda_get_physical_warp_size(), 1)
+__global__ void fwht_set_rows_cuda(const float * src, const int64_t * idx, B * dst, const int64_t rows_per_set,
+        const int64_t dst_row_blocks, const int64_t n_rows, const float scale) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    static_assert(warp_size == 32 && N % 32 == 0, "a block per register index");
+
+    const int64_t r = (int64_t) blockIdx.x * blockDim.y + threadIdx.y;
+    if (r >= n_rows) {
+        return;
+    }
+    src += r * N;
+
+    static constexpr int el_w = N / warp_size;
+    float     reg[el_w];
+    const int lane = threadIdx.x;
+
+#pragma unroll
+    for (int i = 0; i < el_w; ++i) {
+        reg[i] = src[i * warp_size + lane] * scale;
+    }
+#pragma unroll
+    for (int h = 1; h < warp_size; h *= 2) {
+#pragma unroll
+        for (int j = 0; j < el_w; j++) {
+            const float val  = reg[j];
+            const float val2 = __shfl_xor_sync(0xFFFFFFFF, val, h, warp_size);
+            reg[j] = (lane & h) == 0 ? val + val2 : val2 - val;
+        }
+    }
+#pragma unroll
+    for (int h = warp_size; h < N; h *= 2) {
+        const int step = h / warp_size;
+#pragma unroll
+        for (int j = 0; j < el_w; j += 2 * step) {
+#pragma unroll
+            for (int k = 0; k < step; k++) {
+                const float x = reg[j + k];
+                const float y = reg[j + k + step];
+                reg[j + k]        = x + y;
+                reg[j + k + step] = x - y;
+            }
+        }
+    }
+
+    B * y = dst + idx[r / rows_per_set] * dst_row_blocks + (r % rows_per_set) * el_w;
+    if constexpr (std::is_same_v<B, block_q4_0>) {
+#pragma unroll
+        for (int i = 0; i < el_w; ++i) {
+            quantize_warp_q4_0(reg[i], y + i, lane);
+        }
+    } else {
+        quantize_warp_q8_0_n<el_w>(reg, y, lane, el_w);
+    }
+}
+
+// nodes i (fwht of 64-wide rows), views of it, then the SET_ROWS of its rows into a Q4_0 / Q8_0 tensor
+static bool fwht_set_rows_match(const ggml_cgraph * cgraph, int i, int * sr_idx) {
+    const ggml_tensor * mm = cgraph->nodes[i];
+    if (!ggml_cuda_op_mul_mat_use_fwht(mm) || mm->ne[0] != 64 || mm->src[1]->type != GGML_TYPE_F32) {
+        return false;
+    }
+    int k = i + 1;
+    while (k < cgraph->n_nodes && fwht_gate_is_view(cgraph->nodes[k]) && cgraph->nodes[k]->view_src == mm &&
+           cgraph->nodes[k]->view_offs == 0) {
+        k++;
+    }
+    if (k >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * sr  = cgraph->nodes[k];
+    if (sr->op != GGML_OP_SET_ROWS) {
+        return false;
+    }
+    const ggml_tensor * src = sr->src[0];
+    const ggml_tensor * ids = sr->src[1];
+    *sr_idx = k;
+    return (src == mm || (src->view_src == mm && src->view_offs == 0)) && ggml_is_contiguous(src) &&
+        (sr->type == GGML_TYPE_Q4_0 || sr->type == GGML_TYPE_Q8_0) && src->type == GGML_TYPE_F32 &&
+        ids->type == GGML_TYPE_I64 && ggml_is_contiguous(ids) &&
+        src->ne[0] % 64 == 0 && src->ne[2] == 1 && src->ne[3] == 1 && ids->ne[0] == src->ne[1] &&
+        ggml_nelements(ids) == ids->ne[0] && ggml_nelements(src) == ggml_nelements(mm) &&
+        sr->ne[0] == src->ne[0] && sr->nb[1] % ggml_type_size(sr->type) == 0;
+}
+
+int ggml_cuda_try_fuse_fwht_set_rows(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
+    static const bool disabled = getenv("GGML_CUDA_DISABLE_FWHT_SET_ROWS") != nullptr;
+    int k;
+    if (disabled || !fwht_set_rows_match(cgraph, i, &k)) {
+        return 0;
+    }
+    int nodes[8];
+    ggml_op ops[8];
+    int n = 0;
+    if (k - i + 1 > 8) {
+        return 0;
+    }
+    for (int j = i; j <= k; j++) {
+        nodes[n] = j;
+        ops[n++] = cgraph->nodes[j]->op;
+    }
+    if (!ggml_can_fuse_subgraph_ext(cgraph, nodes, n, ops, &k, 1)) {
+        return 0;
+    }
+    const ggml_tensor * mm   = cgraph->nodes[i];
+    const ggml_tensor * rows = mm->src[1];
+    ggml_tensor *       sr   = cgraph->nodes[k];
+    // the warps read the rows and write the destination's blocks (another tensor: the cache)
+    const char * rl = (const char *) rows->data, * rh = rl + ggml_nbytes(rows);
+    const char * dl = (const char *) sr->data,   * dh = dl + ggml_nbytes(sr);
+    if (!ggml_is_contiguous(rows) || (rl < dh && dl < rh)) {
+        return 0;
+    }
+    const ggml_tensor * src = sr->src[0];
+    const int64_t n_rows         = ggml_nelements(mm) / 64;
+    const int64_t rows_per_set   = src->ne[0] / 64;
+    const int64_t dst_row_blocks = sr->nb[1] / ggml_type_size(sr->type);
+    const int rows_per_block = 4;
+    const dim3 grid((n_rows + rows_per_block - 1) / rows_per_block, 1, 1);
+    const dim3 block(ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size, rows_per_block, 1);
+    const int64_t * idx = (const int64_t *) sr->src[1]->data;
+    const float scale = 1.0f / sqrtf(64.0f);
+    if (sr->type == GGML_TYPE_Q4_0) {
+        fwht_set_rows_cuda<64, block_q4_0><<<grid, block, 0, ctx.stream()>>>((const float *) rows->data, idx,
+                (block_q4_0 *) sr->data, rows_per_set, dst_row_blocks, n_rows, scale);
+    } else {
+        fwht_set_rows_cuda<64, block_q8_0><<<grid, block, 0, ctx.stream()>>>((const float *) rows->data, idx,
+                (block_q8_0 *) sr->data, rows_per_set, dst_row_blocks, n_rows, scale);
+    }
+    return k - i;
 }

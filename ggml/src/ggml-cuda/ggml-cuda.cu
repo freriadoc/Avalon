@@ -4561,7 +4561,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (node->op == GGML_OP_MUL_MAT) {
-        const int skip = ggml_cuda_try_fuse_fwht_gate(*cuda_ctx, cgraph, i);
+        int skip = ggml_cuda_try_fuse_fwht_gate(*cuda_ctx, cgraph, i);
+        if (skip == 0) {
+            skip = ggml_cuda_try_fuse_fwht_set_rows(*cuda_ctx, cgraph, i);
+        }
         if (skip > 0) {
             return skip;
         }
@@ -5519,9 +5522,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         // the rotation of the rope's rows that follows (MUL_MAT by a 256-wide Hadamard matrix, its reshapes in between):
         // computed by the same kernel (qwen4exp's Q and K before attention)
         static const bool no_rope_fwht = getenv("GGML_CUDA_DISABLE_ROPE_FWHT") != nullptr;
+        static const bool no_rope_q8   = getenv("GGML_CUDA_DISABLE_ROPE_SET_ROWS_Q8") != nullptr;
         ggml_tensor * rope = cgraph->nodes[i + 2];
-        int nodes[8] = { i, i + 1, i + 2 };
-        ggml_op ops[8] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE };
+        int nodes[12] = { i, i + 1, i + 2 };
+        ggml_op ops[12] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE };
         int n = 3;
         int k = i + 3;
         while (k < cgraph->n_nodes && n < 7 && ggml_cuda_is_view_or_noop(cgraph->nodes[k]) &&
@@ -5530,22 +5534,58 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             ops[n++] = cgraph->nodes[k]->op;
             k++;
         }
+        // a row of x is read whole (norm) before the row of the output is written; rows of x are views of the
+        // projection, other rows of the output may be written meanwhile: no overlap at all
+        const ggml_tensor * x = node->src[0];
+        const auto overlaps_x = [x](const ggml_tensor * t) {
+            const char * xl = (const char *) x->data, * xh = xl + ggml_nbytes(x);
+            const char * ol = (const char *) t->data, * oh = ol + ggml_nbytes(t);
+            return xl < oh && ol < xh;
+        };
         ggml_tensor * mm = k < cgraph->n_nodes ? cgraph->nodes[k] : nullptr;
+        ggml_tensor * fwht = nullptr;
         if (!no_rope_fwht && mm && ggml_cuda_op_mul_mat_use_fwht(mm) && mm->ne[0] == 256 && rope->ne[0] == 256 &&
                 (mm->src[1] == rope || (mm->src[1]->view_src == rope && mm->src[1]->view_offs == 0)) &&
                 rope->type == GGML_TYPE_F32 && ggml_is_contiguous(rope) && ggml_is_contiguous(mm) &&
                 ggml_nelements(mm) == ggml_nelements(rope)) {
+            fwht = mm;
             nodes[n] = k;
             ops[n++] = GGML_OP_MUL_MAT;
-            // a row of x is read whole (norm) before the row of the rotation is written; rows of x are views of the
-            // projection, other rows of the output may be written meanwhile: no overlap at all
-            const ggml_tensor * x = node->src[0];
-            const char * xl = (const char *) x->data, * xh = xl + ggml_nbytes(x);
-            const char * ol = (const char *) mm->data, * oh = ol + ggml_nbytes(mm);
-            if (ggml_can_fuse_subgraph_ext(cgraph, nodes, n, ops, &k, 1) && !(xl < oh && ol < xh)) {
-                ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], rope, nullptr, mm);
-                return k - i;
+            k++;
+        }
+        // then the SET_ROWS of these rows (the rope's or their rotation's) into a Q8_0 tensor, views in between (a view of
+        // the destination is an input): quantized by the same kernel (qwen4exp's K into its cache, the indexer's pooled key)
+        {
+            const ggml_tensor * out = fwht ? fwht : rope;
+            int nq = n;
+            int kq = k;
+            while (kq < cgraph->n_nodes && nq < 11 && ggml_cuda_is_view_or_noop(cgraph->nodes[kq])) {
+                if (cgraph->nodes[kq]->view_src == out && cgraph->nodes[kq]->view_offs == 0) {
+                    nodes[nq] = kq;
+                    ops[nq++] = cgraph->nodes[kq]->op;
+                }
+                kq++;
             }
+            ggml_tensor * sr = kq < cgraph->n_nodes ? cgraph->nodes[kq] : nullptr;
+            const ggml_tensor * rows = sr && sr->op == GGML_OP_SET_ROWS ? sr->src[0] : nullptr;
+            const ggml_tensor * ids  = rows ? sr->src[1] : nullptr;
+            if (!no_rope_q8 && rows && (rows == out || (rows->view_src == out && rows->view_offs == 0)) &&
+                    sr->type == GGML_TYPE_Q8_0 && rows->type == GGML_TYPE_F32 && ggml_is_contiguous(rows) &&
+                    ggml_is_contiguous(rope) && rope->ne[3] == 1 && rope->ne[0] % QK8_0 == 0 && rope->ne[0] <= 256 &&
+                    rows->ne[0] == rope->ne[0]*rope->ne[1] && ggml_nrows(rows) == rope->ne[2] &&
+                    ids->type == GGML_TYPE_I64 && ggml_is_contiguous(ids) && ggml_nelements(ids) == rope->ne[2] &&
+                    sr->ne[0] == rows->ne[0] && sr->nb[1] % sizeof(block_q8_0) == 0 && !overlaps_x(sr)) {
+                nodes[nq] = kq;
+                ops[nq++] = GGML_OP_SET_ROWS;
+                if (ggml_can_fuse_subgraph_ext(cgraph, nodes, nq, ops, &kq, 1)) {
+                    ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], rope, sr, fwht);
+                    return kq - i;
+                }
+            }
+        }
+        if (fwht && ggml_can_fuse_subgraph_ext(cgraph, nodes, n, ops, &nodes[n - 1], 1) && !overlaps_x(fwht)) {
+            ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], rope, nullptr, fwht);
+            return nodes[n - 1] - i;
         }
         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], nullptr);
         return 2;

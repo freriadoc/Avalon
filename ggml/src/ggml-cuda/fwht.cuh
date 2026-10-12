@@ -13,3 +13,8 @@ int ggml_cuda_try_fuse_fwht_gate(ggml_backend_cuda_context & ctx, ggml_cgraph * 
 // the same match, for the allocation dependencies: the product and the two inputs it reads (rotated rows, gate's
 // source), nullptr if no match at i
 ggml_tensor * ggml_cuda_match_fwht_gate(const ggml_cgraph * cgraph, int i, ggml_tensor ** rows, ggml_tensor ** gate_src);
+
+// The rotation of 64-wide rows (MUL_MAT by a Hadamard matrix) written by the SET_ROWS that follows it into a Q4_0 or
+// Q8_0 tensor, quantized as set_rows does (qwen4exp's V into its cache): one kernel. Returns the nodes to skip after
+// i, 0 if not fused.
+int ggml_cuda_try_fuse_fwht_set_rows(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i);
