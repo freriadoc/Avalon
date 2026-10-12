@@ -412,6 +412,9 @@ struct moe_cache_device {
     std::vector<std::pair<uintptr_t, uintptr_t>> pinned;
     std::unordered_map<moe_cache_key, moe_cache_demand, moe_cache_key_hash> demand_count;
     uint64_t freq_demands = 0;   // LFU: demands since the last aging
+    // GGML_CUDA_MOE_CACHE_PROFILE_SAVE: routed rows per (layer, expert) seen by the hosted plans, written at the end
+    std::vector<uint32_t> heat;
+    int64_t heat_experts = 0;
     double freq_period = 0;      // LFU: demands between agings, fixed when first needed (a lent KV tail adds entries later)
     size_t visits_since_new_tensor = 0;
     bool budget_ready = false;
@@ -2320,7 +2323,8 @@ static size_t moe_cache_zone_bytes(const moe_cache_session & session);
 static void moe_cache_setup_zone(moe_cache_device & device, size_t zone_bytes, int n_zones);
 static void moe_cache_attach_test_region(moe_cache_device & device);
 static void moe_cache_attach_kv(moe_cache_session & session, moe_cache_device & device);
-static void moe_cache_preload(moe_cache_device & device);
+static void moe_cache_preload(const moe_cache_session & session, moe_cache_device & device);
+static void moe_cache_profile_save_heat(moe_cache_session & session);
 
 // Every expert tensor registered in place (hipHostRegister, read-only; GGML_CUDA_MOE_PIN=0 disables), once the
 // tensors are known and before any graph runs:
@@ -2464,7 +2468,7 @@ static void moe_cache_build_pending(
     moe_cache_setup_zone(device, moe_cache_zone_bytes(session), session.lend_zones);
     moe_cache_attach_test_region(device);
     moe_cache_attach_kv(session, device);
-    moe_cache_preload(device);
+    moe_cache_preload(session, device);
 }
 
 // An expert tensor shown to the cache (moe_cache_begin): recorded in its layer (number and role read from its name).
@@ -2887,6 +2891,7 @@ static void moe_cache_session_destroy(void * opaque) {
             device_ptr->worker.join();
         }
     }
+    moe_cache_profile_save_heat(*session);
     {
         std::lock_guard<std::mutex> registry_lock(g_registry_mu);
         if (g_sessions.erase(session) > 0) {
@@ -3835,33 +3840,147 @@ static void moe_cache_kv_set_end(moe_cache_device & device, moe_cache_pool & poo
 // in which the KV tensor with the fewest bytes per row holds the largest expert; the first step is never lent. Each
 // tensor goes to the pool whose share of KV bytes (against its slab) is smallest, the largest tensors first, so that
 // no expert type alone carries the loan. The kernels take each entry's address: a range may lie anywhere.
+// Expert rankings, hottest first, in Strata's format: "STRP", then version, layers, experts, slots, pairs (uint32);
+// version 1 (Strata's data/expert-profile.bin) then the pairs as (layer, expert) uint16, version 2 (ours) then
+// (layer uint16, expert uint16, heat uint32): the routed rows counted (GGML_CUDA_MOE_CACHE_PROFILE_SAVE).
+struct moe_cache_ranked_expert {
+    int layer = 0;
+    int expert = 0;
+    uint32_t heat = 0;   // 0 in version 1
+};
+
+static bool moe_cache_ranking_read(const char * path, std::vector<moe_cache_ranked_expert> & out, uint32_t & n_layers,
+                                   uint32_t & n_experts) {
+    std::FILE * f = std::fopen(path, "rb");
+    char magic[4] = {};
+    uint32_t hdr[5] = {};
+    if (!f || std::fread(magic, 1, 4, f) != 4 || std::fread(hdr, 4, 5, f) != 5 || memcmp(magic, "STRP", 4) != 0 ||
+            (hdr[0] != 1 && hdr[0] != 2)) {
+        if (f) std::fclose(f);
+        return false;
+    }
+    n_layers = hdr[1];
+    n_experts = hdr[2];
+    out.resize(hdr[4]);
+    bool ok = true;
+    for (auto & r : out) {
+        uint16_t le[2];
+        uint32_t heat = 0;
+        if (std::fread(le, 2, 2, f) != 2 || (hdr[0] == 2 && std::fread(&heat, 4, 1, f) != 1)) {
+            ok = false;
+            break;
+        }
+        r = { le[0], le[1], heat };
+    }
+    std::fclose(f);
+    return ok;
+}
+
+static const char * moe_cache_profile_save_path() {
+    static const char * path = getenv("GGML_CUDA_MOE_CACHE_PROFILE_SAVE") && *getenv("GGML_CUDA_MOE_CACHE_PROFILE_SAVE")
+        ? getenv("GGML_CUDA_MOE_CACHE_PROFILE_SAVE") : nullptr;
+    return path;
+}
+
+// one hosted plan's routed rows, counted for the saved ranking (session lock held)
+static void moe_cache_heat_note(moe_cache_device & device, int layer_number, const int32_t * ids, int rows, int64_t n_expert) {
+    if (layer_number < 0 || layer_number > 4095 || n_expert <= 0 || n_expert > 65535) {
+        return;
+    }
+    if (device.heat_experts == 0) {
+        device.heat_experts = n_expert;
+    }
+    if (device.heat_experts != n_expert) {
+        return;
+    }
+    const size_t need = (size_t) (layer_number + 1) * n_expert;
+    if (device.heat.size() < need) {
+        device.heat.resize(need, 0);
+    }
+    for (int row = 0; row < rows; row++) {
+        if (ids[row] >= 0 && ids[row] < n_expert && device.heat[(size_t) layer_number * n_expert + ids[row]] < UINT32_MAX) {
+            device.heat[(size_t) layer_number * n_expert + ids[row]]++;
+        }
+    }
+}
+
+// GGML_CUDA_MOE_CACHE_PROFILE_SAVE=FILE: at the end of the session, the routed rows counted, added to the file's (a
+// version 2 ranking of the same model), written back as a version 2 ranking (GGML_CUDA_MOE_CACHE_PRELOAD reads it)
+static void moe_cache_profile_save_heat(moe_cache_session & session) {
+    const char * path = moe_cache_profile_save_path();
+    if (!path || session.devices.empty() || session.devices[0]->heat.empty()) {
+        return;
+    }
+    const moe_cache_device & device = *session.devices[0];
+    const int64_t ne = device.heat_experts;
+    std::vector<uint64_t> total(device.heat.begin(), device.heat.end());
+    std::vector<moe_cache_ranked_expert> old;
+    uint32_t nl = 0, nx = 0;
+    if (moe_cache_ranking_read(path, old, nl, nx) && nx == (uint32_t) ne) {
+        for (const auto & r : old) {
+            const size_t i = (size_t) r.layer * ne + r.expert;
+            if (r.expert < ne) {
+                if (total.size() <= i) total.resize(i + 1, 0);
+                total[i] += r.heat;
+            }
+        }
+    }
+    std::vector<moe_cache_ranked_expert> ranked;
+    for (size_t i = 0; i < total.size(); i++) {
+        if (total[i]) {
+            ranked.push_back({ (int) (i / ne), (int) (i % ne), (uint32_t) std::min<uint64_t>(total[i], UINT32_MAX) });
+        }
+    }
+    std::sort(ranked.begin(), ranked.end(), [](const auto & a, const auto & b) {
+        return a.heat != b.heat ? a.heat > b.heat : a.layer != b.layer ? a.layer < b.layer : a.expert < b.expert;
+    });
+    const std::string tmp = std::string(path) + ".tmp";
+    std::FILE * f = std::fopen(tmp.c_str(), "wb");
+    if (!f) {
+        return;
+    }
+    const uint32_t hdr[5] = { 2, (uint32_t) ((total.size() + ne - 1) / ne), (uint32_t) ne, (uint32_t) ranked.size(), (uint32_t) ranked.size() };
+    bool ok = std::fwrite("STRP", 1, 4, f) == 4 && std::fwrite(hdr, 4, 5, f) == 5;
+    for (const auto & r : ranked) {
+        const uint16_t le[2] = { (uint16_t) r.layer, (uint16_t) r.expert };
+        ok = ok && std::fwrite(le, 2, 2, f) == 2 && std::fwrite(&r.heat, 4, 1, f) == 1;
+    }
+    ok = std::fclose(f) == 0 && ok;
+    if (ok && std::rename(tmp.c_str(), path) == 0) {
+        MOE_CACHE_LOG("[moe-cache] profile: %zu (layer, expert) pairs written to %s\n", ranked.size(), path);
+    } else {
+        std::remove(tmp.c_str());
+    }
+}
+
 // GGML_CUDA_MOE_CACHE_PRELOAD=FILE: the pools are filled before the first graph from a ranking of the experts, hottest
-// first, in Strata's format (data/expert-profile.bin: "STRP", version 1, layers, experts, slots, pairs, then the pairs
-// as (layer, expert) uint16). Nothing runs yet: each pair takes a free entry of its layer's pool and is copied in
+// first (moe_cache_ranking_read). Nothing runs yet: each pair takes a free entry of its layer's pool and is copied in
 // place, without the admission and the fill thread; the LRU follows the ranking (the coldest are evicted first, by the
-// prefill's loans too). Without it the cache starts empty and fills during generation: the first prompt read
-// everything over PCIe.
-static void moe_cache_preload(moe_cache_device & device) {
+// prefill's loans too). With heats (version 2), each entry's LFU count starts where demand at that rate would hold it:
+// a count gains one per demand and halves every P = lfu_window x entries demands, so an expert taking a share q of
+// the demands settles at 2 q P (capped). Without a ranking the cache starts empty and fills during generation: the
+// first prompt read everything over PCIe.
+static void moe_cache_preload(const moe_cache_session & session, moe_cache_device & device) {
     const char * path = getenv("GGML_CUDA_MOE_CACHE_PRELOAD");
     if (!path || !*path) {
         return;
     }
-    std::FILE * f = std::fopen(path, "rb");
-    char magic[4] = {};
-    uint32_t hdr[5] = {};
-    if (!f || std::fread(magic, 1, 4, f) != 4 || std::fread(hdr, 4, 5, f) != 5 || memcmp(magic, "STRP", 4) != 0 || hdr[0] != 1) {
-        MOE_CACHE_LOG("[moe-cache] CUDA%d preload: %s is not a version 1 expert ranking\n", device.physical, path);
-        if (f) std::fclose(f);
+    std::vector<moe_cache_ranked_expert> ranking;
+    uint32_t n_layers = 0, n_experts = 0;
+    if (!moe_cache_ranking_read(path, ranking, n_layers, n_experts)) {
+        MOE_CACHE_LOG("[moe-cache] CUDA%d preload: %s is not an expert ranking (or is truncated)\n", device.physical, path);
         return;
     }
-    const uint32_t n_ranked = hdr[4];
-    std::vector<uint16_t> pairs((size_t) n_ranked * 2);
-    const bool complete = std::fread(pairs.data(), 2, pairs.size(), f) == pairs.size();
-    std::fclose(f);
-    if (!complete) {
-        MOE_CACHE_LOG("[moe-cache] CUDA%d preload: %s is truncated\n", device.physical, path);
-        return;
+    const uint32_t n_ranked = (uint32_t) ranking.size();
+    double heat_total = 0;
+    for (const auto & r : ranking) {
+        heat_total += r.heat;
     }
+    size_t entries = 0;
+    for (const auto & pool : device.pools) {
+        entries += pool->n_slots;
+    }
+    const double period = (double) session.config.lfu_window * (double) std::max<size_t>(entries, 1);
     ggml_cuda_set_device(device.logical);
     const int64_t t0 = ggml_time_us();
     size_t loaded = 0, bytes = 0, skipped = 0;
@@ -3869,7 +3988,7 @@ static void moe_cache_preload(moe_cache_device & device) {
     std::vector<moe_cache_pool *> installed_pool;
     cudaError_t err = cudaSuccess;
     for (uint32_t i = 0; i < n_ranked && err == cudaSuccess; i++) {
-        const int layer_number = pairs[2 * i], expert = pairs[2 * i + 1];
+        const int layer_number = ranking[i].layer, expert = ranking[i].expert;
         const auto l = device.layers.find(layer_number);
         if (l == device.layers.end() || l->second.shape < 0 || expert >= l->second.n_expert) {
             skipped++;
@@ -3903,7 +4022,8 @@ static void moe_cache_preload(moe_cache_device & device) {
         slot.key = key;
         slot.generation++;
         slot.readers = 0;
-        slot.freq = 0;
+        slot.freq = heat_total > 0 && session.config.lfu
+            ? (uint16_t) std::min<double>(session.config.lfu_cap, std::lround(2.0 * ranking[i].heat / heat_total * period)) : 0;
         slot.state = moe_cache_slot_state::valid;
         pool.map.emplace(key, s);
         moe_cache_direct_set(pool, key, s);
@@ -4716,6 +4836,7 @@ struct moe_hosted_mailbox {
 
 struct moe_hosted_layer {
     const ggml_tensor * gate_w = nullptr;
+    int layer_number = -2;           // its layer (moe_cache_device::layer_of), -2 until looked up
     const ggml_tensor * up_w = nullptr;
     const ggml_tensor * down_w = nullptr;
     int64_t n_embd = 0;
@@ -5198,6 +5319,14 @@ static int moe_hosted_plan(moe_hosted_state & st, moe_hosted_layer & layer, cons
         __atomic_store_n(flag, seq, __ATOMIC_RELEASE);
         if (!st.tl_host.empty()) {
             st.tl_host[(seq % MOE_TL_RING) * 3 + 1] = moe_tl_now_ns();
+        }
+
+        if (moe_cache_profile_save_path()) {
+            if (layer.layer_number == -2) {
+                const auto it = device.layer_of.find(key);
+                layer.layer_number = it != device.layer_of.end() ? it->second : -1;
+            }
+            moe_cache_heat_note(device, layer.layer_number, ids, rows, n_expert);
         }
 
         // admissions: inserts_per_plan / 2 experts per plan, the rate the pools per tensor shape had (a budget of
