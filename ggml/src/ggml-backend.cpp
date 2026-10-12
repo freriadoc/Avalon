@@ -1800,12 +1800,15 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 nodes[i]->src[GGML_SCHED_SCRATCH_SRC] = scratch;
             }
         },
+        /* .continues     = */ false,
     };
 
     for (int i = 0; i < sched->n_splits; i++) {
         struct ggml_backend_sched_split * split = &sched->splits[i];
         split->graph = ggml_graph_view(graph, split->i_start, split->i_end);
 
+        opt_params.continues = i > 0 && sched->splits[i - 1].backend_id == split->backend_id &&
+            sched->splits[i - 1].i_end == split->i_start;
         ggml_backend_graph_optimize(sched->backends[split->backend_id], &split->graph, &opt_params);
     }
 

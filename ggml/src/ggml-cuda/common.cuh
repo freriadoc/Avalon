@@ -1488,6 +1488,14 @@ struct ggml_backend_cuda_context {
     // the MUL_MAT(_ID) scratch (GGML_SCHED_SCRATCH_SRC) last filled by mmq, and what it holds: a node
     // with the same scratch and key reads the quantized activation (and expert ids) as they are
     const ggml_tensor * mmq_scratch_last = nullptr;
+    // the last scratch group of the previous graph given to graph_optimize (ggml_cuda_add_mmq_scratch), for a graph
+    // that continues it (a prefill's gate in the split after its up, each split taking one prefetched weight)
+    ggml_tensor *       mmq_carry_scratch = nullptr;
+    int64_t             mmq_carry_key[GGML_CUDA_MMQ_SCRATCH_KEY] = {0};
+    size_t              mmq_carry_size = 0;
+    const ggml_tensor * mmq_carry_src1 = nullptr;
+    // the graphs that continue the previous one (graph_optimize's params->continues): mmq_scratch_last survives into them
+    std::unordered_set<const ggml_cgraph *> mmq_continues;
     int64_t             mmq_scratch_key[GGML_CUDA_MMQ_SCRATCH_KEY] = {0};
 
     struct q8_1_reuse_state {

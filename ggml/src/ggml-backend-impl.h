@@ -123,6 +123,10 @@ extern "C" {
         // buffer before the first of them and frees it after the last, so it is counted in the reservation
         // instead of being allocated by the backend while the graph runs
         void (*add_scratch)(void * user_data, struct ggml_tensor ** nodes, int n_nodes, size_t size);
+
+        // the graph continues the previous one given to this backend (the scheduler's previous split, on the same
+        // backend, ends where this one starts): temporary memory may be shared across the two
+        bool continues;
     };
 
     #define GGML_SCHED_SCRATCH_SRC (GGML_MAX_SRC - 1)

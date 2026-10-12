@@ -5822,7 +5822,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
 
             cuda_ctx->q8_1_reuse.valid = false;
-            cuda_ctx->mmq_scratch_last = nullptr;
+            // a graph continuing the previous split may find the quantized activation its first mmq shares (gate and
+            // up of a prefill, each split taking one prefetched weight) in the scratch the previous one filled
+            if (!cuda_ctx->mmq_continues.count(cgraph)) {
+                cuda_ctx->mmq_scratch_last = nullptr;
+            }
             cuda_ctx->gdn_gathers.clear();
             // a node (or a fused group, a hosted MoE block) computed nodes [first, last]: drop the
             // reused activation quantization if one of them wrote over it
@@ -6174,7 +6178,8 @@ static size_t ggml_cuda_mul_mat_scratch_size(const ggml_tensor * dst, int device
 // cuBLAS's conversions), of the radix top-k and of flash attention comes from the compute buffer: the scheduler counts it in the reservation, where the pool
 // kept the largest request of each size for good (~380 MiB at 8192-token ubatches). Consecutive mmq
 // nodes that quantize the same activation the same way (q/k/v, gate and up, hc down and inject) share
-// one scratch, filled by the first: as long as no node in between writes over that activation.
+// one scratch, filled by the first: as long as no node in between writes over that activation. The sharing continues
+// into a graph that continues the previous one (params->continues: the scheduler's next split on this backend).
 static void ggml_cuda_add_mmq_scratch(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph,
         ggml_backend_graph_optimize_params * params) {
     if (params->add_scratch == nullptr) {
@@ -6186,6 +6191,13 @@ static void ggml_cuda_add_mmq_scratch(ggml_backend_cuda_context * cuda_ctx, ggml
     int64_t group_key[GGML_CUDA_MMQ_SCRATCH_KEY];
     size_t  group_size = 0;
     const ggml_tensor * group_src1 = nullptr;
+    // the previous graph's last group, still usable by this graph's first nodes
+    bool carry = params->continues && cuda_ctx->mmq_carry_scratch != nullptr;
+    if (params->continues) {
+        cuda_ctx->mmq_continues.insert(cgraph);
+    } else {
+        cuda_ctx->mmq_continues.erase(cgraph);
+    }
     const auto flush = [&]() {
         if (!group.empty()) {
             params->add_scratch(params->user_data, group.data(), (int) group.size(), group_size);
@@ -6213,6 +6225,16 @@ static void ggml_cuda_add_mmq_scratch(ggml_backend_cuda_context * cuda_ctx, ggml
             }
             key[0] = -(int64_t) (intptr_t) node;
         }
+        if (need > 0 && carry && group.empty() && need <= cuda_ctx->mmq_carry_size &&
+                memcmp(key, cuda_ctx->mmq_carry_key, sizeof(key)) == 0) {
+            node->src[GGML_SCHED_SCRATCH_SRC] = cuda_ctx->mmq_carry_scratch;
+            continue;
+        }
+        if (need > 0) {
+            carry = false;
+        } else if (carry && cuda_ctx->mmq_carry_src1 && !ggml_cuda_is_view_or_noop(node) && root(node) == cuda_ctx->mmq_carry_src1) {
+            carry = false;
+        }
         if (need > 0) {
             if (!group.empty() && memcmp(key, group_key, sizeof(key)) == 0) {
                 group.push_back(node);
@@ -6231,7 +6253,16 @@ static void ggml_cuda_add_mmq_scratch(ggml_backend_cuda_context * cuda_ctx, ggml
             flush();
         }
     }
-    flush();
+    if (!group.empty()) {
+        ggml_tensor * first = group[0];
+        flush();
+        cuda_ctx->mmq_carry_scratch = first->src[GGML_SCHED_SCRATCH_SRC];
+        memcpy(cuda_ctx->mmq_carry_key, group_key, sizeof(group_key));
+        cuda_ctx->mmq_carry_size = group_size;
+        cuda_ctx->mmq_carry_src1 = group_src1;
+    } else if (!carry) {
+        cuda_ctx->mmq_carry_scratch = nullptr;
+    }
 }
 
 static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
