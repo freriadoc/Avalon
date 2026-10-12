@@ -905,7 +905,7 @@ static moe_cache_config moe_cache_read_config() {
 // the reserve when it runs.
 static size_t moe_cache_recommended_reserve_bytes(size_t total_vram) {
     constexpr size_t MiB = 1024 * 1024;
-    return std::min<size_t>(500 * MiB, total_vram / 4);
+    return std::min<size_t>(400 * MiB, total_vram / 4);
 }
 
 static bool moe_cache_fail(const moe_cache_session & session, const char * stage) {
