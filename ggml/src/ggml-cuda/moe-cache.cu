@@ -5702,14 +5702,18 @@ static moe_hosted_layer * moe_hosted_register(moe_hosted_state & st, moe_cache_d
         const size_t act_bytes = (size_t) tokens * (GGML_PAD(layer->n_embd, MATRIX_ROW_PADDING) / QK8_1) * sizeof(block_q8_1);
         const size_t mid_bytes = (size_t) rows * (GGML_PAD(layer->n_ff, MATRIX_ROW_PADDING) / QK8_1) * sizeof(block_q8_1);
         if (!st.d_q8_act) {
-            if (cudaMalloc((void **) &st.d_q8_act, act_bytes) != cudaSuccess ||
+            // sized for the worst count of tokens (one expert used per token): a context sharing the session (the
+            // MTP draft) may use fewer experts per token than the first block, hence more tokens per block
+            const size_t act_max = (size_t) rows * (GGML_PAD(layer->n_embd, MATRIX_ROW_PADDING) / QK8_1) * sizeof(block_q8_1);
+            if (cudaMalloc((void **) &st.d_q8_act, act_max) != cudaSuccess ||
                 cudaMalloc((void **) &st.d_q8_mid, mid_bytes) != cudaSuccess) {
                 GGML_ABORT("MoE block hosted by the GPU: allocation failed");
             }
-            st.q8_act_bytes = act_bytes;
+            st.q8_act_bytes = act_max;
             st.q8_mid_bytes = mid_bytes;
         }
-        GGML_ASSERT(act_bytes <= st.q8_act_bytes && mid_bytes <= st.q8_mid_bytes);   // one shape per model
+        // addresses captured in graphs: one embedding and expert width per session
+        GGML_ASSERT(act_bytes <= st.q8_act_bytes && mid_bytes <= st.q8_mid_bytes);
     }
     slot = (int) st.layers.size();
     st.slot_of[gate_w->data] = slot;
