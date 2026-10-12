@@ -26,7 +26,8 @@ static __global__ void k_set_rows_quant(const float * __restrict__ src0,
                                         const uint3   ne01,
                                         const uint3   ne02,
                                         const uint3   ne11_fd,
-                                        const uint3   ne12_fd) {
+                                        const uint3   ne12_fd,
+                                        const int64_t ne_valid) {
     const int64_t i = int64_t(blockDim.x) * blockIdx.x + threadIdx.x;
 
     if (i >= ne_total) {
@@ -59,9 +60,15 @@ static __global__ void k_set_rows_quant(const float * __restrict__ src0,
     const float * src0_row = src0 + i01*s01 + i02*s02 + i03*s03;
     block_type * dst_row_ptr = dst + (dst_row*s1 + i02*s2 + i03*s3) / sizeof(block_type);
 
-    const float * src_block = src0_row + i00;
     block_type * dst_block = dst_row_ptr + i00 / qk;
+    if (i00 >= ne_valid) {
+        // past the values of a row read from src0: zeros (ggml_cuda_op_set_rows_padded)
+        float zero[qk] = {};
+        quantize_func(zero, dst_block);
+        return;
+    }
 
+    const float * src_block = src0_row + i00;
     quantize_func(src_block, dst_block);
 
     GGML_UNUSED(ne10);
@@ -79,7 +86,7 @@ static void set_rows_cuda_quant(
         const size_t nb01, const size_t nb02, const size_t nb03,
         const size_t nb10, const size_t nb11, const size_t nb12,
         const size_t nb1, const size_t nb2, const size_t nb3,
-        cudaStream_t stream) {
+        cudaStream_t stream, const int64_t ne_valid = INT64_MAX) {
 
     GGML_ASSERT(ne00 % qk == 0);
     const int64_t ne_total = (ne00 * ne01 * ne02 * ne03) / qk;
@@ -106,7 +113,7 @@ static void set_rows_cuda_quant(
 
         k_set_rows_quant<idx_t, block_type, qk, quantize_func><<<grid_size, block_size, 0, stream>>>(
             src0_d, src1_d, dst_d, ne_total, ne10, ne11, ne12, ne13, s01, s02, s03, s10, s11, s12, s1, s2, s3, ne00_fd,
-            ne01_fd, ne02_fd, ne11_fd, ne12_fd);
+            ne01_fd, ne02_fd, ne11_fd, ne12_fd, ne_valid);
     }
 }
 
@@ -394,5 +401,29 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         }
     } else {
         GGML_ABORT("unsupported type %s", ggml_type_name(src0->type));
+    }
+}
+
+void ggml_cuda_op_set_rows_padded(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * values) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    GGML_ASSERT(dst->type == GGML_TYPE_Q8_0 && values->type == GGML_TYPE_F32 && ggml_is_contiguous(values));
+    GGML_ASSERT(values->ne[0] % QK8_0 == 0 && values->ne[0] <= src0->ne[0] &&
+                ggml_nrows(values) == ggml_nrows(src0));
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+    // row r of src0 (its dims 1 .. 3 flattened) is row r of values, then zeros
+    const int64_t nv = values->ne[0];
+    const size_t vb1 = nv * sizeof(float), vb2 = vb1 * ne01, vb3 = vb2 * ne02;
+    if (src1->type == GGML_TYPE_I64) {
+        set_rows_cuda_quant<int64_t, block_q8_0, QK8_0, quantize_f32_q8_0_block>(
+            (const float *) values->data, (const int64_t *) src1->data, (block_q8_0 *) dst->data,
+            ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, vb1, vb2, vb3, nb10, nb11, nb12, nb1, nb2, nb3,
+            ctx.stream(), nv);
+    } else {
+        set_rows_cuda_quant<int32_t, block_q8_0, QK8_0, quantize_f32_q8_0_block>(
+            (const float *) values->data, (const int32_t *) src1->data, (block_q8_0 *) dst->data,
+            ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, vb1, vb2, vb3, nb10, nb11, nb12, nb1, nb2, nb3,
+            ctx.stream(), nv);
     }
 }

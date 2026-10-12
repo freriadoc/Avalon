@@ -5894,6 +5894,47 @@ struct test_mul_mat_hadamard : public test_mul_mat {
     }
 };
 
+// qwen4exp's indexer keys: the raw key padded with zeros (FILL 0, CONCAT on dim 0) written into the Q8_0 cache;
+// ggml-cuda runs one set_rows that quantizes zeros past the key
+struct test_set_rows_padded : public test_case {
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "SET_ROWS_PADDED"; }
+    std::string vars() override { return VARS_TO_STR1(n_tokens); }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 1e-4; }
+
+    test_set_rows_padded(int64_t n_tokens = 1) : n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t d = 128;
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, 2*d, 64);
+        ggml_set_name(cache, "cache");
+        ggml_tensor * k_raw = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, n_tokens);
+        ggml_set_name(k_raw, "k_raw");
+        ggml_tensor * idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens);
+        ggml_set_name(idx, "idx");
+        ggml_tensor * zero = ggml_fill(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, n_tokens), 0.0f);
+        // the reshapes of qwen4exp (3D for the cache's view of the layer, 2D in cpy_k)
+        ggml_tensor * packed = ggml_reshape_3d(ctx, ggml_concat(ctx, k_raw, zero, 0), 2*d, 1, n_tokens);
+        packed = ggml_reshape_2d(ctx, packed, 2*d, n_tokens);
+        return ggml_set_rows(ctx, cache, packed, idx);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) {
+                continue;
+            }
+            if (t->type == GGML_TYPE_I64) {
+                init_set_rows_row_ids(t, 64);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // qwen4exp's gated attention output: the attention rotated back by 64-wide rows (Hadamard), times the sigmoid of the
 // gate (a strided view of the Q projection, made contiguous), then the output projection. ggml-cuda runs the first
 // four in one kernel that also writes the q8_1 the projection reads.
@@ -10448,6 +10489,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_qwen4_hc_combine_norm(2560, n_tokens));
         test_cases.emplace_back(new test_qwen4_hc_reduce_norm(2560, n_tokens));
         test_cases.emplace_back(new test_fwht_gate(n_tokens));
+        test_cases.emplace_back(new test_set_rows_padded(n_tokens));
         test_cases.emplace_back(new test_qwen4_hc_down_inject(2560, 320, n_tokens));
         test_cases.emplace_back(new test_qwen4_hc_combine_down(2560, 320, n_tokens));
         test_cases.emplace_back(new test_qwen4_hc_up_pre(2560, 320, n_tokens));
@@ -12802,6 +12844,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_qwen4_hc_combine_norm(2560, n_tokens));
         test_cases.emplace_back(new test_qwen4_hc_reduce_norm(2560, n_tokens));
         test_cases.emplace_back(new test_fwht_gate(n_tokens));
+        test_cases.emplace_back(new test_set_rows_padded(n_tokens));
         test_cases.emplace_back(new test_qwen4_hc_down_inject(2560, 320, n_tokens));
         test_cases.emplace_back(new test_qwen4_hc_combine_down(2560, 320, n_tokens));
         test_cases.emplace_back(new test_qwen4_hc_up_pre(2560, 320, n_tokens));

@@ -4524,6 +4524,42 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // a row padded with zeros (FILL 0, CONCAT on dim 0) written into a Q8_0 tensor (qwen4exp's indexer keys): one
+    // set_rows that reads the values and quantizes zeros past them. Only views lie between the concat and the set_rows:
+    // nothing is allocated over the values before it reads them.
+    if (node->op == GGML_OP_FILL && node->type == GGML_TYPE_F32 && ggml_get_op_params_f32(node, 0) == 0.0f &&
+            i + 2 < cgraph->n_nodes) {
+        static const bool disabled = getenv("GGML_CUDA_DISABLE_SET_ROWS_PADDED") != nullptr;
+        ggml_tensor * cat = cgraph->nodes[i + 1];
+        int nodes[8] = { i, i + 1 };
+        ggml_op ops[8] = { GGML_OP_FILL, GGML_OP_CONCAT };
+        int n = 2;
+        int k = i + 2;
+        const ggml_tensor * src = nullptr;
+        while (k < cgraph->n_nodes && n < 7 && ggml_cuda_is_view_or_noop(cgraph->nodes[k]) && cgraph->nodes[k]->view_src == cat &&
+               cgraph->nodes[k]->view_offs == 0) {
+            nodes[n] = k;
+            ops[n++] = cgraph->nodes[k]->op;
+            k++;
+        }
+        ggml_tensor * sr = k < cgraph->n_nodes ? cgraph->nodes[k] : nullptr;
+        if (sr && sr->op == GGML_OP_SET_ROWS) {
+            src = sr->src[0];
+        }
+        const ggml_tensor * values = cat->src[0];
+        if (!disabled && src && (src == cat || (src->view_src == cat && src->view_offs == 0)) && cat->op == GGML_OP_CONCAT &&
+                cat->src[1] == node && ggml_get_op_params_i32(cat, 0) == 0 && ggml_is_contiguous(cat) &&
+                sr->type == GGML_TYPE_Q8_0 && values->type == GGML_TYPE_F32 && ggml_is_contiguous(values) &&
+                values->ne[0] % QK8_0 == 0 && ggml_nrows(values) == ggml_nrows(src) && ggml_is_contiguous(src)) {
+            nodes[n] = k;
+            ops[n++] = GGML_OP_SET_ROWS;
+            if (ggml_can_fuse_subgraph_ext(cgraph, nodes, n, ops, &k, 1)) {
+                ggml_cuda_op_set_rows_padded(*cuda_ctx, sr, values);
+                return k - i;
+            }
+        }
+    }
+
     if (node->op == GGML_OP_MUL_MAT) {
         const int skip = ggml_cuda_try_fuse_fwht_gate(*cuda_ctx, cgraph, i);
         if (skip > 0) {
