@@ -148,7 +148,12 @@ private:
     ggml_context_ptr        cell_pos_ctx;
     ggml_backend_buffer_ptr cell_pos_buf;
     ggml_tensor *           cell_pos_dev = nullptr;
-    std::vector<llama_pos>  cell_pos_stage; // source of the copy, until the next one (the graph that follows waits for it)
+    // the source of the copies, in pinned host memory when the device has some (a copy from pageable memory starts
+    // ~85 us late on ROCm, and the scheduler waits for the stream before the graph's inputs): the cells' positions,
+    // rewritten over the changed range only once the previous copy has run (each graph waits for its inputs)
+    ggml_backend_buffer_ptr cell_pos_stage_buf;
+    std::vector<llama_pos>  cell_pos_stage_vec;
+    llama_pos *             cell_pos_stage = nullptr;
 };
 
 class llama_memory_hybrid_idx_context : public llama_memory_hybrid_context {

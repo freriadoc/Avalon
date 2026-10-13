@@ -86,6 +86,19 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             cell_pos_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(cell_pos_ctx.get(), buft));
             if (!cell_pos_buf) {
                 cell_pos_dev = nullptr;
+                break;
+            }
+            const size_t size_stage = ggml_nbytes(cell_pos_dev);
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+            ggml_backend_buffer_type_t buft_host = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+            if (buft_host) {
+                cell_pos_stage_buf.reset(ggml_backend_buft_alloc_buffer(buft_host, size_stage));
+            }
+            if (cell_pos_stage_buf) {
+                cell_pos_stage = (llama_pos *) ggml_backend_buffer_get_base(cell_pos_stage_buf.get());
+            } else {
+                cell_pos_stage_vec.resize(mem_idx->get_size());
+                cell_pos_stage = cell_pos_stage_vec.data();
             }
             break;
         }
@@ -103,8 +116,8 @@ void llama_memory_hybrid_idx::sync_device(ggml_backend_sched_t sched) {
         return;
     }
     static_assert(sizeof(llama_pos) == sizeof(int32_t), "llama_pos is 32 bits");
-    cell_pos_stage.assign(cells.pos_data() + lo, cells.pos_data() + hi);
     const size_t offs = (size_t) lo*sizeof(int32_t), size = (size_t) (hi - lo)*sizeof(int32_t);
+    memcpy(cell_pos_stage + lo, cells.pos_data() + lo, size);
     // on the backend that runs the graph, ahead of it: no wait, and no write under a graph still reading the copy
     ggml_backend_t backend = nullptr;
     for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
@@ -115,9 +128,9 @@ void llama_memory_hybrid_idx::sync_device(ggml_backend_sched_t sched) {
         }
     }
     if (backend) {
-        ggml_backend_tensor_set_async(backend, cell_pos_dev, cell_pos_stage.data(), offs, size);
+        ggml_backend_tensor_set_async(backend, cell_pos_dev, cell_pos_stage + lo, offs, size);
     } else {
-        ggml_backend_tensor_set(cell_pos_dev, cell_pos_stage.data(), offs, size);
+        ggml_backend_tensor_set(cell_pos_dev, cell_pos_stage + lo, offs, size);
     }
     cells.pos_dirty_clear();
 }
