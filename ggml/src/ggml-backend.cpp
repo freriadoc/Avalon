@@ -1029,6 +1029,10 @@ struct ggml_backend_sched {
     int cur_copy;
     int next_copy;
     ggml_backend_event_t events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
+    // recorded behind the user inputs copied asynchronously to a backend (created at first use; null if the backend
+    // has no events), see ggml_backend_sched_compute_splits
+    ggml_backend_event_t user_inputs_done[GGML_SCHED_MAX_BACKENDS];
+    bool                 user_inputs_done_tried[GGML_SCHED_MAX_BACKENDS];
     struct ggml_tensor ** graph_inputs;
     int n_graph_inputs;
     int graph_inputs_capacity;
@@ -2214,6 +2218,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
+    // backends with user inputs copied asynchronously and not yet waited for: their host source must stay intact until
+    // the copies have run. Only a CPU split (its nodes, or its input copies into host memory, may reuse that memory)
+    // or the caller (which rewrites the inputs of the next graph) could change it: an event recorded behind the copies
+    // is waited for before a CPU split and at the end, so that the GPU split is launched right behind its copies
+    // instead of after them (a backend without events synchronizes before its launch, as before)
+    bool user_inputs_pending[GGML_SCHED_MAX_BACKENDS] = { false };
+    auto wait_user_inputs = [&]() {
+        for (int b = 0; b < sched->n_backends; b++) {
+            if (user_inputs_pending[b]) {
+                ggml_backend_event_synchronize(sched->user_inputs_done[b]);
+                user_inputs_pending[b] = false;
+            }
+        }
+    };
+
     // DIAGNOSTIC (GGML_SCHED_TRACE_INPUTS=N): log every input copy of graphs N to N+29 (all schedulers counted together;
     // each line names its scheduler and its number of splits)
     static const int trace_graph = getenv("GGML_SCHED_TRACE_INPUTS") ? atoi(getenv("GGML_SCHED_TRACE_INPUTS")) : -1;
@@ -2252,6 +2271,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
         ggml_backend_t copies_backend = NULL;
         bool user_inputs_queued = false;
+        if (split_is_cpu) {
+            wait_user_inputs();
+        }
         // the split backend was synchronized in this split: the previous users of its input copies are done, and
         // every copy queued afterwards on its stream is ordered behind that point
         bool dst_synced = false;
@@ -2284,8 +2306,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         dst_synced = true;
                     }
                 }
-                // from host memory to a backend that copies asynchronously: queued, one synchronization
-                // after the split's inputs (a synchronous copy per input cost ~18 us on ROCm: 39 inputs,
+                // from host memory to a backend that copies asynchronously: queued, waited for once
+                // (see user_inputs_pending; a synchronous copy per input cost ~18 us on ROCm: 39 inputs,
                 // ~0.9 ms per generated token, while the GPU waited for the first hosted MoE layer's plan)
                 if (!split_is_cpu && split_backend->iface.set_tensor_async && input->buffer &&
                     ggml_backend_buffer_is_host(input->buffer) && ggml_is_contiguous(input) &&
@@ -2539,7 +2561,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             ggml_backend_synchronize(copies_backend);
         }
         if (user_inputs_queued) {
-            ggml_backend_synchronize(split_backend);
+            if (!sched->user_inputs_done_tried[split_backend_id]) {
+                sched->user_inputs_done_tried[split_backend_id] = true;
+                sched->user_inputs_done[split_backend_id] = ggml_backend_event_new(ggml_backend_get_device(split_backend));
+            }
+            if (sched->user_inputs_done[split_backend_id]) {
+                ggml_backend_event_record(sched->user_inputs_done[split_backend_id], split_backend);
+                user_inputs_pending[split_backend_id] = true;
+            } else {
+                ggml_backend_synchronize(split_backend);
+            }
         }
 
         if (trace_on && getenv("GGML_SCHED_TRACE_NODES")) {
@@ -2570,6 +2601,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 prefetch_input_cpy->data   = prefetch_saved_data;
             }
             if (ec != GGML_STATUS_SUCCESS) {
+                wait_user_inputs();
                 return ec;
             }
         } else {
@@ -2592,6 +2624,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
                 if (ec != GGML_STATUS_SUCCESS) {
+                    wait_user_inputs();
                     return ec;
                 }
 
@@ -2613,6 +2646,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         prev_backend_id = split_backend_id;
     }
+
+    wait_user_inputs();
 
     if (sched_time) {
         st_total += ggml_time_us() - st_t_graph;
@@ -2890,6 +2925,9 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
+        }
+        if (sched->user_inputs_done[b]) {
+            ggml_backend_event_free(sched->user_inputs_done[b]);
         }
     }
     if (sched->prefetch_backend) {

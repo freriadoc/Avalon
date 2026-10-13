@@ -604,6 +604,9 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     ggml_tensor * tok_embd = ggml_get_rows(ctx0, model.tok_embd, inp->tokens);
     cb(tok_embd, "mtp_tok_embd", il);
+    // first in the graph: the lookup runs on the CPU (token embeddings in RAM), before the GPU part, which then makes a
+    // single split (otherwise the GPU ops built first, the QSA pool layout, made a split of their own before it)
+    ggml_build_forward_expand(gf, tok_embd);
 
     ggml_tensor * h = inp->h;
 
