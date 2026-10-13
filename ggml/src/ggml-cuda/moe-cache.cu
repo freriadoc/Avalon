@@ -335,6 +335,11 @@ struct moe_cache_config {
     // GGML_CUDA_MOE_CACHE_LFU=0: readmit_after demands, counts never age
     int lfu = 1;
     int lfu_window = 5;
+    // the window rises from 2 to lfu_window over lfu_ramp x entries demands after the content was renewed (the
+    // preload, the restoration after a prefill): forget a poor start fast, then keep the history (0 = fixed). Replay,
+    // 3-token passes, against a fixed 5: code (a profile serving it poorly) -2.8 % (32k) / -2.1 % (251k), prose
+    // (served well) +0.3 / +0.1 %; a fixed 2 cost prose +0.25 %. 20: the best of 5 - 40 in the cache simulator
+    int lfu_ramp = 20;
     int lfu_cap = 15;
     int queue_max = 128;
     size_t queue_mb = 512;
@@ -412,6 +417,7 @@ struct moe_cache_device {
     std::vector<std::pair<uintptr_t, uintptr_t>> pinned;
     std::unordered_map<moe_cache_key, moe_cache_demand, moe_cache_key_hash> demand_count;
     uint64_t freq_demands = 0;   // LFU: demands since the last aging
+    uint64_t renewed_demands = 0;   // LFU: demands since the content was renewed (lfu_ramp)
     // GGML_CUDA_MOE_CACHE_PROFILE_SAVE: routed rows per (layer, expert) seen by the hosted plans, written at the end
     std::vector<uint32_t> heat;
     int64_t heat_experts = 0;
@@ -870,6 +876,9 @@ static moe_cache_config moe_cache_read_config() {
     }
     if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_LFU_WINDOW", 1, 1000, value)) {
         config.lfu_window = (int)value;
+    }
+    if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_LFU_RAMP", 0, 1000, value)) {
+        config.lfu_ramp = (int)value;
     }
     if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_LFU_CAP", 2, 65535, value)) {
         config.lfu_cap = (int)value;
@@ -2987,6 +2996,7 @@ static void moe_cache_session_enter_impl(void * opaque, bool guest) {
                     }
                 }
                 device.ranking_next = 0;
+                device.renewed_demands = 0;
                 if (pending && !device.rewarm_active) {
                     device.rewarm_active = true;
                     device.rewarm_restored = 0;
@@ -3254,6 +3264,7 @@ static int moe_cache_lookup_or_queue_locked(
     const moe_cache_key key{host_base, expert};
     auto found = pool.map.find(key);
     device.freq_demands++;
+    device.renewed_demands++;
     const uint16_t freq_cap = session.config.lfu ? (uint16_t) session.config.lfu_cap : std::numeric_limits<uint16_t>::max();
     if (found != pool.map.end()) {
         moe_cache_slot & slot = pool.slots[found->second];
@@ -3302,7 +3313,14 @@ static void moe_cache_freq_age_locked(const moe_cache_session & session, moe_cac
         }
         device.freq_period = (double) session.config.lfu_window * (double) std::max<size_t>(entries, 1);
     }
-    if ((double) device.freq_demands < device.freq_period) {
+    double period = device.freq_period;
+    if (session.config.lfu_ramp > 0 && session.config.lfu_window > 2) {
+        const double entries = device.freq_period / session.config.lfu_window;
+        const double w = std::min<double>(session.config.lfu_window,
+            2.0 + (session.config.lfu_window - 2.0) * (double) device.renewed_demands / (session.config.lfu_ramp * entries));
+        period = w * entries;
+    }
+    if ((double) device.freq_demands < period) {
         return;
     }
     device.freq_demands = 0;
@@ -5394,6 +5412,7 @@ static int moe_hosted_plan(moe_hosted_state & st, moe_hosted_layer & layer, cons
             if (slots[row] >= 0) {
                 device.hits++;
                 device.freq_demands++;
+                device.renewed_demands++;
                 moe_cache_slot & slot = pool->slots[slots[row]];
                 slot.freq += slot.freq < (session.config.lfu ? session.config.lfu_cap : std::numeric_limits<uint16_t>::max());
                 moe_cache_lru_remove(*pool, slots[row]);
