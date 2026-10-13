@@ -118,6 +118,10 @@ struct llama_memory_i {
     virtual void get_lendable_kv(std::vector<std::pair<const ggml_tensor *, size_t>> & out) const { (void) out; }
     virtual void set_kv_lent_from(uint32_t rows) { (void) rows; }
 
+    // device copies of host state that graphs read (qwen4exp: the cells' positions), brought up to date on the backend
+    // that runs the graph, in its order: called before each graph, after its inputs are set
+    virtual void sync_device(ggml_backend_sched_t sched) { (void) sched; }
+
     virtual bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) = 0;
     virtual void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) = 0;
     virtual void seq_keep(llama_seq_id seq_id) = 0;

@@ -2,6 +2,8 @@
 
 #include "llama-memory-hybrid.h"
 
+#include "ggml-cpp.h"
+
 #include <array>
 #include <limits>
 #include <memory>
@@ -62,6 +64,8 @@ public:
     void get_lendable_kv(std::vector<std::pair<const ggml_tensor *, size_t>> & out) const override;
     void set_kv_lent_from(uint32_t rows) override;
 
+    void sync_device(ggml_backend_sched_t sched) override;
+
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
@@ -80,6 +84,11 @@ public:
     //
 
     llama_kv_cache * get_mem_idx() const;   // nullptr when the model carries no indexer
+
+    // the position of every cell of the indexer cache (-1 for an empty one) kept on the device, I32 [kv_size], brought
+    // up to date by sync_device (only the cells changed since); nullptr without an indexer on a device or with several
+    // KV streams. With one sequence in the cache, its first n_kv values are the cell_pos of set_input_kpool
+    ggml_tensor * get_cell_pos_dev() const { return cell_pos_dev; }
 
     // The model's indexer pool size.
     uint32_t get_kpool() const { return hparams_idx.indexer_kpool; }
@@ -134,6 +143,12 @@ private:
     llama_pos mem_idx_stale_pos(llama_seq_id seq_id, llama_pos p0) const;
 
     stale_pos_t mem_idx_stale = stale_pos_clean();
+
+    // see get_cell_pos_dev
+    ggml_context_ptr        cell_pos_ctx;
+    ggml_backend_buffer_ptr cell_pos_buf;
+    ggml_tensor *           cell_pos_dev = nullptr;
+    std::vector<llama_pos>  cell_pos_stage; // source of the copy, until the next one (the graph that follows waits for it)
 };
 
 class llama_memory_hybrid_idx_context : public llama_memory_hybrid_context {
@@ -224,6 +239,9 @@ public:
     // then fills layout_meta (I32 [4]: first position, complete pools, padded rep, padded member) instead of them.
     // LLAMA_QSA_DEVICE_LAYOUT=0: always on the host
     bool kpool_layout_on_device(const llama_ubatch & ubatch) const;
+
+    // see llama_memory_hybrid_idx::get_cell_pos_dev
+    ggml_tensor * get_cell_pos_dev() const;
 
 private:
     llama_memory_hybrid_idx * mem = nullptr;

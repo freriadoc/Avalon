@@ -71,7 +71,56 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             model, hparams_idx, type_k, type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
-    }()) {}
+    }()) {
+    // the cells' positions on the device: the QSA tables and masks read them in every graph (I32 [n_kv], 1 MiB at 256k,
+    // uploaded each time otherwise), while only a few cells change from one graph to the next
+    if (mem_idx && mem_idx->get_n_stream() == 1) {
+        for (const auto & [buft, size] : mem_idx->memory_breakdown()) {
+            if (size == 0 || ggml_backend_buft_is_host(buft)) {
+                continue;
+            }
+            ggml_init_params params = { ggml_tensor_overhead(), nullptr, true };
+            cell_pos_ctx.reset(ggml_init(params));
+            cell_pos_dev = ggml_new_tensor_1d(cell_pos_ctx.get(), GGML_TYPE_I32, mem_idx->get_size());
+            ggml_set_name(cell_pos_dev, "idx_cell_pos");
+            cell_pos_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(cell_pos_ctx.get(), buft));
+            if (!cell_pos_buf) {
+                cell_pos_dev = nullptr;
+            }
+            break;
+        }
+    }
+}
+
+void llama_memory_hybrid_idx::sync_device(ggml_backend_sched_t sched) {
+    llama_memory_hybrid::sync_device(sched);
+    if (cell_pos_dev == nullptr) {
+        return;
+    }
+    const auto & cells = mem_idx->get_cells(0);
+    const auto [lo, hi] = cells.pos_dirty();
+    if (lo >= hi) {
+        return;
+    }
+    static_assert(sizeof(llama_pos) == sizeof(int32_t), "llama_pos is 32 bits");
+    cell_pos_stage.assign(cells.pos_data() + lo, cells.pos_data() + hi);
+    const size_t offs = (size_t) lo*sizeof(int32_t), size = (size_t) (hi - lo)*sizeof(int32_t);
+    // on the backend that runs the graph, ahead of it: no wait, and no write under a graph still reading the copy
+    ggml_backend_t backend = nullptr;
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+        ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
+        if (ggml_backend_get_default_buffer_type(b) == ggml_backend_buffer_get_type(cell_pos_buf.get())) {
+            backend = b;
+            break;
+        }
+    }
+    if (backend) {
+        ggml_backend_tensor_set_async(backend, cell_pos_dev, cell_pos_stage.data(), offs, size);
+    } else {
+        ggml_backend_tensor_set(cell_pos_dev, cell_pos_stage.data(), offs, size);
+    }
+    cells.pos_dirty_clear();
+}
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     // note: repeats llama_memory_hybrid::init_batch, as the indexer needs the attention slot infos that the base context hides
@@ -1120,7 +1169,9 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
         }
         const auto & cells = mem->get_mem_idx()->get_cells(s0);
         int32_t * cp = (int32_t *) cell_pos_t->data;
-        if (cells.get_used() == cells.seq_pos_get(s0).size()) {
+        if (cell_pos_t->view_src != nullptr && cell_pos_t->view_src == mem->get_cell_pos_dev()) {
+            // read from the copy on the device, see sync_device
+        } else if (cells.get_used() == cells.seq_pos_get(s0).size()) {
             // every used cell carries s0: the positions as they are (-1 for an empty cell)
             static_assert(sizeof(llama_pos) == sizeof(int32_t), "llama_pos is 32 bits");
             memcpy(cp, cells.pos_data(), (size_t) n_kv * sizeof(int32_t));
@@ -1167,6 +1218,10 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
             }
         }
     }
+}
+
+ggml_tensor * llama_memory_hybrid_idx_context::get_cell_pos_dev() const {
+    return mem ? mem->get_cell_pos_dev() : nullptr;
 }
 
 bool llama_memory_hybrid_idx_context::kpool_layout_on_device(const llama_ubatch & ubatch) const {

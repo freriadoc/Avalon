@@ -3,6 +3,7 @@
 #include "llama.h"
 #include "llama-cparams.h"
 
+#include <algorithm>
 #include <bitset>
 #include <cassert>
 #include <cstring>
@@ -38,6 +39,7 @@ public:
     using seq_set_t = std::bitset<LLAMA_MAX_SEQ>;
 
     void reset() {
+        pos_dirty_all();
         for (uint32_t i = 0; i < pos.size(); ++i) {
             pos[i]   = -1;
             ext[i].reset();
@@ -92,13 +94,24 @@ public:
         return used.empty() ? 0 : *used.begin();
     }
 
-    // the index of the last cell that is used + 1
-    // return 0 if no cells are used
     // the position of every cell, -1 for an empty one
     const llama_pos * pos_data() const {
         return pos.data();
     }
 
+    // the cells whose position changed since the last pos_dirty_clear(), [lo, hi) (empty if lo >= hi): a copy of
+    // pos_data() kept elsewhere (on the device) is brought up to date by copying that range
+    std::pair<uint32_t, uint32_t> pos_dirty() const {
+        return { pos_dirty_lo, std::min<uint32_t>(pos_dirty_hi, size()) };
+    }
+
+    void pos_dirty_clear() const {
+        pos_dirty_lo = UINT32_MAX;
+        pos_dirty_hi = 0;
+    }
+
+    // the index of the last cell that is used + 1
+    // return 0 if no cells are used
     uint32_t used_max_p1() const {
         return used.empty() ? 0 : *used.rbegin() + 1;
     }
@@ -187,6 +200,7 @@ public:
             }
 
             pos[idx] = other.pos[j];
+            pos_dirty_add(idx);
             ext[idx] = other.ext[j];
             seq[idx] = other.seq[j];
 
@@ -218,6 +232,7 @@ public:
             }
 
             pos[idx] = other.pos[j];
+            pos_dirty_add(idx);
             ext[idx] = other.ext[j];
             seq[idx] = other.seq[j];
 
@@ -238,6 +253,7 @@ public:
         seq[i].reset();
 
         pos[i] = -1;
+        pos_dirty_add(i);
         ext[i].reset();
         shift[i] = 0;
 
@@ -257,6 +273,7 @@ public:
 
         if (seq[i].none()) {
             pos[i] = -1;
+            pos_dirty_add(i);
             ext[i].reset();
             shift[i] = 0;
 
@@ -287,6 +304,7 @@ public:
             seq[i].reset();
 
             pos[i] = -1;
+            pos_dirty_add(i);
             ext[i].reset();
             shift[i] = 0;
 
@@ -438,6 +456,7 @@ public:
         assert(seq[i].none());
 
         pos[i] = p;
+        pos_dirty_add(i);
 
         used.insert(i);
     }
@@ -457,6 +476,7 @@ public:
         seq_pos_rm(i);
 
         pos[i]   += d;
+        pos_dirty_add(i);
         shift[i] += d;
 
         has_shift = true;
@@ -464,6 +484,7 @@ public:
         if (pos[i] < 0) {
             seq[i].reset();
             pos[i] = -1;
+            pos_dirty_add(i);
             shift[i] = 0;
 
             used.erase(i);
@@ -488,6 +509,7 @@ public:
         seq_pos_rm(i);
 
         pos[i]   /= d;
+        pos_dirty_add(i);
         shift[i] += p_old - pos[i];
 
         seq_pos_add(i);
@@ -496,6 +518,20 @@ public:
     }
 
 private:
+    void pos_dirty_add(uint32_t i) {
+        pos_dirty_lo = std::min(pos_dirty_lo, i);
+        pos_dirty_hi = std::max(pos_dirty_hi, i + 1);
+    }
+
+    void pos_dirty_all() {
+        pos_dirty_lo = 0;
+        pos_dirty_hi = UINT32_MAX;
+    }
+
+    // see pos_dirty(); everything at first. Bookkeeping of the copy, not state of the cells: mutable
+    mutable uint32_t pos_dirty_lo = 0;
+    mutable uint32_t pos_dirty_hi = UINT32_MAX;
+
     bool has_shift = false;
 
     // set of indices of used cells (i.e. pos[i] != -1, allowed to not have any seq_id)

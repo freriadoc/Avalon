@@ -1648,6 +1648,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
+    if (memory) {
+        memory->sync_device(sched.get());
+    }
 
     // the KV rows this graph reads leave the MoE expert cache first (only when a step boundary is crossed; the cache
     // zeroes them), the rows past the step above them go back to it. After the allocation: the pools may have been
@@ -3882,6 +3885,7 @@ void llama_context::opt_epoch_iter(
             ggml_opt_alloc(opt_ctx, train);
 
             res->set_inputs(&ubatch);
+            memory->sync_device(sched.get());
             {
                 struct ggml_tensor * labels = ggml_opt_labels(opt_ctx);
                 GGML_ASSERT(labels->ne[1] == n_ubatch);

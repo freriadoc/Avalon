@@ -808,11 +808,19 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
     // the masks from positions when possible: the dense KQ mask ([n_kv, n_tokens], 4 GiB at 256k with
     // 8192-token ubatches, filled on the host) and the pool mask are then neither built nor uploaded
     inp->pos_mode = mctx_hyb->kpool_pos_mode(ubatch);
+    const bool layout_on_device = inp->pos_mode && mctx_hyb->kpool_layout_on_device(ubatch);
     if (inp->pos_mode) {
-        inp->cell_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, mctx_idx->get_n_kv());
+        // the cells' positions: read from their copy on the device when one sequence fills the cache (as the layout on
+        // the device requires), uploaded otherwise
+        ggml_tensor * cell_pos_dev = layout_on_device ? mctx_hyb->get_cell_pos_dev() : nullptr;
+        if (cell_pos_dev) {
+            inp->cell_pos = ggml_view_1d(ctx0, cell_pos_dev, mctx_idx->get_n_kv(), 0);
+        } else {
+            inp->cell_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, mctx_idx->get_n_kv());
+            ggml_set_input(inp->cell_pos);
+        }
         inp->tok_pos  = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
         inp->tok_rank = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
-        ggml_set_input(inp->cell_pos);
         ggml_set_input(inp->tok_pos);
         ggml_set_input(inp->tok_rank);
     } else {
@@ -821,7 +829,7 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
     }
     // the pool tables: from the cells' positions on the device when the layout allows it (they are rebuilt and
     // uploaded every graph otherwise: ~1.5 MiB and ~0.5 ms of host time per graph at 250k)
-    if (inp->pos_mode && mctx_hyb->kpool_layout_on_device(ubatch)) {
+    if (layout_on_device) {
         inp->layout_meta = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4);
         ggml_set_input(inp->layout_meta);
         inp->pool_idxs  = ggml_qsa_pool_layout(ctx0, inp->cell_pos, inp->layout_meta, (int32_t) kpool, n_pool, GGML_QSA_SELECT_POOL_MEMBERS);
