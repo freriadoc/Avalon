@@ -3427,12 +3427,15 @@ static bool ggml_cuda_indexer_absorbs_gather(const ggml_cgraph * cgraph, int idx
         }
         return t;
     };
+    // several indexers may read them (a batch cut in query slices, one indexer each): each reads in place, so nothing
+    // may write the cache or the indices before the last of them
     int li_idx = -1;
+    bool written_since = false;
     for (int k = idx + 1; k < cgraph->n_nodes; k++) {
         const ggml_tensor * n = cgraph->nodes[k];
         if (n->op == GGML_OP_LIGHTNING_INDEXER && root(n->src[1]) == gr) {
             const ggml_tensor * kt = n->src[1];
-            if (li_idx >= 0 || !ggml_is_contiguous(kt) || kt->ne[0] != gr->ne[0] || kt->ne[0]*kt->ne[1] != gr->ne[0] ||
+            if (written_since || !ggml_is_contiguous(kt) || kt->ne[0] != gr->ne[0] || kt->ne[0]*kt->ne[1] != gr->ne[0] ||
                     kt->ne[2] != gr->ne[1] || kt->ne[3] != 1) {
                 return false;
             }
@@ -3455,9 +3458,12 @@ static bool ggml_cuda_indexer_absorbs_gather(const ggml_cgraph * cgraph, int idx
                 return false;
             }
         }
-        // nothing may write the cache or the indices before the indexer has read them
-        if (li_idx < 0 && !ggml_cuda_is_view_or_noop(n) && ggml_cuda_node_writes_into(n, src_lo, src_hi, ids_lo, ids_hi)) {
-            return false;
+        // nothing may write the cache or the indices before an indexer has read them
+        if (!ggml_cuda_is_view_or_noop(n) && ggml_cuda_node_writes_into(n, src_lo, src_hi, ids_lo, ids_hi)) {
+            if (li_idx < 0) {
+                return false;
+            }
+            written_since = true;
         }
     }
     return li_idx >= 0;

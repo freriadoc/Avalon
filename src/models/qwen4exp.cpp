@@ -970,6 +970,11 @@ llama_model_qwen4exp::graph::qsa_sel llama_model_qwen4exp::graph::build_qsa_sel(
             (n_t == n_tokens ? inp_kpool->pool_mask :
                 ggml_view_2d(ctx0, inp_kpool->pool_mask, n_pool, n_t, inp_kpool->pool_mask->nb[1], t0*inp_kpool->pool_mask->nb[1]));
         ggml_tensor * score = ggml_lightning_indexer(ctx0, q_t, pooled, weights, pool_mask); // [n_pool, n_t]
+        // a backend's indexer may read the pooled keys in their cache rows through pool_cells (ggml-cuda for small
+        // batches, ggml_cuda_indexer_absorbs_gather): an extra source keeps the indices alive until it ran
+        if (inp_kpool->cache_safe) {
+            score->src[4] = inp_kpool->pool_cells;
+        }
         res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
         cb(score, "indexer_score", il);
 
