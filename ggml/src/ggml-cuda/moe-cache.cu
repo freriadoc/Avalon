@@ -465,6 +465,10 @@ struct moe_cache_device {
     bool rewarm_active = false;
     size_t rewarm_next_pool = 0;
     long long rewarm_restored = 0;
+    // the preload's ranking (pool, key), hottest first: what the restoration after a prefill brings back, the hottest
+    // pairs not in the cache first (empty without GGML_CUDA_MOE_CACHE_PRELOAD: the entries lending evicted instead)
+    std::vector<std::pair<int, moe_cache_key>> ranking;
+    size_t ranking_next = 0;
     char * h_input = nullptr;
     char * d_input = nullptr;
     size_t h_input_cap = 0;
@@ -2976,8 +2980,13 @@ static void moe_cache_session_enter_impl(void * opaque, bool guest) {
                 moe_cache_device & device = *device_ptr;
                 size_t pending = 0;
                 for (auto & pool_ptr : device.pools) {
-                    pending += pool_ptr->rewarm.size();
+                    // with a ranking, the free entries are what the restoration fills
+                    pending += device.ranking.empty() ? pool_ptr->rewarm.size() : pool_ptr->free_slots.size();
+                    if (!device.ranking.empty()) {
+                        pool_ptr->rewarm.clear();
+                    }
                 }
+                device.ranking_next = 0;
                 if (pending && !device.rewarm_active) {
                     device.rewarm_active = true;
                     device.rewarm_restored = 0;
@@ -3162,11 +3171,36 @@ static bool moe_cache_enqueue_locked(
     return true;
 }
 
-// Restore the entries lending evicted, hottest first, into free entries only (never
-// evicting), and only when the fill worker has nothing else queued: an admission waits
-// for at most one restoration. Called when generation starts and after every fill.
+// Restore the entries lending evicted, hottest first (with a preload ranking: the ranking's
+// hottest pairs not in the cache), into free entries only (never evicting), and only when the
+// fill worker has nothing else queued: an admission waits for at most one restoration. Called
+// when generation starts and after every fill.
 static void moe_cache_rewarm_feed_locked(moe_cache_session & session, moe_cache_device & device) {
     if (!device.rewarm_active || !device.queue.empty() || session.stopping || device.dead.load()) {
+        return;
+    }
+    if (!device.ranking.empty()) {
+        // the hottest pairs of the ranking not in the cache, into free entries only
+        while (device.ranking_next < device.ranking.size()) {
+            const auto & r = device.ranking[device.ranking_next++];
+            if (r.first >= (int) device.pools.size()) {
+                continue;   // the pools were rebuilt with fewer shapes
+            }
+            moe_cache_pool & pool = *device.pools[r.first];
+            if (pool.free_slots.empty() || pool.map.count(r.second)) {
+                continue;
+            }
+            int inserts_left = 1;
+            bool wake_worker = false;
+            if (moe_cache_enqueue_locked(session, device, pool, r.first, r.second.tensor, r.second.expert,
+                    pool.expert_size, inserts_left, wake_worker, false, true, false)) {
+                session.cv.notify_all();
+                return;
+            }
+        }
+        device.rewarm_active = false;
+        MOE_CACHE_LOG("[moe-cache] CUDA%d rewarm: %lld entries restored from the ranking\n", device.physical,
+                device.rewarm_restored);
         return;
     }
     const size_t n = device.pools.size();
@@ -3956,7 +3990,9 @@ static void moe_cache_profile_save_heat(moe_cache_session & session) {
 // GGML_CUDA_MOE_CACHE_PRELOAD=FILE: the pools are filled before the first graph from a ranking of the experts, hottest
 // first (moe_cache_ranking_read). Nothing runs yet: each pair takes a free entry of its layer's pool and is copied in
 // place, without the admission and the fill thread; the LRU follows the ranking (the coldest are evicted first, by the
-// prefill's loans too). With heats (version 2), each entry's LFU count starts where demand at that rate would hold it:
+// prefill's loans too). The prefetch zone and the KV's rows are left empty (a prefill or a long context takes them
+// before they serve); the ranking is kept: after each prefill the restoration brings back its hottest pairs not in the
+// cache, into the free entries (moe_cache_rewarm_feed_locked). With heats (version 2), each entry's LFU count starts where demand at that rate would hold it:
 // a count gains one per demand and halves every P = lfu_window x entries demands, so an expert taking a share q of
 // the demands settles at 2 q P (capped). Without a ranking the cache starts empty and fills during generation: the
 // first prompt read everything over PCIe.
@@ -4002,11 +4038,28 @@ static void moe_cache_preload(const moe_cache_session & session, moe_cache_devic
         }
         moe_cache_pool & pool = *device.pools[pool_index];
         const moe_cache_key key{layer.tensor[MOE_ROLE_GATE], expert};
-        if (pool.free_slots.empty() || pool.map.count(key)) {
+        device.ranking.push_back({pool_index, key});
+        if (pool.map.count(key)) {
             continue;
         }
-        const int s = pool.free_slots.back();
-        pool.free_slots.pop_back();
+        // not into the prefetch zone or the KV's rows: a prefill or a long context takes them before they serve; the
+        // restoration after the first prefill fills them
+        int s = -1;
+        for (size_t f = pool.free_slots.size(); f-- > 0;) {
+            const int c = pool.free_slots[f];
+            bool lendable = c >= pool.zone_begin && c < pool.zone_end;
+            for (const auto & kv : pool.kv) {
+                lendable = lendable || (c >= kv.first && c < kv.first + kv.count);
+            }
+            if (!lendable) {
+                s = c;
+                pool.free_slots.erase(pool.free_slots.begin() + f);
+                break;
+            }
+        }
+        if (s < 0) {
+            continue;
+        }
         char * dst = moe_cache_slot_ptr(pool, s);
         for (int r = 0; r < MOE_ROLES && err == cudaSuccess; r++) {
             const char * src = (const char *) layer.tensor[r] + (size_t) expert * layer.bytes[r];
