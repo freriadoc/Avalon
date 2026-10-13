@@ -5364,8 +5364,8 @@ static int moe_hosted_plan(moe_hosted_state & st, moe_hosted_layer & layer, cons
     return n_cpu;
 }
 
-// SPLIT (GGML_CUDA_MOE_SPLIT=0 disables): in a pass of 2 tokens or more, one or two experts of the CPU rows are moved to
-// the GPU when that ends the MoE window sooner. Their missing tensors take cache entries (an admission) and go to the
+// SPLIT (GGML_CUDA_MOE_SPLIT=0 disables): in a pass of 2 tokens or more, experts of the CPU rows are moved to the GPU when
+// that ends the MoE window sooner: the best one or pair, then one more at a time while that still gains. Their missing tensors take cache entries (an admission) and go to the
 // front of the fill queue; the last one to arrive raises the layer's flag, which a kernel queued after the resident rows
 // waits for. The window ends with the later of the CPU rows and the GPU's work: the resident rows, the wait for the
 // moved experts, then the work queued behind it; costs: see moe_split_cpu_fixed_us. Returns the CPU rows left.
@@ -5467,6 +5467,33 @@ static int moe_hosted_split(moe_hosted_state * st, moe_hosted_layer * layer, int
                         best_gain = all - crit;
                         best = {i, j};
                     }
+                }
+            }
+            // past the best pair, one more expert at a time while one still ends the window sooner (the pairs are
+            // searched in full: one expert alone rarely pays for its copy, two may)
+            if (best.size() == 2) {
+                int r = c[best[0]].rows + c[best[1]].rows, t = c[best[0]].tensors + c[best[1]].tensors;
+                double cp = c[best[0]].copies + c[best[1]].copies;
+                for (;;) {
+                    int add = -1;
+                    for (int i = 0; i < D; i++) {
+                        if (std::find(best.begin(), best.end(), i) != best.end()) {
+                            continue;
+                        }
+                        const int n = (int) best.size() + 1;
+                        const double crit = window(D - n, n_cpu - r - c[i].rows, r + c[i].rows, t + c[i].tensors, cp + c[i].copies);
+                        if (all - crit > best_gain) {
+                            best_gain = all - crit;
+                            add = i;
+                        }
+                    }
+                    if (add < 0) {
+                        break;
+                    }
+                    best.push_back(add);
+                    r += c[add].rows;
+                    t += c[add].tensors;
+                    cp += c[add].copies;
                 }
             }
             static const bool verify = getenv("GGML_CUDA_MOE_SPLIT_VERIFY") && atoi(getenv("GGML_CUDA_MOE_SPLIT_VERIFY")) > 0;
