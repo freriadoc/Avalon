@@ -1589,6 +1589,7 @@ static int moe_cache_query_shape(
 
 
 static void moe_cache_rewarm_feed_locked(moe_cache_session & session, moe_cache_device & device);
+static int moe_cache_rewarm_from();
 static bool moe_cache_enqueue_locked(
         moe_cache_session & session, moe_cache_device & device,
         moe_cache_pool & pool, int pool_index, const void * host_base,
@@ -3014,8 +3015,8 @@ static void moe_cache_session_enter_impl(void * opaque, bool guest) {
                 size_t pending = 0;
                 for (auto & pool_ptr : device.pools) {
                     // with a ranking, the free entries are what the restoration fills
-                    pending += device.ranking.empty() ? pool_ptr->rewarm.size() : pool_ptr->free_slots.size();
-                    if (!device.ranking.empty()) {
+                    pending += device.ranking.empty() || moe_cache_rewarm_from() == 1 ? pool_ptr->rewarm.size() : pool_ptr->free_slots.size();
+                    if (!device.ranking.empty() && moe_cache_rewarm_from() == 0) {
                         pool_ptr->rewarm.clear();
                     }
                 }
@@ -3209,11 +3210,49 @@ static bool moe_cache_enqueue_locked(
 // hottest pairs not in the cache), into free entries only (never evicting), and only when the
 // fill worker has nothing else queued: an admission waits for at most one restoration. Called
 // when generation starts and after every fill.
+// What the restoration after a prefill brings back when there is a ranking (GGML_CUDA_MOE_CACHE_REWARM_FROM): the
+// entries the loans evicted, then the ranking's hottest pairs not in the cache into the entries left free ("both",
+// default), the ranking only ("ranking") or the evicted entries only ("evicted"). The evicted entries held the
+// previous answer's experts, which the next turn of a conversation reads again; the ranking fills what they leave
+// (replay of the server's MTP loop at 251k, first 60 steps after an 8192-token message: second turn 42.25 ms per step
+// with the ranking only, 41.78 with both, 41.80 with the evicted only; first turn, cache preloaded: equal)
+static int moe_cache_rewarm_from() {
+    static const int from = [] {
+        const char * v = getenv("GGML_CUDA_MOE_CACHE_REWARM_FROM");
+        return !v ? 2 : !strcmp(v, "ranking") ? 0 : !strcmp(v, "evicted") ? 1 : 2;
+    }();
+    return from;
+}
+
 static void moe_cache_rewarm_feed_locked(moe_cache_session & session, moe_cache_device & device) {
     if (!device.rewarm_active || !device.queue.empty() || session.stopping || device.dead.load()) {
         return;
     }
-    if (!device.ranking.empty()) {
+    const bool use_ranking = !device.ranking.empty() && moe_cache_rewarm_from() != 1;
+    const bool use_evicted = device.ranking.empty() || moe_cache_rewarm_from() != 0;
+    if (use_evicted) {
+        const size_t n = device.pools.size();
+        for (size_t step = 0; step < n; step++) {
+            const size_t index = (device.rewarm_next_pool + step) % n;
+            moe_cache_pool & pool = *device.pools[index];
+            while (!pool.rewarm.empty() && !pool.free_slots.empty()) {
+                const moe_cache_key key = pool.rewarm.back();
+                pool.rewarm.pop_back();
+                if (pool.map.count(key)) {
+                    continue;   // admitted again in the meantime
+                }
+                int inserts_left = 1;
+                bool wake_worker = false;
+                if (moe_cache_enqueue_locked(session, device, pool, (int)index, key.tensor, key.expert,
+                        pool.expert_size, inserts_left, wake_worker, false, true, false)) {
+                    device.rewarm_next_pool = index + 1;
+                    session.cv.notify_all();
+                    return;
+                }
+            }
+        }
+    }
+    if (use_ranking) {
         // the hottest pairs of the ranking not in the cache, into free entries only
         while (device.ranking_next < device.ranking.size()) {
             const auto & r = device.ranking[device.ranking_next++];
@@ -3232,30 +3271,6 @@ static void moe_cache_rewarm_feed_locked(moe_cache_session & session, moe_cache_
                 return;
             }
         }
-        device.rewarm_active = false;
-        MOE_CACHE_LOG("[moe-cache] CUDA%d rewarm: %lld entries restored from the ranking\n", device.physical,
-                device.rewarm_restored);
-        return;
-    }
-    const size_t n = device.pools.size();
-    for (size_t step = 0; step < n; step++) {
-        const size_t index = (device.rewarm_next_pool + step) % n;
-        moe_cache_pool & pool = *device.pools[index];
-        while (!pool.rewarm.empty() && !pool.free_slots.empty()) {
-            const moe_cache_key key = pool.rewarm.back();
-            pool.rewarm.pop_back();
-            if (pool.map.count(key)) {
-                continue;   // admitted again in the meantime
-            }
-            int inserts_left = 1;
-            bool wake_worker = false;
-            if (moe_cache_enqueue_locked(session, device, pool, (int)index, key.tensor, key.expert,
-                    pool.expert_size, inserts_left, wake_worker, false, true, false)) {
-                device.rewarm_next_pool = index + 1;
-                session.cv.notify_all();
-                return;
-            }
-        }
     }
     // nothing left to restore, or no free entry left for it
     device.rewarm_active = false;
@@ -3264,8 +3279,9 @@ static void moe_cache_rewarm_feed_locked(moe_cache_session & session, moe_cache_
         left += pool_ptr->rewarm.size();
         pool_ptr->rewarm.clear();
     }
-    MOE_CACHE_LOG("[moe-cache] CUDA%d rewarm: %lld entries restored, %zu dropped\n",
-            device.physical, device.rewarm_restored, left);
+    MOE_CACHE_LOG("[moe-cache] CUDA%d rewarm: %lld entries restored (%s), %zu evicted ones dropped\n", device.physical,
+            device.rewarm_restored, use_ranking && use_evicted ? "evicted, then the ranking" : use_ranking ? "the ranking" : "evicted",
+            left);
 }
 
 // Stop restoring: a new prefill is lending (what is left belongs to the previous one),
@@ -4033,7 +4049,7 @@ static void moe_cache_profile_save_heat(moe_cache_session & session) {
 // first (moe_cache_ranking_read). Nothing runs yet: each pair takes a free entry of its layer's pool and is copied in
 // place, without the admission and the fill thread; the LRU follows the ranking (the coldest are evicted first, by the
 // prefill's loans too). The prefetch zone and the KV's rows are left empty (a prefill or a long context takes them
-// before they serve); the ranking is kept: after each prefill the restoration brings back its hottest pairs not in the
+// before they serve); the ranking is kept: after each prefill the restoration brings back the evicted entries, then its hottest pairs not in the
 // cache, into the free entries (moe_cache_rewarm_feed_locked). With heats (version 2), each entry's LFU count starts where demand at that rate would hold it:
 // a count gains one per demand and halves every P = lfu_window x entries demands, so an expert taking a share q of
 // the demands settles at 2 q P (capped). Without a ranking the cache starts empty and fills during generation: the
