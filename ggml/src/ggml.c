@@ -6486,6 +6486,33 @@ struct ggml_tensor * ggml_qsa_select(
     return result;
 }
 
+struct ggml_tensor * ggml_qsa_pool_layout(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cell_pos,
+        struct ggml_tensor  * meta,
+        int32_t               kpool,
+        int64_t               n_pool,
+        enum ggml_qsa_select_mode mode) {
+    GGML_ASSERT(cell_pos->type == GGML_TYPE_I32 && ggml_is_contiguous(cell_pos));
+    GGML_ASSERT(meta->type == GGML_TYPE_I32 && ggml_nelements(meta) == 4 && ggml_is_contiguous(meta));
+    GGML_ASSERT(kpool > 0 && n_pool > 0);
+    GGML_ASSERT(mode == GGML_QSA_SELECT_POOL_MEMBERS || mode == GGML_QSA_SELECT_POOL_REP || mode == GGML_QSA_SELECT_POOL_END);
+
+    struct ggml_tensor * result = mode == GGML_QSA_SELECT_POOL_MEMBERS ?
+        ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kpool, n_pool) : ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_pool);
+
+    ggml_set_op_params_i32(result, 0, kpool);
+    ggml_set_op_params_i32(result, 1, (int32_t) mode);
+
+    result->op     = GGML_OP_QSA_SELECT;
+    result->src[0] = NULL;
+    result->src[1] = NULL;
+    result->src[2] = cell_pos;
+    result->src[3] = meta;
+
+    return result;
+}
+
 struct ggml_tensor * ggml_lightning_indexer(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,

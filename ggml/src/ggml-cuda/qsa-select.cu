@@ -63,8 +63,59 @@ static void qsa_select_launch(const ggml_tensor * dst, const dim3 grid, const in
         by_pos ? 0 : vis->nb[1] / sizeof(half), dst->nb[1] / ggml_type_size(dst->type));
 }
 
+// see ggml_qsa_pool_layout: a thread per cell scatters it to its member slot (or block, for the reps); the same thread
+// index also writes the padded slots, which no cell reaches
+template <int mode>
+static __global__ void k_qsa_pool_layout(const int32_t * __restrict__ cell_pos, const int32_t * __restrict__ meta,
+        int32_t * __restrict__ out, const int64_t n_kv, const int64_t n_pool, const int32_t kpool) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int32_t pos_min = meta[0], n_real = meta[1];
+    if constexpr (mode == GGML_QSA_SELECT_POOL_END) {
+        if (i < n_pool) {
+            out[i] = i < n_real ? pos_min + (int32_t) i*kpool + kpool - 1 : -1;
+        }
+        return;
+    }
+    constexpr bool members = mode == GGML_QSA_SELECT_POOL_MEMBERS;
+    const int64_t n_out  = members ? n_pool*kpool : n_pool;
+    const int64_t n_live = members ? (int64_t) n_real*kpool : n_real;
+    if (i >= n_live && i < n_out) {
+        out[i] = members ? meta[3] : meta[2];
+    }
+    if (i < n_kv) {
+        const int32_t p = cell_pos[i];
+        const int64_t d = (int64_t) p - pos_min;
+        if (p >= 0 && d >= 0 && d < (int64_t) n_real*kpool) {
+            if (members) {
+                out[d] = (int32_t) i;
+            } else if (d % kpool == kpool - 1) {
+                out[d / kpool] = (int32_t) i;
+            }
+        }
+    }
+}
+
 void ggml_cuda_op_qsa_select(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int32_t mode   = ggml_get_op_params_i32(dst, 1);
+    if (mode >= GGML_QSA_SELECT_POOL_MEMBERS) {
+        const int32_t kpool  = ggml_get_op_params_i32(dst, 0);
+        const int64_t n_kv   = dst->src[2]->ne[0];
+        const int64_t n_pool = mode == GGML_QSA_SELECT_POOL_MEMBERS ? dst->ne[1] : dst->ne[0];
+        const int64_t n      = std::max(n_kv, mode == GGML_QSA_SELECT_POOL_MEMBERS ? n_pool*kpool : n_pool);
+        const int threads = 256;
+        const int blocks  = (int) ((n + threads - 1) / threads);
+        const int32_t * cp = (const int32_t *) dst->src[2]->data;
+        const int32_t * mt = (const int32_t *) dst->src[3]->data;
+        int32_t * out = (int32_t *) dst->data;
+        cudaStream_t stream = ctx.stream();
+        switch (mode) {
+            case GGML_QSA_SELECT_POOL_MEMBERS: k_qsa_pool_layout<GGML_QSA_SELECT_POOL_MEMBERS><<<blocks, threads, 0, stream>>>(cp, mt, out, n_kv, n_pool, kpool); break;
+            case GGML_QSA_SELECT_POOL_REP:     k_qsa_pool_layout<GGML_QSA_SELECT_POOL_REP>    <<<blocks, threads, 0, stream>>>(cp, mt, out, n_kv, n_pool, kpool); break;
+            default:                           k_qsa_pool_layout<GGML_QSA_SELECT_POOL_END>    <<<blocks, threads, 0, stream>>>(cp, mt, out, n_kv, n_pool, kpool); break;
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     const bool    by_pos = dst->src[2]->type == GGML_TYPE_I32;
     const int64_t n_t    = dst->ne[1];
     const int64_t n_sel  = mode == GGML_QSA_SELECT_CAUSAL ? dst->ne[0] : dst->src[0]->ne[0];

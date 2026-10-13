@@ -12442,8 +12442,47 @@ void ggml_compute_forward_lightning_indexer(
 
 // ggml_qsa_select
 
+// see ggml_qsa_pool_layout
+static void ggml_compute_forward_qsa_pool_layout(ggml_tensor * dst) {
+    const int32_t * cell_pos = (const int32_t *) dst->src[2]->data;
+    const int32_t * meta     = (const int32_t *) dst->src[3]->data;
+    const int32_t kpool  = ggml_get_op_params_i32(dst, 0);
+    const int32_t mode   = ggml_get_op_params_i32(dst, 1);
+    const int64_t n_kv   = dst->src[2]->ne[0];
+    const int64_t n_pool = mode == GGML_QSA_SELECT_POOL_MEMBERS ? dst->ne[1] : dst->ne[0];
+    const int32_t pos_min = meta[0], n_real = meta[1], pad_rep = meta[2], pad_member = meta[3];
+    int32_t * out = (int32_t *) dst->data;
+    if (mode == GGML_QSA_SELECT_POOL_END) {
+        for (int64_t i = 0; i < n_pool; i++) {
+            out[i] = i < n_real ? pos_min + (int32_t) i*kpool + kpool - 1 : -1;
+        }
+        return;
+    }
+    const bool members = mode == GGML_QSA_SELECT_POOL_MEMBERS;
+    const int64_t n_out  = members ? n_pool*kpool : n_pool;
+    const int64_t n_live = members ? (int64_t) n_real*kpool : n_real;
+    for (int64_t i = n_live; i < n_out; i++) {
+        out[i] = members ? pad_member : pad_rep;
+    }
+    for (int64_t c = 0; c < n_kv; c++) {
+        const int64_t d = (int64_t) cell_pos[c] - pos_min;
+        if (cell_pos[c] < 0 || d < 0 || d >= (int64_t) n_real*kpool) {
+            continue;
+        }
+        if (members) {
+            out[d] = (int32_t) c;
+        } else if (d % kpool == kpool - 1) {
+            out[d / kpool] = (int32_t) c;
+        }
+    }
+}
+
 void ggml_compute_forward_qsa_select(const ggml_compute_params * params, ggml_tensor * dst) {
     if (params->ith != 0) {
+        return;
+    }
+    if (ggml_get_op_params_i32(dst, 1) >= GGML_QSA_SELECT_POOL_MEMBERS) {
+        ggml_compute_forward_qsa_pool_layout(dst);
         return;
     }
     const ggml_tensor * sel       = dst->src[0];

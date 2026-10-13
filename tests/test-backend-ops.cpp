@@ -5687,6 +5687,54 @@ struct test_qsa_select : public test_case {
     }
 };
 
+// the k-pool layout of one sequence from the positions of its cells (ggml_qsa_pool_layout): positions pos_min ..
+// pos_min + n_seq - 1 spread over shuffled cells, the others empty (-1); n_seq / kpool complete blocks, padded to n_pool
+struct test_qsa_pool_layout : public test_case {
+    const int64_t n_kv;
+    const int64_t kpool;
+    const int64_t n_seq;
+    const int64_t n_pool;
+    const int     mode;
+
+    std::string vars() override {
+        return VARS_TO_STR5(n_kv, kpool, n_seq, n_pool, mode);
+    }
+
+    test_qsa_pool_layout(int64_t n_kv = 256, int64_t kpool = 4, int64_t n_seq = 201, int64_t n_pool = 64,
+            int mode = GGML_QSA_SELECT_POOL_MEMBERS)
+        : n_kv(n_kv), kpool(kpool), n_seq(n_seq), n_pool(n_pool), mode(mode) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cell_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_kv);
+        ggml_tensor * meta     = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4);
+        ggml_set_name(cell_pos, "cell_pos");
+        ggml_set_name(meta, "meta");
+        return ggml_qsa_pool_layout(ctx, cell_pos, meta, (int32_t) kpool, n_pool, (ggml_qsa_select_mode) mode);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234);
+        const int32_t pos_min = 37;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "cell_pos") == 0) {
+                std::vector<int32_t> perm(n_kv);
+                std::iota(perm.begin(), perm.end(), 0);
+                std::shuffle(perm.begin(), perm.end(), rng);
+                std::vector<int32_t> v(n_kv, -1);
+                for (int64_t k = 0; k < n_seq; k++) {
+                    v[perm[k]] = pos_min + (int32_t) k;
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "meta") == 0) {
+                const int32_t v[4] = { pos_min, (int32_t) (n_seq / kpool), (int32_t) (n_kv - 3), (int32_t) n_kv };
+                ggml_backend_tensor_set(t, v, 0, sizeof(v));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // the QSA prefill's dense mask from the selection the graph assembles (the cells of the top-k pools, then the tail;
 // the scores at the top-k pools): ggml-cuda computes the four nodes in one kernel (ggml_cuda_try_fuse_qsa_select_pooled)
 struct test_qsa_select_pooled : public test_case {
@@ -13007,6 +13055,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     test_cases.emplace_back(new test_gdn_gates(48, 1));
+    for (int m : { GGML_QSA_SELECT_POOL_MEMBERS, GGML_QSA_SELECT_POOL_REP, GGML_QSA_SELECT_POOL_END }) {
+        test_cases.emplace_back(new test_qsa_pool_layout(256,    4, 201,    64, m));
+        test_cases.emplace_back(new test_qsa_pool_layout(262144, 4, 250003, 65536, m));
+        test_cases.emplace_back(new test_qsa_pool_layout(1024,   4, 2,      8, m));   // no complete block
+    }
     for (int m : { GGML_QSA_SELECT_ROWS, GGML_QSA_SELECT_MASK, GGML_QSA_SELECT_DENSE, GGML_QSA_SELECT_CAUSAL }) {
         for (bool by_pos : { false, true }) {
             if (m == GGML_QSA_SELECT_CAUSAL && !by_pos) {

@@ -2681,6 +2681,10 @@ extern "C" {
         GGML_QSA_SELECT_MASK   = 1,
         GGML_QSA_SELECT_DENSE  = 2,
         GGML_QSA_SELECT_CAUSAL = 3,
+        // the k-pool layout of one sequence (ggml_qsa_pool_layout)
+        GGML_QSA_SELECT_POOL_MEMBERS = 4,
+        GGML_QSA_SELECT_POOL_REP     = 5,
+        GGML_QSA_SELECT_POOL_END     = 6,
     };
 
     GGML_API struct ggml_tensor * ggml_qsa_select(
@@ -2690,6 +2694,25 @@ extern "C" {
             struct ggml_tensor     * vis,
             struct ggml_tensor     * tok_pos,
             int32_t                  kpool,
+            enum ggml_qsa_select_mode mode);
+
+    // the k-pool layout of one sequence whose positions are contiguous, from the positions of its cells (the tables
+    // the QSA indexer and selection read, built on the device instead of on the host every graph)
+    //
+    // cell_pos: I32 [n_kv]  position of each cell, -1 for a cell of no position (empty, or of another sequence)
+    // meta:     I32 [4]     pos_min (the sequence's first position), n_real (complete blocks: positions
+    //                       [pos_min, pos_min + n_real*kpool) have one cell each), pad_rep, pad_member
+    //
+    // block i < n_real holds positions pos_min + i*kpool + k, k < kpool; blocks n_real .. n_pool - 1 are padding
+    // mode POOL_MEMBERS: result I32 [kpool, n_pool], the cell of each member, pad_member for a padded block
+    // mode POOL_REP:     result I32 [n_pool], the last member's cell, pad_rep for a padded block
+    // mode POOL_END:     result I32 [n_pool], the last member's position, -1 for a padded block
+    GGML_API struct ggml_tensor * ggml_qsa_pool_layout(
+            struct ggml_context    * ctx,
+            struct ggml_tensor     * cell_pos,
+            struct ggml_tensor     * meta,
+            int32_t                  kpool,
+            int64_t                  n_pool,
             enum ggml_qsa_select_mode mode);
 
     // DSA lightning indexer
