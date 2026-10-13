@@ -824,6 +824,9 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
         inp->pool_idxs  = ggml_qsa_pool_layout(ctx0, inp->cell_pos, inp->layout_meta, (int32_t) kpool, n_pool, GGML_QSA_SELECT_POOL_MEMBERS);
         inp->pool_cells = ggml_qsa_pool_layout(ctx0, inp->cell_pos, inp->layout_meta, (int32_t) kpool, n_pool, GGML_QSA_SELECT_POOL_REP);
         inp->pool_end   = ggml_qsa_pool_layout(ctx0, inp->cell_pos, inp->layout_meta, (int32_t) kpool, n_pool, GGML_QSA_SELECT_POOL_END);
+        for (ggml_tensor * t : { inp->pool_idxs, inp->pool_cells, inp->pool_end }) {
+            cb(t, "qsa_pool_layout", -1);   // on the GPU, see llama_context::graph_get_cb
+        }
     } else {
         inp->pool_cells = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_pool);
         inp->pool_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool, n_pool);

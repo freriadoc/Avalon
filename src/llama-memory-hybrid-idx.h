@@ -219,7 +219,7 @@ public:
     bool kpool_pos_mode(const llama_ubatch & ubatch) const;
 
     // the pool tables (pool_cells, pool_idxs, pool_end) can be built on the device from cell_pos (ggml_qsa_pool_layout):
-    // positions mode, position order, a single sequence in the cache with contiguous positions, its pools the aligned
+    // positions mode (in order mode, positions from 0), a single sequence in the cache with contiguous positions, its pools the aligned
     // blocks from its first position, and the ubatch ending it (the pools it renews are the last ones). set_input_kpool
     // then fills layout_meta (I32 [4]: first position, complete pools, padded rep, padded member) instead of them.
     // LLAMA_QSA_DEVICE_LAYOUT=0: always on the host

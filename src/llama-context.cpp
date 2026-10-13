@@ -2826,6 +2826,20 @@ llm_graph_cb llama_context::graph_get_cb() const {
             ggml_set_name(cur, name);
         }
 
+        // the QSA pool tables built from the cells' positions (qwen4exp, kpool_layout_on_device): their inputs live in
+        // host memory, which would put them on the CPU (a loop over every cell, then an upload) in a context whose
+        // layers are not offloaded the same way (the MTP draft): they belong on the GPU that runs the attention
+        if (strcmp(name, "qsa_pool_layout") == 0) {
+            for (const auto & backend : backends) {
+                if (ggml_backend_dev_type(ggml_backend_get_device(backend.get())) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+                        ggml_backend_supports_op(backend.get(), cur)) {
+                    ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
+                    break;
+                }
+            }
+            return;
+        }
+
         // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
         // - force the last op of the layer on the specified backend to avoid running it on the backend of the next layer due to scheduling
         // FIXME: fix in ggml_backend_sched

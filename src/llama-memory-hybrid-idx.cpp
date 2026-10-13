@@ -1171,7 +1171,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
 
 bool llama_memory_hybrid_idx_context::kpool_layout_on_device(const llama_ubatch & ubatch) const {
     static const bool enabled = !getenv("LLAMA_QSA_DEVICE_LAYOUT") || atoi(getenv("LLAMA_QSA_DEVICE_LAYOUT")) != 0;
-    if (!enabled || !kpool_pos_mode(ubatch) || mem->get_kpool_by_order() || ubatch.n_tokens == 0) {
+    if (!enabled || !kpool_pos_mode(ubatch) || ubatch.n_tokens == 0) {
         return false;
     }
     const uint32_t     kpool = mem->get_kpool();
@@ -1185,6 +1185,11 @@ bool llama_memory_hybrid_idx_context::kpool_layout_on_device(const llama_ubatch 
     const auto & sq  = lay.seqs[s0];
     const uint32_t n = (uint32_t) sq.pools.size();
     if (sq.shared || sq.pos_min != sp.begin()->first || lay.n_pool_real != n) {
+        return false;
+    }
+    // in order mode (the MTP draft's) a pool is kpool consecutive cells in sequence order and pool_end a rank: with
+    // contiguous positions from 0 the rank is the position, so the same blocks and ends (checked below)
+    if (mem->get_kpool_by_order() && sq.pos_min != 0) {
         return false;
     }
     // aligned blocks one after the other from the first cell (each pool's members consecutive positions): then
