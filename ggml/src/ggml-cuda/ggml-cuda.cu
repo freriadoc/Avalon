@@ -3149,6 +3149,11 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     uintptr_t key = (uintptr_t) n0;
     key ^= (uintptr_t) cgraph->n_nodes * 0x9E3779B97F4A7C15ull;
     key ^= (uintptr_t) (n0->ne[1] * 0xC2B2AE3D27D4EB4Full + n0->ne[2] * 0x165667B19E3779F9ull);
+    // the token count, which the first node may not carry (the MTP draft's passes of 1 and of 2 to 4 tokens have
+    // the same node count and first node: one shared graph, its properties changed at every call, never captured)
+    for (int i = 1; i < std::min(cgraph->n_nodes, 16); i++) {
+        key = key*0x100000001B3ull ^ (uintptr_t) cgraph->nodes[i]->ne[1];
+    }
     return (const void *) key;
 }
 
