@@ -984,7 +984,28 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
 
     // Padded entries re-pool cells whose pooled slot is never read: only the reps of complete pools are read.
     // Each entry takes its own cell, entries sharing one would write it from several threads in the scatter.
-    if (n_new_g > n_new) {
+    // The first members of complete pools are never a rep (the last member) and are distinct: they serve when there
+    // are enough of them, without sorting every rep (O(n_pool log n_pool) per graph).
+    uint32_t n_pad_first = 0;
+    if (n_new_g > n_new && kpool > 1) {
+        for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ && n_new + n_pad_first < n_new_g; ++s) {
+            const auto & sq = lay.seqs[s];
+            for (size_t pi = 0; pi < sq.pools.size() && n_new + n_pad_first < n_new_g; ++pi) {
+                const int64_t c = gcell(sq, sq.cells[sq.pools[pi]].second);
+                const uint32_t i = n_new + n_pad_first++;
+                for (uint32_t k = 0; k < kpool; ++k) {
+                    nidx[(size_t) i*kpool + k] = (int32_t) c;
+                }
+                if (nrep != nullptr) {
+                    nrep[i] = c;
+                }
+            }
+        }
+        if (n_new + n_pad_first < n_new_g) {
+            n_pad_first = 0;   // too few pools yet: as below
+        }
+    }
+    if (n_new_g > n_new && n_pad_first == 0) {
         std::vector<int64_t> reps(pcell, pcell + pool_end.size());
         std::sort(reps.begin(), reps.end());
 

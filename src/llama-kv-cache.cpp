@@ -467,15 +467,16 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
         uint32_t new_head = cells.size();
 
-        for (uint32_t i = 0; i < cells.size(); ++i) {
-            if (!cells.pos_in(i, p0, p1)) {
-                continue;
-            }
-
-            if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
-                if (new_head == cells.size()) {
-                    new_head = i;
-                }
+        // the sequence's cells ordered by position: only those in [p0, p1) (a speculative step removes its few
+        // rejected drafts every token, a scan of every cell is O(kv_size))
+        std::vector<uint32_t> idxs;
+        const auto & sp = cells.seq_pos_get(seq_id);
+        for (auto it = sp.lower_bound({ p0, 0u }); it != sp.end() && it->first < p1; ++it) {
+            idxs.push_back(it->second);
+        }
+        for (const uint32_t i : idxs) {
+            if (cells.seq_rm(i, seq_id)) {
+                new_head = std::min(new_head, i);
             }
         }
 
