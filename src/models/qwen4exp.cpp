@@ -728,7 +728,7 @@ public:
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
         mctx->set_input_kpool(pool_cells, pool_idxs, pool_mask, tail_idxs, nullptr, false, new_pool_idxs, new_pool_rep,
-                              ubatch, new_pool_pos, pool_end, cell_pos, tok_pos, tok_rank);
+                              ubatch, new_pool_pos, pool_end, cell_pos, tok_pos, tok_rank, layout_meta);
     }
 
     bool can_reuse(const llm_graph_params & params) override {
@@ -744,6 +744,7 @@ public:
         res &= k_idxs->ne[0]     == params.ubatch.n_tokens;
         res &= pool_cells->ne[0] == mctx->get_n_kpool();
         res &= pos_mode          == mctx->kpool_pos_mode(params.ubatch);
+        res &= (layout_meta != nullptr) == (pos_mode && mctx->kpool_layout_on_device(params.ubatch));
         res &= pos_mode ? tok_pos->ne[0] == params.ubatch.n_tokens && cell_pos->ne[0] == idx->get_n_kv()
                         : pool_mask->ne[1] == params.ubatch.n_tokens;
         res &= tail_idxs->ne[1]  == params.ubatch.n_tokens;
@@ -772,6 +773,8 @@ public:
     ggml_tensor * cell_pos = nullptr; // I32 [n_kv]     position of each cell of the sequence, -1 otherwise
     ggml_tensor * tok_pos  = nullptr; // I32 [n_tokens] position of each token
     ggml_tensor * tok_rank = nullptr; // I32 [n_tokens] what pool_end is compared with (rank or position)
+    // pool_cells, pool_idxs and pool_end built on the device from cell_pos (kpool_layout_on_device): then not inputs
+    ggml_tensor * layout_meta = nullptr; // I32 [4]
 
     const llama_memory_hybrid_idx_context * mctx;
     const uint32_t kpool;
@@ -791,27 +794,21 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
     auto inp = std::make_unique<llm_graph_input_kpool>(mctx_hyb, kpool);
 
     inp->k_idxs     = mctx_idx->build_input_k_idxs(ctx0, ubatch);
-    inp->pool_cells = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_pool);
-    inp->pool_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool, n_pool);
     // the top blocks plus the tail, padded to the K/V tile of the flash attention (256 cells): a gathered
     // attention over a multiple of it may group the heads of a K/V head (2051 -> 2304 cells, the extra slots
     // empty: RDNA3 tile kernel 28.8 -> 16.9 us per QSA layer while decoding)
     const uint32_t n_sel_live = kpool*std::min<uint32_t>(n_pool, hparams.indexer_top_k / kpool) + kpool - 1;
     inp->n_sel      = GGML_PAD(n_sel_live, 256);
     inp->tail_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool - 1 + (inp->n_sel - n_sel_live), n_tokens);
-    ggml_set_input(inp->pool_cells);
-    ggml_set_input(inp->pool_idxs);
     ggml_set_input(inp->tail_idxs);
 
     // the masks from positions when possible: the dense KQ mask ([n_kv, n_tokens], 4 GiB at 256k with
     // 8192-token ubatches, filled on the host) and the pool mask are then neither built nor uploaded
     inp->pos_mode = mctx_hyb->kpool_pos_mode(ubatch);
     if (inp->pos_mode) {
-        inp->pool_end = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_pool);
         inp->cell_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, mctx_idx->get_n_kv());
         inp->tok_pos  = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
         inp->tok_rank = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
-        ggml_set_input(inp->pool_end);
         ggml_set_input(inp->cell_pos);
         ggml_set_input(inp->tok_pos);
         ggml_set_input(inp->tok_rank);
@@ -819,9 +816,27 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
         inp->pool_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_pool, n_tokens);
         ggml_set_input(inp->pool_mask);
     }
+    // the pool tables: from the cells' positions on the device when the layout allows it (they are rebuilt and
+    // uploaded every graph otherwise: ~1.5 MiB and ~0.5 ms of host time per graph at 250k)
+    if (inp->pos_mode && mctx_hyb->kpool_layout_on_device(ubatch)) {
+        inp->layout_meta = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4);
+        ggml_set_input(inp->layout_meta);
+        inp->pool_idxs  = ggml_qsa_pool_layout(ctx0, inp->cell_pos, inp->layout_meta, (int32_t) kpool, n_pool, GGML_QSA_SELECT_POOL_MEMBERS);
+        inp->pool_cells = ggml_qsa_pool_layout(ctx0, inp->cell_pos, inp->layout_meta, (int32_t) kpool, n_pool, GGML_QSA_SELECT_POOL_REP);
+        inp->pool_end   = ggml_qsa_pool_layout(ctx0, inp->cell_pos, inp->layout_meta, (int32_t) kpool, n_pool, GGML_QSA_SELECT_POOL_END);
+    } else {
+        inp->pool_cells = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_pool);
+        inp->pool_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool, n_pool);
+        ggml_set_input(inp->pool_cells);
+        ggml_set_input(inp->pool_idxs);
+        if (inp->pos_mode) {
+            inp->pool_end = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_pool);
+            ggml_set_input(inp->pool_end);
+        }
+    }
 
     // set_input fills them all, so keep them allocated even when no op reads them
-    for (ggml_tensor * t : { inp->pool_cells, inp->pool_idxs, inp->pool_mask, inp->tail_idxs, inp->pool_end, inp->cell_pos, inp->tok_pos, inp->tok_rank }) {
+    for (ggml_tensor * t : { inp->pool_cells, inp->pool_idxs, inp->pool_mask, inp->tail_idxs, inp->pool_end, inp->cell_pos, inp->tok_pos, inp->tok_rank, inp->layout_meta }) {
         if (t) {
             ggml_build_forward_expand(gf, t);
         }

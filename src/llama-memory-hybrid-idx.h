@@ -211,12 +211,19 @@ public:
                          ggml_tensor * gather_mask, bool gather, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
                          const llama_ubatch * ubatch, ggml_tensor * new_pool_pos = nullptr,
                          ggml_tensor * pool_end = nullptr, ggml_tensor * cell_pos = nullptr, ggml_tensor * tok_pos = nullptr,
-                         ggml_tensor * tok_rank = nullptr) const;
+                         ggml_tensor * tok_rank = nullptr, ggml_tensor * layout_meta = nullptr) const;
 
     // masks from positions are possible: one KV stream, one sequence in the ubatch. pool_end and tok_rank
     // then carry the order in which pools become visible (the rank of the pool's last member and of the
     // token in order mode, positions otherwise), cell_pos and tok_pos the causal test of the cells
     bool kpool_pos_mode(const llama_ubatch & ubatch) const;
+
+    // the pool tables (pool_cells, pool_idxs, pool_end) can be built on the device from cell_pos (ggml_qsa_pool_layout):
+    // positions mode, position order, a single sequence in the cache with contiguous positions, its pools the aligned
+    // blocks from its first position, and the ubatch ending it (the pools it renews are the last ones). set_input_kpool
+    // then fills layout_meta (I32 [4]: first position, complete pools, padded rep, padded member) instead of them.
+    // LLAMA_QSA_DEVICE_LAYOUT=0: always on the host
+    bool kpool_layout_on_device(const llama_ubatch & ubatch) const;
 
 private:
     llama_memory_hybrid_idx * mem = nullptr;

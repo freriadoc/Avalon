@@ -94,6 +94,11 @@ public:
 
     // the index of the last cell that is used + 1
     // return 0 if no cells are used
+    // the position of every cell, -1 for an empty one
+    const llama_pos * pos_data() const {
+        return pos.data();
+    }
+
     uint32_t used_max_p1() const {
         return used.empty() ? 0 : *used.rbegin() + 1;
     }
