@@ -201,6 +201,19 @@ int ggml_cuda_try_fuse_qsa_select_pooled(ggml_backend_cuda_context & ctx, ggml_c
     }
     const ggml_tensor * vis     = qs->src[2];
     const ggml_tensor * tok_pos = qs->src[3];
+    // ggml-alloc may place the mask over a tensor whose last reader in the graph ran before it (the scores and the
+    // top-k are last read by the scores' GET_ROWS): the fused kernel reads them while it writes the mask
+    {
+        const char * ml = (const char *) qs->data, * mh = ml + ggml_nbytes(qs);
+        for (const ggml_tensor * t : { top_k, pool_idxs, tail, score, vis, tok_pos }) {
+            if (t) {
+                const char * tl = (const char *) t->data, * th = tl + ggml_nbytes(t);
+                if (tl < mh && ml < th) {
+                    return 0;
+                }
+            }
+        }
+    }
     const bool by_pos  = vis->type == GGML_TYPE_I32;
     const int64_t n_t   = qs->ne[1];
     const int64_t n_top = top_k->ne[0];
