@@ -5687,6 +5687,109 @@ struct test_qsa_select : public test_case {
     }
 };
 
+// the QSA prefill's dense mask from the selection the graph assembles (the cells of the top-k pools, then the tail;
+// the scores at the top-k pools): ggml-cuda computes the four nodes in one kernel (ggml_cuda_try_fuse_qsa_select_pooled)
+struct test_qsa_select_pooled : public test_case {
+    const int64_t n_kv;
+    const int64_t n_pool;
+    const int64_t n_top;
+    const int64_t kpool;
+    const int64_t n_tail;
+    const int64_t n_t;
+    const bool    by_pos;
+
+    std::string vars() override {
+        return VARS_TO_STR7(n_kv, n_pool, n_top, kpool, n_tail, n_t, by_pos);
+    }
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "QSA_SELECT_POOLED"; }
+    // the whole graph is one fused node on the GPU: only its result compares (the top-k is unordered)
+    bool run_whole_graph() override { return true; }
+
+    test_qsa_select_pooled(int64_t n_kv = 256, int64_t n_pool = 32, int64_t n_top = 16, int64_t kpool = 4,
+            int64_t n_tail = 3, int64_t n_t = 1, bool by_pos = true)
+        : n_kv(n_kv), n_pool(n_pool), n_top(n_top), kpool(kpool), n_tail(n_tail), n_t(n_t), by_pos(by_pos) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * score     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_pool, n_t);
+        ggml_tensor * pool_idxs = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kpool, n_pool);
+        ggml_tensor * tail      = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_tail, n_t);
+        ggml_set_name(score, "score");
+        ggml_set_name(pool_idxs, "pool_idxs");
+        ggml_set_name(tail, "tail");
+        ggml_tensor * vis;
+        ggml_tensor * tok = nullptr;
+        if (by_pos) {
+            vis = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_kv);
+            tok = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_t);
+            ggml_set_name(vis, "cell_pos");
+            ggml_set_name(tok, "tok_pos");
+        } else {
+            vis = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, n_t);
+            ggml_set_name(vis, "kq_mask");
+        }
+        // as qwen4exp builds it (llm_build_qwen4exp, select)
+        ggml_tensor * top_k = ggml_top_k(ctx, score, n_top);
+        ggml_tensor * sel   = ggml_get_rows(ctx, pool_idxs, ggml_reshape_1d(ctx, top_k, n_top*n_t));
+        sel = ggml_reshape_2d(ctx, sel, kpool*n_top, n_t);
+        sel = ggml_concat(ctx, sel, tail, 0);
+        ggml_tensor * top_score = ggml_get_rows(ctx, ggml_reshape_3d(ctx, score, 1, n_pool, n_t), top_k);
+        top_score = ggml_reshape_2d(ctx, top_score, n_top, n_t);
+        return ggml_qsa_select(ctx, sel, top_score, vis, tok, (int32_t) kpool, GGML_QSA_SELECT_DENSE);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234);
+        // cells: the pools' first, then the tail's, all distinct; the last pool padded past n_kv
+        std::vector<int32_t> perm(n_kv);
+        std::iota(perm.begin(), perm.end(), 0);
+        std::shuffle(perm.begin(), perm.end(), rng);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "score") == 0) {
+                // distinct finite scores (one top-k on every backend), half the pools invisible: some are picked
+                std::vector<float> v(ggml_nelements(t));
+                for (int64_t q = 0; q < n_t; q++) {
+                    std::vector<int32_t> rank(n_pool);
+                    std::iota(rank.begin(), rank.end(), 0);
+                    std::shuffle(rank.begin(), rank.end(), rng);
+                    for (int64_t p = 0; p < n_pool; p++) {
+                        v[q*n_pool + p] = rank[p] < n_pool/2 ? -INFINITY : (float) rank[p];
+                    }
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "pool_idxs") == 0) {
+                std::vector<int32_t> v(ggml_nelements(t));
+                for (int64_t i = 0; i < (int64_t) v.size(); i++) {
+                    v[i] = i >= (int64_t) v.size() - 2 ? (int32_t) n_kv : perm[i];
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "tail") == 0) {
+                std::vector<int32_t> v(ggml_nelements(t));
+                for (int64_t q = 0; q < n_t; q++) {
+                    for (int64_t j = 0; j < n_tail; j++) {
+                        v[q*n_tail + j] = j == n_tail - 1 ? -1 : perm[n_pool*kpool + j];   // a missing tail cell
+                    }
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "kq_mask") == 0) {
+                std::vector<ggml_fp16_t> v(ggml_nelements(t));
+                for (auto & x : v) {
+                    x = ggml_fp32_to_fp16(rng() % 3 == 0 ? -INFINITY : 0.0f);
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "cell_pos") == 0 || strcmp(t->name, "tok_pos") == 0) {
+                std::vector<int32_t> v(ggml_nelements(t));
+                for (auto & x : v) {
+                    x = rng() % 6 == 0 ? -1 : (int32_t) (rng() % (2*n_kv));
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 struct test_gated_delta_net_cache_fusion : public test_case {
     const ggml_type type;
 
@@ -12912,6 +13015,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_qsa_select(256,  16, 4, 1, m, by_pos));
             test_cases.emplace_back(new test_qsa_select(4096, 512, 4, 3, m, by_pos));
         }
+    }
+    for (bool by_pos : { false, true }) {
+        test_cases.emplace_back(new test_qsa_select_pooled(256,  32,  16, 4, 3,   1, by_pos));
+        test_cases.emplace_back(new test_qsa_select_pooled(4096, 512, 256, 4, 255, 3, by_pos));
     }
     test_cases.emplace_back(new test_ssm_conv_cached(256, 1, 1));
     test_cases.emplace_back(new test_ssm_conv_cached(10240, 1, 1));

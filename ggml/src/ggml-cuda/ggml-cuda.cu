@@ -4578,6 +4578,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    if (node->op == GGML_OP_GET_ROWS) {
+        const int skip = ggml_cuda_try_fuse_qsa_select_pooled(*cuda_ctx, cgraph, i);
+        if (skip > 0) {
+            return skip;
+        }
+    }
+
     if (node->op == GGML_OP_MUL_MAT) {
         int skip = ggml_cuda_try_fuse_fwht_gate(*cuda_ctx, cgraph, i);
         if (skip == 0) {
