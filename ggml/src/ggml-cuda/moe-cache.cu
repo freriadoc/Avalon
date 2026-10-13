@@ -475,6 +475,9 @@ struct moe_cache_device {
     // pairs not in the cache first (empty without GGML_CUDA_MOE_CACHE_PRELOAD: the entries lending evicted instead)
     std::vector<std::pair<int, moe_cache_key>> ranking;
     size_t ranking_next = 0;
+    // the preload's ranking as read, (layer, expert) hottest first: translated again into ranking when a layer joins
+    // the pools later (the MTP draft's, shown when it shares the session), so that its pairs take their place
+    std::vector<std::pair<int, int>> ranking_src;
     char * h_input = nullptr;
     char * d_input = nullptr;
     size_t h_input_cap = 0;
@@ -2484,6 +2487,24 @@ static void moe_cache_build_pending(
     moe_cache_preload(session, device);
 }
 
+// the ranking (ranking_src) translated into (pool, key) for the layers the pools hold, its order kept
+static void moe_cache_ranking_resolve(moe_cache_device & device) {
+    device.ranking.clear();
+    for (const auto & [layer_number, expert] : device.ranking_src) {
+        const auto l = device.layers.find(layer_number);
+        if (l == device.layers.end() || l->second.shape < 0 || expert >= l->second.n_expert) {
+            continue;
+        }
+        const int pool_index = device.shapes[l->second.shape].pool;
+        if (pool_index >= 0 && pool_index < (int) device.pools.size()) {
+            device.ranking.push_back({pool_index, moe_cache_key{l->second.tensor[MOE_ROLE_GATE], expert}});
+        }
+    }
+    device.ranking_next = 0;
+    MOE_CACHE_LOG("[moe-cache] CUDA%d ranking: %zu of %zu pairs in the pools\n", device.physical, device.ranking.size(),
+            device.ranking_src.size());
+}
+
 // An expert tensor shown to the cache (moe_cache_begin): recorded in its layer (number and role read from its name).
 // Once every tensor known has been seen again without a new one (two passes of the scheduler's priming), the complete
 // layers are grouped by expert shape and a pool is built per shape. A layer complete after that joins the pool of its
@@ -2531,6 +2552,9 @@ static int moe_cache_discover_pool(
             sh.n_layers++;
             if (sh.pool >= 0 && sh.pool < (int) device.pools.size()) {
                 device.pools[sh.pool]->covers_all_entries = (uint64_t) device.pools[sh.pool]->n_slots >= sh.n_entries;
+            }
+            if (!device.ranking_src.empty()) {
+                moe_cache_ranking_resolve(device);   // its pairs of the ranking, for the restorations after a prefill
             }
         }
     }
@@ -4026,6 +4050,10 @@ static void moe_cache_preload(const moe_cache_session & session, moe_cache_devic
         return;
     }
     const uint32_t n_ranked = (uint32_t) ranking.size();
+    device.ranking_src.clear();
+    for (const auto & r : ranking) {
+        device.ranking_src.push_back({r.layer, r.expert});
+    }
     double heat_total = 0;
     for (const auto & r : ranking) {
         heat_total += r.heat;
