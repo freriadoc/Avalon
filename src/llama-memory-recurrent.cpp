@@ -52,7 +52,7 @@ llama_memory_recurrent::llama_memory_recurrent(
         if (it == ctx_map.end()) {
             ggml_init_params params = {
                 // r and s per layer, plus the separate PLE conv row where the model has one
-                /*.mem_size   =*/ size_t((hparams.ple_conv_state() > 0 ? 3u : 2u)*n_layer*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t((hparams.ple_conv_state() > 0 ? 4u : 3u)*n_layer*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -73,6 +73,17 @@ llama_memory_recurrent::llama_memory_recurrent(
     r_l.resize(n_layer);
     s_l.resize(n_layer);
     p_l.resize(n_layer);
+    st_l.resize(n_layer);
+
+    // the stash row of a gated delta net token: k [S_k*H_k], v [S_v*H_v], g [H_v], beta [H_v] (qwen4exp's layers)
+    const int64_t gdn_row = (int64_t) hparams.ssm_d_state * hparams.ssm_n_group +
+                            (int64_t) hparams.ssm_d_state * hparams.ssm_dt_rank + 2 * (int64_t) hparams.ssm_dt_rank;
+    {
+        static const bool enabled = !getenv("LLAMA_GDN_REPLAY") || atoi(getenv("LLAMA_GDN_REPLAY")) != 0;
+        gdn_replay = enabled && n_rs_seq > 0 && n_seq_max == 1 && model.arch == LLM_ARCH_QWEN4EXP &&
+                     hparams.n_embd_s() == hparams.ssm_d_state * hparams.ssm_d_state * hparams.ssm_dt_rank;
+        gdn_w = gdn_replay ? n_rs_seq + 1 : 0;
+    }
 
     for (int i = 0; i < n_layer; i++) {
         if (filter && !filter(i)) {
@@ -100,7 +111,13 @@ llama_memory_recurrent::llama_memory_recurrent(
 
         const uint32_t n_rows = mem_size * (1 + n_rs_seq);
         ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), n_rows);
-        ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows);
+        // with the deferred commit, S has its committed state only
+        ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), gdn_replay ? mem_size : n_rows);
+        if (gdn_replay) {
+            GGML_ASSERT(type_s == GGML_TYPE_F32);
+            st_l[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, gdn_row, 2 * gdn_w);
+            ggml_format_name(st_l[i], "cache_gdn_stash_l%d", i);
+        }
         ggml_format_name(r, "cache_r_l%d", i);
         ggml_format_name(s, "cache_s_l%d", i);
         r_l[i] = r;
@@ -130,6 +147,12 @@ llama_memory_recurrent::llama_memory_recurrent(
             n_rs_seq = 0;
             LLAMA_LOG_INFO("%s: disabling rollback snapshots because the memory module is empty\n", __func__);
         }
+        gdn_replay = false;
+        gdn_w      = 0;
+    }
+
+    if (gdn_replay) {
+        LLAMA_LOG_INFO("%s: gated delta net states committed by replay: S without rollback planes, windows of up to %u tokens kept as inputs\n", __func__, gdn_w);
     }
 
     {
@@ -163,6 +186,21 @@ void llama_memory_recurrent::clear(bool data) {
     }
 
     std::fill(rs_idx.begin(), rs_idx.end(), 0);
+    replay_n    = 0;
+    replay_half = 0;
+}
+
+void llama_memory_recurrent::gdn_ctl_take(int32_t * ctl, uint32_t n_seq_tokens) {
+    const bool defer = n_seq_tokens <= gdn_w;
+    ctl[0] = (int32_t) replay_n;
+    ctl[1] = (int32_t) replay_half;
+    ctl[2] = defer ? 1 : 0;
+    if (defer) {
+        replay_n    = n_seq_tokens;
+        replay_half = 1 - replay_half;
+    } else {
+        replay_n = 0;
+    }
 }
 
 bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -184,6 +222,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     const bool rm_all = p0 == 0 && p1 == std::numeric_limits<llama_pos>::max();
     if (rm_all) {
         set_rs_idx(seq_id, 0);
+        replay_n = 0;
     }
 
     // models like Mamba or RWKV can't have a state partially erased at the end
@@ -211,8 +250,15 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 const llama_pos rollback = cell.pos - (p0 - 1);
                 // pending rollback is single-use
                 const bool pending = rs_idx[seq_id] != 0;
+                // the deferred S states can only drop tokens still kept as inputs
+                if (gdn_replay && rollback > (llama_pos) replay_n) {
+                    return false;
+                }
                 if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
                     set_rs_idx(seq_id, (uint32_t) rollback);
+                    if (gdn_replay) {
+                        replay_n -= (uint32_t) rollback;
+                    }
                     cell.pos = p0 - 1;
                     return true;
                 }
@@ -971,11 +1017,20 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
             io.write(&s_size_row, sizeof(s_size_row));
 
             // Write each logical cell row range. With pending recurrent rollback,
-            // the logical current state may live in a rollback snapshot plane.
+            // the logical current state may live in a rollback snapshot plane (S has only the first with gdn_replay)
             for (const auto & range : cell_ranges) {
                 const size_t range_size = range.second - range.first;
                 const size_t buf_size = range_size * s_size_row;
-                io.write_tensor(s_l[il], range.first * s_size_row, buf_size);
+                io.write_tensor(s_l[il], (gdn_replay ? range.first % size : range.first) * s_size_row, buf_size);
+            }
+        }
+        // the inputs still to replay on S, part of its logical state
+        if (gdn_replay) {
+            io.write(&replay_n, sizeof(replay_n));
+            for (uint32_t il = 0; il < n_layer; ++il) {
+                if (st_l[il] == nullptr || replay_n == 0) continue;
+                const size_t row = ggml_row_size(GGML_TYPE_F32, st_l[il]->ne[0]);
+                io.write_tensor(st_l[il], (size_t) replay_half * gdn_w * row, replay_n * row);
             }
         }
     } else {
@@ -1203,6 +1258,22 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
                 io.read_tensor(s_l[il], head * s_size_row, cell_count * s_size_row);
             }
         }
+        // the inputs still to replay on S (state_write_data), back in the first half
+        if (gdn_replay) {
+            uint32_t n = 0;
+            io.read(&n, sizeof(n));
+            if (n > gdn_w) {
+                LLAMA_LOG_ERROR("%s: %u gated delta net tokens to replay, more than %u\n", __func__, n, gdn_w);
+                return false;
+            }
+            for (uint32_t il = 0; il < n_layer; ++il) {
+                if (st_l[il] == nullptr || n == 0) continue;
+                const size_t row = ggml_row_size(GGML_TYPE_F32, st_l[il]->ne[0]);
+                io.read_tensor(st_l[il], 0, n * row);
+            }
+            replay_n    = n;
+            replay_half = 0;
+        }
     } else {
         // For each layer, read the values for each cell (transposed)
         for (uint32_t il = 0; il < n_layer; ++il) {
@@ -1363,6 +1434,22 @@ ggml_tensor * llama_memory_recurrent_context::get_s_l(int32_t il) const {
 
 ggml_tensor * llama_memory_recurrent_context::get_p_l(int32_t il) const {
     return mem->p_l[il];
+}
+
+bool llama_memory_recurrent_context::get_gdn_replay() const {
+    return mem->gdn_replay;
+}
+
+ggml_tensor * llama_memory_recurrent_context::get_st_l(int32_t il) const {
+    return mem->st_l[il];
+}
+
+int32_t llama_memory_recurrent_context::s_copy_s(int i) const {
+    return mem->cells[i + mem->head].src0;
+}
+
+void llama_memory_recurrent_context::gdn_ctl_take(int32_t * ctl, uint32_t n_seq_tokens) const {
+    mem->gdn_ctl_take(ctl, n_seq_tokens);
 }
 
 int32_t llama_memory_recurrent_context::s_copy(int i) const {

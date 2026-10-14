@@ -6445,6 +6445,22 @@ struct ggml_tensor * ggml_gated_delta_net(
     return result;
 }
 
+void ggml_gated_delta_net_set_replay(
+        struct ggml_tensor * gdn,
+        struct ggml_tensor * stash,
+        struct ggml_tensor * ctl) {
+    GGML_ASSERT(gdn->op == GGML_OP_GATED_DELTA_NET && ggml_get_op_params_i32(gdn, 0) == 1);
+    GGML_ASSERT(stash->type == GGML_TYPE_F32 && ggml_is_contiguous(stash) && stash->ne[1] % 2 == 0);
+    GGML_ASSERT(ctl->type == GGML_TYPE_I32 && ggml_nelements(ctl) == 3);
+    const struct ggml_tensor * k = gdn->src[1];
+    const struct ggml_tensor * v = gdn->src[2];
+    const struct ggml_tensor * g = gdn->src[3];
+    GGML_ASSERT(v->ne[3] == 1); // one sequence
+    GGML_ASSERT(stash->ne[0] == k->ne[0]*k->ne[1] + v->ne[0]*v->ne[1] + g->ne[0]*v->ne[1] + v->ne[1]);
+    gdn->src[6] = stash;
+    gdn->src[7] = ctl;
+}
+
 // ggml_lightning_indexer
 
 struct ggml_tensor * ggml_qsa_select(

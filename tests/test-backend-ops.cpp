@@ -5378,6 +5378,71 @@ struct test_gated_delta_net : public test_case {
 // GGML_OP_GATED_DELTA_NET + GGML_OP_CPY (recurrent cache fusion)
 // GDN whose state is gathered from a row cache by GET_ROWS (as a recurrent memory does): the CUDA
 // backend leaves the gather to the GDN kernel, which reads the cache rows itself
+// GATED_DELTA_NET with a deferred commit (ggml_gated_delta_net_set_replay): a replayed prefix, the window kept
+struct test_gated_delta_net_replay : public test_case {
+    const int64_t head_count;
+    const int64_t head_size;
+    const int     v_repeat;
+    const int64_t n_seq_tokens;
+    const int     n_prefix;
+    const int     read_half;
+    const bool    defer;
+    const bool    kda;
+    static constexpr int64_t W = 4;
+
+    std::string vars() override {
+        return VARS_TO_STR8(head_count, head_size, v_repeat, n_seq_tokens, n_prefix, read_half, defer, kda);
+    }
+
+    test_gated_delta_net_replay(int64_t head_count = 4, int64_t head_size = 32, int v_repeat = 1, int64_t n_seq_tokens = 3,
+            int n_prefix = 2, int read_half = 0, bool defer = true, bool kda = false)
+        : head_count(head_count), head_size(head_size), v_repeat(v_repeat), n_seq_tokens(n_seq_tokens), n_prefix(n_prefix),
+          read_half(read_half), defer(defer), kda(kda) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t H = head_count * v_repeat;
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_seq_tokens, 1);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_seq_tokens, 1);
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, H, n_seq_tokens, 1);
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+        const int64_t g_ne0 = kda ? head_size : 1;
+        ggml_tensor * g     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, g_ne0, H, n_seq_tokens, 1);
+        ggml_tensor * beta  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, n_seq_tokens, 1);
+        ggml_tensor * state = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_size, H, 1);
+        ggml_set_name(g,     "g");
+        ggml_set_name(beta,  "beta");
+        ggml_set_name(state, "state");
+        const int64_t row = head_size * head_count + head_size * H + g_ne0 * H + H;
+        ggml_tensor * stash = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, row, 2 * W);
+        ggml_tensor * ctl   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 3);
+        ggml_set_name(stash, "stash");
+        ggml_set_name(ctl,   "ctl");
+        q = ggml_l2_norm(ctx, q, 1e-6f);
+        k = ggml_l2_norm(ctx, k, 1e-6f);
+        ggml_tensor * out = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, 1);
+        ggml_gated_delta_net_set_replay(out, stash, ctl);
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "ctl") == 0) {
+                const int32_t c[3] = { n_prefix, read_half, defer ? 1 : 0 };
+                ggml_backend_tensor_set(t, c, 0, sizeof(c));
+            } else if (strcmp(t->name, "g") == 0 || strcmp(t->name, "stash") == 0) {
+                init_tensor_uniform(t, -0.5f, -1e-4f);
+            } else if (strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 struct test_gated_delta_net_gather : public test_case {
     const int64_t head_count;
     const int64_t head_size;
@@ -13089,6 +13154,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gdn_gates(7, 33));
     test_cases.emplace_back(new test_gated_delta_net_gather(48, 128, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net_gather(4, 32, 3, 2));
+    for (bool kda : { false, true }) {
+        for (int n_prefix : { 0, 1, 3 }) {
+            for (bool defer : { false, true }) {
+                for (int64_t n_tok : { 1, 3, 4 }) {
+                    test_cases.emplace_back(new test_gated_delta_net_replay(4, 128, 3, n_tok, n_prefix, n_prefix % 2, defer, kda));
+                }
+            }
+        }
+    }
+    test_cases.emplace_back(new test_gated_delta_net_replay(4, 32, 1, 8, 2, 1, false, false)); // a longer ubatch: no defer
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, false, true));

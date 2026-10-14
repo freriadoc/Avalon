@@ -543,12 +543,19 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t n_seqs       = s->ne[3];
     const int64_t n_seq_tokens = q->ne[2];
 
-    const bool keep = cparams.n_rs_seq > 0;
+    // the deferred commit (llama_memory_recurrent::gdn_replay) keeps the window's inputs instead of snapshots
+    const bool replay = inp->gdn_ctl != nullptr;
+    const bool keep   = cparams.n_rs_seq > 0 && !replay;
 
     if (!keep) {
         auto attn_out = build_delta_net(q, k, v, g, b, s, il);
         ggml_tensor * output    = attn_out.first;
         ggml_tensor * new_state = attn_out.second;
+        if (replay) {
+            ggml_tensor * gdn = output->view_src;
+            GGML_ASSERT(gdn && gdn->op == GGML_OP_GATED_DELTA_NET && "the deferred commit needs the fused gated delta net");
+            ggml_gated_delta_net_set_replay(gdn, mctx_cur->get_st_l(il), inp->gdn_ctl);
+        }
         cb(output, "attn_output", il);
         cb(new_state, "new_state", il);
 

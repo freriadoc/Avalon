@@ -108,9 +108,22 @@ public:
 
     std::vector<mem_cell> cells;
 
+    // deferred commit of the gated delta net states (ggml_gated_delta_net_set_replay), instead of the n_rs_seq
+    // snapshot planes of S (each the size of S): one sequence, a speculative decoder's windows of at most
+    // gdn_w = n_rs_seq + 1 tokens keep their inputs (st_l), and the next graph replays the replay_n kept ones (those
+    // a rollback left) from half replay_half. R and P keep their planes (small). LLAMA_GDN_REPLAY=0 turns it off
+    bool     gdn_replay  = false;
+    uint32_t gdn_w       = 0;
+    uint32_t replay_n    = 0;
+    uint32_t replay_half = 0;
+
+    // the control of the next graph's replay (n_prefix, read_half, defer), and the state it leaves (once per graph)
+    void gdn_ctl_take(int32_t * ctl, uint32_t n_seq_tokens);
+
     // per layer
     std::vector<ggml_tensor *> r_l;
     std::vector<ggml_tensor *> s_l;
+    std::vector<ggml_tensor *> st_l; // the replay stash, F32 [row, 2*gdn_w] (gdn_replay)
     // a second conv history that must stay replicated across devices, so it cannot share the r row
     std::vector<ggml_tensor *> p_l;
 
@@ -179,6 +192,13 @@ public:
     ggml_tensor * get_r_l(int32_t il) const;
     ggml_tensor * get_s_l(int32_t il) const;
     ggml_tensor * get_p_l(int32_t il) const;
+
+    // the deferred commit of the gated delta net states (llama_memory_recurrent::gdn_replay)
+    bool          get_gdn_replay() const;
+    ggml_tensor * get_st_l(int32_t il) const;
+    // the S rows have no rollback planes then: the cell itself
+    int32_t       s_copy_s(int i) const;
+    void          gdn_ctl_take(int32_t * ctl, uint32_t n_seq_tokens) const;
 
     int32_t s_copy(int i) const;
 

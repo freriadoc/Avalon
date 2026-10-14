@@ -2669,6 +2669,17 @@ extern "C" {
             struct ggml_tensor  * state,
             int64_t               K);
 
+    // Deferred commit of a gated delta net (a speculative decoder's verification): the tokens of a window are kept as
+    // inputs instead of as states, and the next pass replays those its caller kept. stash: F32 [row, 2*W], two halves of
+    // W token rows (k [S_k*H_k], v [S_v*H], g [H or S_v*H], beta [H]); ctl: I32 [3] = { n_prefix, read_half, defer },
+    // read on the device. The op first replays the n_prefix rows of half read_half on the input state (no output); with
+    // defer, the state it outputs (K must be 1) is the one after the prefix, and the window's rows go to the other half;
+    // without, the state after the window, as usual
+    GGML_API void ggml_gated_delta_net_set_replay(
+            struct ggml_tensor * gdn,
+            struct ggml_tensor * stash,
+            struct ggml_tensor * ctl);
+
     // QSA selection for an attention over the selected cells only, or over all cells with the
     // selection's mask
     //

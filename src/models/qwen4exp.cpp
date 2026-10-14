@@ -1407,7 +1407,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
         ggml_build_forward_expand(gf, qk_norm);
     }
 
-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+    // with the deferred commit (gdn_ctl), S has no rollback planes: its rows are the cells themselves
+    ggml_tensor * state = inp->gdn_ctl ?
+        build_rs(ssm_states_all, inp->s_copy_s_main, inp->s_copy_s_extra, hparams.n_embd_s(), n_seqs,
+                 inp->mctx->get_n_rs(), inp->mctx->get_head(), inp->mctx->get_size(), inp->mctx->get_rs_z()) :
+        build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
 
