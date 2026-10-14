@@ -1,5 +1,10 @@
 #pragma once
 
+// ubatches of at most this many tokens (decoding, a speculative decoder's verification windows and draft passes) keep
+// one graph per shape (llama_context::gf_res_small), and their graphs do not depend on the context length where the
+// model allows it (qwen4exp QSA: llama_memory_hybrid_idx_context::kpool_fixed). Strata verifies up to 8 tokens
+#define LLAMA_GRAPH_SMALL_MAX_TOKENS 8
+
 #include "llama-arch.h"
 #include "llama-batch.h"
 #include "llama-hparams.h"

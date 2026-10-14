@@ -505,6 +505,9 @@ struct ggml_gallocr {
     int n_leafs;
 
     bool shrink; // see ggml_gallocr_set_shrink
+
+    // changes whenever a buffer is allocated again or freed: the tensors placed before are no longer valid
+    uint64_t generation;
 };
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
@@ -977,6 +980,7 @@ static bool ggml_gallocr_reserve_n_impl(
                 }
             }
 #endif
+            galloc->generation++;
             ggml_vbuffer_free(galloc->buffers[i]);
             if (no_alloc) {
                 galloc->buffers[i] = NULL;
@@ -1006,6 +1010,10 @@ void ggml_gallocr_reserve_n_size(
 
 bool ggml_gallocr_reserve_n(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids) {
     return ggml_gallocr_reserve_n_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, /*no_alloc =*/ false);
+}
+
+uint64_t ggml_gallocr_get_generation(ggml_gallocr_t galloc) {
+    return galloc->generation;
 }
 
 void ggml_gallocr_set_shrink(ggml_gallocr_t galloc, bool shrink) {

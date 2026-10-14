@@ -389,6 +389,13 @@ private:
 
     llm_graph_result * gf_res_prev_active = nullptr;
 
+    // the graphs of small ubatches (decoding, speculative verification and drafting), one per shape, kept built
+    // with their split and allocation (ggml_backend_sched_plan_*): a change of shape replays the graph of the new
+    // shape instead of building, splitting and allocating it again; most recently used first
+    std::vector<std::pair<uint32_t, llm_graph_result_ptr>> gf_res_small;
+    llm_graph_result * get_gf_res_small(const llama_ubatch & ubatch);
+    void reset_graph_results();
+
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
 
