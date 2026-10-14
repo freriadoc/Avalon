@@ -912,7 +912,8 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
 
     const bool by_order = mem->get_kpool_by_order();
 
-    GGML_ASSERT(n_pool == kpool_pad(st.n_pool_real));
+    // a fixed graph (kpool_fixed) has the tables of every pool the cache can hold, built on the device
+    GGML_ASSERT(n_pool == kpool_pad(st.n_pool_real) || (layout_meta != nullptr && n_pool > st.n_pool_real));
     GGML_ASSERT(st.is_new.size() == st.n_pool_real);
     GGML_ASSERT(pool_mask == nullptr || (pool_mask->ne[0] == (int64_t) n_pool && pool_mask->ne[1] == (int64_t) n_tokens));
     // the tail may be wider than kpool - 1: the extra slots pad the selection and stay empty (sentinel)
@@ -970,7 +971,8 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     }
 
     // Gather maps padding to a real cell and masks it separately.
-    const int32_t sentinel = gather ? (int32_t) dummy_cell : (int32_t) n_kv;
+    // a missing cell: past the cells the graph's cell_pos covers (every cell in a fixed graph, kpool_fixed)
+    const int32_t sentinel = gather ? (int32_t) dummy_cell : (int32_t) (cell_pos_t ? cell_pos_t->ne[0] : n_kv);
 
     float *  gm    = nullptr;
     uint32_t n_sel = 0;
@@ -1161,7 +1163,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
         // the token, by rank in order mode, by position otherwise) and cell_pos <= tok_pos for a cell
         GGML_ASSERT(pool_end_t && cell_pos_t && tok_pos_t && tok_rank_t);
         GGML_ASSERT(pool_end_t->ne[0] == (int64_t) n_pool && tok_pos_t->ne[0] == (int64_t) n_tokens &&
-                    tok_rank_t->ne[0] == (int64_t) n_tokens && cell_pos_t->ne[0] == (int64_t) n_kv);
+                    tok_rank_t->ne[0] == (int64_t) n_tokens && cell_pos_t->ne[0] >= (int64_t) n_kv);
         const llama_seq_id s0 = ubatch->seq_id[0][0];
         int32_t * pe = on_device ? nullptr : (int32_t *) pool_end_t->data;
         for (uint32_t ip = 0; ip < n_pool && !on_device; ++ip) {
@@ -1235,6 +1237,19 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
 
 ggml_tensor * llama_memory_hybrid_idx_context::get_cell_pos_dev() const {
     return mem ? mem->get_cell_pos_dev() : nullptr;
+}
+
+bool llama_memory_hybrid_idx_context::kpool_fixed(const llama_ubatch & ubatch) const {
+    static const bool enabled = !getenv("LLAMA_QSA_FIXED") || atoi(getenv("LLAMA_QSA_FIXED")) != 0;
+    // past the context where the indexer selects (more complete pools than its top-k): below, every cell is attended,
+    // which the plain causal attention does for a few cells (the graph changes shape once, at that point)
+    const uint32_t kpool = mem->get_kpool();
+    return enabled && ubatch.n_tokens <= LLAMA_GRAPH_SMALL_MAX_TOKENS && get_cell_pos_dev() != nullptr &&
+           kpool > 0 && kpool_cur().n_pool_real > mem->get_indexer_top_k() / kpool && kpool_layout_on_device(ubatch);
+}
+
+uint32_t llama_memory_hybrid_idx_context::get_n_kpool_fixed() const {
+    return kpool_pad(mem->get_mem_idx()->get_size() / mem->get_kpool());
 }
 
 bool llama_memory_hybrid_idx_context::kpool_layout_on_device(const llama_ubatch & ubatch) const {

@@ -744,6 +744,17 @@ public:
 
         bool res = true;
 
+        res &= fixed == mctx->kpool_fixed(params.ubatch);
+        if (fixed) {
+            // every size is the cache's, the live counts are read on the device (layout_meta)
+            res &= k_idxs->ne[0]    == params.ubatch.n_tokens;
+            res &= tok_pos->ne[0]   == params.ubatch.n_tokens;
+            res &= tail_idxs->ne[1] == params.ubatch.n_tokens;
+            res &= n_new            == mctx->get_n_kpool_new();
+            res &= cache_safe       == mctx->get_kpool_cache_safe();
+            return res;
+        }
+
         res &= k_idxs->ne[0]     == params.ubatch.n_tokens;
         res &= pool_cells->ne[0] == mctx->get_n_kpool();
         res &= pos_mode          == mctx->kpool_pos_mode(params.ubatch);
@@ -785,6 +796,8 @@ public:
     uint32_t n_sel = 0;
     uint32_t n_kv  = 0;
     bool cache_safe = true;
+    // sized for the whole cache, independent of the context length (llama_memory_hybrid_idx_context::kpool_fixed)
+    bool fixed = false;
 };
 
 llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build_inp_kpool(const llama_memory_hybrid_idx_context * mctx_hyb) {
@@ -792,9 +805,11 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
     GGML_ASSERT(mctx_idx != nullptr);
 
     const uint32_t kpool  = hparams.indexer_kpool;
-    const uint32_t n_pool = mctx_hyb->get_n_kpool();
+    const bool     fixed  = mctx_hyb->kpool_fixed(ubatch);
+    const uint32_t n_pool = fixed ? mctx_hyb->get_n_kpool_fixed() : mctx_hyb->get_n_kpool();
 
     auto inp = std::make_unique<llm_graph_input_kpool>(mctx_hyb, kpool);
+    inp->fixed = fixed;
 
     inp->k_idxs     = mctx_idx->build_input_k_idxs(ctx0, ubatch);
     // the top blocks plus the tail, padded to the K/V tile of the flash attention (256 cells): a gathered
@@ -814,7 +829,7 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
         // the device requires), uploaded otherwise
         ggml_tensor * cell_pos_dev = layout_on_device ? mctx_hyb->get_cell_pos_dev() : nullptr;
         if (cell_pos_dev) {
-            inp->cell_pos = ggml_view_1d(ctx0, cell_pos_dev, mctx_idx->get_n_kv(), 0);
+            inp->cell_pos = ggml_view_1d(ctx0, cell_pos_dev, fixed ? cell_pos_dev->ne[0] : mctx_idx->get_n_kv(), 0);
         } else {
             inp->cell_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, mctx_idx->get_n_kv());
             ggml_set_input(inp->cell_pos);
@@ -856,7 +871,7 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
         }
     }
 
-    inp->n_kv       = mctx_idx->get_n_kv();
+    inp->n_kv       = fixed ? (uint32_t) inp->cell_pos->ne[0] : mctx_idx->get_n_kv();
     inp->n_new      = mctx_hyb->get_n_kpool_new();
     inp->cache_safe = mctx_hyb->get_kpool_cache_safe();
 
@@ -941,7 +956,7 @@ llama_model_qwen4exp::graph::qsa_sel llama_model_qwen4exp::graph::build_qsa_sel(
     // every block selected (short contexts): the selection keeps every visible cell, which is the plain
     // causal attention; the pooled keys above are still written for when the context grows
     const int64_t n_top_pool = std::min<int64_t>(n_pool, hparams.indexer_top_k / kpool);
-    if (n_top_pool == n_pool) {
+    if (n_top_pool == n_pool && !inp_kpool->fixed) {
         qsa_sel res_all;
         if (inp_kpool->pos_mode) {
             // no dense KQ mask in this mode: the causal mask from the positions
@@ -994,6 +1009,12 @@ llama_model_qwen4exp::graph::qsa_sel llama_model_qwen4exp::graph::build_qsa_sel(
 
         ggml_tensor * top_k = ggml_top_k(ctx0, score, n_top_pool); // [n_top_pool, n_t], unordered
         cb(top_k, "indexer_top_k", il);
+        // a fixed graph has a block for every pool the cache can hold: the live ones are the first layout_meta[1]
+        // (complete pools), read on the device; the others score -inf (their pool_end is -1)
+        if (inp_kpool->fixed) {
+            ggml_set_live_count(score, inp_kpool->layout_meta, 1);
+            ggml_set_live_count(top_k, inp_kpool->layout_meta, 1);
+        }
 
         ggml_tensor * tail = n_t == n_tokens ? inp_kpool->tail_idxs :
             ggml_view_2d(ctx0, inp_kpool->tail_idxs, inp_kpool->tail_idxs->ne[0], n_t, inp_kpool->tail_idxs->nb[1], t0*inp_kpool->tail_idxs->nb[1]);
@@ -1021,12 +1042,14 @@ llama_model_qwen4exp::graph::qsa_sel llama_model_qwen4exp::graph::build_qsa_sel(
     // few queries (generation, drafts): the attention gathers the selected cells; a dense scan reads the
     // n_kv cells once for all queries, a gather moves n_sel cells per query (margin of 4 for its
     // scattered reads). One op gives the rows, one the mask (visibility at live slots, -inf at dead ones).
-    if (cparams.flash_attn && kq_mask->ne[2]*kq_mask->ne[3] == 1 && 4*n_tokens*n_sel < n_kv) {
+    // a fixed graph always gathers: a dense scan would cover every cell of the cache
+    if (cparams.flash_attn && kq_mask->ne[2]*kq_mask->ne[3] == 1 && (inp_kpool->fixed || 4*n_tokens*n_sel < n_kv)) {
         const slice_sel ss  = select(0, n_tokens);
         const auto      vis = vis_of(0, n_tokens);
         qsa_sel res_g;
         res_g.rows     = ggml_qsa_select(ctx0, ss.sel_idx, ss.top_score, vis.first, vis.second, (int32_t) kpool, GGML_QSA_SELECT_ROWS);
         res_g.mask_sel = ggml_qsa_select(ctx0, ss.sel_idx, ss.top_score, vis.first, vis.second, (int32_t) kpool, GGML_QSA_SELECT_MASK);
+        res_g.all_cells = inp_kpool->fixed;
         cb(res_g.mask_sel, "indexer_sel", il);
         return res_g;
     }
@@ -1094,8 +1117,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     }
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+    // a fixed graph gathers from every cell (its rows index cells past n_kv's step as the context grows)
+    ggml_tensor * k = sel.all_cells ? mctx_cur->get_k_all(ctx0, il) : mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v = sel.all_cells ? mctx_cur->get_v_all(ctx0, il) : mctx_cur->get_v(ctx0, il);
 
     if (sel.rows) {
         // each query attends its gathered cells; all heads of a cell are adjacent, so a gathered row

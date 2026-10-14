@@ -92,6 +92,7 @@ public:
 
     // The model's indexer pool size.
     uint32_t get_kpool() const { return hparams_idx.indexer_kpool; }
+    uint32_t get_indexer_top_k() const { return hparams_idx.indexer_top_k; }
 
     // Whether pools are kpool consecutive cells in sequence order (qwen4exp) instead of kpool consecutive positions.
     bool get_kpool_by_order() const { return hparams_idx.indexer_kpool_by_order; }
@@ -244,6 +245,12 @@ public:
     // then fills layout_meta (I32 [4]: first position, complete pools, padded rep, padded member) instead of them.
     // LLAMA_QSA_DEVICE_LAYOUT=0: always on the host
     bool kpool_layout_on_device(const llama_ubatch & ubatch) const;
+
+    // the graph of a small ubatch (LLAMA_GRAPH_SMALL_MAX_TOKENS) independent of the context length, as a graph captured
+    // once is replayed: the pool tables sized for every pool the cache can hold (get_n_kpool_fixed) and the cells'
+    // positions for every cell, the live counts read on the device (layout_meta); needs the layout on the device
+    bool kpool_fixed(const llama_ubatch & ubatch) const;
+    uint32_t get_n_kpool_fixed() const;
 
     // see llama_memory_hybrid_idx::get_cell_pos_dev
     ggml_tensor * get_cell_pos_dev() const;

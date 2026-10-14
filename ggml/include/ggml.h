@@ -2464,6 +2464,14 @@ extern "C" {
 
     // top k elements per row
     // note: the resulting top k indices are in no particular order
+    // the ops that support it (GGML_OP_LIGHTNING_INDEXER, GGML_OP_TOP_K on ggml-cuda) process only the first
+    // count[index] entries of dimension 0 (a count read on the device when the graph runs, so the graph keeps its
+    // shape as the count changes); the indexer writes -inf past them, the top-k takes max(count, k) columns. A
+    // backend may ignore it: the entries past the count must then already score -inf
+    #define GGML_LIVE_COUNT_SRC   5
+    #define GGML_LIVE_COUNT_PARAM 15
+    GGML_API void ggml_set_live_count(struct ggml_tensor * op, struct ggml_tensor * count, int32_t index);
+
     GGML_API struct ggml_tensor * ggml_top_k(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,

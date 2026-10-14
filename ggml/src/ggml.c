@@ -5476,6 +5476,13 @@ struct ggml_tensor * ggml_argsort_top_k(
 
 // ggml_top_k
 
+void ggml_set_live_count(struct ggml_tensor * op, struct ggml_tensor * count, int32_t index) {
+    GGML_ASSERT(op->op == GGML_OP_LIGHTNING_INDEXER || op->op == GGML_OP_TOP_K);
+    GGML_ASSERT(count->type == GGML_TYPE_I32 && index >= 0 && index < ggml_nelements(count));
+    op->src[GGML_LIVE_COUNT_SRC] = count;
+    ggml_set_op_params_i32(op, GGML_LIVE_COUNT_PARAM, index);
+}
+
 struct ggml_tensor * ggml_top_k(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,

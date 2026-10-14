@@ -61,6 +61,11 @@ static __device__ __forceinline__ uint32_t top_k_float_to_ordered(float value) {
     return bits ^ mask;
 }
 
+// the columns a row takes: all, or max(live count, k) (ggml_set_live_count: the columns past the count score -inf)
+static __device__ __forceinline__ int top_k_ncols_live(int ncols, int k, const int * __restrict__ n_live) {
+    return n_live ? min(ncols, max(*n_live, k)) : ncols;
+}
+
 struct top_k_radix_state {
     uint32_t prefix;
     uint32_t prefix_mask;
@@ -81,7 +86,9 @@ static __global__ void top_k_radix_histogram(
         int * __restrict__ block_histograms,
         int ncols,
         int blocks_per_row,
-        int shift) {
+        int shift,
+        int k,
+        const int * __restrict__ n_live) {
     constexpr int NBINS = 1 << RADIX_BITS;
 
     const int row = blockIdx.x / blocks_per_row;
@@ -94,8 +101,9 @@ static __global__ void top_k_radix_histogram(
     __syncthreads();
 
     const top_k_radix_state state = states[row];
+    const int ncols_live = top_k_ncols_live(ncols, k, n_live);
     for (int col = row_block * BLOCK_SIZE + tid;
-         col < ncols;
+         col < ncols_live;
          col += blocks_per_row * BLOCK_SIZE) {
         const uint32_t key = top_k_float_to_ordered(row_src[col]);
         if ((key & state.prefix_mask) == state.prefix) {
@@ -163,14 +171,16 @@ static __global__ void top_k_radix_count(
         int2 * __restrict__ counts,
         int ncols,
         int chunk,
-        int blocks_per_row) {
+        int blocks_per_row,
+        int k,
+        const int * __restrict__ n_live) {
     const int row = blockIdx.x / blocks_per_row;
     const int row_block = blockIdx.x % blocks_per_row;
     const int tid = threadIdx.x;
     const float * row_src = src + (size_t) row * ncols;
     const uint32_t prefix = states[row].prefix;
     const int begin = row_block * chunk;
-    const int end = min(begin + chunk, ncols);
+    const int end = min(begin + chunk, top_k_ncols_live(ncols, k, n_live));
 
     int g = 0;
     int e = 0;
@@ -211,7 +221,8 @@ static __global__ void top_k_radix_gather(
         int ncols,
         int k,
         int chunk,
-        int blocks_per_row) {
+        int blocks_per_row,
+        const int * __restrict__ n_live) {
     const int row = blockIdx.x / blocks_per_row;
     const int row_block = blockIdx.x % blocks_per_row;
     const int tid = threadIdx.x;
@@ -220,7 +231,7 @@ static __global__ void top_k_radix_gather(
     const uint32_t prefix = states[row].prefix;
     const int rank = states[row].rank;
     const int begin = row_block * chunk;
-    const int end = min(begin + chunk, ncols);
+    const int end = min(begin + chunk, top_k_ncols_live(ncols, k, n_live));
 
     int g_off = 0;
     int e_off = 0;
@@ -297,7 +308,7 @@ static size_t top_k_radix_states_bytes(int nrows) {
 
 static void top_k_radix_cuda(
         ggml_cuda_pool & pool, char * scratch,
-        const float * src, int * dst, int ncols, int nrows, int k, cudaStream_t stream) {
+        const float * src, int * dst, int ncols, int nrows, int k, cudaStream_t stream, const int * n_live) {
     constexpr int BLOCK_SIZE = 256;
     constexpr int RADIX_BITS = 8;
     constexpr int NBINS = 1 << RADIX_BITS;
@@ -315,7 +326,7 @@ static void top_k_radix_cuda(
     for (int shift = 32 - RADIX_BITS; shift >= 0; shift -= RADIX_BITS) {
         top_k_radix_histogram<BLOCK_SIZE, RADIX_BITS>
             <<<row_grid, BLOCK_SIZE, 0, stream>>>(
-                src, states, histograms, ncols, blocks_per_row, shift);
+                src, states, histograms, ncols, blocks_per_row, shift, k, n_live);
         top_k_radix_select<BLOCK_SIZE, RADIX_BITS>
             <<<nrows, BLOCK_SIZE, 0, stream>>>(histograms, states, blocks_per_row, shift);
     }
@@ -324,10 +335,10 @@ static void top_k_radix_cuda(
     const int chunk = (ncols + blocks_per_row - 1) / blocks_per_row;
     int2 * counts = (int2 *) histograms;
     top_k_radix_count<BLOCK_SIZE>
-        <<<row_grid, BLOCK_SIZE, 0, stream>>>(src, states, counts, ncols, chunk, blocks_per_row);
+        <<<row_grid, BLOCK_SIZE, 0, stream>>>(src, states, counts, ncols, chunk, blocks_per_row, k, n_live);
     top_k_radix_gather<BLOCK_SIZE>
         <<<row_grid, BLOCK_SIZE, 0, stream>>>(
-            src, dst, states, counts, ncols, k, chunk, blocks_per_row);
+            src, dst, states, counts, ncols, k, chunk, blocks_per_row, n_live);
 }
 
 #endif // !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
@@ -386,7 +397,10 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     char * scratch = need > 0 && scratch_t && scratch_t->data && ggml_nbytes(scratch_t) >= need ? (char *) scratch_t->data : nullptr;
 #if defined(GGML_USE_HIP)
     if (ncols > 1024) {
-        top_k_radix_cuda(pool, scratch, src0_d, dst_d, ncols, nrows, k, stream);
+        // the live count (ggml_set_live_count): only that many columns are read
+        const ggml_tensor * lc = dst->src[GGML_LIVE_COUNT_SRC];
+        const int * n_live = lc ? (const int *) lc->data + ggml_get_op_params_i32(dst, GGML_LIVE_COUNT_PARAM) : nullptr;
+        top_k_radix_cuda(pool, scratch, src0_d, dst_d, ncols, nrows, k, stream, n_live);
     } else {
 #endif // defined(GGML_USE_HIP)
         ggml_cuda_pool_alloc<int> temp_dst_alloc(pool);

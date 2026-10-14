@@ -3033,6 +3033,14 @@ ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) cons
     return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
 }
 
+ggml_tensor * llama_kv_cache_context::get_k_all(ggml_context * ctx, int32_t il) const {
+    return kv->get_k(ctx, il, kv->get_size(), sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::get_v_all(ggml_context * ctx, int32_t il) const {
+    return kv->get_v(ctx, il, kv->get_size(), sinfos[i_cur]);
+}
+
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
     return kv->cpy_k(ctx, k_cur, k_idxs, il, sinfos[i_cur]);
 }

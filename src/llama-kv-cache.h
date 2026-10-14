@@ -427,6 +427,9 @@ public:
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
+    // views of every cell of the cache (not only the first n_kv): for graphs that must not depend on n_kv
+    ggml_tensor * get_k_all(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_v_all(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
