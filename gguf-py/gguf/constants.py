@@ -5983,6 +5983,7 @@ class GGMLQuantizationType(IntEnum):
     Q1_0    = 41
     Q2_0    = 42
     IQ3_K   = 43  # fred/master; ik_llama.cpp numbers it 138
+    IQ3_KS  = 44  # fred/master: ik_llama.cpp's IQ3_KS codebook with a block scale (104 B / 256)
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -6195,6 +6196,7 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.Q1_0:    (128, 2 + 16),
     GGMLQuantizationType.Q2_0:    (64, 2 + 16),
     GGMLQuantizationType.IQ3_K:   (256, 2 + 2 + 2 + QK_K // 32 + QK_K // 4 + QK_K // 8),
+    GGMLQuantizationType.IQ3_KS:  (256, 2 + 2 + QK_K // 64 + QK_K // 4 + QK_K // 8),
 }
 
 

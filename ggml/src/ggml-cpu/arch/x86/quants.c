@@ -3966,6 +3966,55 @@ void ggml_vec_dot_iq3_k_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 #endif
 }
 
+void ggml_vec_dot_iq3_ks_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    assert(n % QK_K == 0);
+
+#if defined __AVX2__
+    const block_iq3_ks * GGML_RESTRICT x = vx;
+    const block_q8_K   * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_K;
+
+    // iq3nl_values + 64: the two grids in one register (index | 8 selects the shifted grid), as for iq3_k
+    static const uint8_t kvalues_iq3nl_u[16] = {1, 24, 41, 54, 65, 77, 92, 111, 5, 28, 45, 58, 69, 81, 96, 115};
+    const __m256i values = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *) kvalues_iq3nl_u));
+    const __m256i m1 = _mm256_set1_epi8(1);
+    const __m256i m3 = _mm256_set1_epi8(3);
+
+    float sumf = 0;
+    for (int ibl = 0; ibl < nb; ++ibl) {
+        const __m256i qh = _mm256_loadu_si256((const __m256i *) x[ibl].qh);
+        const uint16_t extra = x[ibl].extra;
+        int16_t ls[QK_K/32];
+        int32_t sum_ls_bsums = 0;
+        for (int ib32 = 0; ib32 < QK_K/32; ++ib32) {
+            ls[ib32] = (int16_t) ((((x[ibl].scales[ib32%4] >> 4*(ib32/4)) & 0xf) | (((extra >> ib32) & 1) << 4)) - 16);
+            sum_ls_bsums += ls[ib32] * (y[ibl].bsums[2*ib32] + y[ibl].bsums[2*ib32 + 1]);
+        }
+        __m256i acc = _mm256_setzero_si256();
+        for (int ib32 = 0; ib32 < QK_K/32; ++ib32) {
+            const __m256i q2 = _mm256_and_si256(_mm256_srli_epi16(_mm256_loadu_si256((const __m256i *)(x[ibl].qs + 32*(ib32/4))), 2*(ib32%4)), m3);
+            const __m256i q1 = _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh, ib32), m1), 2);
+            const __m256i shift = _mm256_set1_epi8(((extra >> (8 + ib32)) & 1) << 3);
+            const __m256i u = _mm256_shuffle_epi8(values, _mm256_or_si256(_mm256_or_si256(q2, q1), shift));
+            const __m256i q8 = _mm256_loadu_si256((const __m256i *)(y[ibl].qs + 32*ib32));
+            const __m256i p16 = _mm256_maddubs_epi16(u, q8);
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(p16, _mm256_set1_epi16(ls[ib32])));
+        }
+        const int32_t sumi = hsum_i32_8(acc) - 64*sum_ls_bsums;
+        sumf += GGML_CPU_FP16_TO_FP32(x[ibl].d) * y[ibl].d * sumi;
+    }
+    *s = sumf;
+#else
+    ggml_vec_dot_iq3_ks_q8_K_generic(n, s, bs, vx, bx, vy, by, nrc);
+#endif
+}
+
 void ggml_vec_dot_iq4_nl_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);
     UNUSED(nrc);
@@ -4395,6 +4444,43 @@ static inline __attribute__((always_inline)) void ggml_vec_dot_iq3_k_q8_0_multi_
 #endif
 }
 
+static inline __attribute__((always_inline)) void ggml_vec_dot_iq3_ks_q8_0_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
+#if defined __AVX2__
+    const block_iq3_ks * GGML_RESTRICT x = vx;
+    const int nb = n / QK_K;
+    // the signed values (iq3nl_values) and their magnitudes, as the iq3_k kernel: |w| times q8 with w's sign
+    static const int8_t kvalues_iq3nl_s[16] = {-63, -40, -23, -10, 1, 13, 28, 47, -59, -36, -19, -6, 5, 17, 32, 51};
+    const __m256i values = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *) kvalues_iq3nl_s));
+    const __m256i m1 = _mm256_set1_epi8(1);
+    const __m256i m3 = _mm256_set1_epi8(3);
+    __m256 accumf[8];
+    for (int c = 0; c < nc; c++) accumf[c] = _mm256_setzero_ps();
+    for (int ibl = 0; ibl < nb; ++ibl) {
+        const __m256i qh = _mm256_loadu_si256((const __m256i *) x[ibl].qh);
+        const uint16_t extra = x[ibl].extra;
+        const float xd = GGML_CPU_FP16_TO_FP32(x[ibl].d);
+#pragma GCC unroll 8
+        for (int ib32 = 0; ib32 < QK_K/32; ++ib32) {
+            const __m256i q2 = _mm256_and_si256(_mm256_srli_epi16(_mm256_loadu_si256((const __m256i *)(x[ibl].qs + 32*(ib32/4))), 2*(ib32%4)), m3);
+            const __m256i q1 = _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh, ib32), m1), 2);
+            const __m256i shift = _mm256_set1_epi8(((extra >> (8 + ib32)) & 1) << 3);
+            const __m256i w  = _mm256_shuffle_epi8(values, _mm256_or_si256(_mm256_or_si256(q2, q1), shift));
+            const __m256i aw = _mm256_sign_epi8(w, w);
+            const __m256i sc = _mm256_set1_epi16((int16_t) ((((x[ibl].scales[ib32%4] >> 4*(ib32/4)) & 0xf) | (((extra >> ib32) & 1) << 4)) - 16));
+            for (int c = 0; c < nc; c++) {
+                const block_q8_0 * y = (const block_q8_0 *) vy[c] + ibl*(QK_K/QK8_0) + ib32;
+                const __m256i q8 = _mm256_sign_epi8(_mm256_loadu_si256((const __m256i *) y->qs), w);
+                const __m256i p  = _mm256_madd_epi16(_mm256_maddubs_epi16(aw, q8), sc);
+                accumf[c] = _mm256_fmadd_ps(_mm256_set1_ps(xd * GGML_CPU_FP16_TO_FP32(y->d)), _mm256_cvtepi32_ps(p), accumf[c]);
+            }
+        }
+    }
+    for (int c = 0; c < nc; c++) s[c] = hsum_float_8(accumf[c]);
+#else
+    for (int c = 0; c < nc; c++) ggml_vec_dot_iq3_ks_q8_0_generic(n, s + c, vx, vy[c]);
+#endif
+}
+
 // The types of ISTA's IQ3_S experts (IQ3_XXS, IQ3_S, IQ4_XS gate / up; Q2_0 down) with q8_0 activations, a weight
 // block decoded once for every activation row (ggml_cpu_moe_experts_multi): the decoding of the one-row q8_K kernels, the
 // integer sums of each block of 32 scaled by its activation scale.
@@ -4588,6 +4674,7 @@ GGML_MULTI_DISPATCH(iq3_xxs)
 GGML_MULTI_DISPATCH(iq3_s)
 GGML_MULTI_DISPATCH(iq4_xs)
 GGML_MULTI_DISPATCH(q2_0)
+GGML_MULTI_DISPATCH(iq3_ks)
 #undef GGML_MULTI_DISPATCH
 
 // one activation row (the case of the most rows: an expert used by one token), from the one-row q8_K kernels with

@@ -1288,6 +1288,41 @@ void ggml_vec_dot_iq3_k_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, 
     *s = sumf;
 }
 
+void ggml_vec_dot_iq3_ks_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    assert(n % QK_K == 0);
+
+    const block_iq3_ks * GGML_RESTRICT x = vx;
+    const block_q8_K   * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_K;
+
+    float sumf = 0;
+    for (int ibl = 0; ibl < nb; ++ibl) {
+        const uint8_t * qh = x[ibl].qh;
+        const uint16_t extra = x[ibl].extra;
+        int32_t sumi = 0;
+        for (int ib32 = 0; ib32 < QK_K/32; ++ib32) {
+            const uint8_t * qs = x[ibl].qs + 32*(ib32/4);
+            const int8_t  * q8 = y[ibl].qs + 32*ib32;
+            const int shift_l = 2*(ib32%4), shift_h = ib32%8;
+            const int ls = (int)(((x[ibl].scales[ib32%4] >> 4*(ib32/4)) & 0xf) | (((extra >> ib32) & 1) << 4)) - 16;
+            const int8_t * values = (extra >> (8 + ib32)) & 1 ? iq3nl_values + 8 : iq3nl_values;
+            int32_t s32 = 0;
+            for (int j = 0; j < 32; ++j) {
+                s32 += values[((qs[j] >> shift_l) & 3) | (((qh[j] >> shift_h) & 1) << 2)] * q8[j];
+            }
+            sumi += ls * s32;
+        }
+        sumf += GGML_CPU_FP16_TO_FP32(x[ibl].d) * y[ibl].d * sumi;
+    }
+    *s = sumf;
+}
+
 void ggml_vec_dot_iq4_nl_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);
     UNUSED(nrc);
@@ -1426,6 +1461,21 @@ void ggml_vec_dot_iq3_k_q8_0_generic(int n, float * GGML_RESTRICT s, const void 
     }
     *s = sum;
 }
+void ggml_vec_dot_iq3_ks_q8_0_generic(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy) {
+    float w[QK_K];
+    const block_q8_0 * GGML_RESTRICT y = vy;
+    float sum = 0.0f;
+    for (int i = 0; i < n / QK_K; ++i) {
+        dequantize_row_iq3_ks((const block_iq3_ks *) vx + i, w, QK_K);
+        for (int b = 0; b < QK_K/QK8_0; ++b) {
+            const block_q8_0 * yb = y + i*(QK_K/QK8_0) + b;
+            float sb = 0.0f;
+            for (int j = 0; j < QK8_0; ++j) sb += w[b*QK8_0 + j] * yb->qs[j];
+            sum += sb * GGML_CPU_FP16_TO_FP32(yb->d);
+        }
+    }
+    *s = sum;
+}
 
 void ggml_vec_dot_q8_0_dequant_generic(enum ggml_type type, int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy) {
     const struct ggml_type_traits * tt = ggml_get_type_traits(type);
@@ -1464,6 +1514,9 @@ void ggml_vec_dot_iq2_s_q8_0_multi(int n, float * GGML_RESTRICT s, const void * 
 }
 void ggml_vec_dot_iq3_k_q8_0_multi(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int nc) {
     for (int c = 0; c < nc; c++) ggml_vec_dot_iq3_k_q8_0_generic(n, s + c, vx, vy[c]);
+}
+void ggml_vec_dot_iq3_ks_q8_0_multi(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int nc) {
+    for (int c = 0; c < nc; c++) ggml_vec_dot_iq3_ks_q8_0_generic(n, s + c, vx, vy[c]);
 }
 // several activation rows against one weight row: one-row kernels on other architectures
 void ggml_vec_dot_iq2_s_q8_K_multi(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int nc) {

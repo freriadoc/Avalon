@@ -454,6 +454,25 @@ static __device__ __forceinline__ void dequantize_iq3_k(const void * vx, const i
 }
 
 template<typename dst_t>
+static __device__ __forceinline__ void dequantize_iq3_ks(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
+    const block_iq3_ks * x = (const block_iq3_ks *)vx + ibs;
+
+    const int ib32 = tid/4; // 0...7: the block of 32
+    const int j0   = 8*(tid%4); // 0, 8, 16, 24: its first weight
+    dst_t * y = yy + 32*ib32 + j0;
+    const uint8_t * qs = x->qs + 32*(ib32/4) + j0;
+    const uint8_t * qh = x->qh + j0;
+    const uint16_t extra = x->extra;
+    const int ls = (int)(((x->scales[ib32%4] >> 4*(ib32/4)) & 0xf) | (((extra >> ib32) & 1) << 4)) - 16;
+    const float d = (float)x->d * ls;
+    const int8_t * values = (extra >> (8 + ib32)) & 1 ? iq3nl_values + 8 : iq3nl_values;
+    const int shift_l = 2*(ib32%4), shift_h = ib32%8;
+    for (int j = 0; j < 8; ++j) {
+        y[j] = ggml_cuda_cast<dst_t>(d * values[((qs[j] >> shift_l) & 3) | (((qh[j] >> shift_h) & 1) << 2)]);
+    }
+}
+
+template<typename dst_t>
 static __device__ __forceinline__ void dequantize_mxfp4(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
 
     const block_mxfp4 * x = (const block_mxfp4 *) vx + ibs*(QK_K/QK_MXFP4);

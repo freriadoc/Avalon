@@ -472,6 +472,19 @@ typedef struct {
 } block_iq3_k;
 static_assert(sizeof(block_iq3_k) == sizeof(ggml_half) + 2*sizeof(uint16_t) + QK_K/32 + QK_K/4 + QK_K/8, "wrong iq3_k block size/padding");
 
+// iq3_ks (ik_llama.cpp's IQ3_KS, with a scale per super-block instead of one per row): 3.25 bpw. The same 3-bit
+// indices on the same grid as iq3_k (qs: 2 low bits, qh: the high bit, laid out as iq3_k's), the grid bit and a
+// signed 5-bit scale per block of 32 (extra: bits 0-7 the scales' bit 4, bits 8-15 the grid bits; scales: the
+// low nibbles of blocks 0-3, the high nibbles of blocks 4-7), one fp16 per super-block of 256.
+typedef struct {
+    ggml_half d;
+    uint16_t extra;
+    uint8_t scales[QK_K/64];
+    uint8_t qs[QK_K/4];
+    uint8_t qh[QK_K/8];
+} block_iq3_ks;
+static_assert(sizeof(block_iq3_ks) == sizeof(ggml_half) + sizeof(uint16_t) + QK_K/64 + QK_K/4 + QK_K/8, "wrong iq3_ks block size/padding");
+
 #endif // GGML_COMMON_DECL
 #endif // GGML_COMMON_DECL
 
