@@ -4529,8 +4529,21 @@ static bool ggml_cpu_moe_experts_multi(const struct ggml_tensor * gate_w, const 
     const enum ggml_type tk = gate_w->type;
     const int64_t n_embd = gate_w->ne[0];
     const int64_t n_ff   = gate_w->ne[1];
-    if ((tk != GGML_TYPE_IQ2_S && tk != GGML_TYPE_IQ3_K) || up_w->type != tk || down_w->type != GGML_TYPE_IQ4_NL ||
-        n_embd % QK_K != 0 || n_ff % QK8_0 != 0 || down_w->ne[0] != n_ff || down_w->ne[1] != n_embd || n <= 0 || n > 256) {
+    // the gate / up and down kernels with q8_0 activations, a weight block decoded once for every row
+    void (*multi_k)(int, float *, const void *, const void * const *, int) = NULL;
+    switch (tk) {
+        case GGML_TYPE_IQ2_S:   multi_k = ggml_vec_dot_iq2_s_q8_0_multi;   break;
+        case GGML_TYPE_IQ3_K:   multi_k = ggml_vec_dot_iq3_k_q8_0_multi;   break;
+        case GGML_TYPE_IQ3_XXS: multi_k = ggml_vec_dot_iq3_xxs_q8_0_multi; break;
+        case GGML_TYPE_IQ3_S:   multi_k = ggml_vec_dot_iq3_s_q8_0_multi;   break;
+        case GGML_TYPE_IQ4_XS:  multi_k = ggml_vec_dot_iq4_xs_q8_0_multi;  break;
+        default: break;
+    }
+    const enum ggml_type td = down_w->type;
+    void (*multi_d)(int, float *, const void *, const void * const *, int) =
+        td == GGML_TYPE_IQ4_NL ? ggml_vec_dot_iq4_nl_q8_0_multi : td == GGML_TYPE_Q2_0 ? ggml_vec_dot_q2_0_q8_0_multi : NULL;
+    if (!multi_k || !multi_d || up_w->type != tk ||
+        n_embd % QK_K != 0 || n_ff % ggml_blck_size(td) != 0 || down_w->ne[0] != n_ff || down_w->ne[1] != n_embd || n <= 0 || n > 256) {
         return false;
     }
     static _Thread_local uint8_t * buf = NULL;
@@ -4573,8 +4586,6 @@ static bool ggml_cpu_moe_experts_multi(const struct ggml_tensor * gate_w, const 
     const int nb_a = (int) (n_embd / QK8_0), nb_0 = (int) (n_ff / QK8_0);
     const int rb1 = 16, n_ch1 = (int) ((n_ff + rb1 - 1) / rb1);
     const int rb3 = 32, n_ch3 = (int) ((n_embd + rb3 - 1) / rb3);
-    void (*multi_k)(int, float *, const void *, const void * const *, int) =
-        tk == GGML_TYPE_IQ2_S ? ggml_vec_dot_iq2_s_q8_0_multi : ggml_vec_dot_iq3_k_q8_0_multi;
     #pragma omp parallel num_threads(n_threads)
     {
         float   hrow[QK8_0];
@@ -4631,7 +4642,7 @@ static bool ggml_cpu_moe_experts_multi(const struct ggml_tensor * gate_w, const 
             const int r0 = first[ue];
             for (int64_t row = (int64_t) ch * rb3; row < (int64_t) (ch + 1) * rb3 && row < n_embd; row++) {
                 const char * wr = (const char *) down_w->data + (size_t) e * down_w->nb[2] + (size_t) row * down_w->nb[1];
-                if (next[r0] < 0) {
+                if (next[r0] < 0 && td == GGML_TYPE_IQ4_NL) {
                     dot_nl((int) n_ff, out + (size_t) r0 * n_embd + row, 0, wr, 0, h8 + (size_t) r0 * h_row, 0, 1);
                 } else {
                     for (int r = r0; r >= 0; ) {
@@ -4640,7 +4651,7 @@ static bool ggml_cpu_moe_experts_multi(const struct ggml_tensor * gate_w, const 
                             rs[nc] = r;
                             ys[nc] = h8 + (size_t) r * h_row;
                         }
-                        ggml_vec_dot_iq4_nl_q8_0_multi((int) n_ff, res, wr, ys, nc);
+                        multi_d((int) n_ff, res, wr, ys, nc);
                         for (int c = 0; c < nc; c++) out[(size_t) rs[c] * n_embd + row] = res[c];
                     }
                 }

@@ -4395,6 +4395,190 @@ static inline __attribute__((always_inline)) void ggml_vec_dot_iq3_k_q8_0_multi_
 #endif
 }
 
+// The types of ISTA's IQ3_S experts (IQ3_XXS, IQ3_S, IQ4_XS gate / up; Q2_0 down) with q8_0 activations, a weight
+// block decoded once for every activation row (ggml_cpu_moe_experts_multi): the decoding of the one-row q8_K kernels, the
+// integer sums of each block of 32 scaled by its activation scale.
+static inline __attribute__((always_inline)) void ggml_vec_dot_iq3_xxs_q8_0_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
+#if defined(__AVX2__)
+    const block_iq3_xxs * GGML_RESTRICT x = vx;
+    const int nb = n / QK_K;
+    const uint64_t * signs64 = (const uint64_t *) keven_signs_q2xs;
+    uint32_t aux32[2];
+    __m256 accumf[8];
+    for (int c = 0; c < nc; c++) accumf[c] = _mm256_setzero_ps();
+    for (int i = 0; i < nb; ++i) {
+        const float xd = GGML_CPU_FP16_TO_FP32(x[i].d);
+        const uint8_t * GGML_RESTRICT q3  = x[i].qs;
+        const uint8_t * GGML_RESTRICT gas = x[i].qs + QK_K/4;
+        for (int ib32 = 0; ib32 < QK_K/32; ib32 += 2) {
+            const __m256i q2_1 = _mm256_set_epi32(iq3xxs_grid[q3[7]], iq3xxs_grid[q3[6]], iq3xxs_grid[q3[5]], iq3xxs_grid[q3[4]],
+                                                  iq3xxs_grid[q3[3]], iq3xxs_grid[q3[2]], iq3xxs_grid[q3[1]], iq3xxs_grid[q3[0]]);
+            q3 += 8;
+            const __m256i q2_2 = _mm256_set_epi32(iq3xxs_grid[q3[7]], iq3xxs_grid[q3[6]], iq3xxs_grid[q3[5]], iq3xxs_grid[q3[4]],
+                                                  iq3xxs_grid[q3[3]], iq3xxs_grid[q3[2]], iq3xxs_grid[q3[1]], iq3xxs_grid[q3[0]]);
+            q3 += 8;
+            memcpy(aux32, gas, 8); gas += 8;
+            const __m256i s2_1 = _mm256_set_epi64x(signs64[(aux32[0] >> 21) & 127], signs64[(aux32[0] >> 14) & 127],
+                                                   signs64[(aux32[0] >>  7) & 127], signs64[(aux32[0] >>  0) & 127]);
+            const __m256i s2_2 = _mm256_set_epi64x(signs64[(aux32[1] >> 21) & 127], signs64[(aux32[1] >> 14) & 127],
+                                                   signs64[(aux32[1] >>  7) & 127], signs64[(aux32[1] >>  0) & 127]);
+            const __m256i sc1 = _mm256_set1_epi16(2*(aux32[0] >> 28) + 1);
+            const __m256i sc2 = _mm256_set1_epi16(2*(aux32[1] >> 28) + 1);
+            for (int c = 0; c < nc; c++) {
+                const block_q8_0 * y = (const block_q8_0 *) vy[c] + i*(QK_K/QK8_0) + ib32;
+                const __m256i p1 = _mm256_madd_epi16(_mm256_maddubs_epi16(q2_1, _mm256_sign_epi8(_mm256_loadu_si256((const __m256i *) y[0].qs), s2_1)), sc1);
+                const __m256i p2 = _mm256_madd_epi16(_mm256_maddubs_epi16(q2_2, _mm256_sign_epi8(_mm256_loadu_si256((const __m256i *) y[1].qs), s2_2)), sc2);
+                accumf[c] = _mm256_fmadd_ps(_mm256_set1_ps(xd * GGML_CPU_FP16_TO_FP32(y[0].d)), _mm256_cvtepi32_ps(p1), accumf[c]);
+                accumf[c] = _mm256_fmadd_ps(_mm256_set1_ps(xd * GGML_CPU_FP16_TO_FP32(y[1].d)), _mm256_cvtepi32_ps(p2), accumf[c]);
+            }
+        }
+    }
+    for (int c = 0; c < nc; c++) s[c] = 0.25f * hsum_float_8(accumf[c]);
+#else
+    for (int c = 0; c < nc; c++) ggml_vec_dot_q8_0_dequant_generic(GGML_TYPE_IQ3_XXS, n, s + c, vx, vy[c]);
+#endif
+}
+
+static inline __attribute__((always_inline)) void ggml_vec_dot_iq3_s_q8_0_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
+#if defined(__AVX2__)
+    static const uint8_t k_mask1[32] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+                                        0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03};
+    static const uint8_t k_mask2[32] = {0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80,
+                                        0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80};
+    const __m256i mask1 = _mm256_loadu_si256((const __m256i*)k_mask1);
+    const __m256i mask2 = _mm256_loadu_si256((const __m256i*)k_mask2);
+    const block_iq3_s * GGML_RESTRICT x = vx;
+    const int nb = n / QK_K;
+#define IQ3S_GRID(qs, qh, k) iq3s_grid[(qs)[k] | ((((uint32_t) (qh)) << (8 - (k))) & 256)]
+    __m256 accumf[8];
+    for (int c = 0; c < nc; c++) accumf[c] = _mm256_setzero_ps();
+    for (int i = 0; i < nb; ++i) {
+        const float xd = GGML_CPU_FP16_TO_FP32(x[i].d);
+        const uint8_t * GGML_RESTRICT qs = x[i].qs;
+        const uint8_t * GGML_RESTRICT qh = x[i].qh;
+        const uint16_t * GGML_RESTRICT signs = (const uint16_t *) x[i].signs;
+        for (int ib32 = 0; ib32 < QK_K/32; ib32 += 2) {
+            const uint32_t h0 = qh[ib32+0], h1 = qh[ib32+1];
+            const __m256i q2_1 = _mm256_set_epi32(
+                    IQ3S_GRID(qs,   h0, 7), IQ3S_GRID(qs,   h0, 6), IQ3S_GRID(qs,   h0, 5), IQ3S_GRID(qs,   h0, 4),
+                    IQ3S_GRID(qs,   h0, 3), IQ3S_GRID(qs,   h0, 2), IQ3S_GRID(qs,   h0, 1), IQ3S_GRID(qs,   h0, 0));
+            const __m256i q2_2 = _mm256_set_epi32(
+                    IQ3S_GRID(qs+8, h1, 7), IQ3S_GRID(qs+8, h1, 6), IQ3S_GRID(qs+8, h1, 5), IQ3S_GRID(qs+8, h1, 4),
+                    IQ3S_GRID(qs+8, h1, 3), IQ3S_GRID(qs+8, h1, 2), IQ3S_GRID(qs+8, h1, 1), IQ3S_GRID(qs+8, h1, 0));
+            qs += 16;
+            __m256i aux256 = _mm256_set1_epi32(signs[0] | (signs[1] << 16));
+            aux256 = _mm256_and_si256(_mm256_shuffle_epi8(aux256, mask1), mask2);
+            const __m256i s2_1 = _mm256_cmpeq_epi8(aux256, mask2);
+            aux256 = _mm256_set1_epi32(signs[2] | (signs[3] << 16));
+            aux256 = _mm256_and_si256(_mm256_shuffle_epi8(aux256, mask1), mask2);
+            const __m256i s2_2 = _mm256_cmpeq_epi8(aux256, mask2);
+            signs += 4;
+            const __m256i sc1 = _mm256_set1_epi16(2*(x[i].scales[ib32/2] & 0xf) + 1);
+            const __m256i sc2 = _mm256_set1_epi16(2*(x[i].scales[ib32/2] >>  4) + 1);
+            for (int c = 0; c < nc; c++) {
+                const block_q8_0 * y = (const block_q8_0 *) vy[c] + i*(QK_K/QK8_0) + ib32;
+                const __m256i q8_1 = _mm256_loadu_si256((const __m256i *) y[0].qs);
+                const __m256i q8_2 = _mm256_loadu_si256((const __m256i *) y[1].qs);
+                const __m256i q8s_1 = _mm256_sub_epi8(_mm256_xor_si256(s2_1, q8_1), s2_1);
+                const __m256i q8s_2 = _mm256_sub_epi8(_mm256_xor_si256(s2_2, q8_2), s2_2);
+                const __m256i p1 = _mm256_madd_epi16(_mm256_maddubs_epi16(q2_1, q8s_1), sc1);
+                const __m256i p2 = _mm256_madd_epi16(_mm256_maddubs_epi16(q2_2, q8s_2), sc2);
+                accumf[c] = _mm256_fmadd_ps(_mm256_set1_ps(xd * GGML_CPU_FP16_TO_FP32(y[0].d)), _mm256_cvtepi32_ps(p1), accumf[c]);
+                accumf[c] = _mm256_fmadd_ps(_mm256_set1_ps(xd * GGML_CPU_FP16_TO_FP32(y[1].d)), _mm256_cvtepi32_ps(p2), accumf[c]);
+            }
+        }
+    }
+#undef IQ3S_GRID
+    for (int c = 0; c < nc; c++) s[c] = hsum_float_8(accumf[c]);
+#else
+    for (int c = 0; c < nc; c++) ggml_vec_dot_q8_0_dequant_generic(GGML_TYPE_IQ3_S, n, s + c, vx, vy[c]);
+#endif
+}
+
+static inline __attribute__((always_inline)) void ggml_vec_dot_iq4_xs_q8_0_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
+#if defined(__AVX2__)
+    const block_iq4_xs * GGML_RESTRICT x = vx;
+    const int nb = n / QK_K;
+    const __m128i values128 = _mm_loadu_si128((const __m128i*)kvalues_iq4nl);
+    const __m128i m4b  = _mm_set1_epi8(0x0f);
+    const __m256i mone = _mm256_set1_epi16(1);
+    __m256 accumf[8];
+    for (int c = 0; c < nc; c++) accumf[c] = _mm256_setzero_ps();
+    for (int i = 0; i < nb; ++i) {
+        const float xd = GGML_CPU_FP16_TO_FP32(x[i].d);
+        const uint8_t * GGML_RESTRICT qs = x[i].qs;
+        for (int ib = 0; ib < QK_K/32; ++ib) {
+            const __m128i q4bits = _mm_loadu_si128((const __m128i *) qs); qs += 16;
+            const __m256i q4b = MM256_SET_M128I(_mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(q4bits, 4), m4b)),
+                                                _mm_shuffle_epi8(values128, _mm_and_si128(q4bits, m4b)));
+            const int ls = (((x[i].scales_l[ib/2] >> 4*(ib%2)) & 0xf) | (((x[i].scales_h >> 2*ib) & 3) << 4)) - 32;
+            const float xs = xd * ls;
+            for (int c = 0; c < nc; c++) {
+                const block_q8_0 * y = (const block_q8_0 *) vy[c] + i*(QK_K/QK8_0) + ib;
+                const __m256i p = _mm256_madd_epi16(mul_add_epi8(q4b, _mm256_loadu_si256((const __m256i *) y->qs)), mone);
+                accumf[c] = _mm256_fmadd_ps(_mm256_set1_ps(xs * GGML_CPU_FP16_TO_FP32(y->d)), _mm256_cvtepi32_ps(p), accumf[c]);
+            }
+        }
+    }
+    for (int c = 0; c < nc; c++) s[c] = hsum_float_8(accumf[c]);
+#else
+    for (int c = 0; c < nc; c++) ggml_vec_dot_q8_0_dequant_generic(GGML_TYPE_IQ4_XS, n, s + c, vx, vy[c]);
+#endif
+}
+
+// Q2_0: blocks of 64 two-bit values q (w = q - 1), element j in bits 2*(j%4) of byte j/4; two q8_0 blocks per block.
+static inline __attribute__((always_inline)) void ggml_vec_dot_q2_0_q8_0_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
+#if defined(__AVX2__)
+    const block_q2_0 * GGML_RESTRICT x = vx;
+    const int nb = n / QK2_0;
+    const __m128i m3   = _mm_set1_epi8(3);
+    const __m256i mone8 = _mm256_set1_epi8(1);
+    __m256 accumf[8];
+    for (int c = 0; c < nc; c++) accumf[c] = _mm256_setzero_ps();
+    for (int i = 0; i < nb; ++i) {
+        const float xd = GGML_CPU_FP16_TO_FP32(x[i].d);
+        const __m128i v = _mm_loadu_si128((const __m128i *) x[i].qs);
+        const __m128i a = _mm_and_si128(v, m3);
+        const __m128i b = _mm_and_si128(_mm_srli_epi16(v, 2), m3);
+        const __m128i c2 = _mm_and_si128(_mm_srli_epi16(v, 4), m3);
+        const __m128i d = _mm_and_si128(_mm_srli_epi16(v, 6), m3);
+        // per byte (a, b, c, d) in element order: bytes 0-7 give elements 0-31, bytes 8-15 elements 32-63
+        const __m128i ab_lo = _mm_unpacklo_epi8(a, b), cd_lo = _mm_unpacklo_epi8(c2, d);
+        const __m128i ab_hi = _mm_unpackhi_epi8(a, b), cd_hi = _mm_unpackhi_epi8(c2, d);
+        const __m256i q0 = MM256_SET_M128I(_mm_unpackhi_epi16(ab_lo, cd_lo), _mm_unpacklo_epi16(ab_lo, cd_lo));
+        const __m256i q1 = MM256_SET_M128I(_mm_unpackhi_epi16(ab_hi, cd_hi), _mm_unpacklo_epi16(ab_hi, cd_hi));
+        const __m256i w0 = _mm256_sub_epi8(q0, mone8), w1 = _mm256_sub_epi8(q1, mone8);
+        const __m256i aw0 = _mm256_sign_epi8(w0, w0), aw1 = _mm256_sign_epi8(w1, w1);
+        for (int c = 0; c < nc; c++) {
+            const block_q8_0 * y = (const block_q8_0 *) vy[c] + 2*i;
+            const __m256i p0 = _mm256_madd_epi16(_mm256_maddubs_epi16(aw0, _mm256_sign_epi8(_mm256_loadu_si256((const __m256i *) y[0].qs), w0)), _mm256_set1_epi16(1));
+            const __m256i p1 = _mm256_madd_epi16(_mm256_maddubs_epi16(aw1, _mm256_sign_epi8(_mm256_loadu_si256((const __m256i *) y[1].qs), w1)), _mm256_set1_epi16(1));
+            accumf[c] = _mm256_fmadd_ps(_mm256_set1_ps(xd * GGML_CPU_FP16_TO_FP32(y[0].d)), _mm256_cvtepi32_ps(p0), accumf[c]);
+            accumf[c] = _mm256_fmadd_ps(_mm256_set1_ps(xd * GGML_CPU_FP16_TO_FP32(y[1].d)), _mm256_cvtepi32_ps(p1), accumf[c]);
+        }
+    }
+    for (int c = 0; c < nc; c++) s[c] = hsum_float_8(accumf[c]);
+#else
+    for (int c = 0; c < nc; c++) ggml_vec_dot_q8_0_dequant_generic(GGML_TYPE_Q2_0, n, s + c, vx, vy[c]);
+#endif
+}
+
+#define GGML_MULTI_DISPATCH(name) \
+void ggml_vec_dot_##name##_q8_0_multi(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int nc) { \
+    switch (nc) {                                                                                                          \
+        case 1:  ggml_vec_dot_##name##_q8_0_multi_n(n, s, vx, vy, 1); break;                                               \
+        case 2:  ggml_vec_dot_##name##_q8_0_multi_n(n, s, vx, vy, 2); break;                                               \
+        case 3:  ggml_vec_dot_##name##_q8_0_multi_n(n, s, vx, vy, 3); break;                                               \
+        case 4:  ggml_vec_dot_##name##_q8_0_multi_n(n, s, vx, vy, 4); break;                                               \
+        default: ggml_vec_dot_##name##_q8_0_multi_n(n, s, vx, vy, nc); break;                                              \
+    }                                                                                                                      \
+}
+GGML_MULTI_DISPATCH(iq3_xxs)
+GGML_MULTI_DISPATCH(iq3_s)
+GGML_MULTI_DISPATCH(iq4_xs)
+GGML_MULTI_DISPATCH(q2_0)
+#undef GGML_MULTI_DISPATCH
+
 // one activation row (the case of the most rows: an expert used by one token), from the one-row q8_K kernels with
 // the activation scale of each block of 32
 static void ggml_vec_dot_iq2_s_q8_0_1(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy) {

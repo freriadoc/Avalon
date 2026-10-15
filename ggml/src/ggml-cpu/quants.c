@@ -1427,7 +1427,38 @@ void ggml_vec_dot_iq3_k_q8_0_generic(int n, float * GGML_RESTRICT s, const void 
     *s = sum;
 }
 
+void ggml_vec_dot_q8_0_dequant_generic(enum ggml_type type, int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy) {
+    const struct ggml_type_traits * tt = ggml_get_type_traits(type);
+    const block_q8_0 * GGML_RESTRICT y = vy;
+    const int64_t blck = tt->blck_size;
+    float w[QK_K];
+    float sum = 0.0f;
+    GGML_ASSERT(blck <= QK_K && blck % QK8_0 == 0 && n % blck == 0);
+    for (int i0 = 0; i0 < n; i0 += (int) blck) {
+        tt->to_float((const char *) vx + (size_t) (i0 / blck) * tt->type_size, w, blck);
+        for (int b = 0; b < blck / QK8_0; ++b) {
+            const block_q8_0 * yb = y + (i0 / QK8_0) + b;
+            float sb = 0.0f;
+            for (int j = 0; j < QK8_0; ++j) sb += w[b*QK8_0 + j] * yb->qs[j];
+            sum += sb * GGML_CPU_FP16_TO_FP32(yb->d);
+        }
+    }
+    *s = sum;
+}
+
 #if !defined(__x86_64__) && !defined(_M_X64)
+void ggml_vec_dot_iq3_xxs_q8_0_multi(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int nc) {
+    for (int c = 0; c < nc; c++) ggml_vec_dot_q8_0_dequant_generic(GGML_TYPE_IQ3_XXS, n, s + c, vx, vy[c]);
+}
+void ggml_vec_dot_iq3_s_q8_0_multi(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int nc) {
+    for (int c = 0; c < nc; c++) ggml_vec_dot_q8_0_dequant_generic(GGML_TYPE_IQ3_S, n, s + c, vx, vy[c]);
+}
+void ggml_vec_dot_iq4_xs_q8_0_multi(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int nc) {
+    for (int c = 0; c < nc; c++) ggml_vec_dot_q8_0_dequant_generic(GGML_TYPE_IQ4_XS, n, s + c, vx, vy[c]);
+}
+void ggml_vec_dot_q2_0_q8_0_multi(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int nc) {
+    for (int c = 0; c < nc; c++) ggml_vec_dot_q8_0_dequant_generic(GGML_TYPE_Q2_0, n, s + c, vx, vy[c]);
+}
 void ggml_vec_dot_iq2_s_q8_0_multi(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int nc) {
     for (int c = 0; c < nc; c++) ggml_vec_dot_iq2_s_q8_0_generic(n, s + c, vx, vy[c]);
 }
