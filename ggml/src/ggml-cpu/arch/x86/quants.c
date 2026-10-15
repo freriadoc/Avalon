@@ -4563,14 +4563,25 @@ static inline __attribute__((always_inline)) void ggml_vec_dot_q2_0_q8_0_multi_n
 #endif
 }
 
+// Each column count in a function of its own: the dispatcher is then a jump. With the cases inlined in it, every call
+// (one row of weights) ran the prologue of the largest (stack realigned to 32 bytes, a frame of 0x1c0 - 0x480 bytes,
+// six registers saved), +4 % on an IQ3_XXS expert's gate / up rows.
+#define GGML_MULTI_CASE_ATTR __attribute__((noinline))
+#define GGML_MULTI_CASES(kern)                                                                                             \
+static GGML_MULTI_CASE_ATTR void kern##_c2(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy) { kern(n, s, vx, vy, 2); } \
+static GGML_MULTI_CASE_ATTR void kern##_c3(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy) { kern(n, s, vx, vy, 3); } \
+static GGML_MULTI_CASE_ATTR void kern##_c4(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy) { kern(n, s, vx, vy, 4); } \
+static GGML_MULTI_CASE_ATTR void kern##_cn(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int nc) { kern(n, s, vx, vy, nc); }
 #define GGML_MULTI_DISPATCH(name) \
+GGML_MULTI_CASES(ggml_vec_dot_##name##_q8_0_multi_n)                                                                     \
+static GGML_MULTI_CASE_ATTR void ggml_vec_dot_##name##_q8_0_multi_n_c1(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy) { ggml_vec_dot_##name##_q8_0_multi_n(n, s, vx, vy, 1); } \
 void ggml_vec_dot_##name##_q8_0_multi(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int nc) { \
     switch (nc) {                                                                                                          \
-        case 1:  ggml_vec_dot_##name##_q8_0_multi_n(n, s, vx, vy, 1); break;                                               \
-        case 2:  ggml_vec_dot_##name##_q8_0_multi_n(n, s, vx, vy, 2); break;                                               \
-        case 3:  ggml_vec_dot_##name##_q8_0_multi_n(n, s, vx, vy, 3); break;                                               \
-        case 4:  ggml_vec_dot_##name##_q8_0_multi_n(n, s, vx, vy, 4); break;                                               \
-        default: ggml_vec_dot_##name##_q8_0_multi_n(n, s, vx, vy, nc); break;                                              \
+        case 1:  ggml_vec_dot_##name##_q8_0_multi_n_c1(n, s, vx, vy); break;                                               \
+        case 2:  ggml_vec_dot_##name##_q8_0_multi_n_c2(n, s, vx, vy); break;                                               \
+        case 3:  ggml_vec_dot_##name##_q8_0_multi_n_c3(n, s, vx, vy); break;                                               \
+        case 4:  ggml_vec_dot_##name##_q8_0_multi_n_c4(n, s, vx, vy); break;                                               \
+        default: ggml_vec_dot_##name##_q8_0_multi_n_cn(n, s, vx, vy, nc); break;                                           \
     }                                                                                                                      \
 }
 GGML_MULTI_DISPATCH(iq3_xxs)
@@ -4581,7 +4592,7 @@ GGML_MULTI_DISPATCH(q2_0)
 
 // one activation row (the case of the most rows: an expert used by one token), from the one-row q8_K kernels with
 // the activation scale of each block of 32
-static void ggml_vec_dot_iq2_s_q8_0_1(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy) {
+static GGML_MULTI_CASE_ATTR void ggml_vec_dot_iq2_s_q8_0_1(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy) {
 #if defined(__AVX2__)
     static const uint8_t k_mask1[32] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
                                         0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03};
@@ -4636,7 +4647,7 @@ static void ggml_vec_dot_iq2_s_q8_0_1(int n, float * GGML_RESTRICT s, const void
 #endif
 }
 
-static void ggml_vec_dot_iq3_k_q8_0_1(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy) {
+static GGML_MULTI_CASE_ATTR void ggml_vec_dot_iq3_k_q8_0_1(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy) {
 #if defined __AVX2__
     const block_iq3_k * GGML_RESTRICT x = vx;
     const block_q8_0  * GGML_RESTRICT y = vy;
@@ -4673,55 +4684,60 @@ static void ggml_vec_dot_iq3_k_q8_0_1(int n, float * GGML_RESTRICT s, const void
 #endif
 }
 
+GGML_MULTI_CASES(ggml_vec_dot_iq2_s_q8_0_multi_n)
 void ggml_vec_dot_iq2_s_q8_0_multi(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int nc) {
     switch (nc) {
         case 1:  ggml_vec_dot_iq2_s_q8_0_1(n, s, vx, vy[0]); break;
-        case 2:  ggml_vec_dot_iq2_s_q8_0_multi_n(n, s, vx, vy, 2); break;
-        case 3:  ggml_vec_dot_iq2_s_q8_0_multi_n(n, s, vx, vy, 3); break;
-        case 4:  ggml_vec_dot_iq2_s_q8_0_multi_n(n, s, vx, vy, 4); break;
-        default: ggml_vec_dot_iq2_s_q8_0_multi_n(n, s, vx, vy, nc); break;
+        case 2:  ggml_vec_dot_iq2_s_q8_0_multi_n_c2(n, s, vx, vy); break;
+        case 3:  ggml_vec_dot_iq2_s_q8_0_multi_n_c3(n, s, vx, vy); break;
+        case 4:  ggml_vec_dot_iq2_s_q8_0_multi_n_c4(n, s, vx, vy); break;
+        default: ggml_vec_dot_iq2_s_q8_0_multi_n_cn(n, s, vx, vy, nc); break;
     }
 }
 
+GGML_MULTI_CASES(ggml_vec_dot_iq3_k_q8_0_multi_n)
 void ggml_vec_dot_iq3_k_q8_0_multi(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int nc) {
     switch (nc) {
         case 1:  ggml_vec_dot_iq3_k_q8_0_1(n, s, vx, vy[0]); break;
-        case 2:  ggml_vec_dot_iq3_k_q8_0_multi_n(n, s, vx, vy, 2); break;
-        case 3:  ggml_vec_dot_iq3_k_q8_0_multi_n(n, s, vx, vy, 3); break;
-        case 4:  ggml_vec_dot_iq3_k_q8_0_multi_n(n, s, vx, vy, 4); break;
-        default: ggml_vec_dot_iq3_k_q8_0_multi_n(n, s, vx, vy, nc); break;
+        case 2:  ggml_vec_dot_iq3_k_q8_0_multi_n_c2(n, s, vx, vy); break;
+        case 3:  ggml_vec_dot_iq3_k_q8_0_multi_n_c3(n, s, vx, vy); break;
+        case 4:  ggml_vec_dot_iq3_k_q8_0_multi_n_c4(n, s, vx, vy); break;
+        default: ggml_vec_dot_iq3_k_q8_0_multi_n_cn(n, s, vx, vy, nc); break;
     }
 }
 
 // the column count as a constant, so that the accumulators stay in registers
+GGML_MULTI_CASES(ggml_vec_dot_iq2_s_q8_K_multi_n)
 void ggml_vec_dot_iq2_s_q8_K_multi(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int nc) {
     switch (nc) {
         case 1:  ggml_vec_dot_iq2_s_q8_K(n, s, 0, vx, 0, vy[0], 0, 1); break;
-        case 2:  ggml_vec_dot_iq2_s_q8_K_multi_n(n, s, vx, vy, 2); break;
-        case 3:  ggml_vec_dot_iq2_s_q8_K_multi_n(n, s, vx, vy, 3); break;
-        case 4:  ggml_vec_dot_iq2_s_q8_K_multi_n(n, s, vx, vy, 4); break;
-        default: ggml_vec_dot_iq2_s_q8_K_multi_n(n, s, vx, vy, nc); break;
+        case 2:  ggml_vec_dot_iq2_s_q8_K_multi_n_c2(n, s, vx, vy); break;
+        case 3:  ggml_vec_dot_iq2_s_q8_K_multi_n_c3(n, s, vx, vy); break;
+        case 4:  ggml_vec_dot_iq2_s_q8_K_multi_n_c4(n, s, vx, vy); break;
+        default: ggml_vec_dot_iq2_s_q8_K_multi_n_cn(n, s, vx, vy, nc); break;
     }
 }
 
 // the column count as a constant, so that the accumulators stay in registers
+GGML_MULTI_CASES(ggml_vec_dot_iq3_k_q8_K_multi_n)
 void ggml_vec_dot_iq3_k_q8_K_multi(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int nc) {
     switch (nc) {
         case 1:  ggml_vec_dot_iq3_k_q8_K(n, s, 0, vx, 0, vy[0], 0, 1); break;
-        case 2:  ggml_vec_dot_iq3_k_q8_K_multi_n(n, s, vx, vy, 2); break;
-        case 3:  ggml_vec_dot_iq3_k_q8_K_multi_n(n, s, vx, vy, 3); break;
-        case 4:  ggml_vec_dot_iq3_k_q8_K_multi_n(n, s, vx, vy, 4); break;
-        default: ggml_vec_dot_iq3_k_q8_K_multi_n(n, s, vx, vy, nc); break;
+        case 2:  ggml_vec_dot_iq3_k_q8_K_multi_n_c2(n, s, vx, vy); break;
+        case 3:  ggml_vec_dot_iq3_k_q8_K_multi_n_c3(n, s, vx, vy); break;
+        case 4:  ggml_vec_dot_iq3_k_q8_K_multi_n_c4(n, s, vx, vy); break;
+        default: ggml_vec_dot_iq3_k_q8_K_multi_n_cn(n, s, vx, vy, nc); break;
     }
 }
 
 // the column count as a constant, so that the accumulators stay in registers
+GGML_MULTI_CASES(ggml_vec_dot_iq4_nl_q8_0_multi_n)
 void ggml_vec_dot_iq4_nl_q8_0_multi(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int nc) {
     switch (nc) {
         case 1:  ggml_vec_dot_iq4_nl_q8_0(n, s, 0, vx, 0, vy[0], 0, 1); break;
-        case 2:  ggml_vec_dot_iq4_nl_q8_0_multi_n(n, s, vx, vy, 2); break;
-        case 3:  ggml_vec_dot_iq4_nl_q8_0_multi_n(n, s, vx, vy, 3); break;
-        case 4:  ggml_vec_dot_iq4_nl_q8_0_multi_n(n, s, vx, vy, 4); break;
-        default: ggml_vec_dot_iq4_nl_q8_0_multi_n(n, s, vx, vy, nc); break;
+        case 2:  ggml_vec_dot_iq4_nl_q8_0_multi_n_c2(n, s, vx, vy); break;
+        case 3:  ggml_vec_dot_iq4_nl_q8_0_multi_n_c3(n, s, vx, vy); break;
+        case 4:  ggml_vec_dot_iq4_nl_q8_0_multi_n_c4(n, s, vx, vy); break;
+        default: ggml_vec_dot_iq4_nl_q8_0_multi_n_cn(n, s, vx, vy, nc); break;
     }
 }
