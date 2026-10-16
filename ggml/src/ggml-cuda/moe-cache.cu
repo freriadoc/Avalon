@@ -2460,27 +2460,26 @@ static void moe_cache_build_pending(
         const long double value = (long double)available * weight / total;
         return value >= (long double)available ? available : (size_t)value;
     };
-    const bool complete_pools = minimum_remaining <= remaining;
+    // each shape's share of the budget by weight, so that every layer holds the same share of its experts whatever its
+    // entry size; the floor (moe_cache_pool_slots_min entries) is a minimum, not a bonus (added to the share, it gave
+    // the one-layer pools of a seven-shape model +50 % of their part), and the shapes after this one keep theirs
     for (moe_cache_shape * shape : pending) {
         const long double weight =
             (long double)shape->expert_size * (long double)shape->n_entries;
         const size_t minimum = shape->expert_size * moe_cache_pool_slots_min;
-        size_t share = weighted_share(remaining, weight, total_weight);
-        if (complete_pools) {
-            const size_t extra = remaining - minimum_remaining;
-            const size_t bonus = weighted_share(extra, weight, total_weight);
-            share = minimum + bonus;
-        } else if (share < minimum && remaining >= minimum) {
-            share = minimum;
+        minimum_remaining -= minimum;   // the floors of the shapes after this one
+        size_t share = std::max(minimum, weighted_share(remaining, weight, total_weight));
+        if (remaining > minimum_remaining && share > remaining - minimum_remaining) {
+            share = remaining - minimum_remaining;
+        }
+        if (share > remaining) {
+            share = remaining;
         }
         const size_t before = device.allocated_bytes;
         moe_cache_allocate_pool(session, device, *shape, share);
         const size_t consumed = device.allocated_bytes - before;
         remaining = consumed <= remaining ? remaining - consumed : 0;
         total_weight -= weight;
-        if (complete_pools) {
-            minimum_remaining -= minimum;
-        }
     }
 
     moe_cache_setup_zone(device, moe_cache_zone_bytes(session), session.lend_zones);
