@@ -1212,15 +1212,28 @@ static void mul_mat_vec_q_moe_entries_launch(
         const uint32_t stride_row_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
         const uint32_t n_hits, const int warp_size,
         const float up_min, const float up_max, const float gate_min, const float gate_max, cudaStream_t stream) {
-    constexpr int rows_per_block = 2;
-    const dim3 block_nums((nrows_x + rows_per_block - 1) / rows_per_block, n_hits);
-    const dim3 block_dims(warp_size, 1);
-    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
-    ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, has_gate, has_clamp, false, true>, launch_params,
-        nullptr, vy, (const int32_t *) up_entries, act_ids, nullptr, (const int32_t *) gate_entries,
-        ggml_cuda_mm_fusion_args_device{}, dst, ncols_x, nchannels_y, nrows_x,
-        stride_row_x, 0, 0, 0, stride_channel_y, stride_channel_dst,
-        1, n_hits, up_min, up_max, gate_min, gate_max);
+    // a warp per block; 4 rows per block when the warp covers a row in at most two passes of its K loop (the down of the
+    // experts, K = 640: the entry address, the reduction and the write would cost as much as the dot products), else 2
+    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = get_vdr_mmvq(type);
+    const bool short_k = (int) (ncols_x / qk) <= 2 * (vdr * warp_size / qi);
+    const auto launch = [&](auto rows_tag) {
+        constexpr int rows_per_block = decltype(rows_tag)::value;
+        const dim3 block_nums((nrows_x + rows_per_block - 1) / rows_per_block, n_hits);
+        const dim3 block_dims(warp_size, 1);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, has_gate, has_clamp, false, true>, launch_params,
+            nullptr, vy, (const int32_t *) up_entries, act_ids, nullptr, (const int32_t *) gate_entries,
+            ggml_cuda_mm_fusion_args_device{}, dst, ncols_x, nchannels_y, nrows_x,
+            stride_row_x, 0, 0, 0, stride_channel_y, stride_channel_dst,
+            1, n_hits, up_min, up_max, gate_min, gate_max);
+    };
+    if (short_k) {
+        launch(std::integral_constant<int, 4>{});
+    } else {
+        launch(std::integral_constant<int, 2>{});
+    }
 }
 
 template <ggml_type type, bool nt_w = false>
