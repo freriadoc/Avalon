@@ -263,7 +263,8 @@ struct moe_cache_shape {
 // a MoE layer as discovered: its three expert tensors (read from the tensor names: blk.N.ffn_{up,gate,down}_exps)
 struct moe_cache_layer {
     const void * tensor[MOE_ROLES] = {};
-    size_t bytes[MOE_ROLES] = {};    // per expert (nb[2])
+    size_t bytes[MOE_ROLES] = {};    // per expert
+    size_t stride[MOE_ROLES] = {};   // from one expert to the next in host memory (nb[2]: bytes, or a packed entry)
     int64_t ne0[MOE_ROLES] = {};     // values per row
     int type[MOE_ROLES] = {-1, -1, -1};
     int64_t n_expert = 0;
@@ -271,8 +272,8 @@ struct moe_cache_layer {
 };
 
 struct moe_cache_seen_tensor {
-    size_t bytes = 0;
-    size_t expert_size = 0;
+    size_t bytes = 0;         // the range: from the first expert to the end of the last one
+    size_t expert_size = 0;   // its bytes per expert
     int wtype = -1;
     int64_t n_expert = 0;
 };
@@ -287,6 +288,7 @@ struct moe_cache_job {
     // the next expert's tensor follows in host memory: a tensor's pad (moe_cache_role_pad) is copied with it, from
     // the next expert's first blocks (any blocks of its type do), in the same copy
     bool pad_follows[MOE_ROLES] = {};
+    bool whole = false;                    // a packed layer laid out as the entry: one copy of bytes from source[0]
     size_t bytes = 0;                      // the entry
     bool rewarm = false;   // an entry lending evicted, restored: joins the LRU at its cold end
     // SPLIT: a tensor of an expert moved to the GPU for the layer being computed; the last one of the expert
@@ -1605,12 +1607,14 @@ static int moe_cache_query_shape(
         return 0;
     }
 
+    // expert_size: nb[2], the expert's bytes or, in a packed layer, the whole entry
     const size_t row_size = ggml_row_size((ggml_type)wtype, n_in);
     if (row_size == 0 || (uint64_t)n_out > SIZE_MAX / row_size ||
-        expert_size != (size_t)n_out * row_size ||
+        expert_size < (size_t)n_out * row_size ||
         expert_size > SIZE_MAX / moe_cache_pool_slots_min) {
         return 0;
     }
+    expert_size = (size_t)n_out * row_size;
 
     moe_cache_scratch scratch;
     if (!moe_cache_scratch_requirements(n_in, n_out, scratch)) {
@@ -1724,6 +1728,12 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
     };
     // the tensors of a job not registered in place, to the staging buffer at their offsets in the entry
     const auto stage_job = [&](const moe_cache_job & j, const moe_cache_pool * p, char * buf) {
+        if (j.whole) {
+            if (!pinned(j.source[0], j.bytes)) {
+                memcpy(buf, j.source[0], j.bytes);
+            }
+            return;
+        }
         for (int r = 0; r < MOE_ROLES; r++) {
             const size_t bytes = j.role_bytes[r] + (j.pad_follows[r] ? p->role_pad[r] : 0);
             if (!pinned(j.source[r], bytes)) {
@@ -1734,7 +1744,11 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
     // the job's three copies, each from the weights or from the staging buffer
     const auto copy_job = [&](const moe_cache_job & j, const moe_cache_pool * p, char * dst, const char * buf) {
         cudaError_t err = cudaSuccess;
-        for (int r = 0; r < MOE_ROLES && err == cudaSuccess; r++) {
+        if (j.whole) {   // a packed layer: the expert's up, gate, down and pads in one copy
+            const void * src = pinned(j.source[0], j.bytes) ? j.source[0] : (const void *) buf;
+            err = cudaMemcpyAsync(dst, src, j.bytes, cudaMemcpyHostToDevice, stream);
+        }
+        for (int r = 0; r < MOE_ROLES && err == cudaSuccess && !j.whole; r++) {
             const size_t bytes = j.role_bytes[r] + (j.pad_follows[r] ? p->role_pad[r] : 0);
             const void * src = pinned(j.source[r], bytes) ? j.source[r] : (const void *) (buf + p->role_offset[r]);
             err = cudaMemcpyAsync(dst + p->role_offset[r], src, bytes, cudaMemcpyHostToDevice, stream);
@@ -2013,6 +2027,8 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                         f_cpy = f_dma = f_idle = f_call = 0;
                     }
                 }
+            } else if (error == cudaSuccess && job.whole) {
+                error = cudaMemcpy(destination, job.source[0], job.bytes, cudaMemcpyHostToDevice);
             } else if (error == cudaSuccess) {
                 for (int r = 0; r < MOE_ROLES && error == cudaSuccess; r++) {
                     error = cudaMemcpy(destination + pool->role_offset[r], job.source[r],
@@ -2407,7 +2423,12 @@ static bool moe_cache_pin_enabled() {
 static bool moe_cache_pin_tensor(moe_cache_device & device, const void * base, const moe_cache_seen_tensor & t, size_t & bytes) {
     const uintptr_t b = (uintptr_t) base;
     const uintptr_t ib = b & ~(uintptr_t) 4095;
-    const uintptr_t ie = GGML_PAD(b + (size_t) t.n_expert * t.expert_size, 4096);
+    const uintptr_t ie = GGML_PAD(b + t.bytes, 4096);
+    for (const auto & range : device.pinned) {   // a packed layer: its three tensors share one range
+        if (ib >= range.first && ie <= range.second) {
+            return true;
+        }
+    }
     if (cudaHostRegister((void *) ib, ie - ib, cudaHostRegisterReadOnly) != cudaSuccess) {
         (void) cudaGetLastError();
         return false;
@@ -2424,8 +2445,25 @@ static void moe_cache_pin_experts(moe_cache_device & device) {
     const int64_t t0 = ggml_time_us();
     ggml_cuda_set_device(device.logical);
     size_t bytes = 0, fail = 0;
+    // the tensors' page ranges, merged where they overlap (the three tensors of a packed layer), registered once each
+    std::vector<std::pair<uintptr_t, uintptr_t>> ranges;
     for (const auto & t : device.seen_tensors) {
-        fail += !moe_cache_pin_tensor(device, t.first, t.second, bytes);
+        const uintptr_t b = (uintptr_t) t.first;
+        ranges.push_back({b & ~(uintptr_t) 4095, GGML_PAD(b + t.second.bytes, 4096)});
+    }
+    std::sort(ranges.begin(), ranges.end());
+    std::vector<std::pair<uintptr_t, uintptr_t>> merged;
+    for (const auto & r : ranges) {
+        if (!merged.empty() && r.first <= merged.back().second) {
+            merged.back().second = std::max(merged.back().second, r.second);
+        } else {
+            merged.push_back(r);
+        }
+    }
+    for (const auto & r : merged) {
+        moe_cache_seen_tensor whole;
+        whole.bytes = r.second - r.first;
+        fail += !moe_cache_pin_tensor(device, (const void *) r.first, whole, bytes);
     }
     std::sort(device.pinned.begin(), device.pinned.end());
     MOE_CACHE_LOG("[moe-cache] CUDA%d pin: %zu expert tensors registered (%zu MiB) in %.1f s, %zu failed\n",
@@ -2557,7 +2595,7 @@ static void moe_cache_ranking_resolve(moe_cache_device & device) {
 // shape, if there is one. Returns the pool of the tensor's layer, -1 if none (yet).
 static int moe_cache_discover_pool(
         moe_cache_session & session, moe_cache_device & device, const char * name,
-        const void * host_base, size_t tensor_size, size_t expert_size,
+        const void * host_base, size_t tensor_size, size_t expert_size, size_t stride,
         int wtype, int64_t n_expert, int64_t n_in) {
     int layer_number = -1;
     const int role = moe_cache_role_of_name(name);
@@ -2570,6 +2608,7 @@ static int moe_cache_discover_pool(
     if (first_visit) {
         layer.tensor[role] = host_base;
         layer.bytes[role] = expert_size;
+        layer.stride[role] = stride;
         layer.ne0[role] = n_in;
         layer.type[role] = wtype;
         layer.n_expert = layer.n_expert ? std::min(layer.n_expert, n_expert) : n_expert;
@@ -3126,12 +3165,15 @@ static void * moe_cache_begin(
         n_in <= 0 || n_out <= 0 || n_expert <= 0 || !moe_cache_type_supported((ggml_type)wtype)) {
         return nullptr;
     }
+    // expert_size: the step from one expert to the next (nb[2]), its bytes or, in a packed layer, the whole entry
     const size_t row_size = ggml_row_size((ggml_type)wtype, n_in);
-    if (row_size == 0 || (uint64_t)n_out > SIZE_MAX / row_size || expert_size != (size_t)n_out * row_size ||
-        (uint64_t)n_expert > SIZE_MAX / expert_size || expert_size > SIZE_MAX / moe_cache_pool_slots_min) {
+    const size_t stride = expert_size;
+    if (row_size == 0 || (uint64_t)n_out > SIZE_MAX / row_size || stride < (size_t)n_out * row_size ||
+        (uint64_t)n_expert > SIZE_MAX / stride || stride > SIZE_MAX / moe_cache_pool_slots_min) {
         return nullptr;
     }
-    const size_t tensor_size = (size_t)n_expert * expert_size;
+    expert_size = (size_t)n_out * row_size;
+    const size_t tensor_size = (size_t)(n_expert - 1) * stride + expert_size;
     std::lock_guard<std::mutex> lock(session->mu);
     if (session->stopping) {
         return nullptr;
@@ -3142,7 +3184,7 @@ static void * moe_cache_begin(
             continue;
         }
         try {
-            (void) moe_cache_discover_pool(*session, device, name, host_base, tensor_size, expert_size, wtype, n_expert, n_in);
+            (void) moe_cache_discover_pool(*session, device, name, host_base, tensor_size, expert_size, stride, wtype, n_expert, n_in);
         } catch (...) {
             MOE_CACHE_LOG("[moe-cache] CUDA%d: tensor discovery failed (host allocation)\n", device.physical);
         }
@@ -3228,10 +3270,14 @@ static bool moe_cache_enqueue_locked(
         job.slot = slot_index;
         job.generation = slot.generation;
         job.key = key;
+        job.whole = true;
         for (int r = 0; r < MOE_ROLES; r++) {
-            job.source[r] = (const char *)layer->tensor[r] + (size_t)expert * layer->bytes[r];
-            job.pad_follows[r] = expert + 1 < layer->n_expert;
+            job.source[r] = (const char *)layer->tensor[r] + (size_t)expert * layer->stride[r];
+            // the pad copied from the next expert's first bytes when they follow (stride = bytes)
+            job.pad_follows[r] = expert + 1 < layer->n_expert && layer->stride[r] == layer->bytes[r];
             job.role_bytes[r] = layer->bytes[r];
+            job.whole = job.whole && layer->stride[r] == pool.expert_size &&
+                (const char *) job.source[r] == (const char *) job.source[0] + pool.role_offset[r];
         }
         job.bytes = pool.expert_size;
         job.rewarm = rewarm;
@@ -3494,7 +3540,7 @@ static void moe_cache_invalidate_session(
         std::vector<int> gone;
         for (auto & [number, layer] : device.layers) {
             for (int r = 0; r < MOE_ROLES; r++) {
-                if (layer.tensor[r] && moe_cache_ranges_overlap(layer.tensor[r], (size_t) layer.n_expert * layer.bytes[r], base, size)) {
+                if (layer.tensor[r] && moe_cache_ranges_overlap(layer.tensor[r], (size_t) (layer.n_expert - 1) * layer.stride[r] + layer.bytes[r], base, size)) {
                     gone.push_back(number);
                     break;
                 }
@@ -3851,7 +3897,7 @@ static void moe_cache_zone_check(moe_cache_device & device, moe_cache_pool & poo
     device.zone_checked++;
     bool same = true;
     for (int r = 0; r < MOE_ROLES; r++) {
-        const char * source = (const char *)layer->tensor[r] + (size_t)slot.key.expert * layer->bytes[r];
+        const char * source = (const char *)layer->tensor[r] + (size_t)slot.key.expert * layer->stride[r];
         same = same && memcmp(host_copy.data() + pool.role_offset[r], source, pool.role_bytes[r]) == 0;
     }
     if (!same) {
@@ -4209,8 +4255,8 @@ static void moe_cache_preload(const moe_cache_session & session, moe_cache_devic
         }
         char * dst = moe_cache_slot_ptr(pool, s);
         for (int r = 0; r < MOE_ROLES && err == cudaSuccess; r++) {
-            const char * src = (const char *) layer.tensor[r] + (size_t) expert * layer.bytes[r];
-            const bool follows = expert + 1 < layer.n_expert;
+            const char * src = (const char *) layer.tensor[r] + (size_t) expert * layer.stride[r];
+            const bool follows = expert + 1 < layer.n_expert && layer.stride[r] == layer.bytes[r];
             err = cudaMemcpyAsync(dst + pool.role_offset[r], src, pool.role_bytes[r] + (follows ? pool.role_pad[r] : 0),
                                   cudaMemcpyHostToDevice, moe_cache_zone_stream);
             if (err == cudaSuccess && pool.role_pad[r] && !follows) {
@@ -4498,7 +4544,7 @@ static int moe_cache_prefill_residents(void * opaque, void * backend, const ggml
         return 0;
     }
     moe_cache_pool & pool = *device->pools[pool_index];
-    if (!pool.slab || pool.role_bytes[role] != w->nb[2] || pool.role_pad[role] < moe_cache_role_pad(w->type, w->ne[0])) {
+    if (!pool.slab || pool.role_bytes[role] != w->nb[1]*w->ne[1] || pool.role_pad[role] < moe_cache_role_pad(w->type, w->ne[0])) {
         device->prefill_streamed += n_expert;
         return 0;
     }
@@ -6324,8 +6370,10 @@ static moe_hosted_layer * moe_hosted_register(moe_hosted_state & st, moe_cache_d
             return nullptr;
         }
         const moe_cache_pool & pool = *device.pools[layer->pool_index];
-        if (pool.role_bytes[MOE_ROLE_UP] != (size_t) up_w->nb[2] || pool.role_bytes[MOE_ROLE_GATE] != (size_t) gate_w->nb[2] ||
-            pool.role_bytes[MOE_ROLE_DOWN] != (size_t) down_w->nb[2]) {
+        // an expert's bytes (nb[2] is an entry in a packed layer)
+        if (pool.role_bytes[MOE_ROLE_UP] != (size_t) (up_w->nb[1]*up_w->ne[1]) ||
+            pool.role_bytes[MOE_ROLE_GATE] != (size_t) (gate_w->nb[1]*gate_w->ne[1]) ||
+            pool.role_bytes[MOE_ROLE_DOWN] != (size_t) (down_w->nb[1]*down_w->ne[1])) {
             return nullptr;
         }
         layer->base = device.pools[layer->pool_index]->gpu_base;

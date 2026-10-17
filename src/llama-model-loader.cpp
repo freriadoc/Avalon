@@ -714,6 +714,59 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
     }
 
+    // packed expert layers (avalon.experts_packed.blk.N, written by pack-experts.py): one I8 tensor per layer holding
+    // each expert's up, gate and down one after the other; the three expert tensors become views of it, the step from
+    // one expert to the next being the packed entry (nb[2]), so that the MoE cache fills an expert with one copy
+    if (metadata) {
+        std::vector<std::string> packed;
+        for (const auto & it : weights_map) {
+            int layer = -1;
+            char tail[32] = {};
+            if (sscanf(it.first.c_str(), "blk.%d.%31s", &layer, tail) == 2 && strcmp(tail, "ffn_exps_packed") == 0) {
+                packed.push_back(it.first);
+            }
+        }
+        if (!packed.empty()) {
+            if (!use_mmap && !no_alloc) {   // the memory-fit pass (no_alloc) reads no weight
+                throw std::runtime_error("packed expert layers need the model to be memory mapped (no --no-mmap / --load-mode)");
+            }
+            ggml_init_params params = { 3 * packed.size() * ggml_tensor_overhead(), nullptr, true };
+            ggml_context * ctx = ggml_init(params);
+            contexts.emplace_back(ctx);
+            static const char * roles[3] = { "ffn_up_exps", "ffn_gate_exps", "ffn_down_exps" };
+            for (const std::string & name : packed) {
+                const int layer = atoi(name.c_str() + 4);
+                const std::string key = format("avalon.experts_packed.blk.%d", layer);
+                const int kid = gguf_find_key(metadata, key.c_str());
+                if (kid < 0 || gguf_get_arr_type(metadata, kid) != GGUF_TYPE_UINT64 || gguf_get_arr_n(metadata, kid) != 14) {
+                    throw std::runtime_error(format("packed expert layer %d: key %s missing or malformed", layer, key.c_str()));
+                }
+                const uint64_t * v = (const uint64_t *) gguf_get_arr_data(metadata, kid);
+                const llama_tensor_weight & w = weights_map.at(name);
+                const uint64_t stride = v[0], n_expert = v[1];
+                if ((uint64_t) ggml_nbytes(w.tensor) != stride * n_expert) {
+                    throw std::runtime_error(format("packed expert layer %d: %zu bytes, expected %" PRIu64 " x %" PRIu64,
+                        layer, ggml_nbytes(w.tensor), stride, n_expert));
+                }
+                for (int r = 0; r < 3; r++) {
+                    const ggml_type type = (ggml_type) v[2 + 4*r];
+                    const int64_t ne[4] = { (int64_t) v[3 + 4*r], (int64_t) v[4 + 4*r], (int64_t) n_expert, 1 };
+                    ggml_tensor * t = ggml_new_tensor(ctx, type, 3, ne);
+                    t->nb[2] = stride;
+                    t->nb[3] = stride * n_expert;
+                    const std::string tname = format("blk.%d.%s.weight", layer, roles[r]);
+                    ggml_set_name(t, tname.c_str());
+                    if (v[5 + 4*r] + t->nb[1] * ne[1] > stride || weights_map.count(tname)) {
+                        throw std::runtime_error(format("packed expert layer %d: %s does not fit its entry or is duplicated", layer, tname.c_str()));
+                    }
+                    weights_map.emplace(tname, llama_tensor_weight(files.at(w.idx).get(), w.idx, w.offs + v[5 + 4*r], t));
+                }
+                weights_map.erase(name);
+            }
+            LLAMA_LOG_INFO("%s: %zu packed expert layers (one copy per expert)\n", __func__, packed.size());
+        }
+    }
+
     n_kv      = gguf_get_n_kv(metadata);
     n_tensors = weights_map.size();
 
@@ -1408,6 +1461,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     struct ggml_tensor * tensor = ggml_dup_tensor(ctx, &t_meta);
     ggml_set_name(tensor, ggml_get_name(&t_meta));
+    if (!ggml_is_contiguous(&t_meta)) {   // an expert tensor of a packed layer: its experts lie an entry apart
+        for (int dim = 0; dim < GGML_MAX_DIMS; dim++) {
+            tensor->nb[dim] = t_meta.nb[dim];
+        }
+    }
 
     if (duplicated) {
         size_data += ggml_nbytes(&t_meta);

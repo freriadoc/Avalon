@@ -1743,7 +1743,10 @@ void ggml_cuda_mul_mat_vec_q(
         const size_t size_data  = ggml_nbytes(src0);
         const size_t size_alloc = ggml_backend_buffer_get_alloc_size(src0->buffer, src0);
         if (size_alloc > size_data) {
-            GGML_ASSERT(ggml_is_contiguously_allocated(src0));
+            // contiguous, or experts at a step above their bytes (a packed layer's copy): nothing past ggml_nbytes either way
+            GGML_ASSERT(ggml_is_contiguously_allocated(src0) ||
+                (src0->nb[1] == ggml_row_size(src0->type, src0->ne[0]) && src0->nb[2] >= src0->nb[1]*src0->ne[1] &&
+                 src0->nb[3] >= src0->nb[2]*src0->ne[2]));
             GGML_ASSERT(!src0->view_src);
             CUDA_CHECK(cudaMemsetAsync((char *) src0->data + size_data, 0, size_alloc - size_data, stream));
         }

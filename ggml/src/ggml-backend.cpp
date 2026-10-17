@@ -959,6 +959,51 @@ static struct ggml_tensor * ggml_dup_tensor_layout(struct ggml_context * ctx, co
     return dup;
 }
 
+// the step from one expert to the next in the copy of an expert tensor of a packed layer (its experts an entry apart
+// in host memory, nb[2] above its bytes): the expert's bytes and what MMQ reads past its last row (the MoE cache's
+// moe_cache_role_pad before its rounding to 256 bytes); 0 for any other tensor. A packed entry stores that pad (the
+// next expert's first bytes) right after the expert's bytes: a run of experts is one 2D copy, nothing past it to copy.
+static size_t ggml_sched_packed_expert_step(const struct ggml_tensor * t) {
+    if (t->ne[2] <= 1 || t->ne[3] != 1 || !ggml_is_quantized(t->type) || t->nb[1] != ggml_row_size(t->type, t->ne[0]) ||
+            t->nb[2] <= t->nb[1]*t->ne[1] || !t->buffer || t->view_src ||
+            ggml_backend_buffer_get_usage(t->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+        return 0;
+    }
+    // whole blocks (MMQ counts the step in blocks), within the entry's pad (that, rounded up to 256 bytes)
+    const size_t over = (size_t) ((GGML_PAD(t->ne[0], 512) - t->ne[0]) / ggml_blck_size(t->type)) * ggml_type_size(t->type);
+    const size_t step = t->nb[1]*t->ne[1] + over;
+    GGML_ASSERT(step <= t->nb[2]);
+    return step;
+}
+
+// experts e0 .. e1 - 1 of an expert tensor of a packed layer into its copy (at their step), each with its pad, one 2D
+// copy; the last expert of the tensor without its pad (past ggml_nbytes: the copy's padding, zeroed by the caller)
+static void ggml_sched_copy_packed_experts(ggml_backend_t backend, struct ggml_tensor * dst, const struct ggml_tensor * src,
+        int64_t e0, int64_t e1, size_t step) {
+    const int64_t n_expert = src->ne[2];
+    const int64_t full = e1 == n_expert ? e1 - 1 : e1;   // the rows copied with their pad
+    if (full > e0) {
+        ggml_backend_tensor_set_2d_async(backend, dst, (const uint8_t *) src->data + e0*src->nb[2], e0*step, step,
+            full - e0, step, src->nb[2]);
+    }
+    if (full < e1) {
+        ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + full*src->nb[2], full*step,
+            src->nb[1]*src->ne[1]);
+    }
+}
+
+// a copy of the tensor with the same memory layout; for an expert tensor of a packed layer, its experts at their
+// step (ggml_sched_packed_expert_step) instead of an entry apart
+static struct ggml_tensor * ggml_dup_tensor_copy_layout(struct ggml_context * ctx, const struct ggml_tensor * tensor) {
+    struct ggml_tensor * dup = ggml_dup_tensor_layout(ctx, tensor);
+    const size_t step = ggml_sched_packed_expert_step(tensor);
+    if (step) {
+        dup->nb[2] = step;
+        dup->nb[3] = step*dup->ne[2];
+    }
+    return dup;
+}
+
 static bool ggml_is_view_op(enum ggml_op op) {
     return op == GGML_OP_VIEW || op == GGML_OP_RESHAPE || op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE;
 }
@@ -1739,7 +1784,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                         ggml_backend_t backend = sched->backends[cur_backend_id];
                         for (int c = 0; c < sched->n_copies; c++) {
-                            struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
+                            struct ggml_tensor * tensor_copy = ggml_dup_tensor_copy_layout(sched->ctx, src);
                             ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
                             if (sched->n_copies > 1) {
                                 ggml_set_input(tensor_copy);
@@ -1788,7 +1833,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     if (c == sched->cur_copy) {
                         tensor_copy = leaf; // use the original tensor as the current copy
                     } else {
-                        tensor_copy = ggml_dup_tensor_layout(sched->ctx, leaf);
+                        tensor_copy = ggml_dup_tensor_copy_layout(sched->ctx, leaf);
                         ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), leaf->name, c);
                     }
                     ggml_set_input(tensor_copy);
@@ -2109,6 +2154,19 @@ static void ggml_backend_sched_prefetch_disable(ggml_backend_sched_t sched, ggml
 // backends such as CUDA/HIP pad the last row of quantized tensors (MATRIX_ROW_PADDING)
 // and their kernels read into that padding, so a slot must hold the padded size, not
 // ggml_nbytes, or the kernel reads past the end of the slot
+// the size of a weight's copy in a buffer of buft (an expert tensor of a packed layer: its experts at their step)
+static size_t ggml_backend_sched_input_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * input) {
+    const size_t step = ggml_sched_packed_expert_step(input);
+    if (!step) {
+        return ggml_backend_buft_get_alloc_size(buft, input);
+    }
+    ggml_tensor t = *input;
+    t.nb[2] = step;
+    t.nb[3] = step*t.ne[2];
+    t.view_src = nullptr;
+    return ggml_backend_buft_get_alloc_size(buft, &t);
+}
+
 static size_t ggml_backend_sched_prefetch_max_size(ggml_backend_sched_t sched, ggml_backend_buffer_type_t buft) {
     size_t max_size = 0;
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
@@ -2121,7 +2179,7 @@ static size_t ggml_backend_sched_prefetch_max_size(ggml_backend_sched_t sched, g
             if (input->buffer &&
                 ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
                 ggml_backend_buffer_is_host(input->buffer)) {
-                max_size = std::max(max_size, ggml_backend_buft_get_alloc_size(buft, input));
+                max_size = std::max(max_size, ggml_backend_sched_input_alloc_size(buft, input));
             }
         }
     }
@@ -2381,7 +2439,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         const int64_t n_expert = input->ne[2];
                         if (ids->ne[0]*ids->ne[1] >= 2*n_expert &&
                             ggml_backend_sched_prefetch_init(sched, split_backend,
-                                ggml_backend_buft_get_alloc_size(ggml_backend_get_default_buffer_type(split_backend), input))) {
+                                ggml_backend_sched_input_alloc_size(ggml_backend_get_default_buffer_type(split_backend), input))) {
                             const int slot = sched->prefetch_cur;
                             sched->prefetch_cur = (sched->prefetch_cur + 1) % sched->prefetch_n_slots;
                             // wait for the previous user of this slot to finish computing
@@ -2399,8 +2457,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             input_cpy->data   = sched->prefetch_slot_data[slot];
                             // the experts the cache holds are read in place: only the others are copied, and the
                             // slot gets the table of all the experts' addresses (resident: their entry; others: here)
-                            const size_t padded_size = ggml_backend_buft_get_alloc_size(
+                            const size_t padded_size = ggml_backend_sched_input_alloc_size(
                                 ggml_backend_get_default_buffer_type(split_backend), input);
+                            // a packed layer: each expert copied with its pad, at its step in the slot (one 2D copy a run)
+                            const size_t packed_step = ggml_sched_packed_expert_step(input);
                             int n_resident = -1;
                             if (sched->moe_cache_session && ggml_moe_cache.prefill_residents && sched->prefetch_lent &&
                                     n_expert <= GGML_SCHED_PREFETCH_TABLE_EXPERTS) {
@@ -2415,7 +2475,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                     node, input, sched->prefetch_table[slot]);
                                 sched->prefill_pinned = sched->prefill_pinned || n_resident > 0;
                             }
-                            if (n_resident <= 0) {
+                            if (n_resident <= 0 && packed_step) {
+                                ggml_sched_copy_packed_experts(sched->prefetch_backend, input_cpy, input, 0, n_expert, packed_step);
+                            } else if (n_resident <= 0) {
                                 ggml_backend_tensor_set_async(sched->prefetch_backend, input_cpy, input->data, 0, ggml_nbytes(input));
                             } else {
                                 // runs of copied experts; MMQ reads a little past an expert's last row (up to 512
@@ -2431,6 +2493,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                     while (e1 < n_expert && !res[e1]) {
                                         e1++;
                                     }
+                                    if (packed_step) {
+                                        ggml_sched_copy_packed_experts(sched->prefetch_backend, input_cpy, input, e0, e1, packed_step);
+                                        e0 = e1;
+                                        continue;
+                                    }
                                     const size_t off  = e0*expert_size;
                                     const size_t tail = e1 < n_expert ? std::min<size_t>(expert_size, 512) : 0;
                                     ggml_backend_tensor_set_async(sched->prefetch_backend, input_cpy,
@@ -2443,7 +2510,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 const uint64_t base = (uint64_t) (uintptr_t) sched->prefetch_slot_data[slot];
                                 for (int64_t e = 0; e < n_expert; e++) {
                                     if (!tab[e]) {
-                                        tab[e] = base + e*input->nb[2];
+                                        tab[e] = base + e*input_cpy->nb[2];
                                     }
                                 }
                                 GGML_ASSERT(sched->prefetch_backend->iface.set_tensor_async != NULL);
@@ -2456,7 +2523,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 // re-zero the row padding: a previous, larger tensor may have
                                 // left its bytes there (the public setter stops at ggml_nbytes)
                                 static const std::vector<uint8_t> zeros(64*1024, 0);
-                                const size_t nbytes = ggml_nbytes(input);
+                                const size_t nbytes = ggml_nbytes(input_cpy);
                                 const size_t padded = padded_size;
                                 if (padded > nbytes) {
                                     GGML_ASSERT(padded - nbytes <= zeros.size());
@@ -2549,7 +2616,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
 
                     // group consecutive experts and copy them together
+                    const size_t packed_step = node->op == GGML_OP_MUL_MAT_ID ? ggml_sched_packed_expert_step(input) : 0;
                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
+                        if (packed_step) {   // a packed layer: each expert with its pad, one 2D copy
+                            ggml_sched_copy_packed_experts(split_backend, input_cpy, input, first_id, last_id + 1, packed_step);
+                            return;
+                        }
                         const size_t expert_offset = first_id * expert_size;
                         const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
                         const size_t padding = std::min<size_t>(expert_size, 512);
