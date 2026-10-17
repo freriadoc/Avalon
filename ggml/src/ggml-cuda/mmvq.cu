@@ -902,7 +902,8 @@ static __device__ __forceinline__ const void * mmvq_global_ptr(uint64_t addr) {
 // entry_ptrs (the MoE cache): ids and gate_ids hold each routed row's entry address (64 bits, 0 for a row the cache does
 // not hold) instead of a matrix index, one row per block: the address is read by a scalar load and the blocks inside
 // the entry are counted in 32 bits, wherever the cache's ranges lie (the slab, memory lent by the KV cache).
-template <ggml_type type, int c_rows_per_block, bool has_fusion, bool has_clamp, bool flat_hits = false, bool entry_ptrs = false>
+template <ggml_type type, int c_rows_per_block, bool has_fusion, bool has_clamp, bool flat_hits = false, bool entry_ptrs = false,
+          bool flat_k = false>
 __launch_bounds__((flat_hits ? 2 : entry_ptrs ? 1 : get_mmvq_mmid_max_batch_for_device<type>())*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_moe(
         const void * vx_ptr, const void * vy_ptr,
@@ -1022,17 +1023,57 @@ static __global__ void mul_mat_vec_q_moe(
     float tmp[c_rows_per_block] = {0.0f};
     float tmp_gate[c_rows_per_block] = {0.0f};
 
-    for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
-        const int kby = kbx * (qk/QK8_1);
-        const int kqs = vdr * (threadIdx.x % (qi/vdr));
+    if constexpr (flat_k) {
+        // the (row, chunk) pairs of the block's rows numbered one after the other and dealt to the lanes: a row of
+        // 80 chunks takes 2.5 passes of a warp, 2 rows 5 full passes (no lane idles at the end of each row)
+        constexpr int lanes_per_block = qi/vdr;
+        const int per_row   = blocks_per_row_x * lanes_per_block;
+        const int rows_here = min(c_rows_per_block, (int) nrows_x - row0);
+        int r = 0;
+        int c = threadIdx.x;
+        while (c >= per_row) {
+            c -= per_row;
+            ++r;
+        }
+        while (r < rows_here) {
+            const int kbx = c / lanes_per_block;
+            const int kqs = vdr * (c % lanes_per_block);
+            const int kby = kbx * (qk/QK8_1);
+            const float v = vec_dot_q_cuda(vx, &y[kby], kbx_offset + r*stride_row_x + kbx, kqs);
+            float w = 0.0f;
+            if constexpr (has_fusion) {
+                if (use_gate) {
+                    w = vec_dot_q_cuda(vgate, &y[kby], gate_kbx_offset + r*stride_row_x + kbx, kqs);
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < c_rows_per_block; ++i) {
+                if (i == r) {
+                    tmp[i] += v;
+                    if constexpr (has_fusion) {
+                        tmp_gate[i] += w;
+                    }
+                }
+            }
+            c += warp_size;
+            while (c >= per_row) {
+                c -= per_row;
+                ++r;
+            }
+        }
+    } else {
+        for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+            const int kby = kbx * (qk/QK8_1);
+            const int kqs = vdr * (threadIdx.x % (qi/vdr));
 
 #pragma unroll
-        for (int i = 0; i < c_rows_per_block; ++i) {
-            if (uint32_t(row0 + i) < nrows_x) {
-                tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
-                if constexpr (has_fusion) {
-                    if (use_gate) {
-                        tmp_gate[i] += vec_dot_q_cuda(vgate, &y[kby], gate_kbx_offset + i*stride_row_x + kbx, kqs);
+            for (int i = 0; i < c_rows_per_block; ++i) {
+                if (uint32_t(row0 + i) < nrows_x) {
+                    tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                    if constexpr (has_fusion) {
+                        if (use_gate) {
+                            tmp_gate[i] += vec_dot_q_cuda(vgate, &y[kby], gate_kbx_offset + i*stride_row_x + kbx, kqs);
+                        }
                     }
                 }
             }
@@ -1218,12 +1259,14 @@ static void mul_mat_vec_q_moe_entries_launch(
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
     constexpr int vdr = get_vdr_mmvq(type);
     const bool short_k = (int) (ncols_x / qk) <= 2 * (vdr * warp_size / qi);
+    // the others (up / gate, K = 2560) deal the (row, chunk) pairs of their 2 rows to the lanes (flat_k)
     const auto launch = [&](auto rows_tag) {
         constexpr int rows_per_block = decltype(rows_tag)::value;
+        constexpr bool flat = rows_per_block == 2;
         const dim3 block_nums((nrows_x + rows_per_block - 1) / rows_per_block, n_hits);
         const dim3 block_dims(warp_size, 1);
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
-        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, has_gate, has_clamp, false, true>, launch_params,
+        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, has_gate, has_clamp, false, true, flat>, launch_params,
             nullptr, vy, (const int32_t *) up_entries, act_ids, nullptr, (const int32_t *) gate_entries,
             ggml_cuda_mm_fusion_args_device{}, dst, ncols_x, nchannels_y, nrows_x,
             stride_row_x, 0, 0, 0, stride_channel_y, stride_channel_dst,
