@@ -341,8 +341,15 @@ struct moe_cache_config {
     // (served well) +0.3 / +0.1 %; a fixed 2 cost prose +0.25 %. 20: the best of 5 - 40 in the cache simulator
     int lfu_ramp = 20;
     int lfu_cap = 15;
-    int queue_max = 128;
-    size_t queue_mb = 512;
+    // the window follows the context depth (KV rows): lfu_window up to depth_window[0], depth_window[1] from
+    // depth_window[2], linear between, without the ramp; a deep context's demand moves faster.
+    // GGML_CUDA_MOE_CACHE_LFU_WINDOW_DEPTH="d0,w1,d1", "0" for the fixed window. MEASURED: see the commit
+    double depth_window[3] = {32768, 2, 250000};
+    // deferred admissions (GGML_CUDA_MOE_CACHE_DEFER=0 disables): see moe_hosted_admit_deferred
+    bool defer = true;
+    // a pass's deferred admissions can come in bursts (up to ~180 after a long prefill)
+    int queue_max = 1024;
+    size_t queue_mb = 4096;
     int stats_every = 0;
     int max_devices = INT_MAX;
     int min_compute_capability = moe_cache_cc_forced_min;
@@ -434,6 +441,20 @@ struct moe_cache_device {
     moe_cache_scratch scratch_reserve;
 
     std::deque<moe_cache_job> queue;
+    // deferred admissions (moe_hosted_admit_deferred): the candidates of the pass's main-model layers so far, the start
+    // of the current layer's, and the main model's first and last layers (the layers known when the pools are built:
+    // the MTP draft's joins later and admits as before)
+    struct deferred_candidate {
+        int pool = -1;
+        moe_cache_key key;
+        uint16_t freq = 0;
+        bool contest = false;
+    };
+    std::vector<deferred_candidate> deferred;
+    size_t deferred_layer = 0;
+    bool deferring = false;   // a main-model layer's plan runs: an admission is recorded, not made
+    int main_first = -1;
+    int main_last = -1;
     // PREGATE (moe_pregate_k): prefetches of the experts predicted for the next layer, served only
     // in the window from a layer's CPU rows done to the next layer's publication (CPU idle, GPU on the rest
     // of the layer in VRAM), after the ordinary fills
@@ -882,6 +903,19 @@ static moe_cache_config moe_cache_read_config() {
     }
     if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_LFU_RAMP", 0, 1000, value)) {
         config.lfu_ramp = (int)value;
+    }
+    if (const char * a = getenv("GGML_CUDA_MOE_CACHE_LFU_WINDOW_DEPTH")) {
+        double d0 = 0, w1 = 0, d1 = 0;
+        if (sscanf(a, "%lf,%lf,%lf", &d0, &w1, &d1) == 3 && d1 > d0 && w1 >= 1) {
+            config.depth_window[0] = d0;
+            config.depth_window[1] = w1;
+            config.depth_window[2] = d1;
+        } else {
+            config.depth_window[0] = config.depth_window[2] = 0;   // the fixed window
+        }
+    }
+    if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_DEFER", 0, 1, value)) {
+        config.defer = value != 0;
     }
     if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_LFU_CAP", 2, 65535, value)) {
         config.lfu_cap = (int)value;
@@ -2404,6 +2438,10 @@ static void moe_cache_build_pending(
         }
     }
     device.pools_built = true;
+    if (!device.layers.empty()) {
+        device.main_first = device.layers.begin()->first;
+        device.main_last = device.layers.rbegin()->first;
+    }
     if (!moe_cache_prepare_budget(session, device)) {
         for (moe_cache_shape & shape : device.shapes) {
             if (shape.n_layers > 0) {
@@ -3118,6 +3156,7 @@ static void * moe_cache_begin(
     return nullptr;
 }
 
+static constexpr size_t moe_cache_deferred_max = 4096;   // candidates of a pass kept for its end (a bound only)
 static bool moe_cache_enqueue_locked(
         moe_cache_session & session, moe_cache_device & device,
         moe_cache_pool & pool, int pool_index, const void * host_base,
@@ -3125,6 +3164,15 @@ static bool moe_cache_enqueue_locked(
         bool & wake_worker, bool allow_eviction, bool rewarm, bool pregate, uint16_t freq, bool contest) {
     GGML_UNUSED(expert_size);   // the entry: pool.expert_size
     const moe_cache_key key{host_base, expert};
+    if (device.deferring && !rewarm && !pregate) {
+        if (device.deferred.size() < moe_cache_deferred_max) {
+            try {
+                device.deferred.push_back({pool_index, key, freq, contest});
+            } catch (...) {
+            }
+        }
+        return false;
+    }
     const moe_cache_layer * layer = moe_cache_layer_of(device, host_base);
     const size_t queue_limit = session.config.queue_mb << 20;
     if (!layer || expert < 0 || expert >= layer->n_expert || inserts_left <= 0 ||
@@ -3358,6 +3406,14 @@ static void moe_cache_freq_age_locked(const moe_cache_session & session, moe_cac
         const double entries = device.freq_period / session.config.lfu_window;
         const double w = std::min<double>(session.config.lfu_window,
             2.0 + (session.config.lfu_window - 2.0) * (double) device.renewed_demands / (session.config.lfu_ramp * entries));
+        period = w * entries;
+    }
+    if (session.config.depth_window[2] > session.config.depth_window[0]) {
+        const double entries = device.freq_period / session.config.lfu_window;
+        const double d0 = session.config.depth_window[0], w1 = session.config.depth_window[1], d1 = session.config.depth_window[2];
+        const double w0 = session.config.lfu_window;
+        const double d = (double) device.kv_end_rows;
+        const double w = d <= d0 ? w0 : d >= d1 ? w1 : w0 + (w1 - w0) * (d - d0) / (d1 - d0);
         period = w * entries;
     }
     if ((double) device.freq_demands < period) {
@@ -5382,6 +5438,60 @@ static void moe_hosted_unpin_session(moe_cache_session & session) {
 // in the same row order. The cache's structures are cold by then (the previous layer's CPU rows
 // evicted them): 12.5 us for the 30 rows of a 3-token pass, 2.6 of them in that bookkeeping. The
 // resident rows are found through the pools' direct index, not the hash map (no chain of dependent loads).
+// Deferred admissions (GGML_CUDA_MOE_CACHE_DEFER=0 disables). A copy into the cache reads the RAM at ~13 GB/s: during
+// the CPU rows (RAM bound, ~31 GB/s) it slowed them by ~30 %. The plan of a main-model layer only records the
+// candidates the admission rule passes; at the end of the layer's CPU rows its most demanded one is admitted, its copy
+// running while the GPU finishes the layer; at the end of the pass's last layer, all the others still absent, most
+// demanded first: their copies run during the MTP draft, and the next pass's first layer waits for them. The victim is
+// chosen then, not at the plan. MEASURED: see the commit.
+static void moe_hosted_admit_deferred(moe_hosted_state & st, moe_hosted_layer & layer) {
+    moe_cache_session & session = *st.session;
+    moe_cache_device & device = *st.device;
+    if (!session.config.defer) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(session.mu);
+    if (device.main_first < 0 || layer.layer_number < device.main_first || layer.layer_number > device.main_last) {
+        return;
+    }
+    auto & c = device.deferred;
+    bool wake = false;
+    const auto admit = [&](const moe_cache_device::deferred_candidate & k) -> bool {
+        if (session.stopping || session.dormant || device.dead.load() || k.pool < 0 || k.pool >= (int) device.pools.size()) {
+            return false;
+        }
+        moe_cache_pool & pool = *device.pools[k.pool];
+        if (!pool.slab || pool.map.count(k.key)) {
+            return false;
+        }
+        int inserts_left = 1;
+        if (!moe_cache_enqueue_locked(session, device, pool, k.pool, k.key.tensor, k.key.expert, pool.expert_size,
+                                      inserts_left, wake, true, false, false, k.freq, k.contest)) {
+            return false;
+        }
+        if (session.config.lfu) {
+            device.demand_count.erase(k.key);
+        }
+        return true;
+    };
+    if (device.deferred_layer < c.size()) {   // this layer's most demanded candidate the rule admits
+        std::stable_sort(c.begin() + device.deferred_layer, c.end(), [](const auto & x, const auto & y) { return x.freq > y.freq; });
+        for (size_t i = device.deferred_layer; i < c.size() && !admit(c[i]); i++) {
+        }
+    }
+    if (layer.layer_number == device.main_last) {   // the pass's others
+        std::stable_sort(c.begin(), c.end(), [](const auto & x, const auto & y) { return x.freq > y.freq; });
+        for (const auto & k : c) {
+            admit(k);
+        }
+        c.clear();
+    }
+    device.deferred_layer = c.size();
+    if (wake) {
+        session.cv.notify_all();
+    }
+}
+
 static int moe_hosted_plan(moe_hosted_state & st, moe_hosted_layer & layer, const int32_t * ids, int rows,
                            uint64_t * out, int32_t * cpu_rows, uint32_t * flag, uint32_t seq) {
     moe_cache_session & session = *st.session;
@@ -5389,7 +5499,19 @@ static int moe_hosted_plan(moe_hosted_state & st, moe_hosted_layer & layer, cons
     int n_cpu = 0;
     bool wake_worker = false;
     {
-        std::lock_guard<std::mutex> lock(session.mu);
+        std::unique_lock<std::mutex> lock(session.mu);
+        if (layer.layer_number == -2) {
+            const auto it = device.layer_of.find(layer.gate_w->data);
+            layer.layer_number = it != device.layer_of.end() ? it->second : -1;
+        }
+        const bool defer = session.config.defer && device.main_first >= 0 &&
+            layer.layer_number >= device.main_first && layer.layer_number <= device.main_last;
+        if (defer && layer.layer_number == device.main_first) {
+            // the previous pass's admissions land before this one computes (they copied during the draft)
+            session.idle_cv.wait(lock, [&] {
+                return (device.queue.empty() && !device.inflight) || session.stopping || device.dead.load();
+            });
+        }
         moe_hosted_unpin_locked(st);
 
         moe_cache_pool * pool = nullptr;
@@ -5447,6 +5569,8 @@ static int moe_hosted_plan(moe_hosted_state & st, moe_hosted_layer & layer, cons
         // admissions: inserts_per_plan / 2 experts per plan, the rate the pools per tensor shape had (a budget of
         // inserts_per_plan tensors for the gate / up pool, two tensors an expert)
         int inserts = std::max(1, session.config.inserts_per_plan / 2);
+        device.deferring = defer;
+        device.deferred_layer = device.deferred.size();
         for (int row = 0; row < rows; row++) {
             const int32_t expert = ids[row];
             if (!pool || expert < 0 || expert >= n_expert) {
@@ -5471,6 +5595,7 @@ static int moe_hosted_plan(moe_hosted_state & st, moe_hosted_layer & layer, cons
                 device.misses++;
             }
         }
+        device.deferring = false;
         device.nodes++;
         moe_cache_freq_age_locked(session, device);
     }
@@ -5891,6 +6016,7 @@ static void moe_hosted_serve_one(moe_hosted_state * st, uint32_t seq) {
         }
     }
     __atomic_store_n(&layer->h_flags[16], seq, __ATOMIC_RELEASE);
+    moe_hosted_admit_deferred(*st, *layer);
     if (!st->tl_host.empty()) {
         moe_tl_account(st, seq);
     }
