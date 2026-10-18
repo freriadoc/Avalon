@@ -155,9 +155,9 @@ static void mk_launch_chain128(const ggml_cuda_mk_tasks & T, int n_stages, cudaS
         int per_cu = 0;
         CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_cu, k_mk_chain128, 128, 32 * sizeof(float)));
         const int nsm = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
-        // every block resident at once (else the barrier waits for ever): at most what the device holds, and room
-        // left for the kernels of other queues
-        cap = std::max(1, std::min(per_cu, 4) * nsm);
+        // every block resident at once (else the barrier waits for ever): at most what the device holds, and under
+        // the waves it dispatches whatever other queues hold (grid-barrier.cuh)
+        cap = std::max(1, std::min(std::min(per_cu, 4) * nsm, ggml_cuda_grid_barrier_max_blocks(128)));
     }
     int need = 1;
     for (int i = 0; i < T.n; i++) {
@@ -171,8 +171,9 @@ static void mk_launch_chain128(const ggml_cuda_mk_tasks & T, int n_stages, cudaS
 // its virtual blocks, a grid barrier between two stages (its own pair: it never runs at the same time as k_mk_chain128)
 static __device__ __attribute__((aligned(256))) unsigned g_mk_bar256[128];   // count [0], generation [64]
 
-// the chain kernel's grid (at most: a few blocks, all resident at once whatever runs on other queues; at the full
-// occupancy, 7 x 42 blocks, it waited for ever in a prefill), and the largest task it takes (a few loops of its blocks)
+// the chain kernel's grid (at most: a few blocks, all resident at once whatever runs on other queues, grid-barrier.cuh;
+// at the full occupancy, 7 x 42 blocks, it waited for ever in a prefill), and the largest task it takes (a few loops
+// of its blocks)
 #define GGML_CUDA_MK_CHAIN256_GRID       64
 #define GGML_CUDA_MK_CHAIN256_MAX_BLOCKS 256
 
@@ -238,7 +239,8 @@ static void mk_launch_chain256(const ggml_cuda_mk_tasks & T, int n_stages, cudaS
     for (int i = 0; i < T.n; i++) {
         need = std::max(need, T.t[i].n_blocks);
     }
-    k_mk_chain256<<<std::min(std::min(need, cap), GGML_CUDA_MK_CHAIN256_GRID), GGML_CUDA_MK_THREADS, smem, stream>>>(T, n_stages);
+    k_mk_chain256<<<std::min(std::min(need, cap), std::min(GGML_CUDA_MK_CHAIN256_GRID, ggml_cuda_grid_barrier_max_blocks(GGML_CUDA_MK_THREADS))),
+        GGML_CUDA_MK_THREADS, smem, stream>>>(T, n_stages);
     CUDA_CHECK(cudaGetLastError());
 }
 

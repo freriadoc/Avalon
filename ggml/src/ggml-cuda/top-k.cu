@@ -549,9 +549,10 @@ static bool top_k_radix_fused_cuda(int * histograms, size_t hist_count, const fl
         int per_cu = 0, per_cu_t = 0;
         CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_cu, top_k_radix_fused<BLOCK_SIZE, RADIX_BITS, false>, BLOCK_SIZE, 0));
         CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_cu_t, top_k_radix_fused<BLOCK_SIZE, RADIX_BITS, true>, BLOCK_SIZE, 0));
-        // every block resident at once: half the occupancy, as k_mk_chain128 (a chain kernel at the full occupancy,
-        // 7 x 42 blocks, waited for ever in a prefill: the device does not guarantee it)
-        cap = std::max(1, std::min(per_cu, per_cu_t) / 2 * ggml_cuda_info().devices[ggml_cuda_get_device()].nsm);
+        // every block resident at once: half the occupancy, and under the waves the device dispatches whatever other
+        // queues hold (grid-barrier.cuh)
+        cap = std::max(1, std::min(std::min(per_cu, per_cu_t) / 2 * ggml_cuda_info().devices[ggml_cuda_get_device()].nsm,
+                                   ggml_cuda_grid_barrier_max_blocks(BLOCK_SIZE)));
     }
     // at most 32 blocks per row (2048 columns each at 256k): the gather keeps the columns' order, the same result
     const int blocks_per_row = std::min(top_k_radix_blocks_per_row(ncols), 32);
