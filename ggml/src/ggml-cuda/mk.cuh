@@ -1,6 +1,6 @@
 #pragma once
 
-// Multi-task kernel (GGML_CUDA_MK=1): consecutive independent small kernels launched as one. Each launch costs
+// Multi-task kernel (on by default, GGML_CUDA_MK=0 turns it off): consecutive independent small kernels launched as one. Each launch costs
 // ~2.4 us on RDNA3 between two dependent kernels of a graph (tests/gapbench); kernels that do not depend on each
 // other need no such wait. While the graph is evaluated, the launchers that support it record their task here
 // instead of launching it, with the memory its nodes read and write; before a node that reads what a pending task

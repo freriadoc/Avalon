@@ -17,5 +17,5 @@ void ggml_cuda_op_gated_delta_net_fused_cache(ggml_backend_cuda_context & ctx, g
 // left that gather to the kernel, nullptr otherwise
 const ggml_tensor * ggml_cuda_gdn_state_gather_of(const ggml_backend_cuda_context & ctx, const ggml_tensor * state);
 
-// whether the multi-task kernel takes this gated delta net (GGML_CUDA_MK=1, mk.cuh)
+// whether the multi-task kernel takes this gated delta net (mk.cuh)
 bool ggml_cuda_gdn_mk_recordable(const ggml_tensor * dst);

@@ -6091,7 +6091,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             // reused activation quantization if one of them wrote over it
             static const bool depchain = getenv("GGML_CUDA_DEPCHAIN") && atoi(getenv("GGML_CUDA_DEPCHAIN")) > 0;
             std::vector<std::pair<int, int>> units;
-            static const bool mk_enabled = getenv("GGML_CUDA_MK") && atoi(getenv("GGML_CUDA_MK")) > 0;
+            static const bool mk_enabled = !getenv("GGML_CUDA_MK") || atoi(getenv("GGML_CUDA_MK")) > 0;   // GGML_CUDA_MK=0: off
             if (mk_enabled) {
                 if (!cuda_ctx->mk_owned) {
                     cuda_ctx->mk_owned = new ggml_cuda_mk();

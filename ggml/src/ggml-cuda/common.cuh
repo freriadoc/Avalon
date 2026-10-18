@@ -1618,7 +1618,7 @@ struct ggml_backend_cuda_context {
 
     ggml_cuda_stream_context concurrent_stream_context;
 
-    // the multi-task kernel's recorder while a graph is evaluated with GGML_CUDA_MK=1 (mk.cuh), else nullptr
+    // the multi-task kernel's recorder while a graph is evaluated (mk.cuh; GGML_CUDA_MK=0 turns it off), else nullptr
     ggml_cuda_mk * mk = nullptr;
     ggml_cuda_mk * mk_owned = nullptr;
 
