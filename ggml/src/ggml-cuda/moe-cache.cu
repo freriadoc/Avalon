@@ -5135,6 +5135,7 @@ struct moe_hosted_state {
     std::unordered_map<uint32_t, int> pg_demand;             // PREGATE: predictions per (layer, expert)
     char * d_q8_act = nullptr;
     char * d_q8_mid = nullptr;
+    unsigned * d_q8_count = nullptr;   // the up / gate kernel's warps done per q8_1 block of d_q8_mid (zero between launches)
     size_t q8_act_bytes = 0;
     size_t q8_mid_bytes = 0;
     int n_threads = 1;
@@ -6341,6 +6342,7 @@ static void moe_hosted_shutdown(moe_cache_session * session) {
     if (st->d_seq) cudaFree(st->d_seq);
     if (st->d_q8_act) cudaFree(st->d_q8_act);
     if (st->d_q8_mid) cudaFree(st->d_q8_mid);
+    if (st->d_q8_count) cudaFree(st->d_q8_count);
     // the pins of the last plan go with the pools the session is about to free
 }
 
@@ -6420,7 +6422,9 @@ static moe_hosted_layer * moe_hosted_register(moe_hosted_state & st, moe_cache_d
             // MTP draft) may use fewer experts per token than the first block, hence more tokens per block
             const size_t act_max = (size_t) rows * (GGML_PAD(layer->n_embd, MATRIX_ROW_PADDING) / QK8_1) * sizeof(block_q8_1);
             if (cudaMalloc((void **) &st.d_q8_act, act_max) != cudaSuccess ||
-                cudaMalloc((void **) &st.d_q8_mid, mid_bytes) != cudaSuccess) {
+                cudaMalloc((void **) &st.d_q8_mid, mid_bytes) != cudaSuccess ||
+                cudaMalloc((void **) &st.d_q8_count, mid_bytes / sizeof(block_q8_1) * sizeof(unsigned)) != cudaSuccess ||
+                cudaMemset(st.d_q8_count, 0, mid_bytes / sizeof(block_q8_1) * sizeof(unsigned)) != cudaSuccess) {
                 GGML_ABORT("MoE block hosted by the GPU: allocation failed");
             }
             st.q8_act_bytes = act_max;
@@ -6522,11 +6526,22 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
         q8_act = st->d_q8_act;
     }
     char * q8_mid = st->d_q8_mid;
-    ggml_cuda_moe_cache_mmv_fused(wtype, q8_act, layer->d_plan, layer->d_plan + rows,
-                                  layer->d_act_ids, (float *) glu->data, n_embd, n_ff,
-                                  rows, n_tokens, -INFINITY, INFINITY, -INFINITY, INFINITY, stream);
-    quantize_row_q8_1_cuda((const float *) glu->data, nullptr, q8_mid, wtype, n_ff, n_ff, (int64_t) rows * n_ff,
-                           (int64_t) rows * n_ff, padded_ff, rows, 1, 1, stream);
+    // up / gate / swiglu, and the q8_1 of the result for down written by the same kernel (GGML_CUDA_MOE_Q8_FUSED=0: a
+    // quantization kernel after it)
+    static const bool q8_fused = !getenv("GGML_CUDA_MOE_Q8_FUSED") || atoi(getenv("GGML_CUDA_MOE_Q8_FUSED")) != 0;
+    const auto up_gate = [&](const uint64_t * plan) {
+        if (q8_fused && n_ff % QK8_1 == 0) {
+            ggml_cuda_moe_cache_mmv_fused(wtype, q8_act, plan, plan + rows, layer->d_act_ids, (float *) glu->data, n_embd, n_ff,
+                                          rows, n_tokens, -INFINITY, INFINITY, -INFINITY, INFINITY, stream, q8_mid,
+                                          padded_ff / QK8_1, st->d_q8_count);
+            return;
+        }
+        ggml_cuda_moe_cache_mmv_fused(wtype, q8_act, plan, plan + rows, layer->d_act_ids, (float *) glu->data, n_embd, n_ff,
+                                      rows, n_tokens, -INFINITY, INFINITY, -INFINITY, INFINITY, stream);
+        quantize_row_q8_1_cuda((const float *) glu->data, nullptr, q8_mid, wtype, n_ff, n_ff, (int64_t) rows * n_ff,
+                               (int64_t) rows * n_ff, padded_ff, rows, 1, 1, stream);
+    };
+    up_gate(layer->d_plan);
     ggml_cuda_moe_cache_mmv(down->src[0]->type, q8_mid, layer->d_plan + 2 * rows, nullptr,
                             (float *) down->data, n_ff, n_embd, rows, rows, stream);
     // SPLIT: the rows of the expert moved to the GPU, once it arrived; the kernels skip every other row
@@ -6535,11 +6550,7 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
         ctx.split_wait_queued = true;
         ctx.split_wait_captured = true;
         k_moe_split_wait<<<1, 256, 0, stream>>>(layer->d_expect, layer->m_flags + 24, layer->m_plan2, layer->d_plan2, 3 * rows, g_tl_m);
-        ggml_cuda_moe_cache_mmv_fused(wtype, q8_act, layer->d_plan2, layer->d_plan2 + rows,
-                                      layer->d_act_ids, (float *) glu->data, n_embd, n_ff,
-                                      rows, n_tokens, -INFINITY, INFINITY, -INFINITY, INFINITY, stream);
-        quantize_row_q8_1_cuda((const float *) glu->data, nullptr, q8_mid, wtype, n_ff, n_ff, (int64_t) rows * n_ff,
-                               (int64_t) rows * n_ff, padded_ff, rows, 1, 1, stream);
+        up_gate(layer->d_plan2);
         ggml_cuda_moe_cache_mmv(down->src[0]->type, q8_mid, layer->d_plan2 + 2 * rows, nullptr,
                                 (float *) down->data, n_ff, n_embd, rows, rows, stream);
         static const bool verify = getenv("GGML_CUDA_MOE_SPLIT_VERIFY") && atoi(getenv("GGML_CUDA_MOE_SPLIT_VERIFY")) > 0;

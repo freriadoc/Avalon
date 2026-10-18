@@ -902,8 +902,11 @@ static __device__ __forceinline__ const void * mmvq_global_ptr(uint64_t addr) {
 // entry_ptrs (the MoE cache): ids and gate_ids hold each routed row's entry address (64 bits, 0 for a row the cache does
 // not hold) instead of a matrix index, one row per block: the address is read by a scalar load and the blocks inside
 // the entry are counted in 32 bits, wherever the cache's ranges lie (the slab, memory lent by the KV cache).
+// q8_out (entry_ptrs, one warp per block): the results also written as the q8_1 activation of down (fusion.q8_dst) by the
+// last warp to finish the rows of a q8_1 block (a counter per block, fusion.q8_count, reset by that warp), with the code
+// of quantize_q8_1 on the values in dst: no warp waits for another
 template <ggml_type type, int c_rows_per_block, bool has_fusion, bool has_clamp, bool flat_hits = false, bool entry_ptrs = false,
-          bool flat_k = false>
+          bool flat_k = false, bool q8_out = false>
 __launch_bounds__((flat_hits ? 2 : entry_ptrs ? 1 : get_mmvq_mmid_max_batch_for_device<type>())*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_moe(
         const void * vx_ptr, const void * vy_ptr,
@@ -1151,6 +1154,37 @@ static __global__ void mul_mat_vec_q_moe(
         }
     }
 
+    if constexpr (q8_out) {
+        constexpr int warps_per_q8 = QK8_1 / c_rows_per_block;
+        const uint32_t ib = (uint32_t) row0 / QK8_1;
+        unsigned * count = fusion.q8_count + (size_t) channel_dst*fusion.q8_stride + ib;
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+        unsigned prev = 0;
+        if (threadIdx.x == 0) {
+            prev = atomicAdd(count, 1u);
+        }
+        prev = __shfl_sync(0xffffffff, prev, 0, warp_size);
+        if (prev == warps_per_q8 - 1) {
+            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+            // the code of quantize_q8_1, one lane per value (same reductions, same bits)
+            if (threadIdx.x < QK8_1) {
+                const float xi = dst[channel_dst*stride_channel_dst + ib*QK8_1 + threadIdx.x];
+                float amax = fabsf(xi);
+                float sum = xi;
+                amax = warp_reduce_max<QK8_1>(amax);
+                sum  = warp_reduce_sum<QK8_1>(sum);
+                const float  d = amax / 127.0f;
+                const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+                block_q8_1 * yq = (block_q8_1 *) fusion.q8_dst + (size_t) channel_dst*fusion.q8_stride + ib;
+                yq->qs[threadIdx.x] = q;
+                if (threadIdx.x == 0) {
+                    yq->ds = make_half2(d, sum);
+                    *count = 0;
+                }
+            }
+        }
+    }
+
     if constexpr (!has_fusion) {
         GGML_UNUSED_VARS(use_gate, use_cache_gate, tmp_gate, vgate, x_bias, gate_bias, active_glu, glu_limit, x_scale, gate_scale);
     } else if constexpr (type != GGML_TYPE_NVFP4) {
@@ -1252,7 +1286,26 @@ static void mul_mat_vec_q_moe_entries_launch(
         float * dst, const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
         const uint32_t stride_row_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
         const uint32_t n_hits, const int warp_size,
-        const float up_min, const float up_max, const float gate_min, const float gate_max, cudaStream_t stream) {
+        const float up_min, const float up_max, const float gate_min, const float gate_max, cudaStream_t stream,
+        void * q8_dst = nullptr, uint32_t q8_stride = 0, unsigned * q8_count = nullptr) {
+    if (q8_dst) {
+        // up / gate / GLU and the q8_1 of the result for down: 2 rows per warp (flat_k), as below
+        GGML_ASSERT(has_gate && nrows_x % QK8_1 == 0 && warp_size == QK8_1 && (int) (ncols_x / ggml_cuda_type_traits<type>::qk) >
+                    2 * (get_vdr_mmvq(type) * warp_size / ggml_cuda_type_traits<type>::qi));
+        ggml_cuda_mm_fusion_args_device fa{};
+        fa.q8_dst = q8_dst;
+        fa.q8_stride = q8_stride;
+        fa.q8_count = q8_count;
+        const dim3 block_nums(nrows_x / 2, n_hits);
+        const dim3 block_dims(warp_size, 1);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, 2, has_gate, has_clamp, false, true, true, true>, launch_params,
+            nullptr, vy, (const int32_t *) up_entries, act_ids, nullptr, (const int32_t *) gate_entries,
+            fa, dst, ncols_x, nchannels_y, nrows_x,
+            stride_row_x, 0, 0, 0, stride_channel_y, stride_channel_dst,
+            1, n_hits, up_min, up_max, gate_min, gate_max);
+        return;
+    }
     // a warp per block; 4 rows per block when the warp covers a row in at most two passes of its K loop (the down of the
     // experts, K = 640: the entry address, the reduction and the write would cost as much as the dot products), else 2
     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
@@ -1928,7 +1981,7 @@ static void ggml_cuda_moe_cache_mmv_fused_t(
         const char * act_q8, const uint64_t * up_entries_dev, const uint64_t * gate_entries_dev,
         const int32_t * act_ids_dev, float * dst_dev, int64_t n_in, int64_t n_out,
         int64_t n_hits, int64_t act_rows, float up_min, float up_max,
-        float gate_min, float gate_max, cudaStream_t stream) {
+        float gate_min, float gate_max, cudaStream_t stream, void * q8_dst, int64_t q8_stride, unsigned * q8_count) {
     const int64_t ts0 = ggml_type_size(type);
     const int64_t ne10_padded = GGML_PAD(n_in, MATRIX_ROW_PADDING);
     const int64_t s01 = ggml_row_size(type, n_in) / ts0;
@@ -1938,11 +1991,11 @@ static void ggml_cuda_moe_cache_mmv_fused_t(
     if (up_min == -inf && up_max == inf && gate_min == -inf && gate_max == inf) {
         mul_mat_vec_q_moe_entries_launch<type, true, false>(
             up_entries_dev, gate_entries_dev, act_q8, act_ids_dev, dst_dev, n_in, init_fastdiv_values(act_rows), n_out,
-            s01, s11, n_out, n_hits, warp_size, up_min, up_max, gate_min, gate_max, stream);
+            s01, s11, n_out, n_hits, warp_size, up_min, up_max, gate_min, gate_max, stream, q8_dst, (uint32_t) q8_stride, q8_count);
     } else {
         mul_mat_vec_q_moe_entries_launch<type, true, true>(
             up_entries_dev, gate_entries_dev, act_q8, act_ids_dev, dst_dev, n_in, init_fastdiv_values(act_rows), n_out,
-            s01, s11, n_out, n_hits, warp_size, up_min, up_max, gate_min, gate_max, stream);
+            s01, s11, n_out, n_hits, warp_size, up_min, up_max, gate_min, gate_max, stream, q8_dst, (uint32_t) q8_stride, q8_count);
     }
 }
 
@@ -1951,11 +2004,11 @@ void ggml_cuda_moe_cache_mmv_fused(
         const uint64_t * gate_entries_dev, const int32_t * act_ids_dev,
         float * dst_dev, int64_t n_in, int64_t n_out, int64_t n_hits, int64_t act_rows,
         float up_min, float up_max, float gate_min, float gate_max,
-        cudaStream_t stream) {
+        cudaStream_t stream, void * q8_dst, int64_t q8_stride, unsigned * q8_count) {
 #define MOE_CACHE_MMV_FUSED_CASE(type_name) \
         case type_name: \
             ggml_cuda_moe_cache_mmv_fused_t<type_name>(act_q8, up_entries_dev, gate_entries_dev, act_ids_dev, \
-                dst_dev, n_in, n_out, n_hits, act_rows, up_min, up_max, gate_min, gate_max, stream); \
+                dst_dev, n_in, n_out, n_hits, act_rows, up_min, up_max, gate_min, gate_max, stream, q8_dst, q8_stride, q8_count); \
             break
     switch (type0) {
         MOE_CACHE_MMV_FUSED_CASE(GGML_TYPE_Q1_0);

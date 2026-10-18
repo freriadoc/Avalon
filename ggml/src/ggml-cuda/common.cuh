@@ -1715,6 +1715,11 @@ struct ggml_cuda_mm_fusion_args_device {
     uint32_t     multi_row_end[GGML_CUDA_MMVQ_MULTI_MAX] = {0};
     const void * multi_x[GGML_CUDA_MMVQ_MULTI_MAX]       = {nullptr};
     float *      multi_dst[GGML_CUDA_MMVQ_MULTI_MAX]     = {nullptr};
+    // the MoE cache's up / gate / GLU (q8_out): the result also written as the q8_1 activation of down, block b of row r
+    // at q8_dst + r*q8_stride + b, by the last warp to finish its rows
+    void *       q8_dst    = nullptr;
+    uint32_t     q8_stride = 0;
+    unsigned *   q8_count  = nullptr;   // warps done per q8_1 block (zero between launches)
 };
 
 struct ggml_cuda_kernel_launch_params {

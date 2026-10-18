@@ -34,4 +34,4 @@ void ggml_cuda_moe_cache_mmv_fused(
     const uint64_t * gate_entries_dev, const int32_t * act_ids_dev,
     float * dst_dev, int64_t n_in, int64_t n_out, int64_t n_hits, int64_t act_rows,
     float up_min, float up_max, float gate_min, float gate_max,
-    cudaStream_t stream);
+    cudaStream_t stream, void * q8_dst = nullptr, int64_t q8_stride = 0, unsigned * q8_count = nullptr);
