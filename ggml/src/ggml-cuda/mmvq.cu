@@ -877,6 +877,56 @@ static __global__ void mul_mat_vec_q(
         }
     }
 
+    if constexpr (has_fusion) {
+        // fusion.q8_dst: the q8_1 of the result too, written by the last block to finish the rows of a q8_1 block (a
+        // counter per block, reset by that block) with quantize_q8_1's code on the values in dst, one column after
+        // the other; the block of the last rows also writes the padding's blocks (zeros, as quantize_q8_1)
+        if (fusion.q8_dst) {
+            constexpr int blocks_per_q8 = QK8_1 / rows_per_cuda_block;
+            static_assert(QK8_1 % rows_per_cuda_block == 0, "q8_dst: rows per block");
+            const uint32_t nrows = stride_col_dst;
+            const uint32_t ib = (uint32_t) row0 / QK8_1;
+            unsigned * count = fusion.q8_count + ib;
+            const float * dst0 = dst - row0;
+            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+            unsigned prev = 0;
+            if (threadIdx.x == 0) {
+                prev = atomicAdd(count, 1u);
+            }
+            prev = __shfl_sync(0xffffffff, prev, 0, warp_size);
+            if (prev == blocks_per_q8 - 1 && threadIdx.x < QK8_1) {
+                __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    const float xi = dst0[j*stride_col_dst + ib*QK8_1 + threadIdx.x];
+                    float amax = fabsf(xi);
+                    float sum = xi;
+                    amax = warp_reduce_max<QK8_1>(amax);
+                    sum  = warp_reduce_sum<QK8_1>(sum);
+                    const float  d = amax / 127.0f;
+                    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+                    block_q8_1 * yq = (block_q8_1 *) fusion.q8_dst + (size_t) j*fusion.q8_stride + ib;
+                    yq->qs[threadIdx.x] = q;
+                    if (threadIdx.x == 0) {
+                        yq->ds = make_half2(d, sum);
+                    }
+                    if (ib == nrows/QK8_1 - 1) {
+                        for (uint32_t b = nrows/QK8_1; b < fusion.q8_stride; ++b) {
+                            block_q8_1 * yp = (block_q8_1 *) fusion.q8_dst + (size_t) j*fusion.q8_stride + b;
+                            yp->qs[threadIdx.x] = 0;
+                            if (threadIdx.x == 0) {
+                                yp->ds = make_half2(0.0f, 0.0f);
+                            }
+                        }
+                    }
+                }
+                if (threadIdx.x == 0) {
+                    *count = 0;
+                }
+            }
+        }
+    }
+
     if constexpr (!has_fusion) {
         GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_scale, use_gate_scale, active_glu, glu_limit, gate_bias, x_bias, x_scale, gate_scale, tmp_gate);
     }
@@ -1789,6 +1839,13 @@ void ggml_cuda_mul_mat_vec_q(
         }
         fusion_local.glu_op = fusion->glu_op;
         fusion_local.glu_limit = fusion->glu_limit;
+        if (fusion->q8_dst) {
+            // the generic kernel writes it (one matrix, no ids)
+            GGML_ASSERT(!ids && fusion->gate && !fusion->shared_up && ne0 % QK8_1 == 0 && ne2 == 1 && ne3 == 1);
+            fusion_local.q8_dst    = fusion->q8_dst;
+            fusion_local.q8_stride = fusion->q8_stride;
+            fusion_local.q8_count  = fusion->q8_count;
+        }
     }
 
     // If src0 is a temporary compute buffer, clear any potential padding.
@@ -1812,7 +1869,10 @@ void ggml_cuda_mul_mat_vec_q(
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        src1_q8_1 = ggml_cuda_q8_1_reuse(ctx, src1_d, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        src1_q8_1 = ggml_cuda_q8_1_out_match(ctx, src1_d, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13);
+        if (!src1_q8_1) {
+            src1_q8_1 = ggml_cuda_q8_1_reuse(ctx, src1_d, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        }
         if (!src1_q8_1) {
             // the scheduler's scratch when it gave one (GGML_SCHED_SCRATCH_SRC), else pool memory
             const size_t need = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;

@@ -85,3 +85,10 @@ void ggml_cuda_q8_1_reuse_written(ggml_backend_cuda_context & ctx, const ggml_te
 // it is (same address, two dimensions, contiguous, rows a multiple of MATRIX_ROW_PADDING), else null. The buffer
 // is then registered as holding that activation (call it right before the launch).
 void * ggml_cuda_q8_1_produce(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int out_idx);
+// the q8_1 of node out_idx (F32, contiguous, of a width multiple of QK8_1) written by the kernel that computes it into
+// ctx.q8_1_out (rows padded to MATRIX_ROW_PADDING, the padding's blocks zero as quantize_q8_1 writes them), for the first
+// product of quantized weights that reads it (ggml_cuda_q8_1_out_match); nullptr if none or it does not qualify
+void * ggml_cuda_q8_1_produce_out(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int out_idx);
+// q8_1_out's buffer if it holds the activation that ggml_cuda_q8_1_reuse would quantize with these arguments
+const void * ggml_cuda_q8_1_out_match(ggml_backend_cuda_context & ctx, const float * x,
+        int64_t ne00, int64_t s01, int64_t s02, int64_t s03, int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3);

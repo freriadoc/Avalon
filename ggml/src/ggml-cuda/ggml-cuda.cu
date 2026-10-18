@@ -5405,6 +5405,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.gate      = gate->src[0];
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
                 fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
+                // the q8_1 of the GLU for the product that reads it, written by the kernel (a dense FFN of a few
+                // tokens: the shared expert's down); GGML_CUDA_FFN_Q8=0: quantized by that product
+                static const bool ffn_q8 = !getenv("GGML_CUDA_FFN_Q8") || atoi(getenv("GGML_CUDA_FFN_Q8")) != 0;
+                if (ffn_q8 && !ids && glu->ne[0] % QK8_1 == 0 && glu->ne[1] <= 8 && ggml_nrows(glu) == glu->ne[1]) {
+                    fusion_data.q8_dst = ggml_cuda_q8_1_produce_out(*cuda_ctx, cgraph, i + 2);
+                    fusion_data.q8_stride = (uint32_t) (GGML_PAD(glu->ne[0], MATRIX_ROW_PADDING) / QK8_1);
+                    fusion_data.q8_count = cuda_ctx->q8_1_out.count;
+                }
 
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                 fused_mul_mat_vec = true;
@@ -6081,12 +6089,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
 
             cuda_ctx->q8_1_reuse.valid = false;
+            cuda_ctx->q8_1_out.valid = false;
             // a graph continuing the previous split may find the quantized activation its first mmq shares (gate and
             // up of a prefill, each split taking one prefetched weight) in the scratch the previous one filled
             if (!cuda_ctx->mmq_continues.count(cgraph)) {
                 cuda_ctx->mmq_scratch_last = nullptr;
             }
             cuda_ctx->gdn_gathers.clear();
+            cuda_ctx->absorbed.clear();
             // a node (or a fused group, a hosted MoE block) computed nodes [first, last]: drop the
             // reused activation quantization if one of them wrote over it
             static const bool depchain = getenv("GGML_CUDA_DEPCHAIN") && atoi(getenv("GGML_CUDA_DEPCHAIN")) > 0;
@@ -6115,6 +6125,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     }
                 }
                 cuda_ctx->q8_1_reuse.producer = nullptr;
+                cuda_ctx->q8_1_out.producer = nullptr;
             };
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
@@ -6283,6 +6294,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 for (int k = i; k < std::min(i + hosted_read_window, cgraph->n_nodes); k++) {
                     ggml_cuda_moe_hosted_flush(*cuda_ctx, cgraph->nodes[k]);
                 }
+                // computed by another kernel (the shared expert's gate, by the hosted MoE block's merge)
+                if (cuda_ctx->absorbed.count(node)) {
+                    written(i, i);
+                    continue;
+                }
 
                 // weights in host memory: the scheduler left a MoE block of the cache on the GPU
                 if (node->op == GGML_OP_MUL_MAT_ID && node->src[0]->buffer &&
@@ -6423,7 +6439,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     // 1 MiB holds the activations of up to 64 rows of 10240 (larger ones are not reused)
     if (!cuda_ctx->q8_1_reuse.buf) {
         const size_t size = GGML_CUDA_Q8_1_REUSE_BYTES;
-        if (cudaMalloc((void **) &cuda_ctx->q8_1_reuse.buf, size) == cudaSuccess) {
+        if (cudaMalloc((void **) &cuda_ctx->q8_1_reuse.buf, size) == cudaSuccess &&
+                cudaMalloc((void **) &cuda_ctx->q8_1_out.buf, size) == cudaSuccess &&
+                cudaMalloc((void **) &cuda_ctx->q8_1_out.count, size / sizeof(block_q8_1) * sizeof(unsigned)) == cudaSuccess &&
+                cudaMemset(cuda_ctx->q8_1_out.count, 0, size / sizeof(block_q8_1) * sizeof(unsigned)) == cudaSuccess) {
             cuda_ctx->q8_1_reuse.size = size;
         } else {
             (void) cudaGetLastError();

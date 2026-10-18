@@ -5162,11 +5162,25 @@ static std::mutex g_hosted_mu;
 static std::unordered_map<moe_cache_session *, std::unique_ptr<moe_hosted_state>> g_hosted;
 
 // a hosted block queued but whose CPU rows are not copied in yet (graph evaluation thread)
+// the shared expert's gate (a row of F32 weights times the block's activations), computed by one more workgroup of the
+// merge with the arithmetic of mul_mat_vec_f<float, float, ncols, 256> (the node is then skipped)
+#define MOE_SGATE_MAX_COLS 8
+struct moe_sgate_args {
+    const float * x = nullptr;
+    const float * y = nullptr;
+    float * dst = nullptr;
+    int ncols2 = 0;
+    int stride_col_y2 = 0;
+    int stride_col_dst = 0;
+    int ncols = 0;
+};
+
 struct moe_hosted_pending {
     moe_hosted_layer * layer = nullptr;
     const ggml_tensor * down = nullptr;
     int rows = 0;
     bool split = false;   // SPLIT: the merge skips the rows of the moved expert
+    moe_sgate_args sg;    // the shared expert's gate, or none
 };
 static thread_local moe_hosted_pending g_hosted_pending;
 
@@ -5459,10 +5473,61 @@ static __global__ void k_moe_split_check(const uint32_t * d_expect, const uint64
     }
 }
 
+// mul_mat_vec_f<float, float, ncols, 256> (no fusion) for one row: the same loads, products and reductions
+static __device__ void moe_sgate_body(const moe_sgate_args & a) {
+    constexpr int block_size = 256;
+    constexpr int warp_size  = ggml_cuda_get_physical_warp_size();
+    const int tid = threadIdx.x;
+    __shared__ float buf_iw[warp_size];
+    if (tid < warp_size) {
+        buf_iw[tid] = 0.0f;
+    }
+    __syncthreads();
+    float sumf[MOE_SGATE_MAX_COLS] = {0.0f};
+    const float2 * x2 = (const float2 *) a.x;
+    const float2 * y2 = (const float2 *) a.y;
+    for (int col2 = tid; col2 < a.ncols2; col2 += block_size) {
+        const float2 tmpx = x2[col2];
+#pragma unroll
+        for (int j = 0; j < MOE_SGATE_MAX_COLS; ++j) {
+            if (j < a.ncols) {
+                const float2 tmpy = y2[j*a.stride_col_y2 + col2];
+                ggml_cuda_mad(sumf[j], tmpx.x, tmpy.x);
+                ggml_cuda_mad(sumf[j], tmpx.y, tmpy.y);
+            }
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < MOE_SGATE_MAX_COLS; ++j) {
+        if (j < a.ncols) {
+            sumf[j] = warp_reduce_sum<warp_size>(sumf[j]);
+            buf_iw[tid/warp_size] = sumf[j];
+            __syncthreads();
+            if (tid < warp_size) {
+                sumf[j] = buf_iw[tid];
+                sumf[j] = warp_reduce_sum<warp_size>(sumf[j]);
+            }
+            __syncthreads();
+        }
+    }
+    if (tid < a.ncols) {
+        float v = 0.0f;
+#pragma unroll
+        for (int j = 0; j < MOE_SGATE_MAX_COLS; ++j) {
+            v = j == tid ? sumf[j] : v;
+        }
+        a.dst[tid*a.stride_col_dst] = v;
+    }
+}
+
 static __global__ void k_moe_hosted_merge(const uint32_t * d_expect, const volatile uint32_t * flag,
                                           const uint64_t * d_down_ids, const uint64_t * d_moved_down_ids,
                                           const volatile float * m_res, float * dst, int n_embd,
-                                          volatile unsigned long long * tl) {
+                                          volatile unsigned long long * tl, const moe_sgate_args sg) {
+    if (sg.x && blockIdx.x == gridDim.x - 1) {
+        moe_sgate_body(sg);   // the last workgroup: the shared expert's gate
+        return;
+    }
     const int row = blockIdx.x;
     if (d_down_ids[row] != 0 || (d_moved_down_ids && d_moved_down_ids[row] != 0)) {
         return;   // resident, or moved to the GPU (SPLIT)
@@ -6439,6 +6504,86 @@ static moe_hosted_layer * moe_hosted_register(moe_hosted_state & st, moe_cache_d
     return st.layers.back().get();
 }
 
+// the shared expert's gate after the hosted block at node i: a MUL_MAT of a row of F32 weights (device memory) by the
+// block's activations, that mul_mat_vec_f would compute with 256 threads; taken by the merge when the merge is launched
+// by the node after it at the latest (one of the 3 nodes after it reads the block's output: the hosted flush window) and
+// no node between the block and it writes where its result goes (ggml-alloc may give that memory to an earlier tensor).
+// GGML_CUDA_MOE_SGATE=0: computed by its own node
+static moe_sgate_args moe_sgate_find(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i,
+                                     const ggml_tensor * act, const ggml_tensor * down, int n_tokens) {
+    static const bool on = !getenv("GGML_CUDA_MOE_SGATE") || atoi(getenv("GGML_CUDA_MOE_SGATE")) != 0;
+    const int64_t n_embd = act->ne[0];
+    if (!on || n_tokens > MOE_SGATE_MAX_COLS || n_embd % 2 != 0) {
+        return {};
+    }
+    // mul_mat_vec_f's block size for this width (ggml_cuda_mul_mat_vec_f): 256 only
+    const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+    int64_t bs_best = warp_size, niter_best = (n_embd + 2*warp_size - 1) / (2*warp_size);
+    for (int64_t bs = 2*warp_size; bs <= 256; bs += warp_size) {
+        const int64_t niter = (n_embd + 2*bs - 1) / (2*bs);
+        if (niter < niter_best) {
+            niter_best = niter;
+            bs_best = bs;
+        }
+    }
+    if (bs_best != 256) {
+        return {};
+    }
+    const auto reads_down = [&](const ggml_tensor * t) {
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            const ggml_tensor * src = t->src[j];
+            if (src && (src == down || src->view_src == down)) {
+                return true;
+            }
+        }
+        return false;
+    };
+    for (int g = i + 4; g < std::min(i + 24, cgraph->n_nodes); g++) {
+        const ggml_tensor * node = cgraph->nodes[g];
+        if (reads_down(node)) {
+            return {};   // past the merge
+        }
+        if (node->op != GGML_OP_MUL_MAT) {
+            continue;
+        }
+        const ggml_tensor * w = node->src[0];
+        const ggml_tensor * y = node->src[1];
+        if (w->type != GGML_TYPE_F32 || w->ne[0] != n_embd || w->ne[1] != 1 || w->ne[2] != 1 || w->ne[3] != 1 ||
+                !ggml_is_contiguous(w) || !w->buffer || ggml_backend_buffer_is_host(w->buffer) ||
+                y->type != GGML_TYPE_F32 || y->data != act->data || y->ne[0] != n_embd || y->ne[1] != n_tokens ||
+                y->ne[2] != 1 || y->ne[3] != 1 || y->nb[0] != sizeof(float) ||
+                node->type != GGML_TYPE_F32 || node->ne[0] != 1 || node->ne[1] != n_tokens) {
+            continue;
+        }
+        bool next_reads = false;
+        for (int k = g + 1; k <= g + 3 && k < cgraph->n_nodes; k++) {
+            next_reads = next_reads || reads_down(cgraph->nodes[k]);
+        }
+        const char * d0 = (const char *) node->data;
+        const char * d1 = d0 + ggml_nbytes(node);
+        bool clash = false;
+        for (int k = i + 4; k < g && !clash; k++) {
+            const ggml_tensor * t = cgraph->nodes[k];
+            const char * t0 = (const char *) t->data;
+            clash = t0 && t0 < d1 && d0 < t0 + ggml_nbytes(t);
+        }
+        if (!next_reads || clash) {
+            return {};
+        }
+        ctx.absorbed.insert(node);
+        moe_sgate_args a;
+        a.x = (const float *) w->data;
+        a.y = (const float *) y->data;
+        a.dst = (float *) node->data;
+        a.ncols2 = (int) (n_embd / 2);
+        a.stride_col_y2 = (int) (y->nb[1] / sizeof(float) / 2);
+        a.stride_col_dst = (int) (node->nb[1] / sizeof(float));
+        a.ncols = n_tokens;
+        return a;
+    }
+    return {};
+}
+
 int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
     if (i + 3 >= cgraph->n_nodes) {
         return -1;
@@ -6596,7 +6741,7 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
     // the CPU rows are copied in when a node first reads the block's output (the shared expert,
     // queued in between, runs while the CPU computes them)
     CUDA_CHECK(cudaGetLastError());
-    g_hosted_pending = {layer, down, rows, split_on};
+    g_hosted_pending = {layer, down, rows, split_on, moe_sgate_find(ctx, cgraph, i, act, down, (int) n_tokens)};
     return 3;
 }
 
@@ -6616,10 +6761,10 @@ void ggml_cuda_moe_hosted_flush(ggml_backend_cuda_context & ctx, const ggml_tens
         }
     }
     ggml_cuda_q8_1_reuse_written(ctx, p.down);
-    k_moe_hosted_merge<<<p.rows, 256, 0, ctx.stream()>>>(p.layer->d_expect, p.layer->m_flags + 16,
+    k_moe_hosted_merge<<<p.rows + (p.sg.x ? 1 : 0), 256, 0, ctx.stream()>>>(p.layer->d_expect, p.layer->m_flags + 16,
                                                           p.layer->d_plan + 2 * p.rows, p.split ? p.layer->d_plan2 + 2 * p.rows : nullptr,
                                                           p.layer->m_res,
-                                                          (float *) p.down->data, (int) p.layer->n_embd, g_tl_m);
+                                                          (float *) p.down->data, (int) p.layer->n_embd, g_tl_m, p.sg);
     CUDA_CHECK(cudaGetLastError());
     p = {};
 }

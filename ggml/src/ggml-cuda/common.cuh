@@ -1525,6 +1525,18 @@ struct ggml_backend_cuda_context {
         // check that follows the launch of its group leaves it valid
         const ggml_tensor * producer = nullptr;
     } q8_1_reuse;
+    // the q8_1 of an output written by the kernel that computes it (ggml_cuda_q8_1_produce_out), for the product that
+    // reads it next; its own buffer, the kernel reading its input from q8_1_reuse's
+    struct q8_1_out_state {
+        char *        buf   = nullptr;   // allocated with q8_1_reuse's
+        unsigned *    count = nullptr;   // the kernel's blocks done per q8_1 block of a row (zero between uses)
+        bool          valid = false;
+        const float * x     = nullptr;
+        int64_t       key[8] = {0};
+        const char *  lo    = nullptr;
+        const char *  hi    = nullptr;
+        const ggml_tensor * producer = nullptr;   // its writer, in the group being launched
+    } q8_1_out;
 
     // a MoE top-k left to the hosted MoE block that reads its ids (its entry kernel computes it), see
     // ggml_cuda_topk_moe_defer; launched as usual if anything else reads its ids or weights first
@@ -1551,6 +1563,8 @@ struct ggml_backend_cuda_context {
     // (gated delta net, cached ssm_conv: ggml_cuda_gdn_state_gather_of), the pooled keys of the lightning indexer
     // (ggml_cuda_gathered_rows_of); reset at the start of every graph
     std::unordered_set<const ggml_tensor *> gdn_gathers;
+    // nodes another kernel computes (the shared expert's gate, in the hosted MoE block's merge): skipped
+    std::unordered_set<const ggml_tensor *> absorbed;
 
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
@@ -1693,6 +1707,10 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * shared_up = nullptr;
     const ggml_tensor * shared_gate = nullptr;
     ggml_tensor * shared_dst = nullptr;
+    // the q8_1 of the result written by the kernel too (ggml_cuda_q8_1_produce_padded): see the device args
+    void *     q8_dst    = nullptr;
+    uint32_t   q8_stride = 0;
+    unsigned * q8_count  = nullptr;
 };
 #define GGML_CUDA_MMVQ_MULTI_MAX 4
 

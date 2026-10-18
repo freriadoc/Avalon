@@ -758,14 +758,64 @@ void * ggml_cuda_q8_1_produce(ggml_backend_cuda_context & ctx, const ggml_cgraph
     return nullptr;
 }
 
+void * ggml_cuda_q8_1_produce_out(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int out_idx) {
+    auto & o = ctx.q8_1_out;
+    const ggml_tensor * out = cgraph->nodes[out_idx];
+    if (!o.buf || ctx.curr_stream_no != 0 || out->type != GGML_TYPE_F32 || !ggml_is_contiguous(out)) {
+        return nullptr;
+    }
+    const auto root = [](const ggml_tensor * t) {
+        while (t && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW) && t->view_offs == 0) {
+            t = t->src[0];
+        }
+        return t;
+    };
+    // the first product that reads the output
+    for (int k = out_idx + 1; k < cgraph->n_nodes; k++) {
+        const ggml_tensor * n = cgraph->nodes[k];
+        if (n->op != GGML_OP_MUL_MAT || root(n->src[1]) != out || !ggml_is_quantized(n->src[0]->type)) {
+            continue;
+        }
+        const ggml_tensor * src1 = n->src[1];
+        const int64_t ne10 = src1->ne[0], ne11 = src1->ne[1];
+        const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+        if (src1->type != GGML_TYPE_F32 || src1->data != out->data || !ggml_is_contiguous(src1) || src1->ne[2] != 1 ||
+                src1->ne[3] != 1 || ne10 % QK8_1 != 0 || ne11 > MMVQ_MAX_BATCH_SIZE ||
+                (size_t) (ne10_padded*ne11) * sizeof(block_q8_1) / QK8_1 > ctx.q8_1_reuse.size) {
+            return nullptr;
+        }
+        // the key ggml_cuda_q8_1_reuse builds for this product
+        const int64_t key[8] = {ne10, ne11 > 1 ? ne10 : 0, 0, 0, ne10_padded, ne11, 1, 1};
+        o.valid    = true;
+        o.x        = (const float *) out->data;
+        memcpy(o.key, key, sizeof(key));
+        o.lo       = (const char *) out->data;
+        o.hi       = o.lo + ggml_nbytes(out);
+        o.producer = out;
+        return o.buf;
+    }
+    return nullptr;
+}
+
+const void * ggml_cuda_q8_1_out_match(ggml_backend_cuda_context & ctx, const float * x,
+        int64_t ne00, int64_t s01, int64_t s02, int64_t s03, int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3) {
+    const auto & o = ctx.q8_1_out;
+    const int64_t key[8] = {ne00, ne1 > 1 ? s01 : 0, ne2 > 1 ? s02 : 0, ne3 > 1 ? s03 : 0, ne0, ne1, ne2, ne3};
+    return o.valid && o.x == x && ctx.curr_stream_no == 0 && memcmp(key, o.key, sizeof(key)) == 0 ? o.buf : nullptr;
+}
+
 void ggml_cuda_q8_1_reuse_written(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
-    auto & r = ctx.q8_1_reuse;
-    if (!r.valid || !dst->data) {
+    if (!dst->data) {
         return;
     }
     const char * lo = (const char *) dst->data;
     const char * hi = lo + ggml_nbytes(dst);
-    if (lo < r.hi && r.lo < hi) {
+    auto & r = ctx.q8_1_reuse;
+    if (r.valid && lo < r.hi && r.lo < hi) {
         r.valid = false;
+    }
+    auto & o = ctx.q8_1_out;
+    if (o.valid && !o.producer && lo < o.hi && o.lo < hi) {   // not in the group that writes it
+        o.valid = false;
     }
 }
