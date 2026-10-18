@@ -13149,6 +13149,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_multi(GGML_TYPE_Q8_0, 2560, 3, {1024, 48, 48, 512}));
     test_cases.emplace_back(new test_mul_mat_multi(GGML_TYPE_Q4_K, 512, 2, {64, 40, 0, 0}));
     test_cases.emplace_back(new test_mul_mat_multi(GGML_TYPE_IQ4_NL, 256, 1, {24, 16, 7, 0}));
+    // mmvf: float matrices (qwen4exp's indexer key and query projections: 128 and 512 rows of 2560)
+    test_cases.emplace_back(new test_mul_mat_multi(GGML_TYPE_F32, 2560, 3, {128, 512, 0, 0}));
+    test_cases.emplace_back(new test_mul_mat_multi(GGML_TYPE_F32, 2560, 1, {128, 512, 0, 0}));
+    test_cases.emplace_back(new test_mul_mat_multi(GGML_TYPE_F16, 256, 2, {64, 48, 7, 0}));
+    test_cases.emplace_back(new test_mul_mat_multi(GGML_TYPE_BF16, 512, 8, {24, 16, 40, 8}));
     test_cases.emplace_back(new test_gated_norm({128, 48, 1, 1}));
     test_cases.emplace_back(new test_gated_norm({128, 48, 3, 1}));
     test_cases.emplace_back(new test_gated_norm({100, 7, 5, 2}));

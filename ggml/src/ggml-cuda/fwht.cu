@@ -2,7 +2,11 @@
 #include "convert.cuh"
 #include "cpy-utils.cuh"
 #include "fwht.cuh"
+#include "fwht-gate-body.cuh"
 #include "quantize.cuh"
+#include "fwht-sr.cuh"
+#include "mk.cuh"
+#include "ggml-backend-impl.h"
 
 #include <vector>
 
@@ -252,70 +256,12 @@ bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src,
 // quantize_q8_1 writes them (N % 32 == 0: a register index of the warp is a block).
 template <int N>
 __launch_bounds__(4*ggml_cuda_get_physical_warp_size(), 1)
-__global__ void fwht_gate_cuda(const float * src, const char * gate, const int64_t g_ne0, const int64_t g_ne1,
-        const int64_t g_ne2, const size_t g_nb0, const size_t g_nb1, const size_t g_nb2, const size_t g_nb3,
-        float * dst, block_q8_1 * dst_q8_1, const int64_t n_rows, const float scale) {
-    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
-    static_assert(warp_size == QK8_1, "a q8_1 block per register index");
-
+__global__ void fwht_gate_cuda(const float * src, const fwht_gate_args a, const int64_t n_rows) {
     const int64_t r = (int64_t) blockIdx.x * blockDim.y + threadIdx.y;
     if (r >= n_rows) {
         return;
     }
-    src += r * N;
-
-    static constexpr int el_w = N / warp_size;
-    float     reg[el_w];
-    const int lane = threadIdx.x;
-
-#pragma unroll
-    for (int i = 0; i < el_w; ++i) {
-        reg[i] = src[i * warp_size + lane] * scale;
-    }
-#pragma unroll
-    for (int h = 1; h < warp_size; h *= 2) {
-#pragma unroll
-        for (int j = 0; j < el_w; j++) {
-            const float val  = reg[j];
-            const float val2 = __shfl_xor_sync(0xFFFFFFFF, val, h, warp_size);
-            reg[j] = (lane & h) == 0 ? val + val2 : val2 - val;
-        }
-    }
-#pragma unroll
-    for (int h = warp_size; h < N; h *= 2) {
-        const int step = h / warp_size;
-#pragma unroll
-        for (int j = 0; j < el_w; j += 2 * step) {
-#pragma unroll
-            for (int k = 0; k < step; k++) {
-                const float x = reg[j + k];
-                const float y = reg[j + k + step];
-                reg[j + k]        = x + y;
-                reg[j + k + step] = x - y;
-            }
-        }
-    }
-
-#pragma unroll
-    for (int i = 0; i < el_w; ++i) {
-        const int64_t e = r * N + i * warp_size + lane;
-        int64_t t = e;
-        const int64_t i0 = t % g_ne0; t /= g_ne0;
-        const int64_t i1 = t % g_ne1; t /= g_ne1;
-        const int64_t i2 = t % g_ne2; t /= g_ne2;
-        const float g = *(const float *) (gate + i0*g_nb0 + i1*g_nb1 + i2*g_nb2 + t*g_nb3);
-        const float v = (1.0f / (1.0f + expf(-g))) * reg[i];
-        dst[e] = v;
-        if (dst_q8_1) {
-            const float amax = warp_reduce_max<QK8_1>(fabsf(v));
-            const float sum  = warp_reduce_sum<QK8_1>(v);
-            const float d    = amax / 127.0f;
-            dst_q8_1[e / QK8_1].qs[e % QK8_1] = amax == 0.0f ? 0 : roundf(v / d);
-            if (lane == 0) {
-                dst_q8_1[e / QK8_1].ds = make_half2(d, sum);
-            }
-        }
-    }
+    fwht_gate_row<N>(src + r * N, r, threadIdx.x, a);
 }
 
 static bool fwht_gate_is_view(const ggml_tensor * t) {
@@ -373,6 +319,22 @@ ggml_tensor * ggml_cuda_match_fwht_gate(const ggml_cgraph * cgraph, int i, ggml_
     return cgraph->nodes[idx[3]];
 }
 
+static fwht_gate_args fwht_gate_args_of(const ggml_tensor * gate, ggml_tensor * mul, block_q8_1 * q8_1) {
+    fwht_gate_args a;
+    a.gate = (const char *) gate->data;
+    a.g_ne0 = gate->ne[0]; a.g_ne1 = gate->ne[1]; a.g_ne2 = gate->ne[2];
+    a.g_nb0 = gate->nb[0]; a.g_nb1 = gate->nb[1]; a.g_nb2 = gate->nb[2]; a.g_nb3 = gate->nb[3];
+    a.dst = (float *) mul->data; a.dst_q8_1 = q8_1; a.scale = 1.0f / sqrtf(64.0f); a.n_dst = ggml_nelements(mul);
+    return a;
+}
+
+void ggml_cuda_fwht_gate_launch(const float * rows, int64_t n_rows, const fwht_gate_args & a, cudaStream_t stream) {
+    const int rows_per_block = 4;
+    const dim3 grid((n_rows + rows_per_block - 1) / rows_per_block, 1, 1);
+    const dim3 block(ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size, rows_per_block, 1);
+    fwht_gate_cuda<64><<<grid, block, 0, stream>>>(rows, a, n_rows);
+}
+
 int ggml_cuda_try_fuse_fwht_gate(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
     static const bool disabled = getenv("GGML_CUDA_DISABLE_FWHT_GATE") != nullptr;
     int idx[4];
@@ -416,13 +378,8 @@ int ggml_cuda_try_fuse_fwht_gate(ggml_backend_cuda_context & ctx, ggml_cgraph * 
         return 0;
     }
     const int64_t n_rows = ggml_nelements(mm) / 64;
-    block_q8_1 * q8_1 = (block_q8_1 *) ggml_cuda_q8_1_produce(ctx, cgraph, idx[3]);
-    const int rows_per_block = 4;
-    const dim3 grid((n_rows + rows_per_block - 1) / rows_per_block, 1, 1);
-    const dim3 block(ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size, rows_per_block, 1);
-    fwht_gate_cuda<64><<<grid, block, 0, ctx.stream()>>>((const float *) rows->data, (const char *) gate->data,
-            gate->ne[0], gate->ne[1], gate->ne[2], gate->nb[0], gate->nb[1], gate->nb[2], gate->nb[3],
-            (float *) mul->data, q8_1, n_rows, 1.0f / sqrtf(64.0f));
+    const fwht_gate_args a = fwht_gate_args_of(gate, mul, (block_q8_1 *) ggml_cuda_q8_1_produce(ctx, cgraph, idx[3]));
+    ggml_cuda_fwht_gate_launch((const float *) rows->data, n_rows, a, ctx.stream());
     return idx[3] - i;
 }
 
@@ -431,60 +388,11 @@ int ggml_cuda_try_fuse_fwht_gate(ggml_backend_cuda_context & ctx, ggml_cgraph * 
 // One warp per row of N values: the transform of fwht_cuda<N, float> (same arithmetic), then the row quantized into
 // the set_rows destination as k_set_rows_quant writes it (a register index of the warp is a block). Row r is part
 // rr = r % rows_per_set of the set_rows row r / rows_per_set, which goes to destination row idx[r / rows_per_set].
+// The body: fwht-sr.cuh.
 template <int N, typename B>
 __launch_bounds__(4*ggml_cuda_get_physical_warp_size(), 1)
-__global__ void fwht_set_rows_cuda(const float * src, const int64_t * idx, B * dst, const int64_t rows_per_set,
-        const int64_t dst_row_blocks, const int64_t n_rows, const float scale) {
-    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
-    static_assert(warp_size == 32 && N % 32 == 0, "a block per register index");
-
-    const int64_t r = (int64_t) blockIdx.x * blockDim.y + threadIdx.y;
-    if (r >= n_rows) {
-        return;
-    }
-    src += r * N;
-
-    static constexpr int el_w = N / warp_size;
-    float     reg[el_w];
-    const int lane = threadIdx.x;
-
-#pragma unroll
-    for (int i = 0; i < el_w; ++i) {
-        reg[i] = src[i * warp_size + lane] * scale;
-    }
-#pragma unroll
-    for (int h = 1; h < warp_size; h *= 2) {
-#pragma unroll
-        for (int j = 0; j < el_w; j++) {
-            const float val  = reg[j];
-            const float val2 = __shfl_xor_sync(0xFFFFFFFF, val, h, warp_size);
-            reg[j] = (lane & h) == 0 ? val + val2 : val2 - val;
-        }
-    }
-#pragma unroll
-    for (int h = warp_size; h < N; h *= 2) {
-        const int step = h / warp_size;
-#pragma unroll
-        for (int j = 0; j < el_w; j += 2 * step) {
-#pragma unroll
-            for (int k = 0; k < step; k++) {
-                const float x = reg[j + k];
-                const float y = reg[j + k + step];
-                reg[j + k]        = x + y;
-                reg[j + k + step] = x - y;
-            }
-        }
-    }
-
-    B * y = dst + idx[r / rows_per_set] * dst_row_blocks + (r % rows_per_set) * el_w;
-    if constexpr (std::is_same_v<B, block_q4_0>) {
-#pragma unroll
-        for (int i = 0; i < el_w; ++i) {
-            quantize_warp_q4_0(reg[i], y + i, lane);
-        }
-    } else {
-        quantize_warp_q8_0_n<el_w>(reg, y, lane, el_w);
-    }
+__global__ void fwht_set_rows_cuda(const fwht_set_rows_args a) {
+    fwht_set_rows_body<N, B>(a, (int64_t) blockIdx.x * blockDim.y + threadIdx.y, threadIdx.x);
 }
 
 // nodes i (fwht of 64-wide rows), views of it, then the SET_ROWS of its rows into a Q4_0 / Q8_0 tensor
@@ -551,14 +459,76 @@ int ggml_cuda_try_fuse_fwht_set_rows(ggml_backend_cuda_context & ctx, ggml_cgrap
     const int rows_per_block = 4;
     const dim3 grid((n_rows + rows_per_block - 1) / rows_per_block, 1, 1);
     const dim3 block(ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size, rows_per_block, 1);
-    const int64_t * idx = (const int64_t *) sr->src[1]->data;
-    const float scale = 1.0f / sqrtf(64.0f);
-    if (sr->type == GGML_TYPE_Q4_0) {
-        fwht_set_rows_cuda<64, block_q4_0><<<grid, block, 0, ctx.stream()>>>((const float *) rows->data, idx,
-                (block_q4_0 *) sr->data, rows_per_set, dst_row_blocks, n_rows, scale);
+    fwht_set_rows_args a;
+    a.src = (const float *) rows->data; a.idx = (const int64_t *) sr->src[1]->data; a.dst = sr->data;
+    a.rows_per_set = rows_per_set; a.dst_row_blocks = dst_row_blocks; a.n_rows = n_rows; a.scale = 1.0f / sqrtf(64.0f);
+    a.q4_0 = sr->type == GGML_TYPE_Q4_0;
+    if (ctx.mk && ggml_cuda_mk_add_fwht_set_rows(ctx.mk, a)) {   // the multi-task kernel takes it (mk.cuh)
+        return k - i;
+    }
+    if (a.q4_0) {
+        fwht_set_rows_cuda<64, block_q4_0><<<grid, block, 0, ctx.stream()>>>(a);
     } else {
-        fwht_set_rows_cuda<64, block_q8_0><<<grid, block, 0, ctx.stream()>>>((const float *) rows->data, idx,
-                (block_q8_0 *) sr->data, rows_per_set, dst_row_blocks, n_rows, scale);
+        fwht_set_rows_cuda<64, block_q8_0><<<grid, block, 0, ctx.stream()>>>(a);
     }
     return k - i;
+}
+
+int ggml_cuda_fwht_gate_after_fattn(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i, fwht_gate_args * a,
+                                    int64_t * n_rows) {
+    static const bool disabled = getenv("GGML_CUDA_DISABLE_FWHT_GATE") != nullptr;
+    const ggml_tensor * fa = cgraph->nodes[i];
+    int j = i + 1;
+    while (j < cgraph->n_nodes && fwht_gate_is_view(cgraph->nodes[j])) {
+        j++;
+    }
+    int idx[4];
+    if (disabled || fa->op != GGML_OP_FLASH_ATTN_EXT || fa->type != GGML_TYPE_F32 || !ggml_is_contiguous(fa) ||
+            j >= cgraph->n_nodes || !fwht_gate_match(cgraph, j, idx)) {
+        return 0;
+    }
+    const ggml_tensor * mm   = cgraph->nodes[j];
+    const ggml_tensor * rows = mm->src[1];
+    if (rows->data != fa->data || !ggml_is_contiguous(rows) || ggml_nelements(rows) != ggml_nelements(fa) ||
+            fwht_gate_root(rows->view_src ? rows->view_src : rows) != fa) {
+        return 0;
+    }
+    // the flash attention, the views of it, the four nodes and the views of them in between
+    std::vector<int> nodes;
+    std::vector<ggml_op> ops;
+    for (int k = i; k <= idx[3]; k++) {
+        const ggml_tensor * n = cgraph->nodes[k];
+        bool in = k == i || k == idx[0] || k == idx[1] || k == idx[2] || k == idx[3];
+        if (!in && fwht_gate_is_view(n)) {
+            for (const ggml_tensor * v = n->view_src ? n->view_src : n->src[0]; v && !in; v = v->view_src) {
+                for (int m : nodes) {
+                    in = in || cgraph->nodes[m] == v;
+                }
+            }
+        }
+        if (in) {
+            nodes.push_back(k);
+            ops.push_back(n->op);
+        }
+    }
+    const int out_idx = idx[3];
+    if (!ggml_can_fuse_subgraph_ext(cgraph, nodes.data(), (int) nodes.size(), ops.data(), &out_idx, 1)) {
+        return 0;
+    }
+    const ggml_tensor * gate = cgraph->nodes[idx[1]]->src[0];
+    ggml_tensor *       mul  = cgraph->nodes[idx[3]];
+    // the product may not cover what is read after the flash attention's kernel: the rows (by the unfused kernel), the
+    // gate, the partial results (by the combination: launch_fattn takes them from the pool when they would); its other
+    // inputs were read before
+    const auto overlap = [](const ggml_tensor * x, const ggml_tensor * y) {
+        const char * xl = (const char *) x->data, * xh = xl + ggml_nbytes(x);
+        const char * yl = (const char *) y->data, * yh = yl + ggml_nbytes(y);
+        return xl < yh && yl < xh;
+    };
+    if (overlap(mul, rows) || overlap(mul, gate)) {
+        return 0;
+    }
+    *n_rows = ggml_nelements(mm) / 64;
+    *a = fwht_gate_args_of(gate, mul, (block_q8_1 *) ggml_cuda_q8_1_produce(ctx, cgraph, idx[3]));
+    return idx[3];
 }

@@ -1,4 +1,6 @@
 #include "norm.cuh"
+#include "norm-gate-body.cuh"
+#include "mk.cuh"
 #include <cstdint>
 
 template <int block_size>
@@ -759,49 +761,10 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
 // rms_norm(x) * w * sigmoid(gate) per row (a gated norm, as qwen4exp ends its linear attention); w is
 // one vector of ncols. A block reads its row of x and of gate before writing it: dst may alias x or
-// gate exactly.
+// gate exactly. The body: norm-gate-body.cuh.
 template <int block_size>
-static __global__ void rms_norm_mul_sigmoid_gate_f32(const float * x, const float * w, const float * gate, float * dst,
-        const int ncols, const int64_t sx1, const int64_t sx2, const int64_t sx3,
-        const int64_t sg1, const int64_t sg2, const int64_t sg3, const float eps, block_q8_1 * dst_q8_1) {
-    const int nrows     = gridDim.x;
-    const int nchannels = gridDim.y;
-    const int row       = blockIdx.x;
-    const int channel   = blockIdx.y;
-    const int sample    = blockIdx.z;
-    const int tid       = threadIdx.x;
-
-    x    += sample*sx3 + channel*sx2 + row*sx1;
-    gate += sample*sg3 + channel*sg2 + row*sg1;
-    const int64_t dst_off = ((int64_t) (sample*nchannels + channel)*nrows + row)*ncols;
-    dst  += dst_off;
-
-    float tmp = 0.0f;
-    for (int col = tid; col < ncols; col += block_size) {
-        const float xi = x[col];
-        tmp += xi * xi;
-    }
-    extern __shared__ float s_sum[];
-    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
-    const float scale = rsqrtf(tmp / ncols + eps);
-
-    for (int col = tid; col < ncols; col += block_size) {
-        const float g = 1.0f / (1.0f + expf(-gate[col]));
-        const float v = scale * x[col] * w[col] * g;
-        dst[col] = v;
-        if (dst_q8_1) {
-            // the q8_1 block of the 32 values of this warp, as quantize_q8_1 writes it (lane = index in the block;
-            // ncols % QK8_1 == 0, so every warp is whole)
-            const float amax = warp_reduce_max<QK8_1>(fabsf(v));
-            const float sum  = warp_reduce_sum<QK8_1>(v);
-            const float d    = amax / 127.0f;
-            const int64_t i  = dst_off + col;
-            dst_q8_1[i / QK8_1].qs[i % QK8_1] = amax == 0.0f ? 0 : roundf(v / d);
-            if (i % QK8_1 == 0) {
-                dst_q8_1[i / QK8_1].ds = make_half2(d, sum);
-            }
-        }
-    }
+static __global__ void rms_norm_mul_sigmoid_gate_f32(const rms_norm_gate_args a) {
+    rms_norm_mul_sigmoid_gate_body<block_size>(a, blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x);
 }
 
 void ggml_cuda_op_rms_norm_mul_sigmoid_gate(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm,
@@ -814,7 +777,13 @@ void ggml_cuda_op_rms_norm_mul_sigmoid_gate(ggml_backend_cuda_context & ctx, con
     const int64_t sx1 = x->nb[1] / sizeof(float), sx2 = x->nb[2] / sizeof(float), sx3 = x->nb[3] / sizeof(float);
     const int64_t sg1 = gate->nb[1] / sizeof(float), sg2 = gate->nb[2] / sizeof(float), sg3 = gate->nb[3] / sizeof(float);
     constexpr int block_size = 128;
-    rms_norm_mul_sigmoid_gate_f32<block_size><<<blocks_num, block_size, 32 * sizeof(float), ctx.stream()>>>(
-        (const float *) x->data, (const float *) w->data, (const float *) gate->data, (float *) dst->data,
-        (int) ncols, sx1, sx2, sx3, sg1, sg2, sg3, eps, (block_q8_1 *) dst_q8_1);
+    rms_norm_gate_args a;
+    a.x = (const float *) x->data; a.w = (const float *) w->data; a.gate = (const float *) gate->data; a.dst = (float *) dst->data;
+    a.ncols = (int) ncols; a.sx1 = sx1; a.sx2 = sx2; a.sx3 = sx3; a.sg1 = sg1; a.sg2 = sg2; a.sg3 = sg3; a.eps = eps;
+    a.dst_q8_1 = (block_q8_1 *) dst_q8_1;
+    a.nrows = (int) x->ne[1]; a.nchannels = (int) x->ne[2]; a.nsamples = (int) x->ne[3];
+    if (ctx.mk && ggml_cuda_mk_add_norm_gate(ctx.mk, a)) {   // the multi-task kernel takes it (mk.cuh)
+        return;
+    }
+    rms_norm_mul_sigmoid_gate_f32<block_size><<<blocks_num, block_size, 32 * sizeof(float), ctx.stream()>>>(a);
 }

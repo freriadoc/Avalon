@@ -1,6 +1,9 @@
 #include "argsort.cuh"
 #include "top-k.cuh"
 #include "ggml-backend-impl.h"
+#if defined(GGML_USE_HIP)
+#    include "grid-barrier.cuh"
+#endif
 
 #ifdef GGML_CUDA_USE_CUB
 #    include <cub/cub.cuh>
@@ -286,6 +289,225 @@ static __global__ void top_k_radix_gather(
     }
 }
 
+// The whole selection in one kernel for a few rows (generation, verification): one block per row block, all resident
+// at once, the steps above separated by grid barriers (11 launches of ~1.5 us, each behind the ~2.4 us a dependent
+// launch costs, become one). Same arithmetic as the step kernels: every block of a row redoes its row's selection
+// from the blocks' histograms and keeps the state in registers. The histograms alternate between two buffers (a
+// block may still read pass p's while another writes pass p + 1's); the gather's counts go in the first, free from
+// pass 3 on.
+static __device__ __attribute__((aligned(256))) unsigned g_top_k_bar[128];   // count [0], generation [64]: two lines
+
+#define TOP_K_QSA_TAIL_PER_THREAD 8   // selection slots a thread of the fused kernel holds
+
+// with tail, the QSA selection of the rows after one more barrier (top_k_qsa_tail)
+template<int BLOCK_SIZE, int RADIX_BITS, bool tail>
+__launch_bounds__(BLOCK_SIZE, 1)
+static __global__ void top_k_radix_fused(
+        const float * __restrict__ src,
+        int * __restrict__ dst,
+        int * __restrict__ histograms,
+        size_t hist_stride,
+        int ncols,
+        int k,
+        int chunk,
+        int blocks_per_row,
+        const int * __restrict__ n_live,
+        const top_k_qsa_tail qt) {
+    constexpr int NBINS = 1 << RADIX_BITS;
+    static_assert(NBINS == BLOCK_SIZE, "one bin per thread");
+    unsigned gen = ggml_cuda_grid_barrier_start(&g_top_k_bar[64]);
+
+    const int row = blockIdx.x / blocks_per_row;
+    const int row_block = blockIdx.x % blocks_per_row;
+    const int tid = threadIdx.x;
+    const float * row_src = src + (size_t) row * ncols;
+    const int ncols_live = top_k_ncols_live(ncols, k, n_live);
+    __shared__ int histogram[NBINS];
+    __shared__ int s_bin, s_above;
+
+    uint32_t prefix = 0, prefix_mask = 0;
+    int rank = k;
+    for (int pass = 0, shift = 32 - RADIX_BITS; shift >= 0; pass++, shift -= RADIX_BITS) {
+        int * hist = histograms + (pass & 1) * hist_stride;
+        // top_k_radix_histogram
+        histogram[tid] = 0;
+        __syncthreads();
+        for (int col = row_block * BLOCK_SIZE + tid; col < ncols_live; col += blocks_per_row * BLOCK_SIZE) {
+            const uint32_t key = top_k_float_to_ordered(row_src[col]);
+            if ((key & prefix_mask) == prefix) {
+                atomicAdd(&histogram[(key >> shift) & (NBINS - 1)], 1);
+            }
+        }
+        __syncthreads();
+        hist[((size_t) row * blocks_per_row + row_block) * NBINS + tid] = histogram[tid];
+        ggml_cuda_grid_barrier(&g_top_k_bar[0], &g_top_k_bar[64], gen);
+
+        // top_k_radix_select
+        int count = 0;
+#pragma unroll 8
+        for (int b = 0; b < blocks_per_row; ++b) {
+            count += hist[((size_t) row * blocks_per_row + b) * NBINS + tid];
+        }
+        histogram[tid] = count;
+        __syncthreads();
+        for (int off = 1; off < NBINS; off <<= 1) {
+            const int add = tid + off < NBINS ? histogram[tid + off] : 0;
+            __syncthreads();
+            histogram[tid] += add;
+            __syncthreads();
+        }
+        const int suffix = histogram[tid];
+        const int above = tid + 1 < NBINS ? histogram[tid + 1] : 0;
+        if ((suffix >= rank || tid == 0) && above < rank) {
+            s_bin = tid;
+            s_above = above;
+        }
+        __syncthreads();
+        rank -= s_above;
+        prefix |= (uint32_t) s_bin << shift;
+        prefix_mask |= (uint32_t) (NBINS - 1) << shift;
+        __syncthreads();
+    }
+
+    // top_k_radix_count
+    int2 * counts = (int2 *) histograms;
+    const int begin = row_block * chunk;
+    const int end = min(begin + chunk, ncols_live);
+    {
+        int g = 0;
+        int e = 0;
+        for (int col = begin + tid; col < end; col += BLOCK_SIZE) {
+            const uint32_t key = top_k_float_to_ordered(row_src[col]);
+            g += key > prefix;
+            e += key == prefix;
+        }
+        constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+        constexpr int n_warps = BLOCK_SIZE / warp_size;
+        __shared__ int warp_g[n_warps];
+        __shared__ int warp_e[n_warps];
+        g = warp_reduce_sum<warp_size>(g);
+        e = warp_reduce_sum<warp_size>(e);
+        if (tid % warp_size == 0) {
+            warp_g[tid / warp_size] = g;
+            warp_e[tid / warp_size] = e;
+        }
+        __syncthreads();
+        if (tid == 0) {
+            int greater = 0;
+            int equal = 0;
+            for (int w = 0; w < n_warps; ++w) {
+                greater += warp_g[w];
+                equal += warp_e[w];
+            }
+            counts[(size_t) row * blocks_per_row + row_block] = make_int2(greater, equal);
+        }
+    }
+    ggml_cuda_grid_barrier(&g_top_k_bar[0], &g_top_k_bar[64], gen);
+
+    // top_k_radix_gather
+    int * row_dst = dst + (size_t) row * k;
+    int g_off = 0;
+    int e_off = 0;
+#pragma unroll 8
+    for (int b = 0; b < row_block; ++b) {
+        const int2 c = counts[(size_t) row * blocks_per_row + b];
+        g_off += c.x;
+        e_off += c.y;
+    }
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int n_warps = BLOCK_SIZE / warp_size;
+    __shared__ int warp_g[n_warps];
+    __shared__ int warp_e[n_warps];
+    const int lane = tid % warp_size;
+    const int warp = tid / warp_size;
+    const uint64_t below = (1ull << lane) - 1;
+    for (int base = begin; base < end; base += BLOCK_SIZE) {
+        const int col = base + tid;
+        const uint32_t key = col < end ? top_k_float_to_ordered(row_src[col]) : 0;
+        const bool is_g = col < end && key > prefix;
+        const bool is_e = col < end && key == prefix;
+        const uint64_t mg = __ballot(is_g);
+        const uint64_t me = __ballot(is_e);
+        if (lane == 0) {
+            warp_g[warp] = __popcll(mg);
+            warp_e[warp] = __popcll(me);
+        }
+        __syncthreads();
+        int pg = 0, pe = 0, tg = 0, te = 0;
+        for (int w = 0; w < n_warps; ++w) {
+            if (w < warp) {
+                pg += warp_g[w];
+                pe += warp_e[w];
+            }
+            tg += warp_g[w];
+            te += warp_e[w];
+        }
+        if (is_g) {
+            row_dst[g_off + pg + __popcll(mg & below)] = col;
+        }
+        if (is_e) {
+            const int pos = e_off + pe + __popcll(me & below);
+            if (pos < rank) {
+                row_dst[k - rank + pos] = col;
+            }
+        }
+        g_off += tg;
+        e_off += te;
+        __syncthreads();
+    }
+
+    if constexpr (tail) {
+        // everything read, a barrier, then everything written: ggml-alloc may place the selection's results over the
+        // top-k or the scores (their last reader in the graph is the scores' GET_ROWS)
+        ggml_cuda_grid_barrier(&g_top_k_bar[0], &g_top_k_bar[64], gen);
+        const int nrows = gridDim.x / blocks_per_row;
+        const int64_t n_pooled = (int64_t) k * qt.kpool;
+        const int64_t n_sel = n_pooled + qt.n_tail;
+        const int64_t stride = (int64_t) gridDim.x * BLOCK_SIZE;
+        const int64_t i0 = (int64_t) blockIdx.x * BLOCK_SIZE + tid;
+        int32_t c_r[TOP_K_QSA_TAIL_PER_THREAD];
+        float   s_r[TOP_K_QSA_TAIL_PER_THREAD];
+        bool    v_r[TOP_K_QSA_TAIL_PER_THREAD];
+#pragma unroll
+        for (int u = 0; u < TOP_K_QSA_TAIL_PER_THREAD; u++) {
+            const int64_t i = i0 + u*stride;
+            if (i < nrows * n_sel) {
+                const int64_t t = i / n_sel, j = i % n_sel;
+                if (j < n_pooled) {
+                    const int32_t pool = dst[t*k + j / qt.kpool];
+                    c_r[u] = qt.pool_idxs[pool*qt.s_pool + j % qt.kpool];
+                    s_r[u] = src[t*ncols + pool];
+                } else {
+                    c_r[u] = qt.tail[t*qt.s_tail + (j - n_pooled)];
+                    s_r[u] = 0.0f;
+                }
+                const bool cell = c_r[u] >= 0 && c_r[u] < qt.n_kv;
+                if (qt.mask) {   // k_qsa_select_body<GGML_QSA_SELECT_MASK, true>
+                    const int32_t pc = cell ? qt.cell_pos[c_r[u]] : -1;
+                    v_r[u] = cell && s_r[u] != -INFINITY && pc >= 0 && pc <= qt.tok_pos[t];
+                }
+            }
+        }
+        ggml_cuda_grid_barrier(&g_top_k_bar[0], &g_top_k_bar[64], gen);
+#pragma unroll
+        for (int u = 0; u < TOP_K_QSA_TAIL_PER_THREAD; u++) {
+            const int64_t i = i0 + u*stride;
+            if (i < nrows * n_sel) {
+                const int64_t t = i / n_sel, j = i % n_sel;
+                const int32_t c = c_r[u];
+                if (j < n_pooled && j % qt.kpool == 0) {
+                    qt.top_score[t*k + j / qt.kpool] = s_r[u];
+                }
+                qt.sel[t*qt.s_sel + j]   = c;
+                qt.rows[t*qt.s_rows + j] = c >= 0 && c < qt.n_kv ? c : 0;
+                if (qt.mask) {
+                    qt.mask[t*qt.s_mask + j] = v_r[u] ? __float2half(0.0f) : __float2half(-INFINITY);
+                }
+            }
+        }
+    }
+}
+
 static constexpr int top_k_radix_bins = 1 << 8;
 
 static int top_k_radix_blocks_per_row(int ncols) {
@@ -306,6 +528,52 @@ static size_t top_k_radix_states_bytes(int nrows) {
     return GGML_PAD(nrows * sizeof(top_k_radix_state), 256);
 }
 
+// the rows the fused kernel may take (its second histogram buffer is part of the scratch for them only)
+static constexpr int top_k_radix_fused_max_rows = 16;
+
+static size_t top_k_radix_scratch_bytes(int ncols, int nrows) {
+    const size_t hist = top_k_radix_hist_count(ncols, nrows) * sizeof(int);
+    return top_k_radix_states_bytes(nrows) + (nrows <= top_k_radix_fused_max_rows ? 2 : 1) * hist;
+}
+
+// the fused kernel if it applies (few rows, all its blocks resident at once: else its barriers would wait for ever);
+// false if not launched
+template<int BLOCK_SIZE, int RADIX_BITS>
+static bool top_k_radix_fused_cuda(int * histograms, size_t hist_count, const float * src, int * dst, int ncols, int nrows,
+        int k, cudaStream_t stream, const int * n_live, const top_k_qsa_tail * qt) {
+    if (nrows > top_k_radix_fused_max_rows) {
+        return false;
+    }
+    static int cap = 0;
+    if (cap == 0) {
+        int per_cu = 0, per_cu_t = 0;
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_cu, top_k_radix_fused<BLOCK_SIZE, RADIX_BITS, false>, BLOCK_SIZE, 0));
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_cu_t, top_k_radix_fused<BLOCK_SIZE, RADIX_BITS, true>, BLOCK_SIZE, 0));
+        // every block resident at once: half the occupancy, as k_mk_chain128 (a chain kernel at the full occupancy,
+        // 7 x 42 blocks, waited for ever in a prefill: the device does not guarantee it)
+        cap = std::max(1, std::min(per_cu, per_cu_t) / 2 * ggml_cuda_info().devices[ggml_cuda_get_device()].nsm);
+    }
+    // at most 32 blocks per row (2048 columns each at 256k): the gather keeps the columns' order, the same result
+    const int blocks_per_row = std::min(top_k_radix_blocks_per_row(ncols), 32);
+    if (blocks_per_row * nrows > cap) {
+        return false;
+    }
+    const int chunk = (ncols + blocks_per_row - 1) / blocks_per_row;
+    if (qt && (int64_t) nrows * ((int64_t) k * qt->kpool + qt->n_tail) >
+              (int64_t) TOP_K_QSA_TAIL_PER_THREAD * blocks_per_row * nrows * BLOCK_SIZE) {
+        return false;   // more slots than the threads hold
+    }
+    if (qt) {
+        top_k_radix_fused<BLOCK_SIZE, RADIX_BITS, true><<<blocks_per_row * nrows, BLOCK_SIZE, 0, stream>>>(
+            src, dst, histograms, hist_count, ncols, k, chunk, blocks_per_row, n_live, *qt);
+    } else {
+        top_k_radix_fused<BLOCK_SIZE, RADIX_BITS, false><<<blocks_per_row * nrows, BLOCK_SIZE, 0, stream>>>(
+            src, dst, histograms, hist_count, ncols, k, chunk, blocks_per_row, n_live, top_k_qsa_tail{});
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 static void top_k_radix_cuda(
         ggml_cuda_pool & pool, char * scratch,
         const float * src, int * dst, int ncols, int nrows, int k, cudaStream_t stream, const int * n_live) {
@@ -317,8 +585,14 @@ static void top_k_radix_cuda(
 
     ggml_cuda_pool_alloc<top_k_radix_state> states_alloc(pool);
     ggml_cuda_pool_alloc<int> histograms_alloc(pool);
+    const size_t hist_count = top_k_radix_hist_count(ncols, nrows);
+    const bool few = nrows <= top_k_radix_fused_max_rows;
     top_k_radix_state * states = scratch ? (top_k_radix_state *) scratch : states_alloc.alloc(nrows);
-    int * histograms = scratch ? (int *) (scratch + top_k_radix_states_bytes(nrows)) : histograms_alloc.alloc(top_k_radix_hist_count(ncols, nrows));
+    int * histograms = scratch ? (int *) (scratch + top_k_radix_states_bytes(nrows)) : histograms_alloc.alloc((few ? 2 : 1) * hist_count);
+
+    if (few && top_k_radix_fused_cuda<BLOCK_SIZE, RADIX_BITS>(histograms, hist_count, src, dst, ncols, nrows, k, stream, n_live, nullptr)) {
+        return;
+    }
 
     top_k_radix_init<<<(nrows + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(states, nrows, k);
 
@@ -414,6 +688,32 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 #endif
 }
 
+bool ggml_cuda_top_k_qsa_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const top_k_qsa_tail & tail) {
+#if !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
+    const ggml_tensor * src0 = dst->src[0];
+    const int ncols = (int) src0->ne[0];
+    const int nrows = (int) ggml_nrows(src0);
+    const int k     = (int) dst->ne[0];
+    if (src0->type != GGML_TYPE_F32 || !ggml_is_contiguous(src0) || ncols <= 1024 ||
+            nrows > top_k_radix_fused_max_rows) {
+        return false;
+    }
+    const ggml_tensor * scratch_t = dst->src[GGML_SCHED_SCRATCH_SRC];
+    const size_t        need      = ggml_cuda_top_k_scratch_size(dst);
+    char * scratch = scratch_t && scratch_t->data && ggml_nbytes(scratch_t) >= need ? (char *) scratch_t->data : nullptr;
+    const ggml_tensor * lc = dst->src[GGML_LIVE_COUNT_SRC];
+    const int * n_live = lc ? (const int *) lc->data + ggml_get_op_params_i32(dst, GGML_LIVE_COUNT_PARAM) : nullptr;
+    const size_t hist_count = top_k_radix_hist_count(ncols, nrows);
+    ggml_cuda_pool_alloc<int> histograms_alloc(ctx.pool());
+    int * histograms = scratch ? (int *) (scratch + top_k_radix_states_bytes(nrows)) : histograms_alloc.alloc(2 * hist_count);
+    return top_k_radix_fused_cuda<256, 8>(histograms, hist_count, (const float *) src0->data, (int *) dst->data, ncols,
+                                          nrows, k, ctx.stream(), n_live, &tail);
+#else
+    GGML_UNUSED(ctx); GGML_UNUSED(dst); GGML_UNUSED(tail);
+    return false;
+#endif
+}
+
 size_t ggml_cuda_top_k_scratch_size(const ggml_tensor * dst) {
 #if !defined(GGML_CUDA_USE_CUB)
     const ggml_tensor * src0 = dst->src[0];
@@ -421,7 +721,7 @@ size_t ggml_cuda_top_k_scratch_size(const ggml_tensor * dst) {
     const int nrows = (int) ggml_nrows(src0);
 #if defined(GGML_USE_HIP)
     if (ncols > 1024) {
-        return top_k_radix_states_bytes(nrows) + top_k_radix_hist_count(ncols, nrows) * sizeof(int);
+        return top_k_radix_scratch_bytes(ncols, nrows);
     }
 #endif
     // the bitonic sort's full index rows

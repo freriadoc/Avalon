@@ -1,5 +1,6 @@
 #include "fill.cuh"
 #include "convert.cuh"
+#include "mk.cuh"
 
 #define CUDA_FILL_BLOCK_SIZE 256
 
@@ -23,6 +24,11 @@ void ggml_cuda_op_fill(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     const int64_t k = ggml_nelements(dst);
     const int64_t num_blocks = (k + CUDA_FILL_BLOCK_SIZE - 1) / CUDA_FILL_BLOCK_SIZE;
+
+    // the multi-task kernel takes it (mk.cuh)
+    if (dst->type == GGML_TYPE_F32 && ctx.mk && ggml_cuda_mk_add_fill(ctx.mk, { (float *) dst_d, k, value })) {
+        return;
+    }
 
     switch (dst->type) {
         case GGML_TYPE_F32:

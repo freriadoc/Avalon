@@ -1,44 +1,13 @@
 #include "qsa-select.cuh"
+#include "qsa-select-body.cuh"
+#include "mk.cuh"
+#include "top-k.cuh"
+#include "ggml-backend-impl.h"
 
-// visibility of cell c for query t: the dense mask, or 0 / -inf from the positions
-template <bool by_pos>
-static __device__ __forceinline__ half qsa_visibility(const void * vis, const int32_t * tok_pos, const int64_t s_mask,
-                                                      const int64_t t, const int32_t c) {
-    if constexpr (by_pos) {
-        const int32_t pc = ((const int32_t *) vis)[c];
-        return pc >= 0 && pc <= tok_pos[t] ? __float2half(0.0f) : __float2half(-INFINITY);
-    } else {
-        return ((const half *) vis)[t*s_mask + c];
-    }
-}
-
-// see ggml_qsa_select: a thread per (slot, query)
+// see ggml_qsa_select: a thread per (slot, query) (the body: qsa-select-body.cuh)
 template <int mode, bool by_pos>
-static __global__ void k_qsa_select(const int32_t * sel, const float * top_score, const void * vis, const int32_t * tok_pos,
-        void * dst, const int64_t n_sel, const int64_t n_top, const int64_t n_kv, const int32_t kpool,
-        const int64_t s_sel, const int64_t s_score, const int64_t s_mask, const int64_t s_dst) {
-    const int64_t j = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    const int64_t t = blockIdx.y;
-    if (j >= n_sel) {
-        return;
-    }
-    if constexpr (mode == GGML_QSA_SELECT_CAUSAL) {
-        ((half *) dst)[t*s_dst + j] = qsa_visibility<by_pos>(vis, tok_pos, s_mask, t, (int32_t) j);
-        return;
-    }
-    const int32_t c    = sel[t*s_sel + j];
-    const bool    cell = c >= 0 && c < n_kv;
-    const bool    live = cell && (j >= n_top*kpool || top_score[t*s_score + j/kpool] != -INFINITY);
-    if constexpr (mode == GGML_QSA_SELECT_ROWS) {
-        ((int32_t *) dst)[t*s_dst + j] = cell ? c : 0;
-    } else if constexpr (mode == GGML_QSA_SELECT_MASK) {
-        ((half *) dst)[t*s_dst + j] = live ? qsa_visibility<by_pos>(vis, tok_pos, s_mask, t, c) : __float2half(-INFINITY);
-    } else {
-        // live slots name distinct cells
-        if (live) {
-            ((half *) dst)[t*s_dst + c] = qsa_visibility<by_pos>(vis, tok_pos, s_mask, t, c);
-        }
-    }
+static __global__ void k_qsa_select(const qsa_select_args a) {
+    k_qsa_select_body<mode, by_pos>(a, (int64_t) blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y);
 }
 
 static __global__ void k_qsa_fill_neg_inf(half * dst, const int64_t n) {
@@ -49,18 +18,24 @@ static __global__ void k_qsa_fill_neg_inf(half * dst, const int64_t n) {
 }
 
 template <int mode, bool by_pos>
-static void qsa_select_launch(const ggml_tensor * dst, const dim3 grid, const int threads, cudaStream_t stream,
-                              const int64_t n_sel, const int64_t n_top) {
+static void qsa_select_launch(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, const dim3 grid, const int threads,
+                              cudaStream_t stream, const int64_t n_sel, const int64_t n_top) {
     const ggml_tensor * sel       = dst->src[0];
     const ggml_tensor * top_score = dst->src[1];
     const ggml_tensor * vis       = dst->src[2];
     const ggml_tensor * tok_pos   = dst->src[3];
-    k_qsa_select<mode, by_pos><<<grid, threads, 0, stream>>>(
-        sel ? (const int32_t *) sel->data : nullptr, top_score ? (const float *) top_score->data : nullptr, vis->data,
-        tok_pos ? (const int32_t *) tok_pos->data : nullptr, dst->data, n_sel, n_top, vis->ne[0],
-        ggml_get_op_params_i32(dst, 0),
-        sel ? sel->nb[1] / sizeof(int32_t) : 0, top_score ? top_score->nb[1] / sizeof(float) : 0,
-        by_pos ? 0 : vis->nb[1] / sizeof(half), dst->nb[1] / ggml_type_size(dst->type));
+    qsa_select_args a;
+    a.sel = sel ? (const int32_t *) sel->data : nullptr; a.top_score = top_score ? (const float *) top_score->data : nullptr;
+    a.vis = vis->data; a.tok_pos = tok_pos ? (const int32_t *) tok_pos->data : nullptr; a.dst = dst->data;
+    a.n_sel = n_sel; a.n_top = n_top; a.n_kv = vis->ne[0]; a.kpool = ggml_get_op_params_i32(dst, 0);
+    a.s_sel = sel ? sel->nb[1] / sizeof(int32_t) : 0; a.s_score = top_score ? top_score->nb[1] / sizeof(float) : 0;
+    a.s_mask = by_pos ? 0 : vis->nb[1] / sizeof(half); a.s_dst = dst->nb[1] / ggml_type_size(dst->type);
+    a.mode = mode; a.by_pos = by_pos; a.n_t = (int) grid.y;
+    // the multi-task kernel takes it (mk.cuh); not the dense mode, whose fill must come first
+    if (mode != GGML_QSA_SELECT_DENSE && ctx.mk && ggml_cuda_mk_add_qsa_select(ctx.mk, a)) {
+        return;
+    }
+    k_qsa_select<mode, by_pos><<<grid, threads, 0, stream>>>(a);
 }
 
 // see ggml_qsa_pool_layout: a thread per cell scatters it to its member slot (or block, for the reps); the same thread
@@ -127,8 +102,8 @@ void ggml_cuda_op_qsa_select(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         const int64_t n = ggml_nelements(dst);
         k_qsa_fill_neg_inf<<<(n + threads - 1) / threads, threads, 0, stream>>>((half *) dst->data, n);
     }
-#define QSA_LAUNCH(M) (by_pos ? qsa_select_launch<M, true>(dst, grid, threads, stream, n_sel, n_top) \
-                              : qsa_select_launch<M, false>(dst, grid, threads, stream, n_sel, n_top))
+#define QSA_LAUNCH(M) (by_pos ? qsa_select_launch<M, true>(ctx, dst, grid, threads, stream, n_sel, n_top) \
+                              : qsa_select_launch<M, false>(ctx, dst, grid, threads, stream, n_sel, n_top))
     switch (mode) {
         case GGML_QSA_SELECT_ROWS:   QSA_LAUNCH(GGML_QSA_SELECT_ROWS);   break;
         case GGML_QSA_SELECT_MASK:   QSA_LAUNCH(GGML_QSA_SELECT_MASK);   break;
@@ -291,4 +266,122 @@ int ggml_cuda_try_fuse_qsa_select_pooled(ggml_backend_cuda_context & ctx, ggml_c
     }
     CUDA_CHECK(cudaGetLastError());
     return iq - i;
+}
+
+int ggml_cuda_try_fuse_qsa_select_rows(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
+    ggml_tensor * top_k = cgraph->nodes[i];
+    if (top_k->op != GGML_OP_TOP_K || top_k->type != GGML_TYPE_I32 || !ggml_is_contiguous(top_k)) {
+        return 0;
+    }
+    const int ir = qsa_pooled_next(cgraph, i);
+    const int ic = ir < 0 ? -1 : qsa_pooled_next(cgraph, ir);
+    const int ig = ic < 0 ? -1 : qsa_pooled_next(cgraph, ic);
+    const int iq = ig < 0 ? -1 : qsa_pooled_next(cgraph, ig);
+    if (iq < 0) {
+        return 0;
+    }
+    const ggml_tensor * cells = cgraph->nodes[ir];
+    const ggml_tensor * cat   = cgraph->nodes[ic];
+    const ggml_tensor * gs    = cgraph->nodes[ig];
+    const ggml_tensor * qs    = cgraph->nodes[iq];
+    if (cells->op != GGML_OP_GET_ROWS || cells->type != GGML_TYPE_I32 || cat->op != GGML_OP_CONCAT ||
+            gs->op != GGML_OP_GET_ROWS || qs->op != GGML_OP_QSA_SELECT ||
+            ggml_get_op_params_i32(qs, 1) != GGML_QSA_SELECT_ROWS || ggml_get_op_params_i32(cat, 0) != 0) {
+        return 0;
+    }
+    const ggml_tensor * pool_idxs = cells->src[0];
+    const ggml_tensor * tail      = cat->src[1];
+    const ggml_tensor * score     = qsa_pooled_root(gs->src[0]);
+    const int32_t       kpool     = ggml_get_op_params_i32(qs, 0);
+    // as ggml_cuda_try_fuse_qsa_select_pooled; the selection and the scores at the top-k are read again (the mask's
+    // QSA_SELECT), the rows by the gathers
+    if (qsa_pooled_root(cells->src[1]) != top_k || score != top_k->src[0] || gs->src[1] != top_k ||
+            qsa_pooled_root(cat->src[0]) != cells || qs->src[0] != cat || qsa_pooled_root(qs->src[1]) != gs ||
+            pool_idxs->type != GGML_TYPE_I32 || pool_idxs->ne[0] != kpool || pool_idxs->nb[0] != sizeof(int32_t) ||
+            tail->type != GGML_TYPE_I32 || tail->nb[0] != sizeof(int32_t) || score->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(score) || !ggml_is_contiguous(cat) || !ggml_is_contiguous(gs) || !ggml_is_contiguous(qs) ||
+            score->ne[1] != top_k->ne[1] || tail->ne[1] != top_k->ne[1] || cat->ne[0] != kpool*top_k->ne[0] + tail->ne[0] ||
+            cat->ne[1] != top_k->ne[1] || qs->ne[0] != cat->ne[0] || qs->ne[1] != top_k->ne[1] ||
+            ggml_nelements(gs) != ggml_nelements(top_k) || qs->type != GGML_TYPE_I32) {
+        return 0;
+    }
+    // the mask's QSA_SELECT right after (qwen4exp builds it there), from the positions
+    const int im = qsa_pooled_next(cgraph, iq);
+    const ggml_tensor * qm = im < 0 ? nullptr : cgraph->nodes[im];
+    if (qm && !(qm->op == GGML_OP_QSA_SELECT && ggml_get_op_params_i32(qm, 1) == GGML_QSA_SELECT_MASK &&
+                ggml_get_op_params_i32(qm, 0) == kpool && qm->src[0] == cat && qsa_pooled_root(qm->src[1]) == gs &&
+                qm->src[2] && qm->src[2]->type == GGML_TYPE_I32 && qm->src[2]->ne[0] == qs->src[2]->ne[0] &&
+                qm->src[3] && qm->src[3]->type == GGML_TYPE_I32 && qm->type == GGML_TYPE_F16 && ggml_is_contiguous(qm) &&
+                qm->ne[0] == cat->ne[0] && qm->ne[1] == cat->ne[1])) {
+        qm = nullptr;
+    }
+    const int last = qm ? im : iq;
+    int     nodes[16];
+    ggml_op ops[16];
+    int     n_nodes = 0;
+    if (last - i + 1 > 16) {
+        return 0;
+    }
+    for (int k = i; k <= last; k++) {
+        const ggml_tensor * t = cgraph->nodes[k];
+        if (qsa_pooled_is_view(t)) {
+            bool inside = false;
+            for (int m = 0; m < n_nodes; m++) {
+                inside = inside || cgraph->nodes[nodes[m]] == t->view_src || cgraph->nodes[nodes[m]] == t->src[0];
+            }
+            if (!inside) {
+                continue;
+            }
+        }
+        nodes[n_nodes] = k;
+        ops[n_nodes++] = t->op;
+    }
+    // everything is written but the pools' cells (and their reshape), which only the CONCAT may read
+    int outs[16];
+    int n_outs = 0;
+    for (int m = 0; m < n_nodes; m++) {
+        const ggml_tensor * t = cgraph->nodes[nodes[m]];
+        if (t != cells && t->src[0] != cells) {
+            outs[n_outs++] = nodes[m];
+        }
+    }
+    if (!ggml_can_fuse_subgraph_ext(cgraph, nodes, n_nodes, ops, outs, n_outs)) {
+        return 0;
+    }
+    // the selection's results are written after everything was read (a grid barrier between): they may overlap the
+    // inputs. The top-k and its scratch are written before: against what is read
+    {
+        const ggml_tensor * scratch = top_k->src[GGML_SCHED_SCRATCH_SRC];
+        const ggml_tensor * all[] = { top_k, score, pool_idxs, tail, scratch, top_k->src[GGML_LIVE_COUNT_SRC],
+                                      qm ? qm->src[2] : nullptr, qm ? qm->src[3] : nullptr };
+        const ggml_tensor * written[] = { top_k, scratch };
+        for (const ggml_tensor * w : written) {
+            if (!w || !w->data) {
+                continue;
+            }
+            const char * wl = (const char *) w->data, * wh = wl + ggml_nbytes(w);
+            for (const ggml_tensor * t : all) {
+                if (t && t != w && t->data) {
+                    const char * tl = (const char *) t->data, * th = tl + ggml_nbytes(t);
+                    if (tl < wh && wl < th) {
+                        return 0;
+                    }
+                }
+            }
+        }
+    }
+    top_k_qsa_tail qt;
+    qt.pool_idxs = (const int32_t *) pool_idxs->data; qt.tail = (const int32_t *) tail->data;
+    qt.sel = (int32_t *) cat->data; qt.top_score = (float *) gs->data; qt.rows = (int32_t *) qs->data;
+    qt.s_pool = pool_idxs->nb[1] / sizeof(int32_t); qt.s_tail = tail->nb[1] / sizeof(int32_t);
+    qt.s_sel = cat->nb[1] / sizeof(int32_t); qt.s_rows = qs->nb[1] / sizeof(int32_t);
+    qt.n_tail = tail->ne[0]; qt.n_kv = qs->src[2]->ne[0]; qt.kpool = kpool;
+    qt.mask = qm ? (half *) qm->data : nullptr;
+    qt.cell_pos = qm ? (const int32_t *) qm->src[2]->data : nullptr;
+    qt.tok_pos  = qm ? (const int32_t *) qm->src[3]->data : nullptr;
+    qt.s_mask   = qm ? qm->nb[1] / sizeof(half) : 0;
+    if (!ggml_cuda_top_k_qsa_rows(ctx, top_k, qt)) {
+        return 0;
+    }
+    return last - i;
 }

@@ -18,3 +18,11 @@ ggml_tensor * ggml_cuda_match_fwht_gate(const ggml_cgraph * cgraph, int i, ggml_
 // Q8_0 tensor, quantized as set_rows does (qwen4exp's V into its cache): one kernel. Returns the nodes to skip after
 // i, 0 if not fused.
 int ggml_cuda_try_fuse_fwht_set_rows(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i);
+
+struct fwht_gate_args;
+void ggml_cuda_fwht_gate_launch(const float * rows, int64_t n_rows, const fwht_gate_args & a, cudaStream_t stream);
+// a flash attention (node i) whose output is rotated back and gated (ggml_cuda_try_fuse_fwht_gate's nodes next): the
+// index of the group's last node, its arguments and rows; 0 if it does not apply. The q8_1 of the product is produced
+// (call it right before the launch).
+int ggml_cuda_fwht_gate_after_fattn(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i, fwht_gate_args * a,
+                                    int64_t * n_rows);

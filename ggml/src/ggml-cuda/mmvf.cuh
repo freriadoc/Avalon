@@ -12,3 +12,8 @@ void ggml_cuda_op_mul_mat_vec_f(
     const int64_t src1_padded_row_size, cudaStream_t stream);
 
 bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11);
+
+// consecutive products of the same activation by matrices of one type and width (ggml_cuda_try_fuse): one launch, a
+// block per row selecting its matrix (ggml_cuda_mm_fusion_args_device::multi_*)
+void ggml_cuda_mul_mat_vec_f_multi(ggml_backend_cuda_context & ctx, const ggml_tensor * const * src0, ggml_tensor * const * dst,
+        int n, const ggml_tensor * src1);

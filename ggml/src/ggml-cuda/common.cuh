@@ -1474,8 +1474,16 @@ void ggml_cuda_unregister_context(ggml_backend_cuda_context * ctx);
 // device whatever the grid), so that neither is allocated later, past the cache's reserve
 void ggml_cuda_prime_queues(int device);
 
+struct ggml_cuda_mk;   // mk.cuh
+
+struct fwht_gate_args;
+
 struct ggml_backend_cuda_context {
     int device;
+    // set around a flash attention whose output the rotation back x sigmoid(gate) reads next (ggml_cuda_try_fuse): its
+    // combination of the parallel blocks applies it (fattn-common.cuh) and sets fattn_gate_done
+    const fwht_gate_args * fattn_gate = nullptr;
+    bool fattn_gate_done = false;
     // the weights are read once per token (a model's large matrices while decoding, not an MTP draft's, which
     // reads its small matrices again for every piece of a prefill): Q8_0 mat-vec with non-temporal weight loads
     bool nt_weights = false;
@@ -1609,6 +1617,10 @@ struct ggml_backend_cuda_context {
     }
 
     ggml_cuda_stream_context concurrent_stream_context;
+
+    // the multi-task kernel's recorder while a graph is evaluated with GGML_CUDA_MK=1 (mk.cuh), else nullptr
+    ggml_cuda_mk * mk = nullptr;
+    ggml_cuda_mk * mk_owned = nullptr;
 
     ~ggml_backend_cuda_context();
 

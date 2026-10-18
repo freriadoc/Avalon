@@ -911,6 +911,14 @@ llama_model_qwen4exp::graph::qsa_sel llama_model_qwen4exp::graph::build_qsa_sel(
     // cache rows store raw key | pooled key: pooling precedes norm and rotation, so the raw key gets neither
     ggml_tensor * k_raw = build_lora_mm(model.layers[il].index_k_proj, cur);
     cb(k_raw, "indexer_k_raw", il);
+    // the query's projection next to the key's when the selection needs it (below): a backend can run the two products of
+    // the same input in one launch
+    ggml_tensor * q_proj = nullptr;
+    if (!(std::min<int64_t>(n_pool, hparams.indexer_top_k / kpool) == n_pool && !inp_kpool->fixed)) {
+        q_proj = build_lora_mm(model.layers[il].index_q_proj, cur);
+        ggml_build_forward_expand(gf, k_raw);
+        ggml_build_forward_expand(gf, q_proj);
+    }
 
     ggml_tensor * pzero  = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, idx_dim, n_tokens), 0.0f);
     ggml_tensor * packed = ggml_reshape_3d(ctx0, ggml_concat(ctx0, k_raw, pzero, 0), 2*idx_dim, 1, n_tokens);
@@ -968,7 +976,7 @@ llama_model_qwen4exp::graph::qsa_sel llama_model_qwen4exp::graph::build_qsa_sel(
         return res_all;
     }
 
-    ggml_tensor * q = build_lora_mm(model.layers[il].index_q_proj, cur);
+    ggml_tensor * q = q_proj ? q_proj : build_lora_mm(model.layers[il].index_q_proj, cur);
     q = ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h, n_tokens);
     q = build_norm(q, model.layers[il].index_q_norm, nullptr, LLM_NORM_RMS, il);
     q = ggml_rope_multi(ctx0, q, inp_pos, nullptr,
@@ -1050,7 +1058,12 @@ llama_model_qwen4exp::graph::qsa_sel llama_model_qwen4exp::graph::build_qsa_sel(
         res_g.rows     = ggml_qsa_select(ctx0, ss.sel_idx, ss.top_score, vis.first, vis.second, (int32_t) kpool, GGML_QSA_SELECT_ROWS);
         res_g.mask_sel = ggml_qsa_select(ctx0, ss.sel_idx, ss.top_score, vis.first, vis.second, (int32_t) kpool, GGML_QSA_SELECT_MASK);
         res_g.all_cells = inp_kpool->fixed;
+        cb(res_g.rows, "indexer_rows", il);
         cb(res_g.mask_sel, "indexer_sel", il);
+        // the mask right after the rows, before the gathers that read them: ggml-alloc then cannot place it over the
+        // rows, and ggml-cuda computes the selection's nodes in one kernel with the top-k (ggml_cuda_try_fuse_qsa_select_rows)
+        ggml_build_forward_expand(gf, res_g.rows);
+        ggml_build_forward_expand(gf, res_g.mask_sel);
         return res_g;
     }
 

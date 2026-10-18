@@ -1,5 +1,6 @@
 #include "set-rows.cuh"
 #include "cpy-utils.cuh"
+#include "mk.cuh"
 
 typedef void (*set_rows_kernel_t)(const char * src, char * dst);
 
@@ -415,6 +416,24 @@ void ggml_cuda_op_set_rows_padded(ggml_backend_cuda_context & ctx, ggml_tensor *
     // row r of src0 (its dims 1 .. 3 flattened) is row r of values, then zeros
     const int64_t nv = values->ne[0];
     const size_t vb1 = nv * sizeof(float), vb2 = vb1 * ne01, vb3 = vb2 * ne02;
+    // the multi-task kernel takes it (mk.cuh: the indexer key's chain)
+    const int64_t ne_total = (ne00 * ne01 * ne02 * ne03) / QK8_0;
+    if (ctx.mk && ne_total > 0 && ne00 > 0 && ne01 > 0 && ne02 > 0 && ne11 > 0 && ne12 > 0 && ne00 % QK8_0 == 0) {
+        set_rows_q8_args a;
+        a.src0 = (const float *) values->data; a.idx = src1->data; a.dst = (block_q8_0 *) dst->data;
+        a.ne_total = ne_total;
+        a.s01 = vb1/sizeof(float); a.s02 = vb2/sizeof(float); a.s03 = vb3/sizeof(float);
+        const size_t isz = src1->type == GGML_TYPE_I64 ? sizeof(int64_t) : sizeof(int32_t);
+        a.s10 = nb10/isz; a.s11 = nb11/isz; a.s12 = nb12/isz;
+        a.s1 = nb1; a.s2 = nb2; a.s3 = nb3;
+        a.ne00 = init_fastdiv_values((uint32_t) ne00); a.ne01 = init_fastdiv_values((uint32_t) ne01);
+        a.ne02 = init_fastdiv_values((uint32_t) ne02); a.ne11_fd = init_fastdiv_values((uint32_t) ne11);
+        a.ne12_fd = init_fastdiv_values((uint32_t) ne12);
+        a.ne_valid = nv; a.idx64 = src1->type == GGML_TYPE_I64;
+        if (ggml_cuda_mk_add_set_rows_q8(ctx.mk, a)) {
+            return;
+        }
+    }
     if (src1->type == GGML_TYPE_I64) {
         set_rows_cuda_quant<int64_t, block_q8_0, QK8_0, quantize_f32_q8_0_block>(
             (const float *) values->data, (const int64_t *) src1->data, (block_q8_0 *) dst->data,

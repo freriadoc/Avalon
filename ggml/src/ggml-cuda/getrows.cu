@@ -1,6 +1,7 @@
 #include "getrows.cuh"
 #include "dequantize.cuh"
 #include "convert.cuh"
+#include "mk.cuh"
 
 template<int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void k_get_rows(
@@ -84,6 +85,15 @@ bool ggml_cuda_get_rows_mean(ggml_backend_cuda_context & ctx, const ggml_tensor 
     const int64_t ne00  = src0->ne[0];
     const int64_t n_out = get_rows->ne[1] / n_group;
     cudaStream_t stream = ctx.stream();
+    // the multi-task kernel takes it (mk.cuh: the indexer key's chain)
+    if (ctx.mk && (src0->type == GGML_TYPE_Q8_0 || src0->type == GGML_TYPE_Q4_0) && n_out > 0) {
+        get_rows_mean_args a;
+        a.src0 = src0->data; a.ids = ids; a.dst = dst; a.ne00 = ne00; a.nb01 = src0->nb[1];
+        a.n_group = n_group; a.scale = scale; a.bias = bias; a.n_out = n_out; a.type = src0->type;
+        if (ggml_cuda_mk_add_get_rows_mean(ctx.mk, a)) {
+            return true;
+        }
+    }
     switch (src0->type) {
         case GGML_TYPE_Q4_0:
             get_rows_mean_cuda<QK4_0, QR4_0, dequantize_q4_0>(src0->data, ids, dst, ne00, src0->nb[1], n_out, n_group, scale, bias, stream);

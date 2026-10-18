@@ -162,12 +162,31 @@ static __device__ __forceinline__ float4 qwen4_hc_block_value(const qwen4_hc_red
     return sum;
 }
 
-static __global__ void qwen4_hc_combine_norm_f32(
-        const float * residual, const float * block, const qwen4_hc_reduction red, const float * inject, const float * gamma,
-        float * res_out, float * xn, half * xh,
-        int n_embd, int hc, float s1, float b1, float s2, float b2, float eps) {
-    const int c = blockIdx.x;
-    const int t = blockIdx.y;
+struct qwen4_hc_k1_args {
+    const float * residual;
+    const float * block;
+    qwen4_hc_reduction red;
+    const float * inject;
+    const float * gamma;
+    float * res_out;
+    float * xn;
+    half * xh;
+    int n_embd, hc;
+    float s1, b1, s2, b2, eps;
+};
+
+// the workgroup of stream c, token t (QWEN4_HC_K1_THREADS threads)
+static __device__ __forceinline__ void qwen4_hc_combine_norm_body(const qwen4_hc_k1_args & a, const int c, const int t) {
+    const float * residual = a.residual;
+    const float * block = a.block;
+    const qwen4_hc_reduction & red = a.red;
+    const float * inject = a.inject;
+    const float * gamma = a.gamma;
+    float * res_out = a.res_out;
+    float * xn = a.xn;
+    half * xh = a.xh;
+    const int n_embd = a.n_embd, hc = a.hc;
+    const float s1 = a.s1, b1 = a.b1, s2 = a.s2, b2 = a.b2, eps = a.eps;
 
     const float v = inject[c + t*hc] * s1 + b1;
     const float w = (1.0f / (1.0f + expf(-v))) * s2 + b2;
@@ -208,6 +227,10 @@ static __global__ void qwen4_hc_combine_norm_f32(
             h[1] = __floats2half2_rn(xv.z, xv.w);
         }
     }
+}
+
+static __global__ void qwen4_hc_combine_norm_f32(const qwen4_hc_k1_args a) {
+    qwen4_hc_combine_norm_body(a, blockIdx.x, blockIdx.y);
 }
 
 static bool qwen4_hc_match_k1(const ggml_cgraph * cgraph, int i) {
@@ -277,21 +300,27 @@ static __device__ __forceinline__ float qwen4_hc_dot2(const half2 a, const half2
 
 static constexpr int QWEN4_HC_K2_WARPS = 4; // warps sharing one output row
 
-// one workgroup per output row: rows [0, n_a) from W_a, [n_a, n_a + n_b) from W_b (then scale + silu);
-// a thread takes whole Q8_0 blocks, neighbouring threads neighbouring blocks. With n_b = 0 it is a plain
-// product (ggml_cuda_mul_mat_q8_0_f16, the unfused path), with the same numbers.
+struct qwen4_hc_k2_args {
+    const block_q8_0 * wa;
+    const block_q8_0 * wb;
+    const half * xh;
+    float * out_a;
+    float * out_b;
+    int n_in, n_a, n_b;
+    float s, b;
+};
+
+// the workgroup of an output row (QWEN4_HC_K2_WARPS warps, tid its thread), partial its shared memory
 template <int T>
-static __global__ void qwen4_hc_down_inject_f16(
-        const block_q8_0 * wa, const block_q8_0 * wb, const half * xh,
-        float * out_a, float * out_b, int n_in, int n_a, int n_b, float s, float b) {
-    const int nb   = n_in / QK8_0;
-    const int row  = blockIdx.x;
-    const int lane = threadIdx.x % WARP_SIZE;
-    const int warp = threadIdx.x / WARP_SIZE;
-    const block_q8_0 * w = row < n_a ? wa + (size_t) row * nb : wb + (size_t) (row - n_a) * nb;
+static __device__ __forceinline__ void qwen4_hc_down_inject_body(const qwen4_hc_k2_args & a, const int row, const int tid,
+        float (*partial)[T]) {
+    const int nb   = a.n_in / QK8_0;
+    const int lane = tid % WARP_SIZE;
+    const int warp = tid / WARP_SIZE;
+    const block_q8_0 * w = row < a.n_a ? a.wa + (size_t) row * nb : a.wb + (size_t) (row - a.n_a) * nb;
 
     float acc[T] = { 0.0f };
-    for (int ib = threadIdx.x; ib < nb; ib += blockDim.x) {
+    for (int ib = tid; ib < nb; ib += QWEN4_HC_K2_WARPS*WARP_SIZE) {
         const float dw = __half2float(w[ib].d);
         half2 wh[QK8_0/2];
 #pragma unroll
@@ -302,7 +331,7 @@ static __global__ void qwen4_hc_down_inject_f16(
         }
 #pragma unroll
         for (int t = 0; t < T; ++t) {
-            const int4 * xb = (const int4 *) (xh + (size_t) t*n_in + ib*QK8_0);
+            const int4 * xb = (const int4 *) (a.xh + (size_t) t*a.n_in + ib*QK8_0);
             float sum = 0.0f;
 #pragma unroll
             for (int q = 0; q < QK8_0/8; ++q) {
@@ -319,7 +348,6 @@ static __global__ void qwen4_hc_down_inject_f16(
         }
     }
 
-    __shared__ float partial[QWEN4_HC_K2_WARPS][T];
 #pragma unroll
     for (int t = 0; t < T; ++t) {
         const float v = warp_reduce_sum(acc[t]);
@@ -328,20 +356,31 @@ static __global__ void qwen4_hc_down_inject_f16(
         }
     }
     __syncthreads();
-    if (threadIdx.x < T) {
-        const int t = threadIdx.x;
+    if (tid < T) {
+        const int t = tid;
         float v = 0.0f;
 #pragma unroll
         for (int k = 0; k < QWEN4_HC_K2_WARPS; ++k) {
             v += partial[k][t];
         }
-        if (row < n_a) {
-            out_a[(size_t) t*n_a + row] = v;
+        if (row < a.n_a) {
+            a.out_a[(size_t) t*a.n_a + row] = v;
         } else {
-            const float y = v * s + b;
-            out_b[(size_t) t*n_b + row - n_a] = y / (1.0f + expf(-y));
+            const float y = v * a.s + a.b;
+            a.out_b[(size_t) t*a.n_b + row - a.n_a] = y / (1.0f + expf(-y));
         }
     }
+}
+
+// one workgroup per output row: rows [0, n_a) from W_a, [n_a, n_a + n_b) from W_b (then scale + silu);
+// a thread takes whole Q8_0 blocks, neighbouring threads neighbouring blocks. With n_b = 0 it is a plain
+// product (ggml_cuda_mul_mat_q8_0_f16, the unfused path), with the same numbers.
+template <int T>
+static __global__ void qwen4_hc_down_inject_f16(
+        const block_q8_0 * wa, const block_q8_0 * wb, const half * xh,
+        float * out_a, float * out_b, int n_in, int n_a, int n_b, float s, float b) {
+    __shared__ float partial[QWEN4_HC_K2_WARPS][T];
+    qwen4_hc_down_inject_body<T>({ wa, wb, xh, out_a, out_b, n_in, n_a, n_b, s, b }, blockIdx.x, threadIdx.x, partial);
 }
 
 template <int T>
@@ -480,6 +519,63 @@ static __device__ __forceinline__ void qwen4_hc_load_shared(const float * x, int
     }
 }
 
+struct qwen4_hc_k3_args {
+    const block_q8_0 * w;
+    const float * lo;
+    const float * xn;
+    float * mixed;
+    int n_lo, n_embd, hc;
+    float scale;
+    block_q8_1 * mixed_q8_1;
+};
+
+// workgroup bx (blockDim.x threads), smem its shared memory
+template <int T, int NB = 0>
+static __device__ __forceinline__ void qwen4_hc_up_pre_body(const qwen4_hc_k3_args & a, const int bx, float * smem) {
+    const int n_lo = a.n_lo, n_embd = a.n_embd, hc = a.hc;
+    const int nb = n_lo / QK8_0;
+    qwen4_hc_load_shared<T*QWEN4_HC_K3_MAX_LO>(a.lo, T*n_lo, smem);
+    __syncthreads();
+
+    const int e = bx * (blockDim.x / WARP_SIZE) + threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    if (e < n_embd) {
+        const int c = lane >> 3;
+        const int k = lane & 7;
+
+        float acc[T];
+        qwen4_hc_row_q8_0_f32<T, NB>(a.w + ((size_t) (e + min(c, hc - 1)*n_embd)) * nb, nb, smem, k, acc);
+#pragma unroll
+        for (int t = 0; t < T; ++t) {
+            float m = (c < hc && k == 0) ? a.xn[((size_t) t*hc + c) * n_embd + e] / (1.0f + expf(-acc[t])) : 0.0f;
+            m += __shfl_xor_sync(0xffffffff, m, 8, WARP_SIZE);
+            m += __shfl_xor_sync(0xffffffff, m, 16, WARP_SIZE);
+            if (lane == 0) {
+                a.mixed[(size_t) t*n_embd + e] = a.scale * m;
+                if (a.mixed_q8_1) {
+                    smem[T*n_lo + t*QK8_1 + threadIdx.x / WARP_SIZE] = a.scale * m;
+                }
+            }
+        }
+    }
+    if (a.mixed_q8_1) {
+        // warp t quantizes the QK8_1 outputs of token t, lane = index in the block (quantize_q8_1's layout)
+        __syncthreads();
+        const int wt = threadIdx.x / WARP_SIZE;
+        if (wt < T) {
+            const float v    = smem[T*n_lo + wt*QK8_1 + lane];
+            const float amax = warp_reduce_max<QK8_1>(fabsf(v));
+            const float sum  = warp_reduce_sum<QK8_1>(v);
+            const float d    = amax / 127.0f;
+            block_q8_1 & y = a.mixed_q8_1[((size_t) wt*n_embd + bx * QK8_1) / QK8_1];
+            y.qs[lane] = amax == 0.0f ? 0 : roundf(v / d);
+            if (lane == 0) {
+                y.ds = make_half2(d, sum);
+            }
+        }
+    }
+}
+
 // mixed_q8_1 (null: none): the q8_1 of mixed as quantize_q8_1 writes it, for the product that reads it; then a
 // workgroup has QK8_1 warps (n_embd % QK8_1 == 0): its outputs are one q8_1 block per token
 template <int T, int NB = 0>
@@ -487,48 +583,7 @@ static __global__ void qwen4_hc_up_pre_q8_0(
         const block_q8_0 * w, const float * lo, const float * xn, float * mixed,
         int n_lo, int n_embd, int hc, float scale, block_q8_1 * mixed_q8_1) {
     extern __shared__ float qwen4_hc_k3_smem[];
-    const int nb = n_lo / QK8_0;
-    qwen4_hc_load_shared<T*QWEN4_HC_K3_MAX_LO>(lo, T*n_lo, qwen4_hc_k3_smem);
-    __syncthreads();
-
-    const int e = blockIdx.x * (blockDim.x / WARP_SIZE) + threadIdx.x / WARP_SIZE;
-    const int lane = threadIdx.x % WARP_SIZE;
-    if (e >= n_embd) {
-        return;
-    }
-    const int c = lane >> 3;
-    const int k = lane & 7;
-
-    float acc[T];
-    qwen4_hc_row_q8_0_f32<T, NB>(w + ((size_t) (e + min(c, hc - 1)*n_embd)) * nb, nb, qwen4_hc_k3_smem, k, acc);
-#pragma unroll
-    for (int t = 0; t < T; ++t) {
-        float m = (c < hc && k == 0) ? xn[((size_t) t*hc + c) * n_embd + e] / (1.0f + expf(-acc[t])) : 0.0f;
-        m += __shfl_xor_sync(0xffffffff, m, 8, WARP_SIZE);
-        m += __shfl_xor_sync(0xffffffff, m, 16, WARP_SIZE);
-        if (lane == 0) {
-            mixed[(size_t) t*n_embd + e] = scale * m;
-            if (mixed_q8_1) {
-                qwen4_hc_k3_smem[T*n_lo + t*QK8_1 + threadIdx.x / WARP_SIZE] = scale * m;
-            }
-        }
-    }
-    if (mixed_q8_1) {
-        // warp t quantizes the QK8_1 outputs of token t, lane = index in the block (quantize_q8_1's layout)
-        __syncthreads();
-        const int wt = threadIdx.x / WARP_SIZE;
-        if (wt < T) {
-            const float v    = qwen4_hc_k3_smem[T*n_lo + wt*QK8_1 + lane];
-            const float amax = warp_reduce_max<QK8_1>(fabsf(v));
-            const float sum  = warp_reduce_sum<QK8_1>(v);
-            const float d    = amax / 127.0f;
-            block_q8_1 & y = mixed_q8_1[((size_t) wt*n_embd + blockIdx.x * QK8_1) / QK8_1];
-            y.qs[lane] = amax == 0.0f ? 0 : roundf(v / d);
-            if (lane == 0) {
-                y.ds = make_half2(d, sum);
-            }
-        }
-    }
+    qwen4_hc_up_pre_body<T, NB>({ w, lo, xn, mixed, n_lo, n_embd, hc, scale, mixed_q8_1 }, blockIdx.x, qwen4_hc_k3_smem);
 }
 
 static constexpr int QWEN4_HC_MM_MAX_N = 1024;
@@ -642,6 +697,17 @@ static bool qwen4_hc_match_k3(const ggml_cgraph * cgraph, int i, qwen4_hc_span &
 
 // ---------------------------------------------------------------- entry
 
+void ggml_cuda_qwen4_hc_alloc_deps(const ggml_cgraph * cgraph, void (*add)(void *, ggml_tensor *, ggml_tensor *), void * user) {
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        qwen4_hc_span span;
+        if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT && qwen4_hc_match_k3(cgraph, i, span)) {
+            ggml_tensor * mm  = cgraph->nodes[span.idx[0]];
+            ggml_tensor * pre = cgraph->nodes[span.idx[1]];
+            add(user, mm->src[1], pre);   // lo alive until pre: the fused kernel reads it while writing pre
+        }
+    }
+}
+
 // views write nothing: only K2's two real outputs enter the overlap check
 static bool qwen4_hc_k2_ranges_ok(const ggml_cgraph * cgraph, int i, const qwen4_hc_span & span,
         bool (*check_ranges)(const ggml_cgraph *, int, int, const int *, int)) {
@@ -721,12 +787,13 @@ static int qwen4_hc_fuse_k1(ggml_backend_cuda_context & ctx, ggml_cgraph * cgrap
     if (with_k2) {
         xh.alloc((size_t) T * hc * n_embd);
     }
-    qwen4_hc_combine_norm_f32<<<dim3(hc, T), QWEN4_HC_K1_THREADS, 0, stream>>>(
+    const qwen4_hc_k1_args a1 = {
             (const float *) residual->data, red ? nullptr : (const float *) post->src[0]->data, red ? *red : qwen4_hc_reduction(),
             (const float *) sc1->src[0]->data, (const float *) mul->src[1]->data,
             (float *) post->data, (float *) mul->data, with_k2 ? xh.get() : nullptr, n_embd, hc,
             ggml_get_op_params_f32(sc1, 0), ggml_get_op_params_f32(sc1, 1),
-            ggml_get_op_params_f32(sc2, 0), ggml_get_op_params_f32(sc2, 1), eps);
+            ggml_get_op_params_f32(sc2, 0), ggml_get_op_params_f32(sc2, 1), eps };
+    qwen4_hc_combine_norm_f32<<<dim3(hc, T), QWEN4_HC_K1_THREADS, 0, stream>>>(a1);
     if (!with_k2) {
         return 5;
     }

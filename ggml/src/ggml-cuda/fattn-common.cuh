@@ -1,5 +1,6 @@
 #pragma once
 
+#include "fwht-gate-body.cuh"
 #include "common.cuh"
 #include "ggml-backend-impl.h"
 #include "convert.cuh"
@@ -978,6 +979,65 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
+// flash_attn_combine_results, then its row (D values) rotated back by groups of 64 and times the sigmoid of its gate
+// with the q8_1 of the product (fwht-gate-body.cuh: the arithmetic of fwht_gate_cuda), instead of written; for the
+// attention output that qwen4exp rotates back (ggml_cuda_try_fuse)
+template<int D>
+__launch_bounds__(D, 1)
+static __global__ void flash_attn_combine_results_gate(
+        const float  * VKQ_parts_ptr,
+        const float2 * VKQ_meta_ptr,
+        const int parallel_blocks,
+        const fwht_gate_args g) {
+    static_assert(D % 64 == 0 && D / 64 <= D / WARP_SIZE, "a warp per group of 64");
+    const float  * GGML_CUDA_RESTRICT VKQ_parts = VKQ_parts_ptr;
+    const float2 * GGML_CUDA_RESTRICT VKQ_meta  = VKQ_meta_ptr;
+
+    const int ne01 = gridDim.x;
+    const int ne02 = gridDim.y;
+
+    const int col      = blockIdx.x;
+    const int head     = blockIdx.y;
+    const int sequence = blockIdx.z;
+
+    const int j_dst_unrolled = (sequence*ne01 + col)*ne02 + head;
+
+    VKQ_parts += j_dst_unrolled * parallel_blocks*D;
+    VKQ_meta  += j_dst_unrolled * parallel_blocks;
+
+    const int tid = threadIdx.x;
+    __builtin_assume(tid < D);
+
+    extern __shared__ float2 meta[];
+    __shared__ float row[D];
+    for (int i = tid; i < 2*parallel_blocks; i += D) {
+        ((float *) meta)[i] = ((const float *)VKQ_meta) [i];
+    }
+
+    __syncthreads();
+
+    float kqmax = meta[0].x;
+    for (int l = 1; l < parallel_blocks; ++l) {
+        kqmax = max(kqmax, meta[l].x);
+    }
+
+    float VKQ_numerator   = 0.0f;
+    float VKQ_denominator = 0.0f;
+    for (int l = 0; l < parallel_blocks; ++l) {
+        const float KQ_max_scale = expf(meta[l].x - kqmax);
+
+        VKQ_numerator   += KQ_max_scale * VKQ_parts[l*D + tid];
+        VKQ_denominator += KQ_max_scale * meta[l].y;
+    }
+
+    row[tid] = VKQ_numerator / VKQ_denominator;
+    __syncthreads();
+    const int warp = tid / WARP_SIZE;
+    if (warp < D / 64) {
+        fwht_gate_row<64>(row + warp*64, (int64_t) j_dst_unrolled*(D / 64) + warp, tid % WARP_SIZE, g);
+    }
+}
+
 // the temporary memory of launch_fattn: the mask's KV bounds or sparse lists, the partial results of
 // the parallel blocks and their meta data (or the stream-k fixup's), each 256-byte aligned
 struct fattn_scratch_layout {
@@ -1061,7 +1121,15 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    const bool scan_mask = !use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1);
+    // Not for the mask of a QSA gather (QSA_SELECT MASK, a sequence per query): only its last batch can be fully masked
+    //     (the padding after the incomplete block's cells, when that block is empty: about one pass in four, one batch
+    //     of nine at 2304 slots); the scan's launch costs more than that batch on average. A masked batch adds zeros.
+    const ggml_tensor * mask_root = mask;
+    while (mask_root && mask_root->view_src) {
+        mask_root = mask_root->view_src;
+    }
+    const bool scan_mask = !use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1) &&
+        mask_root->op != GGML_OP_QSA_SELECT;
     const dim3 blocks_num_KV_max(ntiles_x, Q->ne[3], 1);
     if (scan_mask) {
         KV_max_n = blocks_num_KV_max.x*blocks_num_KV_max.y;
@@ -1169,6 +1237,15 @@ void launch_fattn(
     const ggml_tensor * scratch_t = dst->src[GGML_SCHED_SCRATCH_SRC];
     char * scratch = scratch_l.size > 0 && scratch_t && scratch_t->data && ggml_nbytes(scratch_t) >= scratch_l.size ?
         (char *) scratch_t->data : nullptr;
+    // a combination that writes the gated product (ctx.fattn_gate) while other blocks still read their partial
+    // results: those from the pool if ggml-alloc placed the product over them (the scratch is free after this node)
+    if (scratch && ctx.fattn_gate) {
+        const char * gl = (const char *) ctx.fattn_gate->dst, * gh = gl + ctx.fattn_gate->n_dst*sizeof(float);
+        const char * sl = scratch + scratch_l.dst_tmp, * sh = scratch + scratch_l.size;
+        if (gl < sh && sl < gh) {
+            scratch = nullptr;
+        }
+    }
 
     ggml_cuda_pool_alloc<int>    KV_max(pool);
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
@@ -1352,6 +1429,15 @@ void launch_fattn(
         const size_t nbytes_shared_combine = parallel_blocks*sizeof(float2);
 
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream);
+        if constexpr (DV % 64 == 0) {
+            if (ctx.fattn_gate) {
+                flash_attn_combine_results_gate<DV><<<blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream>>>(
+                    dst_tmp_ptr, dst_tmp_meta_ptr, parallel_blocks, *ctx.fattn_gate);
+                ctx.fattn_gate_done = true;
+                CUDA_CHECK(cudaGetLastError());
+                return;
+            }
+        }
         ggml_cuda_kernel_launch(flash_attn_combine_results<DV>, launch_params,
             dst_tmp_ptr, dst_tmp_meta_ptr, (float *) KQV->data, parallel_blocks);
     }
