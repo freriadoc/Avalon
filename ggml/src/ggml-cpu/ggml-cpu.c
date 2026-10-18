@@ -4527,6 +4527,46 @@ int ggml_cpu_has_sme2(void) {
 // (ggml_vec_dot_*_multi). The activations are quantized as the GPU's q8_1 (quantize_row_q8_0_gpu: blocks of 32),
 // not q8_K: the CPU and the GPU start from the same bytes (their results differ by 4e-4 instead of 1.5e-2) and the
 // CPU rounds closer to the exact product (-18 % error). False for other types or shapes (the graph computes them).
+// the slices of a phase of ggml_cpu_moe_experts_multi, for pairs (expert, matrix) of n_ch slices each, cut in two
+// halves: half g for the threads of L3 group g (the CPU's L3 ids), dealt dynamically within the group from a counter
+// of its own (its cache line stays in that L3), a group done taking what is left of the other half
+// (GGML_CPU_MOE_SCHED=dynamic: omp's dynamic schedule, one counter for the whole team)
+static int ggml_cpu_moe_l3_group(void) {
+    static int8_t group[256];
+    static bool init = false;
+    if (!init) {
+        for (int c = 0; c < 256; c++) {
+            char path[96];
+            snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cache/index3/id", c);
+            FILE * f = fopen(path, "r");
+            int id = 0;
+            if (f) {
+                if (fscanf(f, "%d", &id) != 1) {
+                    id = 0;
+                }
+                fclose(f);
+            }
+            group[c] = (int8_t) (id > 0 ? 1 : 0);
+        }
+        init = true;
+    }
+    const int cpu = sched_getcpu();
+    return cpu >= 0 && cpu < 256 ? group[cpu] : 0;
+}
+
+static inline int ggml_cpu_moe_l3_next(int * const * cnt, int g, int n_pairs, int n_ch) {
+    const int c0 = (n_ch + 1) / 2;
+    for (int k = 0; k < 2; k++) {
+        const int h = k == 0 ? g : 1 - g;
+        const int len = h == 0 ? c0 : n_ch - c0;
+        const int i = __atomic_fetch_add(cnt[h], 1, __ATOMIC_RELAXED);
+        if (i < n_pairs * len) {
+            return (i / len) * n_ch + (h == 0 ? 0 : c0) + i % len;
+        }
+    }
+    return -1;
+}
+
 static bool ggml_cpu_moe_experts_multi(const struct ggml_tensor * gate_w, const struct ggml_tensor * up_w,
                                        const struct ggml_tensor * down_w, const float * act, const void * act_q8,
                                        const int32_t * experts, int n, float * out, int n_threads) {
@@ -4592,6 +4632,13 @@ static bool ggml_cpu_moe_experts_multi(const struct ggml_tensor * gate_w, const 
     const int nb_a = (int) (n_embd / QK8_0), nb_0 = (int) (n_ff / QK8_0);
     const int rb1 = 16, n_ch1 = (int) ((n_ff + rb1 - 1) / rb1);
     const int rb3 = 32, n_ch3 = (int) ((n_embd + rb3 - 1) / rb3);
+    static int l3_split = -1;
+    if (l3_split < 0) {
+        l3_split = !(getenv("GGML_CPU_MOE_SCHED") && strcmp(getenv("GGML_CPU_MOE_SCHED"), "dynamic") == 0);
+    }
+    // a cache line per counter
+    _Alignas(64) int cnt_lines[4][16] = {{0}};
+    int * cnt_gu[2] = { cnt_lines[0], cnt_lines[1] }, * cnt_d[2] = { cnt_lines[2], cnt_lines[3] };
     #pragma omp parallel num_threads(n_threads)
     {
         float   hrow[QK8_0];
@@ -4608,27 +4655,41 @@ static bool ggml_cpu_moe_experts_multi(const struct ggml_tensor * gate_w, const 
                 quantize_row_q8_0_gpu(act + (size_t) j * n_embd + (size_t) b * QK8_0, a8 + (size_t) j * a_row + (size_t) b * sizeof(block_q8_0), QK8_0);
             }
         }
+        const int l3_g = l3_split ? ggml_cpu_moe_l3_group() : 0;
         // gate and up
-        #pragma omp for schedule(dynamic, 1)
-        for (int it = 0; it < n_uniq * 2 * n_ch1; it++) {
-            const int ue = it / (2 * n_ch1), t = (it / n_ch1) % 2, ch = it % n_ch1;
-            const struct ggml_tensor * W = t ? up_w : gate_w;
-            float * dst = t ? u : g;
-            const int32_t e = uniq[ue];
-            const int r0 = first[ue];
-            for (int64_t row = (int64_t) ch * rb1; row < (int64_t) (ch + 1) * rb1 && row < n_ff; row++) {
-                const char * wr = (const char *) W->data + (size_t) e * W->nb[2] + (size_t) row * W->nb[1];
-                for (int r = r0; r >= 0; ) {
-                    int nc = 0;
-                    for (; r >= 0 && nc < 8; r = next[r], nc++) {
-                        rs[nc] = r;
-                        ys[nc] = a8 + (size_t) r * a_row;
-                    }
-                    multi_k((int) n_embd, res, wr, ys, nc);
-                    for (int c = 0; c < nc; c++) dst[(size_t) rs[c] * n_ff + row] = res[c];
-                }
-            }
+        #define MOE_GU_BODY(it) { \
+            const int ue = it / (2 * n_ch1), t = (it / n_ch1) % 2, ch = it % n_ch1; \
+            const struct ggml_tensor * W = t ? up_w : gate_w; \
+            float * dst = t ? u : g; \
+            const int32_t e = uniq[ue]; \
+            const int r0 = first[ue]; \
+            for (int64_t row = (int64_t) ch * rb1; row < (int64_t) (ch + 1) * rb1 && row < n_ff; row++) { \
+                const char * wr = (const char *) W->data + (size_t) e * W->nb[2] + (size_t) row * W->nb[1]; \
+                for (int r = r0; r >= 0; ) { \
+                    int nc = 0; \
+                    for (; r >= 0 && nc < 8; r = next[r], nc++) { \
+                        rs[nc] = r; \
+                        ys[nc] = a8 + (size_t) r * a_row; \
+                    } \
+                    multi_k((int) n_embd, res, wr, ys, nc); \
+                    for (int c = 0; c < nc; c++) dst[(size_t) rs[c] * n_ff + row] = res[c]; \
+                } \
+            } \
         }
+        if (l3_split) {
+            for (;;) {
+                const int it = ggml_cpu_moe_l3_next(cnt_gu, l3_g, n_uniq * 2, n_ch1);
+                if (it < 0) {
+                    break;
+                }
+                MOE_GU_BODY(it)
+            }
+            #pragma omp barrier
+        } else {
+            #pragma omp for schedule(dynamic, 1)
+            for (int it = 0; it < n_uniq * 2 * n_ch1; it++) MOE_GU_BODY(it)
+        }
+        #undef MOE_GU_BODY
         // swiglu, then the activations of down, a q8_0 block per item (every thread works, not one per row)
         #pragma omp for
         for (int it = 0; it < n * nb_0; it++) {
@@ -4641,28 +4702,40 @@ static bool ggml_cpu_moe_experts_multi(const struct ggml_tensor * gate_w, const 
             quantize_row_q8_0_gpu(hrow, h8 + (size_t) j * h_row + (size_t) b * sizeof(block_q8_0), QK8_0);
         }
         // down
-        #pragma omp for schedule(dynamic, 1)
-        for (int it = 0; it < n_uniq * n_ch3; it++) {
-            const int ue = it / n_ch3, ch = it % n_ch3;
-            const int32_t e = uniq[ue];
-            const int r0 = first[ue];
-            for (int64_t row = (int64_t) ch * rb3; row < (int64_t) (ch + 1) * rb3 && row < n_embd; row++) {
-                const char * wr = (const char *) down_w->data + (size_t) e * down_w->nb[2] + (size_t) row * down_w->nb[1];
-                if (next[r0] < 0 && td == GGML_TYPE_IQ4_NL) {
-                    dot_nl((int) n_ff, out + (size_t) r0 * n_embd + row, 0, wr, 0, h8 + (size_t) r0 * h_row, 0, 1);
-                } else {
-                    for (int r = r0; r >= 0; ) {
-                        int nc = 0;
-                        for (; r >= 0 && nc < 8; r = next[r], nc++) {
-                            rs[nc] = r;
-                            ys[nc] = h8 + (size_t) r * h_row;
-                        }
-                        multi_d((int) n_ff, res, wr, ys, nc);
-                        for (int c = 0; c < nc; c++) out[(size_t) rs[c] * n_embd + row] = res[c];
-                    }
-                }
-            }
+        #define MOE_D_BODY(it) { \
+            const int ue = it / n_ch3, ch = it % n_ch3; \
+            const int32_t e = uniq[ue]; \
+            const int r0 = first[ue]; \
+            for (int64_t row = (int64_t) ch * rb3; row < (int64_t) (ch + 1) * rb3 && row < n_embd; row++) { \
+                const char * wr = (const char *) down_w->data + (size_t) e * down_w->nb[2] + (size_t) row * down_w->nb[1]; \
+                if (next[r0] < 0 && td == GGML_TYPE_IQ4_NL) { \
+                    dot_nl((int) n_ff, out + (size_t) r0 * n_embd + row, 0, wr, 0, h8 + (size_t) r0 * h_row, 0, 1); \
+                } else { \
+                    for (int r = r0; r >= 0; ) { \
+                        int nc = 0; \
+                        for (; r >= 0 && nc < 8; r = next[r], nc++) { \
+                            rs[nc] = r; \
+                            ys[nc] = h8 + (size_t) r * h_row; \
+                        } \
+                        multi_d((int) n_ff, res, wr, ys, nc); \
+                        for (int c = 0; c < nc; c++) out[(size_t) rs[c] * n_embd + row] = res[c]; \
+                    } \
+                } \
+            } \
         }
+        if (l3_split) {
+            for (;;) {
+                const int it = ggml_cpu_moe_l3_next(cnt_d, l3_g, n_uniq, n_ch3);
+                if (it < 0) {
+                    break;
+                }
+                MOE_D_BODY(it)
+            }
+        } else {
+            #pragma omp for schedule(dynamic, 1)
+            for (int it = 0; it < n_uniq * n_ch3; it++) MOE_D_BODY(it)
+        }
+        #undef MOE_D_BODY
     }
     return true;
 #else
