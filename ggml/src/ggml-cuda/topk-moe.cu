@@ -254,6 +254,7 @@ void ggml_cuda_topk_moe_pending_flush(ggml_backend_cuda_context & ctx) {
     if (!p.logits) {
         return;
     }
+    ggml_cuda_router_flush(ctx);   // the logits first
     topk_moe_config config;
     config.use_sigmoid       = false;
     config.use_sqrt_softplus = false;

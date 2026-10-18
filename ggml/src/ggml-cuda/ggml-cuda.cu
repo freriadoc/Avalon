@@ -4539,6 +4539,77 @@ static int ggml_cuda_set_rows_padded_match(const ggml_cgraph * cgraph, int i) {
     return -1;
 }
 
+static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst);
+
+// a MoE router left to the hosted MoE block's entry kernel (k_moe_hosted_enter computes it with mul_mat_vec_f's
+// arithmetic, its top-k waiting for it): BF16 weights of TOPK_MOE_HOSTED_N_EXPERT rows in device memory, a few
+// contiguous F32 columns, the layout mul_mat_vec_f reads 4 values at a time with 256 threads, the next node reading the
+// logits and a hosted block after it. GGML_CUDA_MOE_ROUTER=0: launched by its node
+static bool ggml_cuda_router_defer_ok(const ggml_cgraph * cgraph, int i) {
+    static const bool on = !getenv("GGML_CUDA_MOE_ROUTER") || atoi(getenv("GGML_CUDA_MOE_ROUTER")) != 0;
+    const ggml_tensor * node = cgraph->nodes[i];
+    if (!on || node->op != GGML_OP_MUL_MAT || i + 1 >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * w = node->src[0];
+    const ggml_tensor * y = node->src[1];
+    const int64_t k = w->ne[0];
+    if (w->type != GGML_TYPE_BF16 || w->ne[1] != TOPK_MOE_HOSTED_N_EXPERT || w->ne[2] != 1 || w->ne[3] != 1 ||
+            !ggml_is_contiguous(w) || !w->buffer || !ggml_backend_buft_is_cuda(w->buffer->buft) ||
+            y->type != GGML_TYPE_F32 || y->ne[0] != k || y->ne[1] < 1 || y->ne[1] > 8 || y->ne[2] != 1 || y->ne[3] != 1 ||
+            y->nb[0] != sizeof(float) || node->type != GGML_TYPE_F32 || !ggml_is_contiguous(node) ||
+            k % 4 != 0 || (y->nb[1] / sizeof(float)) % 4 != 0 || (uintptr_t) w->data % 8 != 0 || (uintptr_t) y->data % 16 != 0) {
+        return false;
+    }
+    // mul_mat_vec_f's block size for this width: 256 only
+    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+    int64_t bs_best = warp_size, niter_best = (k + 2*warp_size - 1) / (2*warp_size);
+    for (int64_t bs = 2*warp_size; bs <= 256; bs += warp_size) {
+        const int64_t niter = (k + 2*bs - 1) / (2*bs);
+        if (niter < niter_best) {
+            niter_best = niter;
+            bs_best = bs;
+        }
+    }
+    if (bs_best != 256) {
+        return false;
+    }
+    const ggml_tensor * next = cgraph->nodes[i + 1];
+    if (next->op != GGML_OP_SOFT_MAX || next->src[0] != node) {
+        return false;
+    }
+    for (int j = i + 2; j < std::min(i + 24, cgraph->n_nodes); j++) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n->op == GGML_OP_MUL_MAT_ID) {
+            return n->src[0]->buffer && !ggml_backend_buft_is_cuda(n->src[0]->buffer->buft);
+        }
+    }
+    return false;
+}
+
+void ggml_cuda_router_flush(ggml_backend_cuda_context & ctx) {
+    ggml_tensor * node = (ggml_tensor *) ctx.router_pending;
+    if (!node) {
+        return;
+    }
+    ctx.router_pending = nullptr;
+    ctx.router_next = -1;
+    GGML_ASSERT(ggml_cuda_compute_forward(ctx, node));
+}
+
+static bool ggml_cuda_router_read(const ggml_backend_cuda_context & ctx, const ggml_tensor * node) {
+    if (!ctx.router_pending) {
+        return false;
+    }
+    for (int j = 0; j < GGML_MAX_SRC; j++) {
+        const ggml_tensor * src = node->src[j];
+        if (src && (src == ctx.router_pending || src->view_src == ctx.router_pending)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -4955,6 +5026,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                         }
                     }
                     if (!(hosted_reader && ggml_cuda_topk_moe_defer(*cuda_ctx, logits, weights, ids, clamp, scale, args))) {
+                        ggml_cuda_router_flush(*cuda_ctx);
                         ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
                     }
                     return ops.size() - 1;
@@ -6270,6 +6342,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                // the deferred router, before anything but the top-k after it reads its logits
+                if (cuda_ctx->router_pending && i != cuda_ctx->router_next && ggml_cuda_router_read(*cuda_ctx, node)) {
+                    ggml_cuda_router_flush(*cuda_ctx);
+                }
+                // a MoE router whose top-k the hosted block's entry kernel computes: computed by that kernel too
+                if (!cuda_ctx->router_pending && ggml_cuda_router_defer_ok(cgraph, i)) {
+                    if (cuda_ctx->mk) {
+                        ggml_cuda_mk_flush(cuda_ctx->mk, cuda_ctx->stream());
+                    }
+                    cuda_ctx->router_pending = node;
+                    cuda_ctx->router_next = i + 1;
+                    written(i, i);
+                    continue;
+                }
+
                 // a deferred top-k, before anything but its hosted block reads its ids or weights
                 if (cuda_ctx->topk_pending.logits) {
                     const auto & tp = cuda_ctx->topk_pending;
@@ -6323,6 +6410,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+                if (i == cuda_ctx->router_next && cuda_ctx->router_pending) {
+                    // only the deferred top-k leaves the router pending past the node that reads its logits
+                    GGML_ASSERT(nodes_to_skip == 0 || cuda_ctx->topk_pending.logits == cuda_ctx->router_pending->data);
+                    if (nodes_to_skip == 0) {
+                        ggml_cuda_router_flush(*cuda_ctx);
+                    }
+                }
 
                 if (nodes_to_skip != 0) {
                     written(i, i + nodes_to_skip);
@@ -6369,6 +6463,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
             ggml_cuda_moe_hosted_flush(*cuda_ctx, nullptr);
             ggml_cuda_topk_moe_pending_flush(*cuda_ctx);
+            ggml_cuda_router_flush(*cuda_ctx);
             if (depchain) {
                 ggml_cuda_depchain_report(cgraph, units);
             }

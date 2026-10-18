@@ -35,6 +35,7 @@ bool ggml_cuda_moe_hosted_wait(void * stream, void * event) {
 #include "topk-moe.cuh"
 #include "mmvq.cuh"
 #include "quantize.cuh"
+#include "convert.cuh"
 #include "fattn.cuh"
 #include "ggml-backend-impl.h"
 #include "ggml-cuda.h"
@@ -5135,7 +5136,8 @@ struct moe_hosted_state {
     std::unordered_map<uint32_t, int> pg_demand;             // PREGATE: predictions per (layer, expert)
     char * d_q8_act = nullptr;
     char * d_q8_mid = nullptr;
-    unsigned * d_q8_count = nullptr;   // the up / gate kernel's warps done per q8_1 block of d_q8_mid (zero between launches)
+    unsigned * d_q8_count = nullptr;
+    unsigned * d_router_done = nullptr;   // the router's rows done (k_moe_hosted_enter), zero between layers   // the up / gate kernel's warps done per q8_1 block of d_q8_mid (zero between launches)
     size_t q8_act_bytes = 0;
     size_t q8_mid_bytes = 0;
     int n_threads = 1;
@@ -5162,6 +5164,8 @@ static std::mutex g_hosted_mu;
 static std::unordered_map<moe_cache_session *, std::unique_ptr<moe_hosted_state>> g_hosted;
 
 // a hosted block queued but whose CPU rows are not copied in yet (graph evaluation thread)
+#define MOE_HOSTED_ENTER_BLOCKS 8
+
 // the shared expert's gate (a row of F32 weights times the block's activations), computed by one more workgroup of the
 // merge with the arithmetic of mul_mat_vec_f<float, float, ncols, 256> (the node is then skipped)
 #define MOE_SGATE_MAX_COLS 8
@@ -5336,14 +5340,90 @@ static __global__ void k_pregate_topk(const float * logits, int n_expert, int n_
     }
 }
 
+// the MoE router computed by the hosted block's entry kernel (ggml_cuda_router_defer_ok): BF16 weights, ncols token
+// columns, a workgroup of 256 threads per row with mul_mat_vec_f's arithmetic (4 values per load), the top-k waiting
+// on done for all nrows rows
+#define MOE_ROUTER_MAX_COLS 8
+struct moe_router_args {
+    const nv_bfloat16 * x = nullptr;
+    const float * y = nullptr;
+    float * dst = nullptr;
+    int ncols2 = 0;            // row width / 2
+    int stride_row = 0;        // elements between two rows of x
+    int stride_col_y2 = 0;     // float2 between two columns of y
+    int stride_col_dst = 0;
+    int ncols = 0;
+    int nrows = 0;
+    unsigned * done = nullptr;
+};
+
+static __device__ void moe_router_row(const moe_router_args & a, const int row) {
+    constexpr int block_size = 256;
+    constexpr int warp_size  = ggml_cuda_get_physical_warp_size();
+    const int tid = threadIdx.x;
+    __shared__ float buf_iw[warp_size];
+    if (tid < warp_size) {
+        buf_iw[tid] = 0.0f;
+    }
+    __syncthreads();
+    float sumf[MOE_ROUTER_MAX_COLS] = {0.0f};
+    const int2   * x4 = (const int2 *) (a.x + (int64_t) row * a.stride_row);
+    const float4 * y4 = (const float4 *) a.y;
+    for (int col4 = tid; col4 < a.ncols2/2; col4 += block_size) {
+        const int2 tmpx = x4[col4];
+#pragma unroll
+        for (int j = 0; j < MOE_ROUTER_MAX_COLS; ++j) {
+            if (j < a.ncols) {
+                const float4 tmpy = y4[j*(a.stride_col_y2/2) + col4];
+                ggml_cuda_mad(sumf[j], ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx.x)[0]), tmpy.x);
+                ggml_cuda_mad(sumf[j], ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx.x)[1]), tmpy.y);
+                ggml_cuda_mad(sumf[j], ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx.y)[0]), tmpy.z);
+                ggml_cuda_mad(sumf[j], ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx.y)[1]), tmpy.w);
+            }
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < MOE_ROUTER_MAX_COLS; ++j) {
+        if (j < a.ncols) {
+            sumf[j] = warp_reduce_sum<warp_size>(sumf[j]);
+            buf_iw[tid/warp_size] = sumf[j];
+            __syncthreads();
+            if (tid < warp_size) {
+                sumf[j] = buf_iw[tid];
+                sumf[j] = warp_reduce_sum<warp_size>(sumf[j]);
+            }
+            __syncthreads();
+        }
+    }
+    if (tid < a.ncols) {
+        float v = 0.0f;
+#pragma unroll
+        for (int j = 0; j < MOE_ROUTER_MAX_COLS; ++j) {
+            v = j == tid ? sumf[j] : v;
+        }
+        a.dst[tid*a.stride_col_dst + row] = v;
+    }
+}
+
 static __global__ void k_moe_hosted_enter(const float * act, float * h_act, block_q8_0 * h_act8, int64_t n_act,
                                           const float * tk_logits, float * tk_weights, float tk_clamp, float tk_scale,
                                           int32_t * ids, int64_t ids_nb1, int32_t * h_ids, int n_used, int n_tokens,
                                           uint32_t * d_seq, uint32_t * d_expect, volatile moe_hosted_mailbox * mail,
                                           uint32_t slot, const volatile uint32_t * flag,
                                           const volatile uint64_t * m_plan, uint64_t * d_plan, int n_plan,
-                                          volatile unsigned long long * tl) {
-    for (int64_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n_act; i += (int64_t) gridDim.x * blockDim.x) {
+                                          volatile unsigned long long * tl, const moe_router_args rt) {
+    // the router's workgroups after the entry's MOE_HOSTED_ENTER_BLOCKS
+    if ((int) blockIdx.x >= MOE_HOSTED_ENTER_BLOCKS) {
+        moe_router_row(rt, (int) blockIdx.x - MOE_HOSTED_ENTER_BLOCKS);
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            atomicAdd(rt.done, 1u);
+        }
+        return;
+    }
+    const int n_blocks = MOE_HOSTED_ENTER_BLOCKS;
+    for (int64_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n_act; i += (int64_t) n_blocks * blockDim.x) {
         h_act[i] = act[i];
     }
     // and quantized for the CPU's experts as quantize_q8_1 does (a group of 32 threads per block): the CPU starts
@@ -5351,7 +5431,7 @@ static __global__ void k_moe_hosted_enter(const float * act, float * h_act, bloc
     {
         const int lane   = threadIdx.x % QK8_0;
         const int group  = (blockIdx.x * blockDim.x + threadIdx.x) / QK8_0;
-        const int groups = gridDim.x * blockDim.x / QK8_0;
+        const int groups = n_blocks * blockDim.x / QK8_0;
         for (int64_t ib = group; ib < n_act / QK8_0; ib += groups) {
             const float xi   = act[ib * QK8_0 + lane];
             const float amax = warp_reduce_max<QK8_0>(fabsf(xi));
@@ -5368,6 +5448,16 @@ static __global__ void k_moe_hosted_enter(const float * act, float * h_act, bloc
         // the MoE top-k of the block's tokens (left to this kernel by ggml_cuda_topk_moe_defer): a warp per token in
         // block 0, then its ids to the host
         if (blockIdx.x == 0) {
+            if (rt.x) {   // the router's rows
+                if (threadIdx.x == 0) {
+                    while (__hip_atomic_load(rt.done, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) < (unsigned) rt.nrows) {
+                        __builtin_amdgcn_s_sleep(1);
+                    }
+                    *rt.done = 0;   // for the next layer (stream-ordered)
+                }
+                __syncthreads();
+                __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+            }
             const int warp = threadIdx.x / WARP_SIZE;
             const int t    = warp < n_tokens ? warp : n_tokens - 1;
             topk_moe_config config;
@@ -5386,7 +5476,7 @@ static __global__ void k_moe_hosted_enter(const float * act, float * h_act, bloc
             }
         }
     } else {
-        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_ids; i += gridDim.x * blockDim.x) {
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_ids; i += n_blocks * blockDim.x) {
             const int t = i / n_used;
             h_ids[i] = *(const int32_t *) ((const char *) ids + (int64_t) t * ids_nb1 + (int64_t) (i % n_used) * sizeof(int32_t));
         }
@@ -5396,7 +5486,7 @@ static __global__ void k_moe_hosted_enter(const float * act, float * h_act, bloc
     __syncthreads();
     __shared__ bool last;
     if (threadIdx.x == 0) {
-        last = atomicAdd(d_seq + 1, 1u) == gridDim.x - 1;
+        last = atomicAdd(d_seq + 1, 1u) == (unsigned) n_blocks - 1;
     }
     __syncthreads();
     if (!last) {
@@ -6408,6 +6498,7 @@ static void moe_hosted_shutdown(moe_cache_session * session) {
     if (st->d_q8_act) cudaFree(st->d_q8_act);
     if (st->d_q8_mid) cudaFree(st->d_q8_mid);
     if (st->d_q8_count) cudaFree(st->d_q8_count);
+    if (st->d_router_done) cudaFree(st->d_router_done);
     // the pins of the last plan go with the pools the session is about to free
 }
 
@@ -6650,11 +6741,36 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
     }
 
     // activations and ids to the host, then the mailbox
-    k_moe_hosted_enter<<<8, 256, 0, stream>>>((const float *) act->data, layer->m_act, layer->m_act8, (int64_t) n_tokens * n_embd,
+    // the router whose logits the top-k reads, left to this kernel too (ggml_cuda_router_defer_ok)
+    moe_router_args rta;
+    if (tk && ctx.router_pending && (const float *) ctx.router_pending->data == tp.logits) {
+        const ggml_tensor * rn = ctx.router_pending;
+        const ggml_tensor * w = rn->src[0];
+        const ggml_tensor * y = rn->src[1];
+        rta.x = (const nv_bfloat16 *) w->data;
+        rta.y = (const float *) y->data;
+        rta.dst = (float *) rn->data;
+        rta.ncols2 = (int) (w->ne[0] / 2);
+        rta.stride_row = (int) (w->nb[1] / ggml_type_size(w->type));
+        rta.stride_col_y2 = (int) (y->nb[1] / sizeof(float) / 2);
+        rta.stride_col_dst = (int) (rn->nb[1] / sizeof(float));
+        rta.ncols = (int) y->ne[1];
+        rta.nrows = (int) w->ne[1];
+        if (!st->d_router_done) {
+            CUDA_CHECK(cudaMalloc((void **) &st->d_router_done, 64));
+            CUDA_CHECK(cudaMemsetAsync(st->d_router_done, 0, 64, stream));
+        }
+        rta.done = st->d_router_done;
+        ctx.router_pending = nullptr;
+        ctx.router_next = -1;
+    } else {
+        ggml_cuda_router_flush(ctx);
+    }
+    k_moe_hosted_enter<<<MOE_HOSTED_ENTER_BLOCKS + (rta.x ? rta.nrows : 0), 256, 0, stream>>>((const float *) act->data, layer->m_act, layer->m_act8, (int64_t) n_tokens * n_embd,
                                               tk ? tp.logits : nullptr, tk ? tp.weights : nullptr, tp.clamp, tp.scale,
                                               (int32_t *) ids->data, ids->nb[1], layer->m_ids, n_used, n_tokens,
                                               st->d_seq, layer->d_expect, st->m_mail, (uint32_t) slot, layer->m_flags,
-                                              layer->m_plan, layer->d_plan, 3 * rows, g_tl_m);
+                                              layer->m_plan, layer->d_plan, 3 * rows, g_tl_m, rta);
     if (tk) {
         tp.logits = nullptr;
     }

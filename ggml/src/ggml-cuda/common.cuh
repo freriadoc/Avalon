@@ -1553,6 +1553,11 @@ struct ggml_backend_cuda_context {
         float scale = 1.0f;
     } topk_pending;
 
+    // the router (a MUL_MAT of BF16 weights) that produces a deferred top-k's logits, left to the hosted MoE block's
+    // entry kernel too (ggml_cuda_router_defer_ok): launched as usual before anything else reads its logits
+    const ggml_tensor * router_pending = nullptr;
+    int                 router_next = -1;   // the node after it (the top-k that may take it along)
+
     // a graph queued on the stream waits for a fill of the MoE cache (k_moe_split_wait, the hosted MoE dispatcher):
     // until the stream is synchronized, its copies to and from pinned host memory are made by a kernel
     // (ggml_cuda_host_copy_by_kernel); split_wait_captured: the graph being captured holds one

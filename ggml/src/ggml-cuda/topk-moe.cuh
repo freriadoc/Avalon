@@ -284,6 +284,9 @@ bool ggml_cuda_should_use_topk_moe(const ggml_tensor * gating_op,
 // the number of experts the hosted MoE block's entry kernel computes the top-k for (softmax, normalized weights)
 #define TOPK_MOE_HOSTED_N_EXPERT 512
 
+// the deferred router, launched as usual (ggml-cuda.cu)
+void ggml_cuda_router_flush(ggml_backend_cuda_context & ctx);
+
 // Leaves this top-k (softmax, n_used largest, normalized and scaled weights, no bias) to the hosted MoE block that
 // reads ids next: false if its configuration is not the one that block's entry kernel computes.
 bool ggml_cuda_topk_moe_defer(ggml_backend_cuda_context & ctx, const ggml_tensor * logits, ggml_tensor * weights,
