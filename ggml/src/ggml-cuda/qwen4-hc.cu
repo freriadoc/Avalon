@@ -311,16 +311,17 @@ struct qwen4_hc_k2_args {
 };
 
 // the workgroup of an output row (QWEN4_HC_K2_WARPS warps, tid its thread), partial its shared memory
+// (a row past the last, active false: the group only takes part in the block's barrier)
 template <int T>
 static __device__ __forceinline__ void qwen4_hc_down_inject_body(const qwen4_hc_k2_args & a, const int row, const int tid,
-        float (*partial)[T]) {
+        float (*partial)[T], const bool active = true) {
     const int nb   = a.n_in / QK8_0;
     const int lane = tid % WARP_SIZE;
     const int warp = tid / WARP_SIZE;
     const block_q8_0 * w = row < a.n_a ? a.wa + (size_t) row * nb : a.wb + (size_t) (row - a.n_a) * nb;
 
     float acc[T] = { 0.0f };
-    for (int ib = tid; ib < nb; ib += QWEN4_HC_K2_WARPS*WARP_SIZE) {
+    for (int ib = tid; active && ib < nb; ib += QWEN4_HC_K2_WARPS*WARP_SIZE) {
         const float dw = __half2float(w[ib].d);
         half2 wh[QK8_0/2];
 #pragma unroll
@@ -356,7 +357,7 @@ static __device__ __forceinline__ void qwen4_hc_down_inject_body(const qwen4_hc_
         }
     }
     __syncthreads();
-    if (tid < T) {
+    if (active && tid < T) {
         const int t = tid;
         float v = 0.0f;
 #pragma unroll
@@ -395,6 +396,61 @@ static void qwen4_hc_down_inject_launch(
     }
     qwen4_hc_down_inject_f16<T><<<n_a + n_b, QWEN4_HC_K2_WARPS*WARP_SIZE, 0, stream>>>(
             wa, wb, xh, out_a, out_b, n_in, n_a, n_b, s, b);
+}
+
+// ---------------------------------------------------------------- K1 -> K2 in one kernel
+
+// K1's workgroups first (hc*T of them, K1's own body and size), then workgroups of the same size, each running K2 for
+// QWEN4_HC_K12_ROWS rows by groups of QWEN4_HC_K2_WARPS warps (K2's body: the same bits), after waiting for all of K1's (a
+// counter). Only a K2 workgroup waits, only for workgroups of lower index, dispatched before it: no barrier, no residency
+// condition (tests/hcbench/hcfuse.hip, also with another queue holding the device). K1 lasts a few us: the K2 workgroups
+// do not stay resident long (after a long wait of many resident workgroups, the next kernel starts ~4 us later:
+// tests/waitbench). The last workgroup to finish resets the counters.
+static constexpr int QWEN4_HC_K12_ROWS = QWEN4_HC_K1_THREADS / (QWEN4_HC_K2_WARPS*WARP_SIZE);
+
+static __device__ __attribute__((aligned(256))) unsigned g_qwen4_hc_k12[128];   // K1 done [0], finished [64]
+
+template <int T>
+__launch_bounds__(QWEN4_HC_K1_THREADS, 1)
+static __global__ void qwen4_hc_k1_k2(const qwen4_hc_k1_args a1, const qwen4_hc_k2_args a2) {
+    const int n_k1 = a1.hc * T;
+    if ((int) blockIdx.x < n_k1) {
+        qwen4_hc_combine_norm_body(a1, blockIdx.x % a1.hc, blockIdx.x / a1.hc);
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            atomicAdd(&g_qwen4_hc_k12[0], 1u);
+        }
+    } else {
+        if (threadIdx.x == 0) {
+            while (__hip_atomic_load(&g_qwen4_hc_k12[0], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) < (unsigned) n_k1) {
+                __builtin_amdgcn_s_sleep(1);
+            }
+        }
+        __syncthreads();
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+        __shared__ float partial[QWEN4_HC_K12_ROWS][QWEN4_HC_K2_WARPS][T];
+        const int g   = threadIdx.x / (QWEN4_HC_K2_WARPS*WARP_SIZE);
+        const int row = ((int) blockIdx.x - n_k1) * QWEN4_HC_K12_ROWS + g;
+        qwen4_hc_down_inject_body<T>(a2, row, threadIdx.x % (QWEN4_HC_K2_WARPS*WARP_SIZE), partial[g], row < a2.n_a + a2.n_b);
+    }
+    if (threadIdx.x == 0 && atomicAdd(&g_qwen4_hc_k12[64], 1u) == gridDim.x - 1) {
+        g_qwen4_hc_k12[0]  = 0;
+        g_qwen4_hc_k12[64] = 0;
+        __threadfence();
+    }
+}
+
+template <int T>
+static void qwen4_hc_k1_k2_launch(const qwen4_hc_k1_args & a1, const qwen4_hc_k2_args & a2, int T_run, cudaStream_t stream) {
+    if constexpr (T > 1) {
+        if (T_run < T) {
+            qwen4_hc_k1_k2_launch<T - 1>(a1, a2, T_run, stream);
+            return;
+        }
+    }
+    const int k2_blocks = (a2.n_a + a2.n_b + QWEN4_HC_K12_ROWS - 1) / QWEN4_HC_K12_ROWS;
+    qwen4_hc_k1_k2<T><<<a1.hc*T + k2_blocks, QWEN4_HC_K1_THREADS, 0, stream>>>(a1, a2);
 }
 
 static void qwen4_hc_to_f16_launch(const float * x, half * xh, int n, cudaStream_t stream) {
@@ -793,12 +849,21 @@ static int qwen4_hc_fuse_k1(ggml_backend_cuda_context & ctx, ggml_cgraph * cgrap
             (float *) post->data, (float *) mul->data, with_k2 ? xh.get() : nullptr, n_embd, hc,
             ggml_get_op_params_f32(sc1, 0), ggml_get_op_params_f32(sc1, 1),
             ggml_get_op_params_f32(sc2, 0), ggml_get_op_params_f32(sc2, 1), eps };
-    qwen4_hc_combine_norm_f32<<<dim3(hc, T), QWEN4_HC_K1_THREADS, 0, stream>>>(a1);
-    if (!with_k2) {
-        return 5;
+    if (with_k2) {   // K1 and K2 in one kernel
+        ggml_tensor *       mm_a = cgraph->nodes[span2.idx[0]];
+        const ggml_tensor * mm_b = cgraph->nodes[span2.idx[1]];
+        const ggml_tensor * sc   = cgraph->nodes[span2.idx[2]];
+        ggml_tensor *       silu = cgraph->nodes[span2.idx[3]];
+        const ggml_tensor * x    = mm_a->src[1];
+        const qwen4_hc_k2_args a2 = { (const block_q8_0 *) mm_a->src[0]->data, (const block_q8_0 *) mm_b->src[0]->data,
+            xh.get(), (float *) mm_a->data, (float *) silu->data, (int) x->ne[0], (int) mm_a->src[0]->ne[1],
+            (int) mm_b->src[0]->ne[1], ggml_get_op_params_f32(sc, 0), ggml_get_op_params_f32(sc, 1) };
+        qwen4_hc_k1_k2_launch<QWEN4_HC_MAX_TOKENS>(a1, a2, T, stream);
+        CUDA_CHECK(cudaGetLastError());
+        return (j - i) + span2.n_all - 1;
     }
-    qwen4_hc_k2_launch(cgraph, span2, xh.get(), stream);
-    return (j - i) + span2.n_all - 1;
+    qwen4_hc_combine_norm_f32<<<dim3(hc, T), QWEN4_HC_K1_THREADS, 0, stream>>>(a1);
+    return 5;
 }
 
 int ggml_cuda_try_fuse_qwen4_hc(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i,
