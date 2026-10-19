@@ -361,6 +361,7 @@ private:
 
     size_t sched_max_nodes = 0; // the size of sched, see sched_reserve
     void * moe_cache_shared = nullptr; // the MoE cache session of another context, see share_moe_cache
+    std::vector<const ggml_tensor *> moe_cache_guest_weights; // a sharing context's expert weights, see share_moe_cache
 
     bool sched_need_reserve = true;
     bool sched_measure_only = false; // sched_reserve splits the graphs (kernel needs recorded) and allocates nothing

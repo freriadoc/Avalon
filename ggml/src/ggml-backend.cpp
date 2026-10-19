@@ -1160,6 +1160,9 @@ struct ggml_backend_sched {
     // state's key: the graph it was allocated for when plan_set marked it
     size_t graph_size_max;
     std::vector<ggml_backend_sched_plan *> * plans;
+    // expert weights of a scheduler that will share this one's MoE cache session (the MTP draft), shown to the cache
+    // with this scheduler's own when it primes it: the pools' shares count them (ggml_backend_sched_set_moe_guest_weights)
+    std::vector<const struct ggml_tensor *> * moe_guest_weights;
     const struct ggml_cgraph * plan_key;
     int      plan_key_n_nodes;
     uint64_t plan_gen;
@@ -3021,6 +3024,14 @@ void * ggml_backend_sched_get_moe_cache(ggml_backend_sched_t sched) {
     return sched ? sched->moe_cache_session : nullptr;
 }
 
+void ggml_backend_sched_set_moe_guest_weights(ggml_backend_sched_t sched, const struct ggml_tensor * const * weights, int n) {
+    GGML_ASSERT(sched);
+    if (!sched->moe_guest_weights) {
+        sched->moe_guest_weights = new std::vector<const struct ggml_tensor *>();
+    }
+    sched->moe_guest_weights->assign(weights, weights + n);
+}
+
 void ggml_backend_sched_share_moe_cache(ggml_backend_sched_t sched, void * session) {
     GGML_ASSERT(sched);
     ggml_backend_sched_prefetch_restore(sched);
@@ -3071,6 +3082,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         ggml_backend_sched_plan_free(p);
     }
     delete sched->plans;
+    delete sched->moe_guest_weights;
     ggml_free(sched->ctx);
     ggml_hash_set_free(&sched->hash_set);
     for (int i = 0; i < sched->splits_capacity; i++) {
@@ -3353,12 +3365,13 @@ static void ggml_backend_sched_prime_moe_cache(ggml_backend_sched_t sched, struc
     }
 
     int accepted[2] = {0, 0};
-    (sched->moe_cache_guest && ggml_moe_cache.session_enter_guest ? ggml_moe_cache.session_enter_guest
-                                                                  : ggml_moe_cache.session_enter)(sched->moe_cache_session);
+    const bool guest_weights = sched->moe_guest_weights && !sched->moe_guest_weights->empty() && !sched->moe_cache_guest &&
+        ggml_moe_cache.session_enter_guest;
     for (int pass = 0; pass < 2; pass++) {
+        (sched->moe_cache_guest && ggml_moe_cache.session_enter_guest ? ggml_moe_cache.session_enter_guest
+                                                                      : ggml_moe_cache.session_enter)(sched->moe_cache_session);
         for (const ggml_tensor * node : experts) {
             const ggml_tensor * w   = node->src[0];
-            const ggml_tensor * ids = node->src[2];
             // one token routed to one expert: the warmup graph routes every token to
             // all experts (ids->ne[0] == n_expert), which the cache would reject as a
             // batch above its row limit
@@ -3370,8 +3383,21 @@ static void ggml_backend_sched_prime_moe_cache(ggml_backend_sched_t sched, struc
                 ggml_moe_cache.end(probe);
             }
         }
+        ggml_moe_cache.session_leave(sched->moe_cache_session);
+        // the guest's weights in the same passes, in a guest scope (their layers are not the main model's): the pools,
+        // built once every tensor was seen twice, count them in their shares
+        if (guest_weights) {
+            ggml_moe_cache.session_enter_guest(sched->moe_cache_session);
+            for (const ggml_tensor * w : *sched->moe_guest_weights) {
+                void * probe = ggml_moe_cache.begin(w->name, w->data, w->nb[2], w->ne[0], w->ne[1], w->type, w->ne[2],
+                        /*n_tokens =*/ 1, /*n_rows =*/ 1);
+                if (probe) {
+                    ggml_moe_cache.end(probe);
+                }
+            }
+            ggml_moe_cache.session_leave(sched->moe_cache_session);
+        }
     }
-    ggml_moe_cache.session_leave(sched->moe_cache_session);
     GGML_LOG_INFO("%s: MoE cache probed with %zu tensors, accepted %d then %d (first: %s, %s, rows %lld)\n",
             __func__, experts.size(), accepted[0], accepted[1],
             experts[0]->src[0]->name, ggml_type_name(experts[0]->src[0]->type),

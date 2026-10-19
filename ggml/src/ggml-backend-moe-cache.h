@@ -221,9 +221,12 @@ GGML_API void   ggml_backend_sched_attach_moe_cache(ggml_backend_sched_t sched, 
 GGML_API void * ggml_backend_sched_get_moe_cache(ggml_backend_sched_t sched);
 // a scheduler of the same device uses another's session without owning it (the MTP draft, whose expert weights are in
 // host memory: its MoE blocks are hosted by the GPU and their experts cached with the main model's). It never destroys
-// it, does not prefetch, borrows no compute buffer and lends no KV; the owner must outlive it. Replaces (and destroys)
-// the scheduler's own session; NULL detaches.
+// it, does not prefetch and lends no KV, but borrows its compute buffers from it; the owner must outlive it. Replaces
+// (and destroys) the scheduler's own session; NULL detaches.
 GGML_API void   ggml_backend_sched_share_moe_cache(ggml_backend_sched_t sched, void * session);
+// the expert weights (host memory) of a scheduler that will share this one's session, shown to the cache with this
+// scheduler's own when it first primes it: the pools' shares of the budget count them
+GGML_API void   ggml_backend_sched_set_moe_guest_weights(ggml_backend_sched_t sched, const struct ggml_tensor * const * weights, int n);
 
 #ifdef __cplusplus
 }

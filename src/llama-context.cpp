@@ -793,6 +793,9 @@ void llama_context::sched_reserve() {
         void * moe_cache_kept = sched ? ggml_backend_sched_detach_moe_cache(sched.get()) : nullptr;
         sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
         sched_max_nodes = max_nodes;
+        if (!moe_cache_guest_weights.empty()) {
+            ggml_backend_sched_set_moe_guest_weights(sched.get(), moe_cache_guest_weights.data(), (int) moe_cache_guest_weights.size());
+        }
         if (moe_cache_shared) {
             ggml_backend_sched_share_moe_cache(sched.get(), moe_cache_shared);
         } else if (moe_cache_kept) {
@@ -4304,6 +4307,18 @@ bool llama_context::share_moe_cache(llama_context & owner) {
         sched_reserve();
         sched_measure_only = false;
         sched_need_reserve = true;
+    }
+    // this context's expert weights in host memory, shown to the cache with the owner's when the owner's reserve creates
+    // it: the pools' shares of the budget count them (a shape's pool otherwise took them in on top of its own share)
+    owner.moe_cache_guest_weights.clear();
+    for (const auto & [name, t] : model.tensors_by_name) {
+        if (name.find("_exps") != std::string::npos && t->buffer && ggml_backend_buffer_is_host(t->buffer)) {
+            owner.moe_cache_guest_weights.push_back(t);
+        }
+    }
+    if (owner.sched && !owner.moe_cache_guest_weights.empty()) {
+        ggml_backend_sched_set_moe_guest_weights(owner.sched.get(), owner.moe_cache_guest_weights.data(),
+                (int) owner.moe_cache_guest_weights.size());
     }
     // a deferred reserve of the owner creates its cache now
     owner.sched_reserve();

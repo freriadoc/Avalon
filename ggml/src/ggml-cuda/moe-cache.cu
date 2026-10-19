@@ -270,6 +270,7 @@ struct moe_cache_layer {
     int type[MOE_ROLES] = {-1, -1, -1};
     int64_t n_expert = 0;
     int shape = -1;                  // once the pools are built
+    bool guest = false;              // shown by a scheduler sharing the session (the MTP draft): not a main-model layer
 };
 
 struct moe_cache_seen_tensor {
@@ -621,6 +622,7 @@ static std::unordered_map<int, moe_cache_physical_budget> g_physical_budgets;
 struct moe_cache_scope_frame {
     moe_cache_session * requested = nullptr;
     moe_cache_session * active = nullptr;
+    bool guest = false;   // a scheduler sharing another's session (session_enter_guest)
 };
 static thread_local std::vector<moe_cache_scope_frame> g_session_stack;
 static thread_local int g_session_suppressed = 0;
@@ -2485,9 +2487,13 @@ static void moe_cache_build_pending(
         }
     }
     device.pools_built = true;
-    if (!device.layers.empty()) {
-        device.main_first = device.layers.begin()->first;
-        device.main_last = device.layers.rbegin()->first;
+    // the main model's layers (a guest's, counted in the pools' shares, are not: the deferred admissions follow the
+    // main model's pass)
+    for (const auto & [number, layer] : device.layers) {
+        if (!layer.guest) {
+            device.main_first = device.main_first < 0 ? number : std::min(device.main_first, number);
+            device.main_last = std::max(device.main_last, number);
+        }
     }
     if (!moe_cache_prepare_budget(session, device)) {
         for (moe_cache_shape & shape : device.shapes) {
@@ -2607,6 +2613,7 @@ static int moe_cache_discover_pool(
             host_base, moe_cache_seen_tensor{tensor_size, expert_size, wtype, n_expert}).second;
     moe_cache_layer & layer = device.layers[layer_number];
     if (first_visit) {
+        layer.guest = !g_session_stack.empty() && g_session_stack.back().guest;
         layer.tensor[role] = host_base;
         layer.bytes[role] = expert_size;
         layer.stride[role] = stride;
@@ -3084,7 +3091,7 @@ static void moe_cache_session_enter_impl(void * opaque, bool guest) {
         return;
     }
     try {
-        g_session_stack.push_back({session, session});
+        g_session_stack.push_back({session, session, guest});
     } catch (...) {
         g_session_suppressed++;
         return;
@@ -5136,8 +5143,8 @@ struct moe_hosted_state {
     std::unordered_map<uint32_t, int> pg_demand;             // PREGATE: predictions per (layer, expert)
     char * d_q8_act = nullptr;
     char * d_q8_mid = nullptr;
-    unsigned * d_q8_count = nullptr;
-    unsigned * d_router_done = nullptr;   // the router's rows done (k_moe_hosted_enter), zero between layers   // the up / gate kernel's warps done per q8_1 block of d_q8_mid (zero between launches)
+    unsigned * d_q8_count = nullptr;   // the up / gate kernel's warps done per q8_1 block of d_q8_mid (zero between launches)
+    unsigned * d_router_done = nullptr;   // the router's rows done (k_moe_hosted_enter), zero between layers
     size_t q8_act_bytes = 0;
     size_t q8_mid_bytes = 0;
     int n_threads = 1;
