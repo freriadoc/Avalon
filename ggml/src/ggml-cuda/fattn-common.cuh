@@ -1232,6 +1232,12 @@ void launch_fattn(
         if (cudaFuncGetAttributes(&attr, (const void *) fattn_kernel) == cudaSuccess) {
             ctx.fattn_private = std::max(ctx.fattn_private, (size_t) attr.localSizeBytes);
         }
+        const size_t lanes = size_t(blocks_num.x)*blocks_num.y*blocks_num.z * block_dim.x*block_dim.y*block_dim.z;
+        if (ctx.fattn_private > 0 && lanes > ctx.fattn_lanes) {
+            ctx.fattn_lanes = lanes;
+            ctx.fattn_grid  = blocks_num;
+            ctx.fattn_block = block_dim;
+        }
         return;
     }
     const ggml_tensor * scratch_t = dst->src[GGML_SCHED_SCRATCH_SRC];

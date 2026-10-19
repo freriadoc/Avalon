@@ -1628,6 +1628,12 @@ struct ggml_backend_cuda_context {
     size_t fattn_private = 0;
     size_t primed_private = 0;
     bool   primed = false;
+    // launch of the largest grid among those flash attention launches (threads in all): ROCm sizes a queue's scratch
+    // on the dispatch (HSA_SCRATCH_SINGLE_LIMIT, see ggml_hip_set_hw_queues), the prime repeats it
+    dim3   fattn_grid  = dim3(0, 0, 0);
+    dim3   fattn_block = dim3(0, 0, 0);
+    size_t fattn_lanes = 0;
+    size_t primed_lanes = 0;
 
     explicit ggml_backend_cuda_context(int device) :
         device(device),

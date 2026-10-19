@@ -242,9 +242,18 @@ static int ggml_cuda_parse_id(char devName[]) {
 // of the peak). The GEMMs ggml sends run without it: with 64 KiB (0 would mean the managed 32 MiB)
 // the prefill is unchanged (956 vs 955 t/s, 11k prompt) and nothing fails. An explicit
 // ROCBLAS_DEVICE_MEMORY_SIZE is kept.
+//
+// A queue's scratch (the private memory of kernels that spill, the prefill's D=256 flash attention: 564 B per thread)
+// is sized by ROCr for every wave the device can hold (84 CUs x 32 waves x 32 lanes x 576 B = 47.25 MiB) when it is
+// under HSA_SCRATCH_SINGLE_LIMIT (default 140 MiB), and for the dispatch's grid above it: the target's 8192-token
+// batches 42.7 MiB (47.25 for the reservation's grid, which fills the device), the MTP draft's 256-token batches
+// under 1 MiB (with the 140 MiB scratch of the first kernel that used any: 234.5 -> 48 MiB). 1 MiB is under the device-wide size of any kernel that spills (16 B x 86016 lanes = 1.3 MiB), so every
+// one is sized on its dispatch; ggml_cuda_prime_queues repeats the largest dispatch before the MoE cache is sized. An
+// explicit HSA_SCRATCH_SINGLE_LIMIT is kept.
 __attribute__((constructor)) static void ggml_hip_set_hw_queues() {
     setenv("GPU_MAX_HW_QUEUES", "8", /*overwrite =*/ 0);
     setenv("ROCBLAS_DEVICE_MEMORY_SIZE", "65536", /*overwrite =*/ 0);
+    setenv("HSA_SCRATCH_SINGLE_LIMIT", "1048576", /*overwrite =*/ 0);
 }
 #endif
 
@@ -818,14 +827,20 @@ void ggml_cuda_prime_queues(int device) {
             k_queue_prime<<<1, 1, 0, stream>>>();
             ctx->primed = true;
         }
-        if (ctx->fattn_private > ctx->primed_private) {
+        if (ctx->fattn_private > ctx->primed_private || ctx->fattn_lanes > ctx->primed_lanes) {
             size_t got = 0;
             scratch_prime_t k = ggml_cuda_pick_scratch_prime(ctx->fattn_private, got);
             if (k) {
-                k<<<1, WARP_SIZE, 0, stream>>>(nullptr, 0);
-                GGML_LOG_INFO("%s: %s: queue scratch for %zu B of private memory per thread (prime kernel %zu B)\n",
-                        __func__, ctx->name.c_str(), ctx->fattn_private, got);
+                // the grid of the largest launch: the scratch is sized on the dispatch (HSA_SCRATCH_SINGLE_LIMIT)
+                if (ctx->fattn_lanes > 0) {
+                    k<<<ctx->fattn_grid, ctx->fattn_block, 0, stream>>>(nullptr, 0);
+                } else {
+                    k<<<1, WARP_SIZE, 0, stream>>>(nullptr, 0);
+                }
+                GGML_LOG_INFO("%s: %s: queue scratch for %zu B of private memory per thread (prime kernel %zu B), %zu threads\n",
+                        __func__, ctx->name.c_str(), ctx->fattn_private, got, ctx->fattn_lanes);
                 ctx->primed_private = got;
+                ctx->primed_lanes = ctx->fattn_lanes;
             }
         }
         CUDA_CHECK(cudaGetLastError());
