@@ -964,10 +964,18 @@ static bool ggml_gallocr_reserve_n_impl(
         // a buffer that grows keeps every chunk at least at its size: graphs of different shapes needing more in
         // different chunks (the verification batches of a speculative decoder) otherwise reallocated it at
         // every change of shape; it settles at the largest of them
+        // A borrowed chunk that grows at least doubles: the MTP draft's prompt batches need a little more at each
+        // batch as the context fills (+0.5 MiB per 256 tokens at 256k), one loan and one return each time; doubling
+        // bounds the reallocations to a few per prompt for at most twice the room
+        const bool borrowed = galloc->buffers[i] && ggml_moe_cache.borrows && ggml_moe_cache.borrows(galloc->bufts[i]);
         if (realloc && !shrinking && galloc->buffers[i]) {
             for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
                 struct tallocr_chunk * chunk = galloc->buf_tallocs[i]->chunks[c];
-                chunk->max_size = MAX(chunk->max_size, ggml_vbuffer_chunk_size(galloc->buffers[i], c));
+                const size_t cur_chunk_size = ggml_vbuffer_chunk_size(galloc->buffers[i], c);
+                if (borrowed && cur_chunk_size > 0 && chunk->max_size > cur_chunk_size) {
+                    chunk->max_size = MAX(chunk->max_size, MIN(2 * cur_chunk_size, galloc->buf_tallocs[i]->max_chunk_size));
+                }
+                chunk->max_size = MAX(chunk->max_size, cur_chunk_size);
             }
         }
         if (realloc) {
