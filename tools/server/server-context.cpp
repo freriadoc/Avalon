@@ -1278,8 +1278,16 @@ private:
             load_progress_callback(0.0f, &load_progress_spec);
             load_progress_spec.t_last_load_progress_ms = 0;  // reset so internal cbs aren't delayed
 
+            // the draft's experts in host memory are cached with the target's (GGML_MOE_SHARE_DRAFT=0 keeps them on
+            // the CPU)
+            const char * share_env = getenv("GGML_MOE_SHARE_DRAFT");
+            const bool share = !share_env || atoi(share_env) != 0;
+
             {
                 common_params params_dft = common_base_params_to_speculative(params_base);
+                // a draft that shares the cache borrows its compute buffer from it: its first reserve waits for the
+                // session, so that no buffer is allocated next to the cache before the cache is sized
+                params_dft.defer_reserve = share;
 
                 // progress callback
                 params_dft.load_progress_callback           = load_progress_callback;
@@ -1305,18 +1313,15 @@ private:
 
             load_progress_callback(1.0f, &load_progress_spec);
 
-            // deferred target reserve: the warmup's reserve sizes the MoE cache on what is left
-            if (params_base.warmup) {
-                llama_init->warmup(params_base);
+            // before the warmup: sharing makes the target reserve (which sizes the MoE cache on what is left), then the
+            // draft reserve with buffers borrowed from the cache
+            if (share && llama_share_moe_cache(ctx_dft, ctx_tgt)) {
+                SRV_INF("%s", "MoE expert cache shared with the draft context\n");
             }
 
-            // the draft's experts in host memory are cached with the target's (GGML_MOE_SHARE_DRAFT=0 keeps them on
-            // the CPU)
-            {
-                const char * share = getenv("GGML_MOE_SHARE_DRAFT");
-                if ((!share || atoi(share) != 0) && llama_share_moe_cache(ctx_dft, ctx_tgt)) {
-                    SRV_INF("%s", "MoE expert cache shared with the draft context\n");
-                }
+            // deferred target reserve, if not done by the sharing: the warmup's reserve sizes the MoE cache
+            if (params_base.warmup) {
+                llama_init->warmup(params_base);
             }
         }
 

@@ -363,6 +363,7 @@ private:
     void * moe_cache_shared = nullptr; // the MoE cache session of another context, see share_moe_cache
 
     bool sched_need_reserve = true;
+    bool sched_measure_only = false; // sched_reserve splits the graphs (kernel needs recorded) and allocates nothing
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;

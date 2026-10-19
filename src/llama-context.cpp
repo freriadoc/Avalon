@@ -819,6 +819,7 @@ void llama_context::sched_reserve() {
     resolve_fused_ops(mctx.get(), n_seqs);
 
     // reserve worst-case graph
+    const bool split_only = model.hparams.no_alloc || sched_measure_only;
     int n_splits_pp        = -1;
     int n_nodes_pp         = -1;
     int n_inputs_pp        = -1;
@@ -834,7 +835,7 @@ void llama_context::sched_reserve() {
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
-                model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
+                split_only, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
         if (!gf) {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
@@ -860,7 +861,7 @@ void llama_context::sched_reserve() {
         n_splits_tg = n_splits_pp;
         n_nodes_tg  = n_nodes_pp;
     } else {
-        auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), model.hparams.no_alloc);
+        auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), split_only);
         if (!gf) {
             throw std::runtime_error("failed to allocate compute tg buffers");
         }
@@ -882,10 +883,10 @@ void llama_context::sched_reserve() {
                 // [TAG_RESERVE_DIAG_DECAY]
                 // the `inp_diag_decay` tensor size scales with `n_seq_tokens^2` which
                 // makes `n_seqs == 1` use more memory for the compute graph compared to `n_seqs > 1`
-                gf = graph_reserve(n_tokens, 1,      n_outputs_pp, mctx.get(), model.hparams.no_alloc);
+                gf = graph_reserve(n_tokens, 1,      n_outputs_pp, mctx.get(), split_only);
                 break;
             default:
-                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
+                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), split_only);
         };
 
         if (!gf) {
@@ -898,7 +899,7 @@ void llama_context::sched_reserve() {
         // Reserve that case too, so the compute buffer never has to grow during a long
         // prompt; the allocator keeps the largest of the reservations.
         if (n_seqs > 1 && model.arch != LLM_ARCH_MINIMAX_01) {
-            gf = graph_reserve(n_tokens, 1, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
+            gf = graph_reserve(n_tokens, 1, n_outputs_pp, mctx.get(), split_only);
             if (!gf) {
                 throw std::runtime_error("failed to allocate compute pp buffers (single sequence)");
             }
@@ -4295,6 +4296,15 @@ int32_t llama_output_reserve(llama_context * ctx, int32_t n_outputs) {
 }
 
 bool llama_context::share_moe_cache(llama_context & owner) {
+    // a context whose reserve was deferred (to borrow its compute buffers) measures its graphs first, allocating
+    // nothing: its kernels' needs (the flash attention's queue scratch) are known when the owner primes the queues and
+    // sizes the cache, instead of being allocated over the cache's reserve afterwards (46.6 MiB)
+    if (!sched) {
+        sched_measure_only = true;
+        sched_reserve();
+        sched_measure_only = false;
+        sched_need_reserve = true;
+    }
     // a deferred reserve of the owner creates its cache now
     owner.sched_reserve();
     void * session = ggml_backend_sched_get_moe_cache(owner.sched.get());
@@ -4302,7 +4312,10 @@ bool llama_context::share_moe_cache(llama_context & owner) {
         return false;
     }
     moe_cache_shared = session;
-    ggml_backend_sched_share_moe_cache(sched.get(), session);
+    // a context whose reserve was deferred has no scheduler yet: the reserve below creates it with the session
+    if (sched) {
+        ggml_backend_sched_share_moe_cache(sched.get(), session);
+    }
     // reserved again with the session: the scheduler shows its expert tensors to the cache (registered in place
     // before any graph of this context runs) and its MoE blocks go to the GPU
     sched_need_reserve = true;

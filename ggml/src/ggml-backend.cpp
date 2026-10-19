@@ -2798,7 +2798,8 @@ static void ggml_backend_sched_use_borrowed_compute(ggml_backend_sched_t sched) 
     for (int b = 0; b < sched->n_backends; b++) {
         sched->bufts[b] = sched->bufts_plain[b];
     }
-    if (!enabled || !sched->moe_cache_session || sched->moe_cache_guest || !ggml_moe_cache.compute_buffer_type) {
+    // a guest (the MTP draft) borrows too: its compute buffer is otherwise allocated next to the cache (689 MiB at 256k)
+    if (!enabled || !sched->moe_cache_session || !ggml_moe_cache.compute_buffer_type) {
         return;
     }
     for (int b = 0; b < sched->n_backends; b++) {
