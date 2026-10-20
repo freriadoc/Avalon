@@ -7,6 +7,11 @@
 #include <chrono>
 #include <thread>
 
+#ifdef __linux__
+#include <pthread.h>
+#include <sched.h>
+#endif
+
 #define QUE_INF(fmt, ...) LOG_INF("que  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define QUE_WRN(fmt, ...) LOG_WRN("que  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define QUE_ERR(fmt, ...) LOG_ERR("que  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -160,7 +165,27 @@ bool server_queue::process_new_tasks(bool is_yielding) {
     }
 }
 
+#ifdef __linux__
+// the process's CPUs as the library is loaded, before ggml-cpu binds its OpenMP team (OMP_PROC_BIND)
+static const struct initial_affinity {
+    cpu_set_t set;
+    bool      ok;
+    initial_affinity() {
+        CPU_ZERO(&set);
+        ok = sched_getaffinity(0, sizeof(set), &set) == 0;
+    }
+} g_initial_affinity;
+#endif
+
 void server_queue::worker_loop() {
+#ifdef __linux__
+    // this thread inherits the affinity of the thread that starts the loop, the OpenMP master once ggml-cpu has bound
+    // its team: one core, and the wake-up of this thread at the end of each yield waited for that core (up to ~0.6 ms
+    // when another thread ran there)
+    if (g_initial_affinity.ok) {
+        pthread_setaffinity_np(pthread_self(), sizeof(g_initial_affinity.set), &g_initial_affinity.set);
+    }
+#endif
     while (true) {
         {
             std::unique_lock<std::mutex> lock(mutex_tasks);
