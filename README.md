@@ -61,6 +61,25 @@ of VRAM.
 Measured the same night with the same protocol; Strata serves ISTA's IQ3_S model, the one our experts come from, with
 its own drafters on.
 
+## Quality
+
+Speed does not come from a smaller model. Perplexity, 8 × 4,096 tokens of external texts (*War and Peace*, *Les
+Misérables*, SQLite and CPython sources; lower is better):
+
+| quantization | English | French | code |
+|---|---|---|---|
+| Unsloth UD-Q4_K_XL (104 GB) | 1.316 | 3.581 | 1.325 |
+| Unsloth UD-IQ4_XS | 1.401 | 3.841 | 1.343 |
+| **Avalon IQ3_KS hybrid (the model above)** | **1.443** | **3.857** | **1.331** |
+| ISTA GSQ-RCO IQ3_S (served by Strata above) | 1.469 | 3.932 | 1.338 |
+| AtomicChat AD-4.27bpw | 1.509 | 4.073 | 1.347 |
+| ISTA GSQ-RCO IQ3_XXS | 1.596 | 4.294 | 1.364 |
+
+The hybrid keeps ISTA's experts and requantizes the up/gate tensors of 27 layers from the original BF16 weights with an
+importance matrix: it beats the IQ3_S model Strata runs on all three texts and comes close to Unsloth's UD-IQ4_XS. The
+KV cache in q8_0 / q4_0 adds 0.016 of KL divergence over f16 at 32 – 64k of context (same English text, measured on an
+earlier quantization of the model). The MTP draft head agrees with the model on 80.7 % of the positions of a fixed text.
+
 ## What makes it fast
 
 - **GPU expert cache** (from buun-llama-cpp), grown with the VRAM nobody else uses: compute buffers are lent to the
