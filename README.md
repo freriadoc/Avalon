@@ -1,134 +1,131 @@
-# llama.cpp
+# Avalon
 
-![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
+**Qwen3.8-Flash-Next (125B MoE) at 91 tokens/s on a 2019 CPU, DDR4 and an AMD card in a PCIe 3.0 slot.**
 
-<div align="center">
+Avalon is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) built for one model,
+[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) (512 experts, 10 active, 48 layers), on one
+consumer GPU with the experts in system RAM. It is not tuned on a flagship machine: every number below comes from a
+desktop most people would call old.
 
-<b>LLM inference in C/C++</b>
+| part | what we have | why it matters |
+|---|---|---|
+| CPU | **AMD Ryzen 7 3800XT** (Zen 2, Ryzen 3000 family, 2019), 8 cores | computes the experts that are not on the GPU |
+| RAM | **DDR4-3200, dual channel** (33 – 35 GB/s measured), 96 GB | every expert missing from the GPU is read from here |
+| GPU | **AMD Radeon RX 7900 XT 20 GB** (RDNA3, 2022), **ROCm**, no NVIDIA, no CUDA | holds the dense weights, the KV cache and a cache of the hottest experts |
+| bus | **PCIe 3.0 x16** (~14 GB/s), on a B450 board | every expert copied to the GPU goes through it |
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp?filter=v*&color=brightgreen)](https://github.com/ggml-org/llama.cpp/releases?q=tag:v0)
-[![Nightly](https://img.shields.io/github/v/release/ggml-org/llama.cpp?label=nightly&filter=b*&color=orange)](https://github.com/ggml-org/llama.cpp/releases?q=b)
-[![Server](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/server.yml?label=Server)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
-[![Docker](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/docker.yml?label=Docker)](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml)
-[![Winget](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/winget.yml?label=Winget)](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml)
+The model is ~89 GiB; the GPU holds ~4.6 GiB of dense weights plus a cache of 9 – 14 GiB of experts, the rest stays in
+RAM. **64 GB of RAM is enough**: the model is memory-mapped, and with RAM limited to 58 GB generation was within 5 % of
+96 GB.
 
-[ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md) / [maintainer PRs](https://github.com/ggml-org/llama.cpp/issues?q=is%3Apr%20is%3Aopen%20draft%3AFalse%20(author%3Argerganov%20OR%20author%3AKitaitiMakoto%20OR%20author%3Adanbev%20OR%20author%3Aaldehir%20OR%20author%3Amax-krasnyansky%20OR%20author%3ACISC%20OR%20author%3Aggerganov%20OR%20author%3Aam17an%20OR%20author%3Ajhen0409%20OR%20author%3Abartowski1182%20OR%20author%3Anikwen%20OR%20author%3Ahipudding%20OR%20author%3Aravi9%20OR%20author%3AServeurpersoCom%20OR%20author%3Apwilkin%20OR%20author%3Areeselevine%20OR%20author%3Angxson%20OR%20author%3Ajeffbolznv%20OR%20author%3Amarty1885%20OR%20author%3A0cc4m%20OR%20author%3ATitaniumtown%20OR%20author%3Aangt%20OR%20author%3AIMbackK%20OR%20author%3Aarthw%20OR%20author%3AJohannesGaessler%20OR%20author%3AORippler%20OR%20author%3Aruixiang63%20OR%20author%3Axctan%20OR%20author%3Aallozaur%20OR%20author%3Ayomaytk%20OR%20author%3Aaendk%20OR%20author%3Awine99%20OR%20author%3Agaugarg-nv%20OR%20author%3Ataronaeo%20OR%20author%3Aforforever73%20OR%20author%3Alhez%20OR%20author%3Anetrunnereve%20OR%20author%3Afairydreaming)%20sort%3Aupdated-desc) / [dev stats](https://github.com/ggml-org/llama.cpp-dev) / [lib llama API](https://github.com/ggml-org/llama.cpp/issues/9289) / [llama-server REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
+## Two ideas behind Avalon
 
-</div>
+**Squeeze every last drop out of the hardware.** RAM, VRAM, CPU, PCIe link and GPU should all be busy, all the time,
+at their limit. No byte of VRAM sits idle: whatever a phase does not need goes back to the expert cache. Compute
+buffers are lent to the cache between phases and handed back when a graph needs them, the slots of the prefill
+prefetch are borrowed from it, the end of the KV cache past the current context belongs to it until the context grows
+there, and the reserve kept outside it is calculated, not guessed. The CPU computes the missing experts while the GPU
+computes the cached ones. During prefill the PCIe link prefetches the next experts so the GPU hardly ever waits for
+them, while during generation it carries the experts the dispatcher moves to the GPU and the cache fills.
 
-## Quick start
+**Optimization in partnership with an AI.** The macro optimizations, the architecture and the way the work flows
+between RAM, CPU, PCIe and GPU, come from me and my 30 years of optimization work. The AI first served to build the
+simulators, benchmarks and instrumented measurements that made each decision precise. Then every micro optimization,
+the GPU kernels and CPU kernels above all, was written entirely by Claude Opus 5.5, with me steering. I am only the
+driver; the AI is the engine, and the rest of the car.
 
-A few options to get `llama.cpp` installed on your machine:
+## Speed
+
+[IQ3_KS hybrid](https://huggingface.co/freriadoc/Qwen3.8-Flash-Next-Avalon-GGUF) (2 – 4-bit experts, perplexity close
+to Unsloth's UD-IQ4_XS), greedy decoding, 512 tokens, median of 3 runs, MTP speculative decoding with 2 draft tokens:
+
+| case | generation, no MTP | generation, MTP | prefill |
+|---|---|---|---|
+| 32k context, short prompt, warm cache | 62.4 t/s | 91.0 t/s | 1,661 t/s* |
+| 256k context, 131k filled | 55.6 t/s | 74.5 t/s | 1,496 t/s |
+| 256k context, 250k filled | 50.5 t/s | 69.8 t/s | 1,376 t/s |
+
+\* Maximum prefill, measured with a 32k prompt filling the 32k context. Prefill figures are without MTP (with MTP:
+1,544 / 1,387 / 1,273 t/s).
+
+The full 256k context fits with the MTP draft model, the KV cache in q8_0 / q4_0 and the expert cache, under 19.7 GiB
+of VRAM.
+
+### Same machine, Strata
+
+| engine | generation, short prompt, no MTP / MTP | 256k context, 250k filled, no MTP / MTP | max prefill |
+|---|---|---|---|
+| **Avalon** | **62.4 / 91.0 t/s** | **50.5 / 69.8 t/s** | **1,661 t/s** |
+| [Strata](https://github.com/Niko1221/Strata) 0.1.43 (HIP) | 49.0 / 61.9 t/s | 41.8 / 50.0 t/s | 1,376 t/s |
+
+Measured the same night with the same protocol; Strata serves ISTA's IQ3_S model, the one our experts come from, with
+its own drafters on.
+
+## What makes it fast
+
+- **GPU expert cache** (from buun-llama-cpp), grown with the VRAM nobody else uses: compute buffers are lent to the
+  cache between phases, the end of the KV cache past the current context too, and the reserve outside the cache is
+  calculated (400 MiB).
+- **Hosted MoE**: the GPU keeps each MoE block, computes the cached experts while the CPU computes the missing ones,
+  and moves one or two missing experts to the GPU when that finishes sooner (all inside the HIP graph).
+- **Expert prefetch** during prefill on 4 slots borrowed from the cache, cached experts read in place.
+- **Sparse attention (QSA) for long contexts**: masks built on the GPU, gathered cells for generation, split kept
+  across speculative steps.
+- **MTP speculative decoding** with a small draft head (cut LM head over 65k frequent tokens) that shares the main
+  model's expert cache.
+- Fused GPU kernels for generation (a linear-attention layer went from 53 to 39 launches), AVX2 kernels for the experts on the CPU, IQ3_K / IQ3_KS types.
+
+## Build (Linux, ROCm)
+
+Tested with ROCm 7.2.4 on gfx1100 (RX 7900 XT / XTX).
 
 ```bash
-# curl
-curl -LsSf https://llama.app/install.sh | sh
-
-# powershell
-irm https://llama.app/install.ps1 | iex
+git clone https://github.com/freriadoc/Avalon && cd Avalon
+cmake -B build -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1100 -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER=/opt/rocm/bin/amdclang -DCMAKE_CXX_COMPILER=/opt/rocm/bin/amdclang++
+cmake --build build -j$(nproc) --target llama-server
 ```
 
-- Visit https://llama.app and follow the instructions
-- Run with Docker - see our [Docker documentation](docs/docker.md)
-- Download pre-built binaries from the [releases page](https://github.com/ggml-org/llama.cpp/releases)
-- Build from source by cloning this repository - check out [our build guide](docs/build.md)
+## Run
 
-Once installed:
-
-```sh
-# Download and run a model directly from Hugging Face
-llama cli -hf ggml-org/Qwen3.5-0.8B-GGUF
-
-# Launch OpenAI-compatible API server
-llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF
+```bash
+hf download freriadoc/Qwen3.8-Flash-Next-Avalon-GGUF --local-dir Qwen3.8-Flash-Next-Avalon-GGUF
+cd Qwen3.8-Flash-Next-Avalon-GGUF
+../Avalon/build/bin/llama-server -m Qwen3.8-Flash-Next-Avalon-IQ3KS-00001-of-00033.gguf \
+  -c 262144 -b 8192 -ub 8192 -fa on -ctk q8_0 -ctv q4_0 --jinja --parallel 1 \
+  -md MTP/mtp-Qwen3.8-Flash-Next-shared-IQ3K-IQ4NL-FR65k.gguf --spec-type draft-mtp \
+  --spec-draft-n-max 2 -ubd 256 -ctkd q8_0 -ctvd q8_0
 ```
 
-<table align="center">
-    <tr>
-        <td align="center" width=50%>
-            <img width="1310" height="888" alt="VLM session with `llama cli`" src="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4" />
-            <i>VLM session with <b>llama cli</b></i>
-        </td>
-        <td align="center">
-            <img width="1392" height="958" alt="Built-in web UI against `llama serve` running Qwen 3.6" src="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e" />
-            <i>Built-in web UI against <b>llama serve</b></i>
-        </td>
-    </tr>
-<table>
+Nothing else to set: `--fit` (on by default) places the dense weights on the GPU and the experts in RAM, the expert
+cache takes the rest of the VRAM, and the cache is prefilled from `moe-cache-ranking.bin` next to the model.
+`--parallel 1` matters: other slots would keep their part of the KV cache.
 
-## Description
+## Limits
 
-The main goal of `llama.cpp` is to enable LLM (and VLM) inference with minimal setup and state-of-the-art performance on
-a wide range of hardware - locally and in the cloud.
+- **One model.** Avalon is tuned for Qwen3.8-Flash-Next; the GGUF files above use types and a layout stock llama.cpp
+  does not have. Other models run as in llama.cpp, without the expert cache work.
+- **Tested on RDNA3 with ROCm 7.2 only.** The code goes through ggml-cuda, so CUDA should build, but nothing has been
+  measured on NVIDIA. Windows is untested.
+- **Base:** llama.cpp master of Oct 3, 2026, plus the commits of Oct 3 – 11 picked one by one; later master changes
+  are not in.
 
-- Plain C/C++ implementation without any dependencies
-- Apple silicon is a first-class citizen - optimized via ARM NEON, Accelerate and Metal frameworks
-- AVX, AVX2, AVX512 and AMX support for x86 architectures
-- RVV, ZVFH, ZFH, ZICBOP and ZIHINTPAUSE support for RISC-V architectures
-- 1.5-bit, 2-bit, 3-bit, 4-bit, 5-bit, 6-bit, and 8-bit integer quantization for faster inference and reduced memory use
-- Custom CUDA kernels for running LLMs on NVIDIA GPUs (support for AMD GPUs via HIP and Moore Threads GPUs via MUSA)
-- Vulkan and SYCL backend support
-- CPU+GPU hybrid inference to partially accelerate models larger than the total VRAM capacity
+## Credits
 
-The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-org/ggml) library.
+- [llama.cpp](https://github.com/ggml-org/llama.cpp) and the ggml authors: the base.
+- [buun-llama-cpp](https://github.com/spiritbuun/buun-llama-cpp) (spiritbuun): Avalon started as a branch of buun and
+  is built on its GPU expert cache and LFU admission; buun's expert heat profile recorded the shipped
+  `moe-cache-ranking.bin`. Thank you.
+- [thecodacus](https://github.com/thecodacus): the expert prefetch.
+- [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) (Iwan Kawrakow): the IQ3_K and IQ3_KS types, the shared
+  MTP head support.
+- [Strata](https://github.com/Niko1221/Strata) (Niko1221): the expert ranking format and the preload idea.
+- [Unsloth](https://huggingface.co/unsloth): the MTP head we requantized.
+- [ISTA-DASLab](https://huggingface.co/ISTA-DASLab), [AtomicChat](https://huggingface.co/AtomicChat),
+  [drluoto / Vitronia](https://huggingface.co/drluoto): the quantizations and the FR-Spec token list our GGUF files are
+  built from.
+- [Qwen](https://huggingface.co/Qwen): the model.
 
-## Supported backends
+## License
 
-| Backend | Target devices |
-| --- | --- |
-| [BLAS](docs/build.md#blas-build) | All |
-| [BLIS](docs/backend/BLIS.md) | All |
-| [CANN](docs/build.md#cann) | Ascend NPU |
-| [CUDA](docs/build.md#cuda) | Nvidia GPU |
-| [HIP](docs/build.md#hip) | AMD GPU |
-| [Hexagon](docs/backend/snapdragon/README.md) | Snapdragon |
-| [IBM zDNN](docs/backend/zDNN.md) | IBM Z & LinuxONE |
-| [MUSA](docs/build.md#musa) | Moore Threads GPU |
-| [Metal](docs/build.md#metal-build) | Apple Silicon |
-| [OpenCL](docs/backend/OPENCL.md) | Adreno GPU |
-| [OpenVINO [In Progress]](docs/backend/OPENVINO.md) | Intel CPUs, GPUs, and NPUs |
-| [RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | All |
-| [SYCL](docs/backend/SYCL.md) | Intel GPU |
-| [VirtGPU](docs/backend/VirtGPU.md) | VirtGPU APIR |
-| [Vulkan](docs/build.md#vulkan) | GPU |
-| [WebGPU](docs/build.md#webgpu) | All |
-| [ZenDNN](docs/build.md#zendnn) | AMD CPU |
-
-## Documentation
-
-#### Tools
-
-- [cli](tools/cli/README.md)
-- [completion](tools/completion/README.md)
-- [server](tools/server/README.md)
-- [GBNF grammars](grammars/README.md)
-
-#### Development
-
-- [How to build](docs/build.md)
-- [Running on Docker](docs/docker.md)
-- [Build on Android](docs/android.md)
-- [Multi-GPU usage](docs/multi-gpu.md)
-- [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
-- [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)
-- [XCFramework](docs/xcframework.md)
-- [Completions](docs/completions.md)
-- [Models](docs/models.md)
-- [Release process](docs/release.md)
-
-## Contributing
-
-- Contributors can open PRs
-- Collaborators will be invited based on contributions
-- Maintainers can push to branches in the `llama.cpp` repo and merge PRs into the `master` branch
-- Any help with managing issues, PRs and projects is very appreciated!
-- Read the [CONTRIBUTING.md](CONTRIBUTING.md) for more information
-
-## Acknowledgements
-
-- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
-- [nothings/stb](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
-- [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
-- [mackron/miniaudio](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
-- [sheredom/subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+MIT, as llama.cpp. The model files are under the Qwen Community License 1.0.
