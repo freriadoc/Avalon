@@ -1235,6 +1235,20 @@ common_gguf_info common_get_gguf_info(const std::string & fname) {
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
+    // the MoE expert cache filled before the first graph from the ranking next to the model (moe-cache-ranking.bin, read
+    // by the CUDA backend through GGML_CUDA_MOE_CACHE_PRELOAD), unless that variable is set (empty: no preload)
+    if (!getenv("GGML_CUDA_MOE_CACHE_PRELOAD") && !params.model.path.empty()) {
+        const std::filesystem::path ranking = std::filesystem::path(params.model.path).parent_path() / "moe-cache-ranking.bin";
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(ranking, ec)) {
+#ifdef _WIN32
+            _putenv_s("GGML_CUDA_MOE_CACHE_PRELOAD", ranking.string().c_str());
+#else
+            setenv("GGML_CUDA_MOE_CACHE_PRELOAD", ranking.string().c_str(), 0);
+#endif
+            LOG_INF("%s: MoE expert cache preloaded from %s\n", __func__, ranking.string().c_str());
+        }
+    }
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
