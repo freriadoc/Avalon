@@ -3984,6 +3984,7 @@ static void moe_cache_evacuate(
         dst.key = src.key;
         dst.generation++;
         dst.readers = 0;
+        dst.freq = src.freq;   // its LFU count moves with it
         dst.state = moe_cache_slot_state::valid;
         dst.prev = src.prev;
         dst.next = src.next;
@@ -4005,6 +4006,7 @@ static void moe_cache_evacuate(
         src.key = {};
         src.generation++;
         src.readers = 0;
+        src.freq = 0;
         src.state = moe_cache_slot_state::free;
         src.prev = -1;
         src.next = -1;
