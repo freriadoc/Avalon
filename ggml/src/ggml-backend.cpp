@@ -3341,8 +3341,13 @@ static void ggml_backend_sched_prime_moe_cache(ggml_backend_sched_t sched, struc
         }
         experts.push_back(node);
         if (!ggml_backend_buft_is_host(gpu_buft)) {
-            slot_bytes = std::max(slot_bytes, ggml_backend_buft_get_alloc_size(gpu_buft, const_cast<ggml_tensor *>(w)));
+            // the size ggml_backend_sched_prefetch_init asks (a packed layer's expert tensor: its experts at their step,
+            // not the view's span over the whole layer): a different size lays the zones out again at the first prefill
+            slot_bytes = std::max(slot_bytes, ggml_backend_sched_input_alloc_size(gpu_buft, w));
         }
+    }
+    if (slot_bytes && ggml_moe_cache.prefill_residents) {
+        slot_bytes = ggml_backend_sched_prefetch_table_offset(slot_bytes) + GGML_SCHED_PREFETCH_TABLE_BYTES;
     }
     GGML_LOG_INFO("%s: graph with %d nodes: %d MUL_MAT_ID, %zu with host weights, slot %zu MiB\n",
             __func__, graph->n_nodes, n_mmid, experts.size(), slot_bytes >> 20);
