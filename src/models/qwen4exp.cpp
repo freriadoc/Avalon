@@ -602,7 +602,15 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_set_input(inp->h);
     ggml_set_name(inp->h, "mtp_h_input");
 
-    ggml_tensor * tok_embd = ggml_get_rows(ctx0, model.tok_embd, inp->tokens);
+    // a shared head without its own embeddings or LM head is built alone only for --fit to measure it, before the target
+    // exists (llama_model_share_mtp_io): what the target's tensors would produce stands in, as inputs of the same shape
+    ggml_tensor * tok_embd;
+    if (model.tok_embd) {
+        tok_embd = ggml_get_rows(ctx0, model.tok_embd, inp->tokens);
+    } else {
+        tok_embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_input(tok_embd);
+    }
     cb(tok_embd, "mtp_tok_embd", il);
     // first in the graph: the lookup runs on the CPU (token embeddings in RAM), before the GPU part, which then makes a
     // single split (otherwise the GPU ops built first, the QSA pool layout, made a split of their own before it)
@@ -670,7 +678,12 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    if (model.output) {
+        cur = build_lora_mm(model.output, cur, model.output_s);
+    } else {
+        cur = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, (int64_t) model.vocab.n_tokens(), cur->ne[1]);
+        ggml_set_input(cur);
+    }
 
     if (model.d2t) {
         // cut head: scatter its logits to the target vocabulary, -inf elsewhere
