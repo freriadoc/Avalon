@@ -445,9 +445,9 @@ struct moe_cache_device {
     moe_cache_scratch scratch_reserve;
 
     std::deque<moe_cache_job> queue;
-    // deferred admissions (moe_hosted_admit_deferred): the candidates of the pass's main-model layers so far, the start
-    // of the current layer's, and the main model's first and last layers (the layers known when the pools are built:
-    // the MTP draft's joins later and admits as before)
+    // deferred admissions (moe_hosted_admit_deferred): the candidates of the pass's main-model layers so far, one list
+    // kept by decreasing count, arrival order among equals (moe_cache_defer_add), and the main model's first and last
+    // layers (the layers known when the pools are built: the MTP draft's joins later and admits as before)
     struct deferred_candidate {
         int pool = -1;
         moe_cache_key key;
@@ -455,7 +455,6 @@ struct moe_cache_device {
         bool contest = false;
     };
     std::vector<deferred_candidate> deferred;
-    size_t deferred_layer = 0;
     bool deferring = false;   // a main-model layer's plan runs: an admission is recorded, not made
     int main_first = -1;
     int main_last = -1;
@@ -3201,6 +3200,27 @@ static void * moe_cache_begin(
 }
 
 static constexpr size_t moe_cache_deferred_max = 4096;   // candidates of a pass kept for its end (a bound only)
+// a candidate into the pass's list, by decreasing count, arrival order among equals; demanded again (a plan routes up to
+// 3 tokens): its count up, moved after the ones still above it. Short (~100 at most): a scan beats a map
+static void moe_cache_defer_add(moe_cache_device & device, int pool_index, const moe_cache_key & key, uint16_t freq, bool contest) {
+    auto & c = device.deferred;
+    const auto place = [&](auto end) {
+        return std::find_if(c.begin(), end, [&](const auto & x) { return x.freq < freq; });
+    };
+    const auto f = std::find_if(c.begin(), c.end(), [&](const auto & x) { return x.key == key; });
+    if (f != c.end()) {
+        if (freq > f->freq) {
+            f->freq = freq;
+            std::rotate(place(f), f, f + 1);
+        }
+    } else if (c.size() < moe_cache_deferred_max) {
+        try {
+            c.insert(place(c.end()), {pool_index, key, freq, contest});
+        } catch (...) {
+        }
+    }
+}
+
 static bool moe_cache_enqueue_locked(
         moe_cache_session & session, moe_cache_device & device,
         moe_cache_pool & pool, int pool_index, const void * host_base,
@@ -3209,12 +3229,7 @@ static bool moe_cache_enqueue_locked(
     GGML_UNUSED(expert_size);   // the entry: pool.expert_size
     const moe_cache_key key{host_base, expert};
     if (device.deferring && !rewarm && !pregate) {
-        if (device.deferred.size() < moe_cache_deferred_max) {
-            try {
-                device.deferred.push_back({pool_index, key, freq, contest});
-            } catch (...) {
-            }
-        }
+        moe_cache_defer_add(device, pool_index, key, freq, contest);
         return false;
     }
     const moe_cache_layer * layer = moe_cache_layer_of(device, host_base);
@@ -5713,19 +5728,19 @@ static void moe_hosted_admit_deferred(moe_hosted_state & st, moe_hosted_layer & 
         }
         return true;
     };
-    if (device.deferred_layer < c.size()) {   // this layer's most demanded candidate the rule admits
-        std::stable_sort(c.begin() + device.deferred_layer, c.end(), [](const auto & x, const auto & y) { return x.freq > y.freq; });
-        for (size_t i = device.deferred_layer; i < c.size() && !admit(c[i]); i++) {
-        }
-    }
-    if (layer.layer_number == device.main_last) {   // the pass's others
-        std::stable_sort(c.begin(), c.end(), [](const auto & x, const auto & y) { return x.freq > y.freq; });
+    if (layer.layer_number == device.main_last) {   // the pass's end: all of them, in order
         for (const auto & k : c) {
             admit(k);
         }
         c.clear();
+    } else {   // a layer's end: the first of the whole list the rule admits leaves it; the refused stay
+        for (auto it = c.begin(); it != c.end(); ++it) {
+            if (admit(*it)) {
+                c.erase(it);
+                break;
+            }
+        }
     }
-    device.deferred_layer = c.size();
     if (wake) {
         session.cv.notify_all();
     }
@@ -5750,6 +5765,7 @@ static int moe_hosted_plan(moe_hosted_state & st, moe_hosted_layer & layer, cons
             moe_cache_rewarm_start_locked(session, device);
         }
         if (defer && layer.layer_number == device.main_first) {
+            device.deferred.clear();   // a new pass, a new list
             // the previous pass's admissions land before this one computes (they copied during the draft); not the
             // restoration, which keeps one job queued until it ends (waiting for it held the answer's first pass for
             // its whole ~0.3 s)
@@ -5817,7 +5833,6 @@ static int moe_hosted_plan(moe_hosted_state & st, moe_hosted_layer & layer, cons
         // inserts_per_plan tensors for the gate / up pool, two tensors an expert)
         int inserts = std::max(1, session.config.inserts_per_plan / 2);
         device.deferring = defer;
-        device.deferred_layer = device.deferred.size();
         for (int row = 0; row < rows; row++) {
             const int32_t expert = ids[row];
             if (!pool || expert < 0 || expert >= n_expert) {
@@ -6005,8 +6020,15 @@ static int moe_hosted_split(moe_hosted_state * st, moe_hosted_layer * layer, int
                 } else {
                     int inserts_left = 1;
                     bool wake = false;
+                    // its demand count goes with it (at 0 it would be the next victim of a contested admission, just
+                    // after the copy it was moved for)
+                    uint16_t freq = 0;
+                    if (session.config.lfu) {
+                        const auto d = device.demand_count.find(moe_cache_key{key, x.e});
+                        freq = d != device.demand_count.end() ? d->second.count : 0;
+                    }
                     if (moe_cache_enqueue_locked(session, device, *pool, idx, key, x.e, pool->expert_size, inserts_left, wake,
-                                                 true, false, false)) {
+                                                 true, false, false, freq)) {
                         job = device.queue.back();
                         device.queue.pop_back();
                         x.slot = job.slot;
