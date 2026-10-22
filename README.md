@@ -15,7 +15,7 @@ desktop most people would call old.
 | bus | **PCIe 3.0 x16** (~14 GB/s), on a B450 board | every expert copied to the GPU goes through it |
 
 The model is ~89 GiB; the GPU holds ~4.6 GiB of dense weights plus a cache of 9 – 14 GiB of experts, the rest stays in
-RAM. **64 GB of RAM is enough**: the model is memory-mapped, and with RAM limited to 58 GB generation was within 5 % of
+RAM. **64 GB of RAM is enough**: the model is memory-mapped, and with RAM limited to 58 GB generation was within 5% of
 96 GB.
 
 ## Two ideas behind Avalon
@@ -53,6 +53,8 @@ of VRAM.
 
 ### Same machine, Strata
 
+With MTP, Avalon generates **almost 50% faster than Strata at equivalent quantization** (+47% for short prompt):
+
 | engine | generation, short prompt, no MTP / MTP | 256k context, 250k filled, no MTP / MTP | max prefill |
 |---|---|---|---|
 | **Avalon** | **62.4 / 91.0 t/s** | **50.5 / 69.8 t/s** | **1,661 t/s** |
@@ -78,7 +80,7 @@ Misérables*, SQLite and CPython sources; lower is better):
 The hybrid keeps ISTA's experts and requantizes the up/gate tensors of 27 layers from the original BF16 weights with an
 importance matrix: it beats the IQ3_S model Strata runs on all three texts and comes close to Unsloth's UD-IQ4_XS. The
 KV cache in q8_0 / q4_0 adds 0.016 of KL divergence over f16 at 32 – 64k of context (same English text, measured on an
-earlier quantization of the model). The MTP draft head agrees with the model on 80.7 % of the positions of a fixed text.
+earlier quantization of the model). The MTP draft head agrees with the model on 80.7% of the positions of a fixed text.
 
 ## What makes it fast
 
