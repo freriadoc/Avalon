@@ -611,7 +611,9 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
     return 1;
 }
 
-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, bool nt_w = false>
+// swiglu: the fused gate is a SwiGLU, known when compiled (the generic kernel holds every GLU op, chosen at run time)
+template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, bool nt_w = false,
+          bool swiglu = false>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
@@ -693,7 +695,7 @@ static __global__ void mul_mat_vec_q(
     float glu_limit = 0.0f;
 
     if constexpr (has_fusion) {
-        use_gate      = fusion.gate      != nullptr;
+        use_gate      = swiglu || fusion.gate != nullptr;
         use_bias      = fusion.x_bias    != nullptr;
         use_gate_bias = fusion.gate_bias != nullptr && use_gate;
         vgate         = shared_expert ? fusion.shared_gate : fusion.gate;
@@ -853,6 +855,9 @@ static __global__ void mul_mat_vec_q(
                             gate_value *= gate_scales;
                         }
                         gate_value += gate_biases[j];
+                        if constexpr (swiglu) {
+                            result *= ggml_cuda_op_silu_single(gate_value);
+                        } else
                         switch (active_glu) {
                             case GGML_GLU_OP_SWIGLU:
                                 result *= ggml_cuda_op_silu_single(gate_value);
@@ -1271,6 +1276,17 @@ static void mul_mat_vec_q_switch_fusion(
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
     // several columns too (the kernel loops over them for the gate and the biases): a dense FFN of a few tokens, e.g.
     // the shared expert of an MTP verification, in one launch instead of gate, up and the GLU
+    // a SwiGLU gate by its own kernel: the generic one compiles every GLU op for every column (1823 instructions
+    // against 322 unfused, Q8_0, 3 columns)
+    if (has_fusion && fusion.gate != nullptr && fusion.glu_op == GGML_GLU_OP_SWIGLU &&
+        fusion.x_scale == nullptr && fusion.gate_scale == nullptr) {
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
+        ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters, nt_w, true>, launch_params,
+             vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+             channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+             sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+        return;
+    }
     if (has_fusion) {
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
         ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters, nt_w>, launch_params,
