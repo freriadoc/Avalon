@@ -1912,9 +1912,37 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
         }
     };
 
+    // the queue's head taken (session lock held): marked in flight, its entry's address found
+    const auto take_locked = [&](moe_cache_job & j, moe_cache_pool *& p, char *& dst) {
+        j = device->queue.front();
+        device->queue.pop_front();
+        device->queued_bytes = j.bytes <= device->queued_bytes ? device->queued_bytes - j.bytes : 0;
+        device->inflight = true;
+        device->inflight_rewarm = j.rewarm;
+        for (int r = 0; r < MOE_ROLES; r++) {
+            device->inflight_source[r] = j.source[r];
+            device->inflight_bytes[r] = j.role_bytes[r];
+        }
+        p = nullptr;
+        dst = nullptr;
+        if (j.pool >= 0 && j.pool < (int) device->pools.size()) {
+            p = device->pools[j.pool].get();
+            if (p->slab && j.slot >= 0 && j.slot < p->n_slots) {
+                dst = moe_cache_slot_ptr(*p, j.slot);
+            }
+        }
+    };
+    // a fill's closing takes the next job under the same lock when one waits (one lock per fill while the queue holds
+    // jobs, instead of three: take, the entry's address, close)
+    bool have_next = false;
+    moe_cache_job job;
+    moe_cache_pool * pool = nullptr;
+    char * destination = nullptr;
+
     for (;;) {
-        moe_cache_job job;
-        {
+        if (have_next) {
+            have_next = false;
+        } else {
             std::unique_lock<std::mutex> lock(session->mu);
             session->cv.wait(lock, [&] {
                 return session->stopping || device->dead.load() ||
@@ -1931,16 +1959,7 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                 pregate_burst();
                 continue;
             }
-            job = device->queue.front();
-            device->queue.pop_front();
-            device->queued_bytes = job.bytes <= device->queued_bytes
-                ? device->queued_bytes - job.bytes : 0;
-            device->inflight = true;
-            device->inflight_rewarm = job.rewarm;
-            for (int r = 0; r < MOE_ROLES; r++) {
-                device->inflight_source[r] = job.source[r];
-                device->inflight_bytes[r] = job.role_bytes[r];
-            }
+            take_locked(job, pool, destination);
         }
 
         cudaError_t error = cudaSuccess;
@@ -1968,18 +1987,6 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
         }
         if (error == cudaSuccess && stage_capacity < job.bytes) {
             ensure_stages(job.bytes);
-        }
-
-        moe_cache_pool * pool = nullptr;
-        char * destination = nullptr;
-        {
-            std::lock_guard<std::mutex> lock(session->mu);
-            if (job.pool >= 0 && job.pool < (int)device->pools.size()) {
-                pool = device->pools[job.pool].get();
-                if (pool->slab && job.slot >= 0 && job.slot < pool->n_slots) {
-                    destination = moe_cache_slot_ptr(*pool, job.slot);
-                }
-            }
         }
 
         if (error == cudaSuccess && !destination) {
@@ -2075,6 +2082,10 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
             }
             moe_cache_split_done_locked(job);
             moe_cache_rewarm_feed_locked(*session, *device);
+            if (error == cudaSuccess && !session->stopping && !device->dead.load() && !device->queue.empty()) {
+                take_locked(job, pool, destination);
+                have_next = true;
+            }
             session->idle_cv.notify_all();
         }
 
