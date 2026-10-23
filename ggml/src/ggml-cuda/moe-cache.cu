@@ -3727,6 +3727,11 @@ static void moe_cache_setup_zone(moe_cache_device & device, size_t zone_bytes, i
         if (!pool.slab || !pool.expert_size || ggml_type_is_exl3((ggml_type)pool.wtype)) {
             continue;
         }
+        // compute buffer chunks lent from the tail of range 0 (the MTP draft keeps its own for good): a zone set there
+        // now would cover them, and its entries, back in the cache after the prefill, would hold the chunk's tensors
+        if (!pool.lent.empty()) {
+            continue;
+        }
         const int region0 = pool.ranges.empty() ? 0 : pool.ranges[0].count;
         const size_t zone_slots = (zone_bytes + pool.expert_size - 1) / pool.expert_size;
         if (!zone_slots || zone_slots > (size_t)region0 / 2) {
