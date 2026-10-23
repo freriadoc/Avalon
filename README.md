@@ -98,9 +98,25 @@ earlier quantization of the model). The MTP draft head agrees with the model on 
   model's expert cache.
 - Fused GPU kernels for generation (a linear-attention layer went from 53 to 39 launches), AVX2 kernels for the experts on the CPU, IQ3_K / IQ3_KS types.
 
+## Install (one command)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/freriadoc/Avalon/main/install.sh | bash
+```
+
+The installer checks the machine (Linux, AVX2, ROCm 7.x, an RDNA3 GPU, 64 GB of RAM, ~98 GiB of disk), builds
+`llama-server` for the detected GPU, downloads the model and its MTP head (~89 GiB, resumable), verifies every file
+against its SHA-256 on Hugging Face and installs an `avalon-server` launcher in `~/.local/bin` with the command of
+[Run](#run). Settings (environment): `AVALON_DIR`, `MODEL_DIR`, `BIN_DIR`, `AMDGPU_TARGETS`, `SKIP_MODEL=1` (build
+only), `FORCE=1`; see the top of `install.sh`. Then:
+
+```bash
+avalon-server          # OpenAI-compatible API on http://127.0.0.1:8080; extra arguments go to llama-server
+```
+
 ## Build (Linux, ROCm)
 
-Tested with ROCm 7.2.4 on gfx1100 (RX 7900 XT / XTX).
+By hand, without the installer. Tested with ROCm 7.2.4 on gfx1100 (RX 7900 XT / XTX).
 
 ```bash
 git clone https://github.com/freriadoc/Avalon && cd Avalon
