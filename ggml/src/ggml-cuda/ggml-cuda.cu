@@ -6393,6 +6393,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 // product, weighting): a window of 3. A wider one would also hold a node that runs
                 // before such a fusion (the gate's product) behind the CPU rows.
                 constexpr int hosted_read_window = 3;
+                // Tried (Oct 22, removed): while the merge waits for the CPU rows, its blocks read into the device's
+                // caches the weights of the MUL_MATs that follow (in device memory, not the compute buffer; up to 8
+                // ranges, a 4-byte load per 128-byte line, the flag polled between two turns over the grid). On a
+                // bench, K2 and K3 of qwen4exp's hc boundary that follows (3.5 MB each, cold): 10.4 -> 4.8 and
+                // 12.3 -> 6.6 us at 3 tokens (tests/hcbench/hcwarm.hip); in the model they stay at 7.8 and 10.6 us,
+                // even with all 8 MiB read every layer (not understood yet), and the replay is 0.3 - 0.5 % slower.
                 for (int k = i; k < std::min(i + hosted_read_window, cgraph->n_nodes); k++) {
                     ggml_cuda_moe_hosted_flush(*cuda_ctx, cgraph->nodes[k]);
                 }
