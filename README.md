@@ -1,3 +1,5 @@
+<p align="center"><img src="media/avalon-logo.png" alt="Avalon" width="400"></p>
+
 # Avalon
 
 **Qwen3.8-Flash-Next (125B MoE) at 91 tokens/s on a 2019 CPU, DDR4 and an AMD card in a PCIe 3.0 slot.**
