@@ -5161,6 +5161,11 @@ struct moe_hosted_layer {
     uint32_t * d_expect = nullptr;  // sequence number of the layer's last publication
 };
 
+// SPLIT: the dispatcher's CPU time model (moe_split_cpu_*) was fitted on one machine; on another the CPU rows take
+// longer or shorter. Its scale is measured once, on the layers with CPU rows left after a split: the first
+// moe_split_cal_skip warm the caches, the next moe_split_cal_layers are timed, then the scale is fixed (no timing after)
+static constexpr int moe_split_cal_skip = 500, moe_split_cal_layers = 2000;
+
 struct moe_hosted_state {
     moe_cache_session * session = nullptr;
     moe_cache_device * device = nullptr;
@@ -5185,6 +5190,11 @@ struct moe_hosted_state {
     double pcie_bytes_per_us = 13600.0;                      // SPLIT: host -> device copy rate (moe_cache_pcie_bytes_per_us)
     std::vector<moe_cache_pin> pins;                         // held by the last plan
     int64_t split_moved = 0;                                 // SPLIT: experts moved to the GPU
+    int split_tensors = 0;                                   // SPLIT: tensors copied for the last layer's moved experts
+    // SPLIT: the CPU term of the dispatcher's model scaled to this machine (moe_split_calibrate), measured once
+    double cpu_scale = 1.0;
+    int cal_left = moe_split_cal_skip + moe_split_cal_layers;   // GGML_CUDA_MOE_SPLIT_CPU_SCALE=x: fixed, not measured
+    double cal_measured = 0.0, cal_model = 0.0;
     // served by the thread that waits for the stream (ggml_cuda_moe_hosted_wait)
     std::mutex serve_mu;
     uint32_t last_seq = 0;
@@ -5916,6 +5926,7 @@ static int moe_hosted_split(moe_hosted_state * st, moe_hosted_layer * layer, int
     if (!moe_split_enabled() || n_tokens < 2) {
         return n_cpu;
     }
+    st->split_tensors = 0;
     uint64_t * plan2 = layer->h_plan2;
     for (int i = 0; i < 3 * rows; i++) {
         plan2[i] = 0;
@@ -5957,9 +5968,10 @@ static int moe_hosted_split(moe_hosted_state * st, moe_hosted_layer * layer, int
             }
             // the window's end: the later of the CPU rows and the GPU's work (the resident rows, the wait for the moved
             // experts, then the work queued behind it)
-            const auto cpu_time = [](int d, int r, int tensors) {
-                return d > 0 ? moe_split_cpu_fixed_us + moe_split_cpu_expert_us * d + moe_split_cpu_row_us * r +
-                               moe_split_cpu_copy_us * tensors : 0.0;
+            const double scale = st->cpu_scale;
+            const auto cpu_time = [scale](int d, int r, int tensors) {
+                return d > 0 ? scale * (moe_split_cpu_fixed_us + moe_split_cpu_expert_us * d + moe_split_cpu_row_us * r +
+                                        moe_split_cpu_copy_us * tensors) : 0.0;
             };
             const double gpu_before = moe_split_gpu_before_us + moe_split_gpu_row_us * (rows - n_cpu);
             const auto window = [&](int d, int r, int moved_rows, int tensors, double copies) {
@@ -6090,6 +6102,7 @@ static int moe_hosted_split(moe_hosted_state * st, moe_hosted_layer * layer, int
                 }
                 n_cpu = left;
                 st->split_moved += (int64_t) moved_experts.size();
+                st->split_tensors = MOE_ROLES * (int) moved_experts.size();
                 session.cv.notify_all();
             }
         }
@@ -6098,6 +6111,31 @@ static int moe_hosted_split(moe_hosted_state * st, moe_hosted_layer * layer, int
         __atomic_store_n(&layer->h_flags[24], seq, __ATOMIC_RELEASE);
     }
     return n_cpu;
+}
+
+// SPLIT: one timed layer of the calibration (moe_split_cal_skip): its CPU time from the plan to the CPU rows' flag (what
+// the model was fitted on) against the model's for the rows left; at the end the scale is fixed and logged
+static void moe_split_calibrate(moe_hosted_state * st, const moe_hosted_layer * layer, const int32_t * cpu_rows, int n_cpu,
+                                int64_t us) {
+    if (--st->cal_left >= moe_split_cal_layers) {
+        return;
+    }
+    int d = 0;
+    for (int j = 0; j < n_cpu; j++) {
+        bool seen = false;
+        for (int i = 0; i < j && !seen; i++) {
+            seen = layer->h_ids[cpu_rows[i]] == layer->h_ids[cpu_rows[j]];
+        }
+        d += !seen;
+    }
+    st->cal_measured += (double) us;
+    st->cal_model += moe_split_cpu_fixed_us + moe_split_cpu_expert_us * d + moe_split_cpu_row_us * n_cpu +
+                     moe_split_cpu_copy_us * st->split_tensors;
+    if (st->cal_left == 0 && st->cal_model > 0.0) {
+        st->cpu_scale = st->cal_measured / st->cal_model;
+        MOE_CACHE_LOG("[moe-cache] CUDA%d split: CPU rows take %.2f x the model's time (%d layers, %.1f us per layer)\n",
+                      st->device->physical, st->cpu_scale, moe_split_cal_layers, st->cal_measured / moe_split_cal_layers);
+    }
 }
 
 // One publication of the stream: plan the layer, raise the plan flag, compute the missed rows on
@@ -6274,6 +6312,7 @@ static void moe_hosted_serve_one(moe_hosted_state * st, uint32_t seq) {
     const int rows = layer->n_used * n_tokens;
     layer->last_tokens = n_tokens;
     int n_cpu = moe_hosted_plan(*st, *layer, layer->h_ids, rows, layer->h_plan, cpu_rows.data(), &layer->h_flags[0], seq);
+    const int64_t t_cal = st->cal_left > 0 && n_tokens >= 2 && moe_split_enabled() ? ggml_time_us() : 0;
     n_cpu = moe_hosted_split(st, layer, rows, n_tokens, seq, cpu_rows.data(), n_cpu);
     const int64_t t_plan = stats_every > 0 ? ggml_time_us() : 0;
 
@@ -6302,6 +6341,9 @@ static void moe_hosted_serve_one(moe_hosted_state * st, uint32_t seq) {
         }
     }
     __atomic_store_n(&layer->h_flags[16], seq, __ATOMIC_RELEASE);
+    if (t_cal > 0 && n_cpu > 0) {
+        moe_split_calibrate(st, layer, cpu_rows.data(), n_cpu, ggml_time_us() - t_cal);
+    }
     moe_hosted_admit_deferred(*st, *layer);
     if (!st->tl_host.empty()) {
         moe_tl_account(st, seq);
@@ -6513,6 +6555,10 @@ static moe_hosted_state * moe_hosted_state_for(moe_cache_session & session, moe_
     st->device = &device;
     const char * threads = getenv("GGML_CUDA_MOE_HOSTED_THREADS");
     st->n_threads = threads ? std::max(1, atoi(threads)) : moe_hosted_default_threads();
+    if (const char * scale = getenv("GGML_CUDA_MOE_SPLIT_CPU_SCALE")) {
+        st->cpu_scale = atof(scale);
+        st->cal_left = 0;
+    }
     MOE_CACHE_LOG("[moe-cache] CUDA%d CPU rows: %d threads\n", device.physical, st->n_threads);
     {
         std::string desc;
