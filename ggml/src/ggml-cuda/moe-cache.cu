@@ -78,6 +78,7 @@ static inline bool ggml_type_is_exl3(ggml_type) { return false; }
 #  include <process.h>
 #elif defined(__linux__)
 #  include <fcntl.h>
+#  include <sched.h>
 #  include <sys/file.h>
 #  include <sys/mman.h>
 #  include <unistd.h>
@@ -6474,6 +6475,33 @@ static double moe_cache_pcie_bytes_per_us(int physical, std::string & desc) {
     return best * moe_cache_pcie_copy_efficiency * 1000.0;   // 1 GB/s = 1000 bytes per microsecond
 }
 
+// the CPU rows' team: one thread per physical core the process may run on (its affinity mask, SMT siblings counted
+// once); elsewhere, or when the topology is not readable, half the hardware threads
+static int moe_hosted_default_threads() {
+    const int hw = std::max(1, (int) std::thread::hardware_concurrency());
+#if defined(__linux__)
+    cpu_set_t mask;
+    if (sched_getaffinity(0, sizeof(mask), &mask) == 0) {
+        std::set<std::string> cores;
+        for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
+            if (!CPU_ISSET(cpu, &mask)) {
+                continue;
+            }
+            std::ifstream f("/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/topology/thread_siblings_list");
+            std::string siblings;
+            if (!std::getline(f, siblings)) {
+                return std::max(1, hw / 2);
+            }
+            cores.insert(siblings);
+        }
+        if (!cores.empty()) {
+            return (int) cores.size();
+        }
+    }
+#endif
+    return std::max(1, hw / 2);
+}
+
 static moe_hosted_state * moe_hosted_state_for(moe_cache_session & session, moe_cache_device & device) {
     std::lock_guard<std::mutex> lock(g_hosted_mu);
     auto & entry = g_hosted[&session];
@@ -6484,8 +6512,8 @@ static moe_hosted_state * moe_hosted_state_for(moe_cache_session & session, moe_
     st->session = &session;
     st->device = &device;
     const char * threads = getenv("GGML_CUDA_MOE_HOSTED_THREADS");
-    const int hw = (int) std::thread::hardware_concurrency();
-    st->n_threads = threads ? std::max(1, atoi(threads)) : std::max(1, hw / 2);
+    st->n_threads = threads ? std::max(1, atoi(threads)) : moe_hosted_default_threads();
+    MOE_CACHE_LOG("[moe-cache] CUDA%d CPU rows: %d threads\n", device.physical, st->n_threads);
     {
         std::string desc;
         const double rate = moe_cache_pcie_bytes_per_us(device.physical, desc);
