@@ -12,6 +12,8 @@
 //   K2 W_i and W_d over xn      (one pass; xn in f16, written by K1 when the two follow each other)
 //   K3 W_u with the gated stream mean as its epilogue (the four rows of an embedding
 //      channel, e + c*n_embd, are computed by the same warp)
+// The weights are Q8_0 (our quantization) or BF16 (as some quantizations publish them, e.g. ISTA's): a "block" is 32
+// weights of a row either way; BF16 weights are exact in f32 and are multiplied there.
 
 #include "qwen4-hc.cuh"
 #include "common.cuh"
@@ -21,6 +23,20 @@
 #include <cmath>
 
 static constexpr int QWEN4_HC_MAX_TOKENS = 8;
+
+static bool qwen4_hc_weight_type(ggml_type t) {
+    return t == GGML_TYPE_Q8_0 || t == GGML_TYPE_BF16;
+}
+
+// bytes of a row of n weights
+template <ggml_type WT>
+static __host__ __device__ __forceinline__ size_t qwen4_hc_row_bytes(int n) {
+    return WT == GGML_TYPE_Q8_0 ? (size_t) (n / QK8_0) * sizeof(block_q8_0) : (size_t) n * sizeof(uint16_t);
+}
+
+// a BF16 pair (one 32-bit word, element order) as f32
+static __device__ __forceinline__ float qwen4_hc_bf16_lo(const int w) { return __uint_as_float((unsigned) w << 16); }
+static __device__ __forceinline__ float qwen4_hc_bf16_hi(const int w) { return __uint_as_float((unsigned) w & 0xffff0000u); }
 
 static bool qwen4_hc_is_unary(const ggml_tensor * t, ggml_unary_op op) {
     return t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == op;
@@ -301,8 +317,8 @@ static __device__ __forceinline__ float qwen4_hc_dot2(const half2 a, const half2
 static constexpr int QWEN4_HC_K2_WARPS = 4; // warps sharing one output row
 
 struct qwen4_hc_k2_args {
-    const block_q8_0 * wa;
-    const block_q8_0 * wb;
+    const void * wa;
+    const void * wb;
     const half * xh;
     float * out_a;
     float * out_b;
@@ -312,16 +328,49 @@ struct qwen4_hc_k2_args {
 
 // the workgroup of an output row (QWEN4_HC_K2_WARPS warps, tid its thread), partial its shared memory
 // (a row past the last, active false: the group only takes part in the block's barrier)
-template <int T>
+template <int T, ggml_type WT>
 static __device__ __forceinline__ void qwen4_hc_down_inject_body(const qwen4_hc_k2_args & a, const int row, const int tid,
         float (*partial)[T], const bool active = true) {
     const int nb   = a.n_in / QK8_0;
     const int lane = tid % WARP_SIZE;
     const int warp = tid / WARP_SIZE;
-    const block_q8_0 * w = row < a.n_a ? a.wa + (size_t) row * nb : a.wb + (size_t) (row - a.n_a) * nb;
+    const size_t rb = qwen4_hc_row_bytes<WT>(a.n_in);
+    const char * wrow = row < a.n_a ? (const char *) a.wa + (size_t) row * rb : (const char *) a.wb + (size_t) (row - a.n_a) * rb;
 
     float acc[T] = { 0.0f };
-    for (int ib = tid; active && ib < nb; ib += QWEN4_HC_K2_WARPS*WARP_SIZE) {
+    if constexpr (WT == GGML_TYPE_BF16) {
+        // the 32 weights of a block (four 16-byte loads) times the f16 activations, in f32
+        for (int ib = tid; active && ib < nb; ib += QWEN4_HC_K2_WARPS*WARP_SIZE) {
+            const int4 * wb4 = (const int4 *) (wrow + (size_t) ib*QK8_0*sizeof(uint16_t));
+            int wi[QK8_0/2];
+#pragma unroll
+            for (int q = 0; q < QK8_0/8; ++q) {
+                const int4 v = wb4[q];
+                wi[4*q + 0] = v.x; wi[4*q + 1] = v.y; wi[4*q + 2] = v.z; wi[4*q + 3] = v.w;
+            }
+#pragma unroll
+            for (int t = 0; t < T; ++t) {
+                const int4 * xb = (const int4 *) (a.xh + (size_t) t*a.n_in + ib*QK8_0);
+                float sum = 0.0f;
+#pragma unroll
+                for (int q = 0; q < QK8_0/8; ++q) {
+                    const int4 v = xb[q];
+                    const int vv[4] = { v.x, v.y, v.z, v.w };
+#pragma unroll
+                    for (int u = 0; u < 4; ++u) {
+                        half2 xv;
+                        memcpy(&xv, &vv[u], 4);
+                        const float2 xf = __half22float2(xv);
+                        sum = fmaf(qwen4_hc_bf16_lo(wi[4*q + u]), xf.x, sum);
+                        sum = fmaf(qwen4_hc_bf16_hi(wi[4*q + u]), xf.y, sum);
+                    }
+                }
+                acc[t] += sum;
+            }
+        }
+    }
+    const block_q8_0 * w = (const block_q8_0 *) wrow;
+    for (int ib = tid; WT == GGML_TYPE_Q8_0 && active && ib < nb; ib += QWEN4_HC_K2_WARPS*WARP_SIZE) {
         const float dw = __half2float(w[ib].d);
         half2 wh[QK8_0/2];
 #pragma unroll
@@ -376,26 +425,36 @@ static __device__ __forceinline__ void qwen4_hc_down_inject_body(const qwen4_hc_
 // one workgroup per output row: rows [0, n_a) from W_a, [n_a, n_a + n_b) from W_b (then scale + silu);
 // a thread takes whole Q8_0 blocks, neighbouring threads neighbouring blocks. With n_b = 0 it is a plain
 // product (ggml_cuda_mul_mat_q8_0_f16, the unfused path), with the same numbers.
-template <int T>
+template <int T, ggml_type WT>
 static __global__ void qwen4_hc_down_inject_f16(
-        const block_q8_0 * wa, const block_q8_0 * wb, const half * xh,
+        const void * wa, const void * wb, const half * xh,
         float * out_a, float * out_b, int n_in, int n_a, int n_b, float s, float b) {
     __shared__ float partial[QWEN4_HC_K2_WARPS][T];
-    qwen4_hc_down_inject_body<T>({ wa, wb, xh, out_a, out_b, n_in, n_a, n_b, s, b }, blockIdx.x, threadIdx.x, partial);
+    qwen4_hc_down_inject_body<T, WT>({ wa, wb, xh, out_a, out_b, n_in, n_a, n_b, s, b }, blockIdx.x, threadIdx.x, partial);
 }
 
-template <int T>
+template <int T, ggml_type WT>
 static void qwen4_hc_down_inject_launch(
-        const block_q8_0 * wa, const block_q8_0 * wb, const half * xh,
+        const void * wa, const void * wb, const half * xh,
         float * out_a, float * out_b, int n_in, int n_a, int n_b, int T_run, float s, float b, cudaStream_t stream) {
     if constexpr (T > 1) {
         if (T_run < T) {
-            qwen4_hc_down_inject_launch<T - 1>(wa, wb, xh, out_a, out_b, n_in, n_a, n_b, T_run, s, b, stream);
+            qwen4_hc_down_inject_launch<T - 1, WT>(wa, wb, xh, out_a, out_b, n_in, n_a, n_b, T_run, s, b, stream);
             return;
         }
     }
-    qwen4_hc_down_inject_f16<T><<<n_a + n_b, QWEN4_HC_K2_WARPS*WARP_SIZE, 0, stream>>>(
+    qwen4_hc_down_inject_f16<T, WT><<<n_a + n_b, QWEN4_HC_K2_WARPS*WARP_SIZE, 0, stream>>>(
             wa, wb, xh, out_a, out_b, n_in, n_a, n_b, s, b);
+}
+
+static void qwen4_hc_down_inject_launch(ggml_type wt,
+        const void * wa, const void * wb, const half * xh,
+        float * out_a, float * out_b, int n_in, int n_a, int n_b, int T_run, float s, float b, cudaStream_t stream) {
+    if (wt == GGML_TYPE_BF16) {
+        qwen4_hc_down_inject_launch<QWEN4_HC_MAX_TOKENS, GGML_TYPE_BF16>(wa, wb, xh, out_a, out_b, n_in, n_a, n_b, T_run, s, b, stream);
+    } else {
+        qwen4_hc_down_inject_launch<QWEN4_HC_MAX_TOKENS, GGML_TYPE_Q8_0>(wa, wb, xh, out_a, out_b, n_in, n_a, n_b, T_run, s, b, stream);
+    }
 }
 
 // ---------------------------------------------------------------- K1 -> K2 in one kernel
@@ -410,7 +469,7 @@ static constexpr int QWEN4_HC_K12_ROWS = QWEN4_HC_K1_THREADS / (QWEN4_HC_K2_WARP
 
 static __device__ __attribute__((aligned(256))) unsigned g_qwen4_hc_k12[128];   // K1 done [0], finished [64]
 
-template <int T>
+template <int T, ggml_type WT>
 __launch_bounds__(QWEN4_HC_K1_THREADS, 1)
 static __global__ void qwen4_hc_k1_k2(const qwen4_hc_k1_args a1, const qwen4_hc_k2_args a2) {
     const int n_k1 = a1.hc * T;
@@ -432,7 +491,7 @@ static __global__ void qwen4_hc_k1_k2(const qwen4_hc_k1_args a1, const qwen4_hc_
         __shared__ float partial[QWEN4_HC_K12_ROWS][QWEN4_HC_K2_WARPS][T];
         const int g   = threadIdx.x / (QWEN4_HC_K2_WARPS*WARP_SIZE);
         const int row = ((int) blockIdx.x - n_k1) * QWEN4_HC_K12_ROWS + g;
-        qwen4_hc_down_inject_body<T>(a2, row, threadIdx.x % (QWEN4_HC_K2_WARPS*WARP_SIZE), partial[g], row < a2.n_a + a2.n_b);
+        qwen4_hc_down_inject_body<T, WT>(a2, row, threadIdx.x % (QWEN4_HC_K2_WARPS*WARP_SIZE), partial[g], row < a2.n_a + a2.n_b);
     }
     if (threadIdx.x == 0 && atomicAdd(&g_qwen4_hc_k12[64], 1u) == gridDim.x - 1) {
         g_qwen4_hc_k12[0]  = 0;
@@ -441,16 +500,16 @@ static __global__ void qwen4_hc_k1_k2(const qwen4_hc_k1_args a1, const qwen4_hc_
     }
 }
 
-template <int T>
+template <int T, ggml_type WT>
 static void qwen4_hc_k1_k2_launch(const qwen4_hc_k1_args & a1, const qwen4_hc_k2_args & a2, int T_run, cudaStream_t stream) {
     if constexpr (T > 1) {
         if (T_run < T) {
-            qwen4_hc_k1_k2_launch<T - 1>(a1, a2, T_run, stream);
+            qwen4_hc_k1_k2_launch<T - 1, WT>(a1, a2, T_run, stream);
             return;
         }
     }
     const int k2_blocks = (a2.n_a + a2.n_b + QWEN4_HC_K12_ROWS - 1) / QWEN4_HC_K12_ROWS;
-    qwen4_hc_k1_k2<T><<<a1.hc*T + k2_blocks, QWEN4_HC_K1_THREADS, 0, stream>>>(a1, a2);
+    qwen4_hc_k1_k2<T, WT><<<a1.hc*T + k2_blocks, QWEN4_HC_K1_THREADS, 0, stream>>>(a1, a2);
 }
 
 static void qwen4_hc_to_f16_launch(const float * x, half * xh, int n, cudaStream_t stream) {
@@ -458,7 +517,7 @@ static void qwen4_hc_to_f16_launch(const float * x, half * xh, int n, cudaStream
 }
 
 bool ggml_cuda_mul_mat_q8_0_f16_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
-    return src0->type == GGML_TYPE_Q8_0 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+    return qwen4_hc_weight_type(src0->type) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
         ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
         src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
         src1->ne[1] >= 1 && src1->ne[1] <= QWEN4_HC_MAX_TOKENS && src0->ne[0] % QK8_0 == 0;
@@ -470,7 +529,7 @@ void ggml_cuda_mul_mat_q8_0_f16(ggml_backend_cuda_context & ctx, const ggml_tens
     const int T = (int) src1->ne[1];
     ggml_cuda_pool_alloc<half> xh(ctx.pool(), (size_t) T * n);
     qwen4_hc_to_f16_launch((const float *) src1->data, xh.get(), T * n, ctx.stream());
-    qwen4_hc_down_inject_launch<QWEN4_HC_MAX_TOKENS>((const block_q8_0 *) src0->data, nullptr, xh.get(),
+    qwen4_hc_down_inject_launch(src0->type, src0->data, nullptr, xh.get(),
             (float *) dst->data, nullptr, n, (int) src0->ne[1], 0, T, 1.0f, 0.0f, ctx.stream());
 }
 
@@ -491,7 +550,7 @@ static bool qwen4_hc_match_k2(const ggml_cgraph * cgraph, int i, qwen4_hc_span &
         mm_b->src[1] == x &&
         (ggml_prec) ggml_get_op_params_i32(mm_a, 3) == GGML_PREC_F16 &&
         (ggml_prec) ggml_get_op_params_i32(mm_b, 3) == GGML_PREC_F16 &&
-        mm_a->src[0]->type == GGML_TYPE_Q8_0 && mm_b->src[0]->type == GGML_TYPE_Q8_0 &&
+        qwen4_hc_weight_type(mm_a->src[0]->type) && mm_b->src[0]->type == mm_a->src[0]->type &&
         ggml_is_contiguous(mm_a->src[0]) && ggml_is_contiguous(mm_b->src[0]) &&
         ggml_nelements(mm_a->src[0]) == mm_a->src[0]->ne[0]*mm_a->src[0]->ne[1] &&
         ggml_nelements(mm_b->src[0]) == mm_b->src[0]->ne[0]*mm_b->src[0]->ne[1] &&
@@ -515,9 +574,9 @@ static constexpr int QWEN4_HC_K3_MAX_LO  = 512;
 // converted below F32 (ggml_prec_set_src, ggml_cuda_mul_mat_q8_0_f32): the two paths compute the same numbers.
 // NB > 0: nb known at compile time, the loop unrolled whole (every weight load issued at once; with a bound known at
 // run time the compiler waits for each pair of blocks). Faster for one token, slower for three (9.60 -> 10.36 us).
-template <int T, int NB = 0>
+template <int T, int NB = 0, ggml_type WT = GGML_TYPE_Q8_0>
 static __device__ __forceinline__ void qwen4_hc_row_q8_0_f32(
-        const block_q8_0 * wr, int nb_rt, const float * x, int k, float * acc) {
+        const char * wrow, int nb_rt, const float * x, int k, float * acc) {
     const int nb = NB > 0 ? NB : nb_rt;
     const float4 * x4 = (const float4 *) x;   // lane k reads the k-th float4 of a block: no bank conflict
     const int n4 = nb*QK8_0/4;
@@ -525,7 +584,20 @@ static __device__ __forceinline__ void qwen4_hc_row_q8_0_f32(
     for (int t = 0; t < T; ++t) {
         acc[t] = 0.0f;
     }
+    const block_q8_0 * wr = (const block_q8_0 *) wrow;
     const auto block = [&](const int ib) {
+        if constexpr (WT == GGML_TYPE_BF16) {
+            // the same four weights of the block as BF16 (8 bytes)
+            const int2 wi = *(const int2 *) (wrow + ((size_t) ib*QK8_0 + 4*k)*sizeof(uint16_t));
+            const float w0 = qwen4_hc_bf16_lo(wi.x), w1 = qwen4_hc_bf16_hi(wi.x);
+            const float w2 = qwen4_hc_bf16_lo(wi.y), w3 = qwen4_hc_bf16_hi(wi.y);
+#pragma unroll
+            for (int t = 0; t < T; ++t) {
+                const float4 xv = x4[t*n4 + ib*(QK8_0/4) + k];
+                acc[t] += w0*xv.x + w1*xv.y + w2*xv.z + w3*xv.w;
+            }
+            return;
+        }
         const float dw = __half2float(wr[ib].d);
         const int   wi = get_int_b2(wr[ib].qs, k);
         const float w0 = (float) (int8_t) (wi      );
@@ -576,7 +648,7 @@ static __device__ __forceinline__ void qwen4_hc_load_shared(const float * x, int
 }
 
 struct qwen4_hc_k3_args {
-    const block_q8_0 * w;
+    const void * w;
     const float * lo;
     const float * xn;
     float * mixed;
@@ -586,7 +658,7 @@ struct qwen4_hc_k3_args {
 };
 
 // workgroup bx (blockDim.x threads), smem its shared memory
-template <int T, int NB = 0>
+template <int T, int NB = 0, ggml_type WT = GGML_TYPE_Q8_0>
 static __device__ __forceinline__ void qwen4_hc_up_pre_body(const qwen4_hc_k3_args & a, const int bx, float * smem) {
     const int n_lo = a.n_lo, n_embd = a.n_embd, hc = a.hc;
     const int nb = n_lo / QK8_0;
@@ -600,7 +672,8 @@ static __device__ __forceinline__ void qwen4_hc_up_pre_body(const qwen4_hc_k3_ar
         const int k = lane & 7;
 
         float acc[T];
-        qwen4_hc_row_q8_0_f32<T, NB>(a.w + ((size_t) (e + min(c, hc - 1)*n_embd)) * nb, nb, smem, k, acc);
+        qwen4_hc_row_q8_0_f32<T, NB, WT>((const char *) a.w + ((size_t) (e + min(c, hc - 1)*n_embd)) * qwen4_hc_row_bytes<WT>(n_lo),
+                nb, smem, k, acc);
 #pragma unroll
         for (int t = 0; t < T; ++t) {
             float m = (c < hc && k == 0) ? a.xn[((size_t) t*hc + c) * n_embd + e] / (1.0f + expf(-acc[t])) : 0.0f;
@@ -634,19 +707,19 @@ static __device__ __forceinline__ void qwen4_hc_up_pre_body(const qwen4_hc_k3_ar
 
 // mixed_q8_1 (null: none): the q8_1 of mixed as quantize_q8_1 writes it, for the product that reads it; then a
 // workgroup has QK8_1 warps (n_embd % QK8_1 == 0): its outputs are one q8_1 block per token
-template <int T, int NB = 0>
+template <int T, int NB = 0, ggml_type WT = GGML_TYPE_Q8_0>
 static __global__ void qwen4_hc_up_pre_q8_0(
-        const block_q8_0 * w, const float * lo, const float * xn, float * mixed,
+        const void * w, const float * lo, const float * xn, float * mixed,
         int n_lo, int n_embd, int hc, float scale, block_q8_1 * mixed_q8_1) {
     extern __shared__ float qwen4_hc_k3_smem[];
-    qwen4_hc_up_pre_body<T, NB>({ w, lo, xn, mixed, n_lo, n_embd, hc, scale, mixed_q8_1 }, blockIdx.x, qwen4_hc_k3_smem);
+    qwen4_hc_up_pre_body<T, NB, WT>({ w, lo, xn, mixed, n_lo, n_embd, hc, scale, mixed_q8_1 }, blockIdx.x, qwen4_hc_k3_smem);
 }
 
 static constexpr int QWEN4_HC_MM_MAX_N = 1024;
 
-// dst[t][r] = W[r] . x[t] for Q8_0 W [nrows][n <= QWEN4_HC_MM_MAX_N], f32 x [T][n]: four rows per warp
-template <int T>
-static __global__ void qwen4_hc_mul_mat_q8_0_f32(const block_q8_0 * w, const float * x, float * dst, int n, int nrows) {
+// dst[t][r] = W[r] . x[t] for Q8_0 or BF16 W [nrows][n <= QWEN4_HC_MM_MAX_N], f32 x [T][n]: four rows per warp
+template <int T, ggml_type WT>
+static __global__ void qwen4_hc_mul_mat_q8_0_f32(const void * w, const float * x, float * dst, int n, int nrows) {
     extern __shared__ float qwen4_hc_mm_smem[];
     qwen4_hc_load_shared<T*QWEN4_HC_MM_MAX_N>(x, T*n, qwen4_hc_mm_smem);
     __syncthreads();
@@ -657,7 +730,8 @@ static __global__ void qwen4_hc_mul_mat_q8_0_f32(const block_q8_0 * w, const flo
     }
     const int nb = n / QK8_0;
     float acc[T];
-    qwen4_hc_row_q8_0_f32<T>(w + (size_t) min(row, nrows - 1) * nb, nb, qwen4_hc_mm_smem, lane & 7, acc);
+    qwen4_hc_row_q8_0_f32<T, 0, WT>((const char *) w + (size_t) min(row, nrows - 1) * qwen4_hc_row_bytes<WT>(n), nb,
+            qwen4_hc_mm_smem, lane & 7, acc);
     if (row < nrows && (lane & 7) == 0) {
 #pragma unroll
         for (int t = 0; t < T; ++t) {
@@ -666,22 +740,22 @@ static __global__ void qwen4_hc_mul_mat_q8_0_f32(const block_q8_0 * w, const flo
     }
 }
 
-template <int T>
-static void qwen4_hc_mul_mat_launch(const block_q8_0 * w, const float * x, float * dst, int n, int nrows, int T_run,
+template <int T, ggml_type WT>
+static void qwen4_hc_mul_mat_launch(const void * w, const float * x, float * dst, int n, int nrows, int T_run,
         cudaStream_t stream) {
     if constexpr (T > 1) {
         if (T_run < T) {
-            qwen4_hc_mul_mat_launch<T - 1>(w, x, dst, n, nrows, T_run, stream);
+            qwen4_hc_mul_mat_launch<T - 1, WT>(w, x, dst, n, nrows, T_run, stream);
             return;
         }
     }
     const int warps = 8;
-    qwen4_hc_mul_mat_q8_0_f32<T><<<(nrows + 4*warps - 1) / (4*warps), warps*WARP_SIZE, (size_t) T*n*sizeof(float), stream>>>(
+    qwen4_hc_mul_mat_q8_0_f32<T, WT><<<(nrows + 4*warps - 1) / (4*warps), warps*WARP_SIZE, (size_t) T*n*sizeof(float), stream>>>(
             w, x, dst, n, nrows);
 }
 
 bool ggml_cuda_mul_mat_q8_0_f32_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
-    return src0->type == GGML_TYPE_Q8_0 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+    return qwen4_hc_weight_type(src0->type) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
         ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
         src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
         src1->ne[1] >= 1 && src1->ne[1] <= QWEN4_HC_MAX_TOKENS && src0->ne[0] % QK8_0 == 0 &&
@@ -690,38 +764,56 @@ bool ggml_cuda_mul_mat_q8_0_f32_supported(const ggml_tensor * src0, const ggml_t
 
 void ggml_cuda_mul_mat_q8_0_f32(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(ggml_cuda_mul_mat_q8_0_f32_supported(src0, src1, dst));
-    qwen4_hc_mul_mat_launch<QWEN4_HC_MAX_TOKENS>((const block_q8_0 *) src0->data, (const float *) src1->data,
-            (float *) dst->data, (int) src0->ne[0], (int) src0->ne[1], (int) src1->ne[1], ctx.stream());
+    if (src0->type == GGML_TYPE_BF16) {
+        qwen4_hc_mul_mat_launch<QWEN4_HC_MAX_TOKENS, GGML_TYPE_BF16>(src0->data, (const float *) src1->data,
+                (float *) dst->data, (int) src0->ne[0], (int) src0->ne[1], (int) src1->ne[1], ctx.stream());
+    } else {
+        qwen4_hc_mul_mat_launch<QWEN4_HC_MAX_TOKENS, GGML_TYPE_Q8_0>(src0->data, (const float *) src1->data,
+                (float *) dst->data, (int) src0->ne[0], (int) src0->ne[1], (int) src1->ne[1], ctx.stream());
+    }
 }
 
-template <int T>
+template <int T, ggml_type WT>
 static void qwen4_hc_up_pre_launch(int grid, int block, size_t smem, cudaStream_t stream,
-        const block_q8_0 * w, const float * lo, const float * xn, float * mixed,
+        const void * w, const float * lo, const float * xn, float * mixed,
         int n_lo, int n_embd, int hc, int T_run, float scale, block_q8_1 * mixed_q8_1) {
     if constexpr (T > 1) {
         if (T_run < T) {
-            qwen4_hc_up_pre_launch<T - 1>(grid, block, smem, stream, w, lo, xn, mixed, n_lo, n_embd, hc, T_run, scale, mixed_q8_1);
+            qwen4_hc_up_pre_launch<T - 1, WT>(grid, block, smem, stream, w, lo, xn, mixed, n_lo, n_embd, hc, T_run, scale, mixed_q8_1);
             return;
         }
     }
-    qwen4_hc_up_pre_q8_0<T><<<grid, block, smem, stream>>>(w, lo, xn, mixed, n_lo, n_embd, hc, scale, mixed_q8_1);
+    qwen4_hc_up_pre_q8_0<T, 0, WT><<<grid, block, smem, stream>>>(w, lo, xn, mixed, n_lo, n_embd, hc, scale, mixed_q8_1);
 }
 
 // one token: the kernel with nb = n_lo / QK8_0 known at compile time (NB down to 1), the generic one past the bound
-template <int NB>
+template <int NB, ggml_type WT>
 static void qwen4_hc_up_pre_launch_1(int grid, int block, size_t smem, cudaStream_t stream,
-        const block_q8_0 * w, const float * lo, const float * xn, float * mixed,
+        const void * w, const float * lo, const float * xn, float * mixed,
         int n_lo, int n_embd, int hc, float scale, block_q8_1 * mixed_q8_1) {
     if constexpr (NB > 1) {
         if (n_lo / QK8_0 < NB) {
-            qwen4_hc_up_pre_launch_1<NB - 1>(grid, block, smem, stream, w, lo, xn, mixed, n_lo, n_embd, hc, scale, mixed_q8_1);
+            qwen4_hc_up_pre_launch_1<NB - 1, WT>(grid, block, smem, stream, w, lo, xn, mixed, n_lo, n_embd, hc, scale, mixed_q8_1);
             return;
         }
     }
     if (n_lo / QK8_0 == NB) {
-        qwen4_hc_up_pre_q8_0<1, NB><<<grid, block, smem, stream>>>(w, lo, xn, mixed, n_lo, n_embd, hc, scale, mixed_q8_1);
+        qwen4_hc_up_pre_q8_0<1, NB, WT><<<grid, block, smem, stream>>>(w, lo, xn, mixed, n_lo, n_embd, hc, scale, mixed_q8_1);
     } else {
-        qwen4_hc_up_pre_q8_0<1><<<grid, block, smem, stream>>>(w, lo, xn, mixed, n_lo, n_embd, hc, scale, mixed_q8_1);
+        qwen4_hc_up_pre_q8_0<1, 0, WT><<<grid, block, smem, stream>>>(w, lo, xn, mixed, n_lo, n_embd, hc, scale, mixed_q8_1);
+    }
+}
+
+template <ggml_type WT>
+static void qwen4_hc_up_pre_launch_t(int grid, int block, size_t smem, cudaStream_t stream,
+        const void * w, const float * lo, const float * xn, float * mixed,
+        int n_lo, int n_embd, int hc, int T, float scale, block_q8_1 * mixed_q8_1) {
+    if (T == 1) {
+        qwen4_hc_up_pre_launch_1<QWEN4_HC_K3_MAX_LO / QK8_0, WT>(grid, block, smem, stream, w, lo, xn, mixed, n_lo, n_embd, hc,
+                scale, mixed_q8_1);
+    } else {
+        qwen4_hc_up_pre_launch<QWEN4_HC_MAX_TOKENS, WT>(grid, block, smem, stream, w, lo, xn, mixed, n_lo, n_embd, hc, T,
+                scale, mixed_q8_1);
     }
 }
 
@@ -743,7 +835,7 @@ static bool qwen4_hc_match_k3(const ggml_cgraph * cgraph, int i, qwen4_hc_span &
     // the fused kernel multiplies lo in f32, as the unfused product does when the graph forbids converting lo
     return qwen4_hc_view_base(pre->src[1]) == mm && ggml_is_contiguous(pre->src[1]) &&
         ggml_get_op_params_i32(pre, 1) != 0 && (ggml_prec) ggml_get_op_params_i32(mm, 3) == GGML_PREC_F32 &&
-        mm->src[0]->type == GGML_TYPE_Q8_0 && ggml_is_contiguous(mm->src[0]) &&
+        qwen4_hc_weight_type(mm->src[0]->type) && ggml_is_contiguous(mm->src[0]) &&
         qwen4_hc_f32_cont(lo) && qwen4_hc_f32_cont(xn) && qwen4_hc_f32_cont(pre) && qwen4_hc_f32_cont(mm) &&
         hc >= 1 && hc <= 4 && T >= 1 && T <= QWEN4_HC_MAX_TOKENS && xn->ne[3] == 1 &&
         lo->ne[0] % QK8_0 == 0 && lo->ne[0] <= QWEN4_HC_K3_MAX_LO && ggml_nelements(lo) == lo->ne[0]*T &&
@@ -777,8 +869,7 @@ static void qwen4_hc_k2_launch(const ggml_cgraph * cgraph, const qwen4_hc_span &
     const ggml_tensor * sc   = cgraph->nodes[span.idx[2]];
     ggml_tensor *       silu = cgraph->nodes[span.idx[3]];
     const ggml_tensor * x    = mm_a->src[1];
-    qwen4_hc_down_inject_launch<QWEN4_HC_MAX_TOKENS>(
-            (const block_q8_0 *) mm_a->src[0]->data, (const block_q8_0 *) mm_b->src[0]->data, xh,
+    qwen4_hc_down_inject_launch(mm_a->src[0]->type, mm_a->src[0]->data, mm_b->src[0]->data, xh,
             (float *) mm_a->data, (float *) silu->data, (int) x->ne[0], (int) mm_a->src[0]->ne[1], (int) mm_b->src[0]->ne[1],
             (int) x->ne[1], ggml_get_op_params_f32(sc, 0), ggml_get_op_params_f32(sc, 1), stream);
 }
@@ -855,10 +946,14 @@ static int qwen4_hc_fuse_k1(ggml_backend_cuda_context & ctx, ggml_cgraph * cgrap
         const ggml_tensor * sc   = cgraph->nodes[span2.idx[2]];
         ggml_tensor *       silu = cgraph->nodes[span2.idx[3]];
         const ggml_tensor * x    = mm_a->src[1];
-        const qwen4_hc_k2_args a2 = { (const block_q8_0 *) mm_a->src[0]->data, (const block_q8_0 *) mm_b->src[0]->data,
+        const qwen4_hc_k2_args a2 = { mm_a->src[0]->data, mm_b->src[0]->data,
             xh.get(), (float *) mm_a->data, (float *) silu->data, (int) x->ne[0], (int) mm_a->src[0]->ne[1],
             (int) mm_b->src[0]->ne[1], ggml_get_op_params_f32(sc, 0), ggml_get_op_params_f32(sc, 1) };
-        qwen4_hc_k1_k2_launch<QWEN4_HC_MAX_TOKENS>(a1, a2, T, stream);
+        if (mm_a->src[0]->type == GGML_TYPE_BF16) {
+            qwen4_hc_k1_k2_launch<QWEN4_HC_MAX_TOKENS, GGML_TYPE_BF16>(a1, a2, T, stream);
+        } else {
+            qwen4_hc_k1_k2_launch<QWEN4_HC_MAX_TOKENS, GGML_TYPE_Q8_0>(a1, a2, T, stream);
+        }
         CUDA_CHECK(cudaGetLastError());
         return (j - i) + span2.n_all - 1;
     }
@@ -918,14 +1013,13 @@ int ggml_cuda_try_fuse_qwen4_hc(ggml_backend_cuda_context & ctx, ggml_cgraph * c
         block_q8_1 * q8_1 = n_embd % QK8_1 == 0 ? (block_q8_1 *) ggml_cuda_q8_1_produce(ctx, cgraph, span3.idx[1]) : nullptr;
         const int warps = q8_1 ? QK8_1 : QWEN4_HC_K3_THREADS / WARP_SIZE;
         const size_t smem = (size_t) T * (n_lo + (q8_1 ? QK8_1 : 0)) * sizeof(float);
-        if (T == 1) {
-            qwen4_hc_up_pre_launch_1<QWEN4_HC_K3_MAX_LO / QK8_0>((n_embd + warps - 1) / warps, warps*WARP_SIZE, smem, stream,
-                    (const block_q8_0 *) mm->src[0]->data, lo_d, (const float *) xn->data,
-                    (float *) pre->data, n_lo, n_embd, hc, ggml_get_op_params_f32(pre, 0), q8_1);
+        const int grid = (n_embd + warps - 1) / warps;
+        if (mm->src[0]->type == GGML_TYPE_BF16) {
+            qwen4_hc_up_pre_launch_t<GGML_TYPE_BF16>(grid, warps*WARP_SIZE, smem, stream, mm->src[0]->data, lo_d,
+                    (const float *) xn->data, (float *) pre->data, n_lo, n_embd, hc, T, ggml_get_op_params_f32(pre, 0), q8_1);
         } else {
-            qwen4_hc_up_pre_launch<QWEN4_HC_MAX_TOKENS>((n_embd + warps - 1) / warps, warps*WARP_SIZE, smem, stream,
-                    (const block_q8_0 *) mm->src[0]->data, lo_d, (const float *) xn->data,
-                    (float *) pre->data, n_lo, n_embd, hc, T, ggml_get_op_params_f32(pre, 0), q8_1);
+            qwen4_hc_up_pre_launch_t<GGML_TYPE_Q8_0>(grid, warps*WARP_SIZE, smem, stream, mm->src[0]->data, lo_d,
+                    (const float *) xn->data, (float *) pre->data, n_lo, n_embd, hc, T, ggml_get_op_params_f32(pre, 0), q8_1);
         }
         return span3.n_all - 1;
     }

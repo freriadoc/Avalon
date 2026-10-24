@@ -2244,13 +2244,20 @@ static ggml_cuda_mul_mat_path ggml_cuda_mul_mat_get_path(const ggml_tensor * src
     }
 
     // src1 may not be converted below F32 or F16 (ggml_prec_set_src): MMVQ and MMQ would quantize it, cuBLAS
-    // computes in F32 (asked) or F16
+    // computes in F32 (asked) or F16. BF16 weights take the same kernels when they can (the hyper-connection
+    // products, fused or not, compute the same numbers), MMVF otherwise (src1 in F32)
     const ggml_prec prec_src1 = (ggml_prec) ggml_get_op_params_i32(dst, 3);
     if (ggml_is_quantized(src0->type) && prec_src1 == GGML_PREC_F32) {
         return ggml_cuda_mul_mat_q8_0_f32_supported(src0, src1, dst) ? GGML_CUDA_MM_Q8_0_F32 : GGML_CUDA_MM_CUBLAS;
     }
     if (ggml_is_quantized(src0->type) && prec_src1 == GGML_PREC_F16) {
         return ggml_cuda_mul_mat_q8_0_f16_supported(src0, src1, dst) ? GGML_CUDA_MM_Q8_0_F16 : GGML_CUDA_MM_CUBLAS;
+    }
+    if (src0->type == GGML_TYPE_BF16 && prec_src1 == GGML_PREC_F32 && ggml_cuda_mul_mat_q8_0_f32_supported(src0, src1, dst)) {
+        return GGML_CUDA_MM_Q8_0_F32;
+    }
+    if (src0->type == GGML_TYPE_BF16 && prec_src1 == GGML_PREC_F16 && ggml_cuda_mul_mat_q8_0_f16_supported(src0, src1, dst)) {
+        return GGML_CUDA_MM_Q8_0_F16;
     }
 
     const int cc        = ggml_cuda_info().devices[device].cc;
