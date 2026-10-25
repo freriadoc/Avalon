@@ -30,6 +30,7 @@ void ggml_moe_cache_unregister(const void * owner) {
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <map>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -1163,6 +1164,9 @@ struct ggml_backend_sched {
     // expert weights of a scheduler that will share this one's MoE cache session (the MTP draft), shown to the cache
     // with this scheduler's own when it primes it: the pools' shares count them (ggml_backend_sched_set_moe_guest_weights)
     std::vector<const struct ggml_tensor *> * moe_guest_weights;
+    // GGML_MOE_CACHE_LAYER_DEVICE=1: layer -> backend index of the GPU whose expert cache holds the layer's experts (made
+    // when the cache is primed); the layer's hosted MoE blocks run there
+    std::unordered_map<int, int> * moe_layer_backend;
     const struct ggml_cgraph * plan_key;
     int      plan_key_n_nodes;
     uint64_t plan_gen;
@@ -1257,9 +1261,31 @@ static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML
 // returns the backend that should be used for the node based on the current locations
 static bool ggml_backend_sched_is_hosted_moe(ggml_backend_sched_t sched, const struct ggml_tensor * node);
 
+// the backend whose expert cache holds the layer of an expert product (MUL_MAT_ID) or of the swiglu between two
+// (GGML_MOE_CACHE_LAYER_DEVICE=1), -1 if unknown
+static int ggml_backend_sched_moe_layer_backend(ggml_backend_sched_t sched, const struct ggml_tensor * node) {
+    if (!sched->moe_layer_backend || sched->moe_layer_backend->empty()) {
+        return -1;
+    }
+    if (node->op == GGML_OP_GLU && node->src[0]) {
+        node = node->src[0];
+    }
+    int layer;
+    if (node->op != GGML_OP_MUL_MAT_ID || !node->src[0] || sscanf(node->src[0]->name, "blk.%d.", &layer) != 1) {
+        return -1;
+    }
+    const auto it = sched->moe_layer_backend->find(layer);
+    return it == sched->moe_layer_backend->end() ? -1 : it->second;
+}
+
 static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, struct ggml_tensor * tensor) {
-    // a MoE block the GPU hosts: on the first GPU backend (the cache's device)
+    // a MoE block the GPU hosts: on its layer's GPU (layers split over several GPUs), else on the first GPU backend
     if (ggml_backend_sched_is_hosted_moe(sched, tensor)) {
+        const int lb = ggml_backend_sched_moe_layer_backend(sched, tensor);
+        if (lb >= 0 && ggml_backend_supports_op(sched->backends[lb], tensor)) {
+            SET_CAUSE(tensor, "1.moe-layer");
+            return lb;
+        }
         for (int b = 0; b < sched->n_backends - 1; b++) {
             if (ggml_backend_dev_type(ggml_backend_get_device(sched->backends[b])) == GGML_BACKEND_DEVICE_TYPE_GPU &&
                 ggml_backend_supports_op(sched->backends[b], tensor)) {
@@ -3083,6 +3109,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     }
     delete sched->plans;
     delete sched->moe_guest_weights;
+    delete sched->moe_layer_backend;
     ggml_free(sched->ctx);
     ggml_hash_set_free(&sched->hash_set);
     for (int i = 0; i < sched->splits_capacity; i++) {
@@ -3355,41 +3382,61 @@ static void ggml_backend_sched_prime_moe_cache(ggml_backend_sched_t sched, struc
         return;
     }
 
-    // the prefetch's backend now rather than at the first large prefill: its queue then exists when the cache
-    // measures the free memory (prepare_queues)
-    if (sched->prefetch_experts) {
-        ggml_backend_sched_prefetch_backend_init(sched, sched->backends[0]->device);
-    }
-    // a guest's queues were created with the owner's, before the cache was sized
-    if (ggml_moe_cache.prepare_queues && !sched->moe_cache_guest) {
-        ggml_moe_cache.prepare_queues(sched->moe_cache_session, graph);
-    }
-
-    if (sched->prefetch_experts && slot_bytes && ggml_moe_cache.set_lend_size) {
-        ggml_moe_cache.set_lend_size(sched->moe_cache_session, slot_bytes, sched->prefetch_n_slots);
-    }
-
-    // GGML_MOE_CACHE_LAYER_DEVICE=1 (layers split over several GPUs, not the default yet): each expert tensor is tied to
-    // the backend that holds its layer's other weights, the cache learns it on that device only
+    // GGML_MOE_CACHE_LAYER_DEVICE=1 (several GPUs, not the default yet): the dense weights and the KV stay where they are
+    // (one GPU); the MoE layers are shared between the GPUs' expert caches, in layer order, each GPU taking a share of the
+    // experts' bytes proportional to its free memory. Each expert tensor is tied to its layer's GPU (the cache learns it
+    // there only) and the layer's hosted MoE blocks run there (ggml_backend_sched_moe_layer_backend), its activations
+    // copied over by the scheduler. The prefill's expert products stay on the first GPU with the prefetch: a layer that
+    // GPU does not cache is copied whole, as an uncached one is
     const char * layer_device_env = getenv("GGML_MOE_CACHE_LAYER_DEVICE");
     if (layer_device_env && atoi(layer_device_env) && ggml_moe_cache.assign && !sched->moe_cache_guest) {
-        std::unordered_map<int, int> layer_backend;
-        for (int i = 0; i < graph->n_nodes; i++) {
-            const ggml_tensor * node = graph->nodes[i];
-            for (int j = 0; j < GGML_MAX_SRC; j++) {
-                const ggml_tensor * src = node->src[j];
-                const ggml_backend_buffer_t buffer = src ? (src->view_src ? src->view_src->buffer : src->buffer) : nullptr;
-                int layer;
-                if (!buffer || ggml_backend_buffer_is_host(buffer) ||
-                        ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
-                        sscanf(src->name, "blk.%d.", &layer) != 1 || layer_backend.count(layer)) {
-                    continue;
-                }
-                const int b = ggml_backend_sched_backend_from_buffer(sched, src, node);
-                if (b >= 0) {
-                    layer_backend[layer] = b;
-                }
+        if (!sched->moe_layer_backend) {
+            sched->moe_layer_backend = new std::unordered_map<int, int>();
+        }
+        std::unordered_map<int, int> & layer_backend = *sched->moe_layer_backend;
+        layer_backend.clear();
+        std::vector<int> gpus;
+        std::vector<double> share;
+        double free_sum = 0.0;
+        for (int b = 0; b < sched->n_backends - 1; b++) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[b]);
+            if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                continue;
             }
+            size_t free = 0, total = 0;
+            ggml_backend_dev_memory(dev, &free, &total);
+            gpus.push_back(b);
+            share.push_back((double) free);
+            free_sum += (double) free;
+        }
+        // the experts' bytes per layer, in layer order
+        std::map<int, size_t> layer_bytes;
+        for (const ggml_tensor * node : experts) {
+            int layer;
+            if (sscanf(node->src[0]->name, "blk.%d.", &layer) == 1) {
+                layer_bytes[layer] += ggml_nbytes(node->src[0]);
+            }
+        }
+        size_t bytes_sum = 0;
+        for (const auto & lb : layer_bytes) {
+            bytes_sum += lb.second;
+        }
+        size_t done = 0;
+        double bound = 0.0;
+        size_t g = 0;
+        if (!gpus.empty()) {
+            bound = free_sum > 0.0 ? share[0] / free_sum * (double) bytes_sum : (double) bytes_sum;
+        }
+        for (const auto & lb : layer_bytes) {
+            // the layer goes to the GPU whose share its middle falls in
+            while (g + 1 < gpus.size() && (double) done + lb.second / 2.0 > bound) {
+                g++;
+                bound += share[g] / free_sum * (double) bytes_sum;
+            }
+            if (!gpus.empty()) {
+                layer_backend[lb.first] = gpus[g];
+            }
+            done += lb.second;
         }
         std::vector<int> per_backend(sched->n_backends, 0);
         for (const ggml_tensor * node : experts) {
@@ -3406,6 +3453,20 @@ static void ggml_backend_sched_prime_moe_cache(ggml_backend_sched_t sched, struc
                 GGML_LOG_INFO("%s: %d expert tensors tied to %s\n", __func__, per_backend[b], ggml_backend_name(sched->backends[b]));
             }
         }
+    }
+
+    // the prefetch's backend now rather than at the first large prefill: its queue then exists when the cache
+    // measures the free memory (prepare_queues)
+    if (sched->prefetch_experts) {
+        ggml_backend_sched_prefetch_backend_init(sched, sched->backends[0]->device);
+    }
+    // a guest's queues were created with the owner's, before the cache was sized
+    if (ggml_moe_cache.prepare_queues && !sched->moe_cache_guest) {
+        ggml_moe_cache.prepare_queues(sched->moe_cache_session, graph);
+    }
+
+    if (sched->prefetch_experts && slot_bytes && ggml_moe_cache.set_lend_size) {
+        ggml_moe_cache.set_lend_size(sched->moe_cache_session, slot_bytes, sched->prefetch_n_slots);
     }
 
     int accepted[2] = {0, 0};
