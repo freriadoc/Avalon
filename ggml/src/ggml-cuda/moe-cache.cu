@@ -24,8 +24,8 @@ void ggml_cuda_moe_hosted_flush(ggml_backend_cuda_context & ctx, const ggml_tens
     (void) ctx; (void) node;
 }
 
-bool ggml_cuda_moe_hosted_wait(void * stream, void * event) {
-    (void) stream; (void) event;
+bool ggml_cuda_moe_hosted_wait(void * stream, void * event, int device) {
+    (void) stream; (void) event; (void) device;
     return false;
 }
 
@@ -4446,7 +4446,7 @@ static bool moe_cache_kv_needs_set_rows(void * opaque, int64_t rows) {
     return false;
 }
 
-static void moe_hosted_unpin_session(moe_cache_session & session);
+static void moe_hosted_unpin_session(moe_cache_session & session, const moe_cache_device * device);
 
 static void moe_cache_kv_set_rows(void * opaque, int64_t rows) {
     moe_cache_session * session = (moe_cache_session *) opaque;
@@ -4473,7 +4473,7 @@ static void moe_cache_kv_set_rows(void * opaque, int64_t rows) {
             session->idle_cv.wait(lock, [&] { return !device.pg_busy; });
             session->idle_cv.wait(lock, [&] { return device.queue.empty() && !device.inflight; });
             moe_cache_rewarm_stop_locked(device);
-            moe_hosted_unpin_session(*session);
+            moe_hosted_unpin_session(*session, &device);
         }
         ggml_cuda_set_device(device.logical);
         const int64_t ev0 = device.zone_evictions, mv0 = device.zone_moves;
@@ -5227,7 +5227,8 @@ struct moe_hosted_state {
 };
 
 static std::mutex g_hosted_mu;
-static std::unordered_map<moe_cache_session *, std::unique_ptr<moe_hosted_state>> g_hosted;
+// one state per (session, device logical index): with the layers split over several GPUs, each device hosts its own layers
+static std::map<std::pair<moe_cache_session *, int>, std::unique_ptr<moe_hosted_state>> g_hosted;
 
 // a hosted block queued but whose CPU rows are not copied in yet (graph evaluation thread)
 #define MOE_HOSTED_ENTER_BLOCKS 8
@@ -5718,11 +5719,13 @@ static void moe_hosted_unpin_locked(moe_hosted_state & st) {
 }
 
 // KV: the rows the hosted plan pinned for the session's last layer, unpinned (its stream is done: the caller synchronized)
-static void moe_hosted_unpin_session(moe_cache_session & session) {
+// (device: that device's only, nullptr: every device's)
+static void moe_hosted_unpin_session(moe_cache_session & session, const moe_cache_device * device) {
     std::lock_guard<std::mutex> lock(g_hosted_mu);
-    auto it = g_hosted.find(&session);
-    if (it != g_hosted.end() && it->second) {
-        moe_hosted_unpin_locked(*it->second);
+    for (auto & entry : g_hosted) {
+        if (entry.first.first == &session && entry.second && (!device || entry.first.second == device->logical)) {
+            moe_hosted_unpin_locked(*entry.second);
+        }
     }
 }
 
@@ -6431,18 +6434,30 @@ static void moe_hosted_serve_one(moe_hosted_state * st, uint32_t seq) {
 // Wait for the stream (or the event) like cudaStreamSynchronize / cudaEventSynchronize, answering the
 // hosted MoE blocks it publishes meanwhile: the thread that waits for the GPU computes the missed
 // experts. Returns false when no block is hosted (the caller synchronizes as usual).
-bool ggml_cuda_moe_hosted_wait(void * stream_ptr, void * event_ptr) {
+bool ggml_cuda_moe_hosted_wait(void * stream_ptr, void * event_ptr, int device) {
     cudaStream_t stream = (cudaStream_t) stream_ptr;
     cudaEvent_t event = (cudaEvent_t) event_ptr;
-    moe_hosted_state * st;
+    // one state per (session, device): every mailbox is served while waiting, whichever device the stream is on (with the
+    // layers split over several GPUs, a block of one device may wait for its CPU rows while the host waits for another)
+    constexpr int max_states = 8;
+    moe_hosted_state * sts[max_states];
+    int n_st = 0;
     {
         std::lock_guard<std::mutex> lock(g_hosted_mu);
         if (g_hosted.empty()) {
             return false;
         }
-        st = g_hosted.begin()->second.get();
+        for (auto & entry : g_hosted) {
+            if (entry.second && n_st < max_states) {
+                sts[n_st++] = entry.second.get();
+            }
+        }
     }
-    std::unique_lock<std::mutex> serving(st->serve_mu, std::try_to_lock);
+    std::unique_lock<std::mutex> serving[max_states];
+    for (int k = 0; k < n_st; k++) {
+        serving[k] = std::unique_lock<std::mutex>(sts[k]->serve_mu, std::try_to_lock);
+    }
+    moe_hosted_state * st = sts[0];
     const bool tl_on = !st->tl_host.empty();
     for (;;) {
         const int64_t tq = tl_on ? moe_tl_now_ns() : 0;
@@ -6456,24 +6471,39 @@ bool ggml_cuda_moe_hosted_wait(void * stream_ptr, void * event_ptr) {
             if (!event) {
                 // the stream is done, the last hosted layer's rows too: unpin them (a plan unpins the
                 // previous layer's; left pinned after a graph, they made the cache refuse to lend its
-                // zones to the next prefill, which then ran without prefetch)
-                std::lock_guard<std::mutex> lock(st->session->mu);
-                moe_hosted_unpin_locked(*st);
-                moe_cache_prefill_unpin_locked(*st->session);
+                // zones to the next prefill, which then ran without prefetch). Only the stream's device's: another
+                // device may still be computing with its pinned rows
+                for (int k = 0; k < n_st; k++) {
+                    if (n_st > 1 && sts[k]->device->logical != device) {
+                        continue;
+                    }
+                    std::lock_guard<std::mutex> lock(sts[k]->session->mu);
+                    moe_hosted_unpin_locked(*sts[k]);
+                    moe_cache_prefill_unpin_locked(*sts[k]->session);
+                }
             }
             return true;
         }
-        const uint32_t seq = __atomic_load_n(&st->h_mail->seq, __ATOMIC_ACQUIRE);
-        if (serving.owns_lock() && seq != st->last_seq) {
-            st->last_seq = seq;
-            moe_hosted_serve_one(st, seq);
+        bool served = false;
+        for (int k = 0; k < n_st; k++) {
+            moe_hosted_state * s = sts[k];
+            const uint32_t seq = __atomic_load_n(&s->h_mail->seq, __ATOMIC_ACQUIRE);
+            if (serving[k].owns_lock() && seq != s->last_seq) {
+                s->last_seq = seq;
+                moe_hosted_serve_one(s, seq);
+                served = true;
+            }
+        }
+        if (served) {
             continue;
         }
 #if defined(__x86_64__)
         __builtin_ia32_pause();
 #endif
-        if (!serving.owns_lock()) {
-            serving.try_lock();
+        for (int k = 0; k < n_st; k++) {
+            if (!serving[k].owns_lock()) {
+                serving[k].try_lock();
+            }
         }
     }
 }
@@ -6561,7 +6591,7 @@ static int moe_hosted_default_threads() {
 
 static moe_hosted_state * moe_hosted_state_for(moe_cache_session & session, moe_cache_device & device) {
     std::lock_guard<std::mutex> lock(g_hosted_mu);
-    auto & entry = g_hosted[&session];
+    auto & entry = g_hosted[{&session, device.logical}];
     if (entry) {
         return entry.get();
     }
@@ -6610,32 +6640,39 @@ static moe_hosted_state * moe_hosted_state_for(moe_cache_session & session, moe_
 }
 
 static void moe_hosted_shutdown(moe_cache_session * session) {
-    std::unique_ptr<moe_hosted_state> st;
+    std::vector<std::unique_ptr<moe_hosted_state>> states;
     {
         std::lock_guard<std::mutex> lock(g_hosted_mu);
-        auto it = g_hosted.find(session);
-        if (it == g_hosted.end()) {
-            return;
-        }
-        st = std::move(it->second);
-        g_hosted.erase(it);
-    }
-    for (auto & layer : st->layers) {
-        for (void * h : {(void *) layer->h_act, (void *) layer->h_act8, (void *) layer->h_ids, (void *) layer->h_plan, (void *) layer->h_res,
-                         (void *) layer->h_flags}) {
-            if (h) cudaFreeHost(h);
-        }
-        for (void * d : {(void *) layer->d_plan, (void *) layer->d_act_ids, (void *) layer->d_expect}) {
-            if (d) cudaFree(d);
+        for (auto it = g_hosted.begin(); it != g_hosted.end();) {
+            if (it->first.first == session) {
+                states.push_back(std::move(it->second));
+                it = g_hosted.erase(it);
+            } else {
+                ++it;
+            }
         }
     }
-    if (st->h_mail) cudaFreeHost(st->h_mail);
-    if (st->d_seq) cudaFree(st->d_seq);
-    if (st->d_q8_act) cudaFree(st->d_q8_act);
-    if (st->d_q8_mid) cudaFree(st->d_q8_mid);
-    if (st->d_q8_count) cudaFree(st->d_q8_count);
-    if (st->d_router_done) cudaFree(st->d_router_done);
-    // the pins of the last plan go with the pools the session is about to free
+    for (auto & st : states) {
+        if (!st) {
+            continue;
+        }
+        for (auto & layer : st->layers) {
+            for (void * h : {(void *) layer->h_act, (void *) layer->h_act8, (void *) layer->h_ids, (void *) layer->h_plan, (void *) layer->h_res,
+                             (void *) layer->h_flags}) {
+                if (h) cudaFreeHost(h);
+            }
+            for (void * d : {(void *) layer->d_plan, (void *) layer->d_act_ids, (void *) layer->d_expect}) {
+                if (d) cudaFree(d);
+            }
+        }
+        if (st->h_mail) cudaFreeHost(st->h_mail);
+        if (st->d_seq) cudaFree(st->d_seq);
+        if (st->d_q8_act) cudaFree(st->d_q8_act);
+        if (st->d_q8_mid) cudaFree(st->d_q8_mid);
+        if (st->d_q8_count) cudaFree(st->d_q8_count);
+        if (st->d_router_done) cudaFree(st->d_router_done);
+        // the pins of the last plan go with the pools the session is about to free
+    }
 }
 
 static moe_hosted_layer * moe_hosted_register(moe_hosted_state & st, moe_cache_device & device,

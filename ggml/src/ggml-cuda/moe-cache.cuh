@@ -34,7 +34,7 @@ void ggml_cuda_moe_hosted_flush(ggml_backend_cuda_context & ctx, const struct gg
 // Waits for the stream (or the event, if not null) like cudaStreamSynchronize / cudaEventSynchronize
 // while computing the missed experts of the hosted blocks the stream publishes meanwhile. Returns
 // false if no block is hosted: the caller synchronizes as usual.
-bool ggml_cuda_moe_hosted_wait(void * stream, void * event);   // cudaStream_t, cudaEvent_t
+bool ggml_cuda_moe_hosted_wait(void * stream, void * event, int device);   // cudaStream_t, cudaEvent_t, the stream's device
 
 // Prefill: the table of expert addresses of a prefetched MUL_MAT_ID weight (one per expert: its entry in the cache,
 // or its place in the prefetch slot), registered by the scheduler for the duration of its split; nullptr otherwise.

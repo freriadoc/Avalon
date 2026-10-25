@@ -3119,7 +3119,7 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     // a hosted MoE block may be waiting for this thread to compute its missed experts
-    if (!ggml_cuda_moe_hosted_wait((void *) cuda_ctx->stream(), nullptr)) {
+    if (!ggml_cuda_moe_hosted_wait((void *) cuda_ctx->stream(), nullptr, cuda_ctx->device)) {
         CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
     }
     cuda_ctx->split_wait_queued = false;
@@ -8070,7 +8070,7 @@ static void ggml_backend_cuda_device_event_free(ggml_backend_dev_t dev, ggml_bac
 
 static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
     GGML_UNUSED(dev);
-    if (!ggml_cuda_moe_hosted_wait(nullptr, event->context)) {
+    if (!ggml_cuda_moe_hosted_wait(nullptr, event->context, -1)) {
         CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
     }
 }
