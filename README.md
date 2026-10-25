@@ -143,10 +143,28 @@ Nothing else to set: `--fit` (on by default) places the dense weights on the GPU
 cache takes the rest of the VRAM, and the cache is prefilled from `moe-cache-ranking.bin` next to the model.
 `--parallel 1` matters: other slots would keep their part of the KV cache.
 
+### Two or more GPUs (experimental, untested)
+
+```bash
+GGML_MOE_CACHE_LAYER_DEVICE=1 avalon-server   # or the llama-server command above
+```
+
+The second GPU becomes **more expert cache**, it does not split the model: the dense weights and the KV stay on the
+first GPU (`--fit` puts them there), and the MoE layers are shared between the GPUs' expert caches in proportion to
+their free VRAM. In generation, the MoE block of a layer runs on the GPU that caches it (only tens of KB of activations
+cross per layer); the prefill and its expert prefetch stay on the first GPU. With one GPU the option changes nothing
+(measured: same speed, same text).
+
+**It has never run on two GPUs**: I have only one. If you have two RDNA3 cards, please try it and open an
+issue with the server log (`-lv 4`), your GPUs and how they are connected (x16 + x4, x8 / x8...). Known gap: the
+prefill only uses the first GPU's PCIe link, so with two cards in x8 / x8 slots it is probably slower than one card in x16
+(a per-GPU prefetch would fix it). Without the option, several GPUs are untested too.
+
 ## Limits
 
 - **One model.** Avalon is tuned for Qwen3.8-Flash-Next; the GGUF files above use types and a layout stock llama.cpp
   does not have. Other models run as in llama.cpp, without the expert cache work.
+- **One GPU measured.** Two or more: see above, experimental and untested.
 - **Tested on RDNA3 with ROCm 7.2 only.** The code goes through ggml-cuda, so CUDA should build, but nothing has been
   measured on NVIDIA. Windows is untested.
 - **Base:** llama.cpp master of Oct 3, 2026, plus the commits of Oct 3 – 11 picked one by one; later master changes
