@@ -645,6 +645,27 @@ static void common_params_fit_impl(
         if (global_surplus_cpu_moe > 0 && cparams->moe_cache_mode != LLAMA_MOE_CACHE_MODE_OFF) {
             mparams->n_gpu_layers = hp_ngl + 1; // the repeating layers and the output layer
             LOG_INF("%s: MoE expert cache: all %" PRIu32 " layers on the devices, the experts in system memory\n", __func__, hp_ngl + 1);
+            // GGML_MOE_CACHE_LAYER_DEVICE=1 with several GPUs: the other GPUs are expert caches only, the dense weights and
+            // the KV all go to the first one when they fit there (no activation crosses between GPUs but around the
+            // hosted MoE blocks of the layers another GPU caches)
+            const char * layer_device_env = getenv("GGML_MOE_CACHE_LAYER_DEVICE");
+            if (nd > 1 && layer_device_env && atoi(layer_device_env)) {
+                int64_t dense = 0;
+                for (size_t id = 0; id < nd; id++) {
+                    dense += int64_t(dmds_cpu_moe[id].mb.total());
+                }
+                if (dense + margins[0] <= dmds_cpu_moe[0].free) {
+                    for (size_t id = 0; id < nd; id++) {
+                        tensor_split[id] = id == 0 ? 1.0f : 0.0f;
+                    }
+                    mparams->tensor_split = tensor_split;
+                    LOG_INF("%s: MoE expert cache on %zu GPUs: the dense weights and the KV on the first (%" PRId64 " MiB), "
+                        "the others cache experts\n", __func__, nd, dense/MiB);
+                } else {
+                    LOG_INF("%s: MoE expert cache on %zu GPUs: the dense weights (%" PRId64 " MiB) do not fit on the first, "
+                        "split over the GPUs\n", __func__, nd, dense/MiB);
+                }
+            }
             return;
         }
 
