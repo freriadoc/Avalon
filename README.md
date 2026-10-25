@@ -4,6 +4,8 @@
 
 **Qwen3.8-Flash-Next (125B MoE) at 91 tokens/s on a 2019 CPU, DDR4 and an AMD card in a PCIe 3.0 slot.**
 
+**32 GB of RAM is enough:** the 89 GiB model is bigger than RAM and VRAM combined, and still runs at 89 tokens/s.
+
 Avalon is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) built for one model,
 [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) (512 experts, 10 active, 48 layers), on one
 consumer GPU with the experts in system RAM. It is not tuned on a flagship machine: every number below comes from a
@@ -12,7 +14,7 @@ desktop most people would call old.
 | part | what we have | why it matters |
 |---|---|---|
 | CPU | **AMD Ryzen 7 3800XT** (Zen 2, Ryzen 3000 family, 2019), 8 cores | computes the experts that are not on the GPU |
-| RAM | **DDR4-3200, dual channel** (33 – 35 GB/s measured), 96 GB | every expert missing from the GPU is read from here |
+| RAM | **DDR4-3200, dual channel** (33 – 35 GB/s measured), 96 GB (32 GB is enough) | every expert missing from the GPU is read from here |
 | GPU | **AMD Radeon RX 7900 XT 20 GB** (RDNA3, 2022), **ROCm**, no NVIDIA, no CUDA | holds the dense weights, the KV cache and a cache of the hottest experts |
 | bus | **PCIe 3.0 x16** (~14 GB/s), on a B450 board | every expert copied to the GPU goes through it |
 
