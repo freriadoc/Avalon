@@ -109,6 +109,10 @@ struct ggml_moe_cache_api {
                     int64_t n_in, int64_t n_out, int wtype, int64_t n_expert,
                     int64_t n_tokens, int64_t n_rows);
 
+    // Tie a host expert tensor to the device of its layer (the backend that holds the layer's other weights): begin then
+    // discovers it on that device only. An untied tensor is discovered on every device of the session.
+    void   (*assign)(void * session, const void * host_base, void * backend);
+
     // Mark cache hits and enqueue bounded demand fills for misses. A nonnegative slot index means that the row may be omitted from CPU work only if dispatch subsequently succeeds.
     int (*plan)(void * node, const int32_t * ids, int n_ids, int32_t * slot_idx);
 

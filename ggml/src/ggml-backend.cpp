@@ -3369,6 +3369,45 @@ static void ggml_backend_sched_prime_moe_cache(ggml_backend_sched_t sched, struc
         ggml_moe_cache.set_lend_size(sched->moe_cache_session, slot_bytes, sched->prefetch_n_slots);
     }
 
+    // GGML_MOE_CACHE_LAYER_DEVICE=1 (layers split over several GPUs, not the default yet): each expert tensor is tied to
+    // the backend that holds its layer's other weights, the cache learns it on that device only
+    const char * layer_device_env = getenv("GGML_MOE_CACHE_LAYER_DEVICE");
+    if (layer_device_env && atoi(layer_device_env) && ggml_moe_cache.assign && !sched->moe_cache_guest) {
+        std::unordered_map<int, int> layer_backend;
+        for (int i = 0; i < graph->n_nodes; i++) {
+            const ggml_tensor * node = graph->nodes[i];
+            for (int j = 0; j < GGML_MAX_SRC; j++) {
+                const ggml_tensor * src = node->src[j];
+                const ggml_backend_buffer_t buffer = src ? (src->view_src ? src->view_src->buffer : src->buffer) : nullptr;
+                int layer;
+                if (!buffer || ggml_backend_buffer_is_host(buffer) ||
+                        ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+                        sscanf(src->name, "blk.%d.", &layer) != 1 || layer_backend.count(layer)) {
+                    continue;
+                }
+                const int b = ggml_backend_sched_backend_from_buffer(sched, src, node);
+                if (b >= 0) {
+                    layer_backend[layer] = b;
+                }
+            }
+        }
+        std::vector<int> per_backend(sched->n_backends, 0);
+        for (const ggml_tensor * node : experts) {
+            const ggml_tensor * w = node->src[0];
+            int layer;
+            if (sscanf(w->name, "blk.%d.", &layer) == 1 && layer_backend.count(layer)) {
+                const int b = layer_backend[layer];
+                ggml_moe_cache.assign(sched->moe_cache_session, w->data, sched->backends[b]);
+                per_backend[b]++;
+            }
+        }
+        for (int b = 0; b < sched->n_backends; b++) {
+            if (per_backend[b]) {
+                GGML_LOG_INFO("%s: %d expert tensors tied to %s\n", __func__, per_backend[b], ggml_backend_name(sched->backends[b]));
+            }
+        }
+    }
+
     int accepted[2] = {0, 0};
     const bool guest_weights = sched->moe_guest_weights && !sched->moe_guest_weights->empty() && !sched->moe_cache_guest &&
         ggml_moe_cache.session_enter_guest;

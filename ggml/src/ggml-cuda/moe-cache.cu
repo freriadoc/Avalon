@@ -3197,9 +3197,12 @@ static void * moe_cache_begin(
     if (session->stopping) {
         return nullptr;
     }
+    // a tensor tied to its layer's device (moe_cache_assign) is learned there only
+    const auto tied = session->tensor_devices.find(host_base);
+    const int only = tied == session->tensor_devices.end() ? -1 : tied->second;
     for (const auto & device_ptr : session->devices) {
         moe_cache_device & device = *device_ptr;
-        if (device.dead.load() || !moe_cache_prepare_budget(*session, device)) {
+        if ((only >= 0 && device.logical != only) || device.dead.load() || !moe_cache_prepare_budget(*session, device)) {
             continue;
         }
         try {
@@ -4533,6 +4536,18 @@ static moe_cache_device * moe_cache_device_for_backend(
         }
     }
     return nullptr;
+}
+
+static void moe_cache_assign(void * opaque, const void * host_base, void * backend) {
+    moe_cache_session * session = (moe_cache_session *)opaque;
+    if (!session || !host_base) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(session->mu);
+    const moe_cache_device * device = moe_cache_device_for_backend(*session, backend);
+    if (device) {
+        session->tensor_devices[host_base] = device->logical;
+    }
 }
 
 static void moe_cache_set_lend_size(void * opaque, size_t bytes, int n_zones) {
@@ -7024,6 +7039,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.kv_first_lent_row = moe_cache_kv_first_lent_row;
     ggml_moe_cache.session_leave = moe_cache_session_leave;
     ggml_moe_cache.begin = moe_cache_begin;
+    ggml_moe_cache.assign = moe_cache_assign;
     ggml_moe_cache.prepare_queues = moe_cache_prepare_queues;
     ggml_moe_cache.plan = nullptr;   // nodes are served by the hosted MoE only (moe_cache_begin)
     ggml_moe_cache.dispatch = nullptr;   // nodes are served by the hosted MoE only (moe_cache_begin)
