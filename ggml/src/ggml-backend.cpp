@@ -3448,6 +3448,13 @@ static void ggml_backend_sched_prime_moe_cache(ggml_backend_sched_t sched, struc
                 per_backend[b]++;
             }
         }
+        // the guest's (MTP draft's) expert tensors: its scheduler hosts its MoE block on the first GPU (it has no layer map)
+        if (sched->moe_guest_weights && !gpus.empty()) {
+            for (const ggml_tensor * w : *sched->moe_guest_weights) {
+                ggml_moe_cache.assign(sched->moe_cache_session, w->data, sched->backends[gpus[0]]);
+                per_backend[gpus[0]]++;
+            }
+        }
         for (int b = 0; b < sched->n_backends; b++) {
             if (per_backend[b]) {
                 GGML_LOG_INFO("%s: %d expert tensors tied to %s\n", __func__, per_backend[b], ggml_backend_name(sched->backends[b]));

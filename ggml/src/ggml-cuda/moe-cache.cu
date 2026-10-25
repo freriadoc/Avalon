@@ -2433,17 +2433,22 @@ static bool moe_cache_pin_enabled() {
     return enabled;
 }
 
-// one expert tensor registered in place (its range rounded outwards to pages), false if ROCm refuses it
-static bool moe_cache_pin_tensor(moe_cache_device & device, const void * base, const moe_cache_seen_tensor & t, size_t & bytes) {
+// one expert tensor registered in place (its range rounded outwards to pages), false if ROCm refuses it. Portable: with
+// several GPUs a range registered for one device's cache is also copied by another (the first GPU's prefetch copies
+// every layer); a range another device of the session registered is not registered again
+static bool moe_cache_pin_tensor(const moe_cache_session & session, moe_cache_device & device, const void * base,
+                                 const moe_cache_seen_tensor & t, size_t & bytes) {
     const uintptr_t b = (uintptr_t) base;
     const uintptr_t ib = b & ~(uintptr_t) 4095;
     const uintptr_t ie = GGML_PAD(b + t.bytes, 4096);
-    for (const auto & range : device.pinned) {   // a packed layer: its three tensors share one range
-        if (ib >= range.first && ie <= range.second) {
-            return true;
+    for (const auto & d : session.devices) {
+        for (const auto & range : d->pinned) {   // a packed layer: its three tensors share one range
+            if (ib >= range.first && ie <= range.second) {
+                return true;
+            }
         }
     }
-    if (cudaHostRegister((void *) ib, ie - ib, cudaHostRegisterReadOnly) != cudaSuccess) {
+    if (cudaHostRegister((void *) ib, ie - ib, cudaHostRegisterReadOnly | cudaHostRegisterPortable) != cudaSuccess) {
         (void) cudaGetLastError();
         return false;
     }
@@ -2452,7 +2457,7 @@ static bool moe_cache_pin_tensor(moe_cache_device & device, const void * base, c
     return true;
 }
 
-static void moe_cache_pin_experts(moe_cache_device & device) {
+static void moe_cache_pin_experts(const moe_cache_session & session, moe_cache_device & device) {
     if (!moe_cache_pin_enabled() || !device.pinned.empty()) {
         return;
     }
@@ -2477,7 +2482,7 @@ static void moe_cache_pin_experts(moe_cache_device & device) {
     for (const auto & r : merged) {
         moe_cache_seen_tensor whole;
         whole.bytes = r.second - r.first;
-        fail += !moe_cache_pin_tensor(device, (const void *) r.first, whole, bytes);
+        fail += !moe_cache_pin_tensor(session, device, (const void *) r.first, whole, bytes);
     }
     std::sort(device.pinned.begin(), device.pinned.end());
     MOE_CACHE_LOG("[moe-cache] CUDA%d pin: %zu expert tensors registered (%zu MiB) in %.1f s, %zu failed\n",
@@ -2515,7 +2520,7 @@ static void moe_cache_build_pending(
         return;
     }
 
-    moe_cache_pin_experts(device);
+    moe_cache_pin_experts(session, device);
 
     const size_t scratch_reserve =
         moe_cache_scratch_total(device.scratch_reserve);
@@ -2638,7 +2643,7 @@ static int moe_cache_discover_pool(
             // like the others, still before its first graph (registering synchronizes every stream)
             size_t bytes = 0;
             ggml_cuda_set_device(device.logical);
-            if (moe_cache_pin_tensor(device, host_base, device.seen_tensors.at(host_base), bytes)) {
+            if (moe_cache_pin_tensor(session, device, host_base, device.seen_tensors.at(host_base), bytes)) {
                 std::sort(device.pinned.begin(), device.pinned.end());
                 MOE_CACHE_LOG("[moe-cache] CUDA%d pin: %s registered late (%zu MiB)\n", device.physical, name, bytes >> 20);
             }
@@ -2869,8 +2874,10 @@ static void * moe_cache_session_create(
             session->config.min_expert_bytes = default_min_expert_bytes;
         }
         if (!session->config.serial_fill_explicit) {
-            session->config.serial_fill =
-                session->devices.size() < 2 || minimum_capability < moe_cache_cc_ampere;
+            // serial with several GPUs too: the concurrent fills of buun's multi-GPU path were never measured with the
+            // hosted MoE (one session lock, one fill lock)
+            session->config.serial_fill = true;
+            GGML_UNUSED(minimum_capability);
         }
         if (session->config.expert_parallel < 0) {
             session->config.expert_parallel = std::min<int>(
@@ -4183,9 +4190,20 @@ static void moe_cache_profile_save_heat(moe_cache_session & session) {
     if (!path || session.devices.empty() || session.devices[0]->heat.empty()) {
         return;
     }
-    const moe_cache_device & device = *session.devices[0];
-    const int64_t ne = device.heat_experts;
-    std::vector<uint64_t> total(device.heat.begin(), device.heat.end());
+    // every device's counts (with several GPUs each one holds its own layers')
+    const int64_t ne = session.devices[0]->heat_experts;
+    std::vector<uint64_t> total;
+    for (const auto & d : session.devices) {
+        if (d->heat_experts != ne) {
+            continue;
+        }
+        if (total.size() < d->heat.size()) {
+            total.resize(d->heat.size(), 0);
+        }
+        for (size_t i = 0; i < d->heat.size(); i++) {
+            total[i] += d->heat[i];
+        }
+    }
     std::vector<moe_cache_ranked_expert> old;
     uint32_t nl = 0, nx = 0;
     if (moe_cache_ranking_read(path, old, nl, nx) && nx == (uint32_t) ne) {
