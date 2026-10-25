@@ -17,8 +17,9 @@ desktop most people would call old.
 | bus | **PCIe 3.0 x16** (~14 GB/s), on a B450 board | every expert copied to the GPU goes through it |
 
 The model is ~89 GiB; the GPU holds ~4.6 GiB of dense weights plus a cache of 9 – 14 GiB of experts, the rest stays in
-RAM. **64 GB of RAM is enough**: the model is memory-mapped, and with RAM limited to 58 GB generation was within 5% of
-96 GB.
+RAM. **32 GB of RAM is enough**: the model is memory-mapped, and what does not fit is read again from the disk. With
+the server's RAM capped at 28 GB (a 32 GB machine), the MTP best case went from 91.2 to 89.0 t/s and the prefill of a new
+19k prompt from 1,283 to 889 t/s; with 58 GB generation was within 5% of 96 GB.
 
 ## Two ideas behind Avalon
 
@@ -104,7 +105,7 @@ earlier quantization of the model). The MTP draft head agrees with the model on 
 curl -fsSL https://raw.githubusercontent.com/freriadoc/Avalon/main/install.sh | bash
 ```
 
-The installer checks the machine (Linux, AVX2, ROCm 7.x, an RDNA3 GPU, 64 GB of RAM, ~98 GiB of disk), builds
+The installer checks the machine (Linux, AVX2, ROCm 7.x, an RDNA3 GPU, 32 GB of RAM or more, ~98 GiB of disk), builds
 `llama-server` for the detected GPU, downloads the model and its MTP head (~89 GiB, resumable), verifies every file
 against its SHA-256 on Hugging Face and installs an `avalon-server` launcher in `~/.local/bin` with the command of
 [Run](#run). Settings (environment): `AVALON_DIR`, `MODEL_DIR`, `BIN_DIR`, `AMDGPU_TARGETS`, `SKIP_MODEL=1` (build
