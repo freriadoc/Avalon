@@ -74,7 +74,14 @@ fi
 # RAM and disk
 ram_gib=$(( $(awk '/^MemTotal:/ {print $2}' /proc/meminfo) / 1048576 ))
 echo "RAM $ram_gib GiB"
-[ $ram_gib -ge 60 ] || fail "$ram_gib GiB of RAM: Avalon needs 64 GB (the model is memory-mapped, ~89 GiB)"
+# The model (~89 GiB) is memory-mapped: what does not fit in RAM is read again from the disk. Measured on the reference
+# machine with the server's RAM capped at 28 GB (a 32 GB machine): generation -2 to -6 %, prefill of a new 19k prompt
+# -31 % (889 against 1,283 t/s). Not measured below that.
+if [ $ram_gib -lt 28 ]; then
+    fail "$ram_gib GiB of RAM: Avalon is measured with 32 GB or more (the model is memory-mapped, ~89 GiB)"
+elif [ $ram_gib -lt 60 ]; then
+    warn "$ram_gib GiB of RAM: it runs, the experts that do not fit are read from the disk (a fast NVMe helps). Measured at 32 GB: generation a few % slower, prefill of new prompts ~30 % slower"
+fi
 if [ "${SKIP_MODEL:-0}" != 1 ]; then
     mkdir -p "$MODEL_DIR"
     have=$(du -sk "$MODEL_DIR" 2>/dev/null | cut -f1)
