@@ -354,6 +354,7 @@ static ggml_cuda_device_info ggml_cuda_init() {
         info.devices[id].total_vram   = device_vram; // the MoE cache's automatic reserve is bounded by it
         total_vram += device_vram;
         info.devices[id].integrated = false; // Temporarily disabled due to issues with corrupted output (e.g. #15034)
+        info.devices[id].prop_integrated = prop.integrated > 0;
         info.devices[id].nsm        = prop.multiProcessorCount;
         info.devices[id].smpb       = prop.sharedMemPerBlock;
         info.devices[id].warp_size  = prop.warpSize;
@@ -7453,13 +7454,10 @@ static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t *
 
 // ref: https://github.com/ggml-org/llama.cpp/pull/17368
 #if defined(__linux__) && !defined(GGML_USE_HIP)
-    // Check if this is a UMA (Unified Memory Architecture) system
-    cudaDeviceProp prop;
-    CUDA_CHECK(cudaGetDeviceProperties(&prop, ggml_cuda_get_physical_device(ctx->device)));
-
+    // Check if this is a UMA (Unified Memory Architecture) system (read once at init: ggml_cuda_init)
     // Check if UMA is explicitly enabled via environment variable
     bool uma_env = getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") != nullptr;
-    bool is_uma = prop.integrated > 0 || uma_env;
+    bool is_uma = ggml_cuda_info().devices[ctx->device].prop_integrated || uma_env;
 
     if (is_uma) {
         // For UMA systems (like DGX Spark), use system memory info
@@ -7483,10 +7481,9 @@ static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t *
 static enum ggml_backend_dev_type ggml_backend_cuda_device_get_type(ggml_backend_dev_t dev) {
     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *) dev->context;
 
-    cudaDeviceProp prop;
-    CUDA_CHECK(cudaGetDeviceProperties(&prop, ggml_cuda_get_physical_device(ctx->device)));
-
-    return prop.integrated
+    // read once at init (ggml_cuda_init): the scheduler asks the device type for every hosted MoE node of every graph,
+    // and a cudaGetDeviceProperties call costs ~1.3 ms on CUDA (2,698 calls in 15 s of MTP generation on an RTX 4090)
+    return ggml_cuda_info().devices[ctx->device].prop_integrated
         ? GGML_BACKEND_DEVICE_TYPE_IGPU
         : GGML_BACKEND_DEVICE_TYPE_GPU;
 }
