@@ -1,7 +1,7 @@
 #include "argsort.cuh"
 #include "top-k.cuh"
 #include "ggml-backend-impl.h"
-#if defined(GGML_USE_HIP)
+#if !defined(GGML_USE_MUSA)
 #    include "grid-barrier.cuh"
 #endif
 
@@ -56,7 +56,16 @@ static int next_power_of_2(int x) {
 
 #endif                            // CUB_TOP_K_AVAILABLE
 
-#if !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
+#if !defined(GGML_USE_MUSA)
+
+// a warp's vote, as a mask of lanes (HIP: __ballot; CUDA: __ballot_sync over the whole warp)
+static __device__ __forceinline__ uint64_t top_k_ballot(bool pred) {
+#if defined(GGML_USE_HIP)
+    return __ballot(pred);
+#else
+    return __ballot_sync(0xffffffffu, pred);
+#endif // defined(GGML_USE_HIP)
+}
 
 static __device__ __forceinline__ uint32_t top_k_float_to_ordered(float value) {
     const uint32_t bits = __float_as_uint(value);
@@ -258,8 +267,8 @@ static __global__ void top_k_radix_gather(
         const uint32_t key = col < end ? top_k_float_to_ordered(row_src[col]) : 0;
         const bool is_g = col < end && key > prefix;
         const bool is_e = col < end && key == prefix;
-        const uint64_t mg = __ballot(is_g);
-        const uint64_t me = __ballot(is_e);
+        const uint64_t mg = top_k_ballot(is_g);
+        const uint64_t me = top_k_ballot(is_e);
         if (lane == 0) {
             warp_g[warp] = __popcll(mg);
             warp_e[warp] = __popcll(me);
@@ -426,8 +435,8 @@ static __global__ void top_k_radix_fused(
         const uint32_t key = col < end ? top_k_float_to_ordered(row_src[col]) : 0;
         const bool is_g = col < end && key > prefix;
         const bool is_e = col < end && key == prefix;
-        const uint64_t mg = __ballot(is_g);
-        const uint64_t me = __ballot(is_e);
+        const uint64_t mg = top_k_ballot(is_g);
+        const uint64_t me = top_k_ballot(is_e);
         if (lane == 0) {
             warp_g[warp] = __popcll(mg);
             warp_e[warp] = __popcll(me);
@@ -541,6 +550,12 @@ static size_t top_k_radix_scratch_bytes(int ncols, int nrows) {
 template<int BLOCK_SIZE, int RADIX_BITS>
 static bool top_k_radix_fused_cuda(int * histograms, size_t hist_count, const float * src, int * dst, int ncols, int nrows,
         int k, cudaStream_t stream, const int * n_live, const top_k_qsa_tail * qt) {
+#if !defined(GGML_USE_HIP)
+    // the grid barrier's residency bound is measured on an RX 7900 XT only: CUDA keeps the kernels without it
+    GGML_UNUSED(histograms); GGML_UNUSED(hist_count); GGML_UNUSED(src); GGML_UNUSED(dst); GGML_UNUSED(ncols);
+    GGML_UNUSED(k); GGML_UNUSED(stream); GGML_UNUSED(n_live); GGML_UNUSED(qt);
+    return false;
+#endif // !defined(GGML_USE_HIP)
     if (nrows > top_k_radix_fused_max_rows) {
         return false;
     }
@@ -616,7 +631,7 @@ static void top_k_radix_cuda(
             src, dst, states, counts, ncols, k, chunk, blocks_per_row, n_live);
 }
 
-#endif // !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
+#endif // !defined(GGML_USE_MUSA)
 
 void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0   = dst->src[0];
@@ -633,6 +648,21 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t    nrows = ggml_nrows(src0);
     const int64_t    k     = dst->ne[0];
     ggml_cuda_pool & pool  = ctx.pool();
+#if !defined(GGML_USE_MUSA)
+    if (ncols > 1024) {
+        // the radix top-k, its temporaries in the scheduler's scratch (GGML_SCHED_SCRATCH_SRC) when it gave one, else
+        // in the pool. CUDA without CUB's DeviceTopK sorted every row whole instead, its temporary storage from the pool
+        // growing with the rows: the QSA indexer's top-k ran out of memory at 180k tokens on an RTX 4090
+        const ggml_tensor * scratch_t = dst->src[GGML_SCHED_SCRATCH_SRC];
+        const size_t        need      = ggml_cuda_top_k_scratch_size(dst);
+        char * scratch = need > 0 && scratch_t && scratch_t->data && ggml_nbytes(scratch_t) >= need ? (char *) scratch_t->data : nullptr;
+        // the live count (ggml_set_live_count): only that many columns are read
+        const ggml_tensor * lc = dst->src[GGML_LIVE_COUNT_SRC];
+        const int * n_live = lc ? (const int *) lc->data + ggml_get_op_params_i32(dst, GGML_LIVE_COUNT_PARAM) : nullptr;
+        top_k_radix_cuda(pool, scratch, src0_d, dst_d, ncols, nrows, k, stream, n_live);
+        return;
+    }
+#endif // !defined(GGML_USE_MUSA)
 #ifdef CUB_TOP_K_AVAILABLE
     // TODO: Switch to `DeviceSegmentedTopK` for multi-row TopK once implemented
     // https://github.com/NVIDIA/cccl/issues/6391
@@ -670,27 +700,16 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * scratch_t = dst->src[GGML_SCHED_SCRATCH_SRC];
     const size_t        need      = ggml_cuda_top_k_scratch_size(dst);
     char * scratch = need > 0 && scratch_t && scratch_t->data && ggml_nbytes(scratch_t) >= need ? (char *) scratch_t->data : nullptr;
-#if defined(GGML_USE_HIP)
-    if (ncols > 1024) {
-        // the live count (ggml_set_live_count): only that many columns are read
-        const ggml_tensor * lc = dst->src[GGML_LIVE_COUNT_SRC];
-        const int * n_live = lc ? (const int *) lc->data + ggml_get_op_params_i32(dst, GGML_LIVE_COUNT_PARAM) : nullptr;
-        top_k_radix_cuda(pool, scratch, src0_d, dst_d, ncols, nrows, k, stream, n_live);
-    } else {
-#endif // defined(GGML_USE_HIP)
-        ggml_cuda_pool_alloc<int> temp_dst_alloc(pool);
-        int *                     tmp_dst = scratch ? (int *) scratch : temp_dst_alloc.alloc(ncols * nrows);
-        argsort_f32_i32_cuda_bitonic(src0_d, tmp_dst, ncols, nrows, GGML_SORT_ORDER_DESC, stream);
-        CUDA_CHECK(cudaMemcpy2DAsync(dst_d, k * sizeof(int), tmp_dst, ncols * sizeof(int), k * sizeof(int), nrows,
-                                     cudaMemcpyDeviceToDevice, stream));
-#if defined(GGML_USE_HIP)
-    }
-#endif // defined(GGML_USE_HIP)
+    ggml_cuda_pool_alloc<int> temp_dst_alloc(pool);
+    int *                     tmp_dst = scratch ? (int *) scratch : temp_dst_alloc.alloc(ncols * nrows);
+    argsort_f32_i32_cuda_bitonic(src0_d, tmp_dst, ncols, nrows, GGML_SORT_ORDER_DESC, stream);
+    CUDA_CHECK(cudaMemcpy2DAsync(dst_d, k * sizeof(int), tmp_dst, ncols * sizeof(int), k * sizeof(int), nrows,
+                                 cudaMemcpyDeviceToDevice, stream));
 #endif
 }
 
 bool ggml_cuda_top_k_qsa_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const top_k_qsa_tail & tail) {
-#if !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
+#if defined(GGML_USE_HIP)
     const ggml_tensor * src0 = dst->src[0];
     const int ncols = (int) src0->ne[0];
     const int nrows = (int) ggml_nrows(src0);
@@ -716,19 +735,18 @@ bool ggml_cuda_top_k_qsa_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 }
 
 size_t ggml_cuda_top_k_scratch_size(const ggml_tensor * dst) {
-#if !defined(GGML_CUDA_USE_CUB)
     const ggml_tensor * src0 = dst->src[0];
     const int ncols = (int) src0->ne[0];
     const int nrows = (int) ggml_nrows(src0);
-#if defined(GGML_USE_HIP)
+#if !defined(GGML_USE_MUSA)
     if (ncols > 1024) {
         return top_k_radix_scratch_bytes(ncols, nrows);
     }
-#endif
+#endif // !defined(GGML_USE_MUSA)
+#if !defined(GGML_CUDA_USE_CUB)
     // the bitonic sort's full index rows
     return (size_t) ncols * nrows * sizeof(int);
 #else
-    GGML_UNUSED(dst);
     return 0;
 #endif
 }

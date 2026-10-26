@@ -175,7 +175,9 @@ static void launch_mm_ids_helper(
     const int id = ggml_cuda_get_device();
     const int warp_size = ggml_cuda_info().devices[id].warp_size;
     const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
-    CUDA_SET_SHARED_MEMORY_LIMIT(mm_ids_helper<n_expert_used_template>, smpbo);
+    // the dynamic limit leaves room for the kernel's static arrays (warp_compact, warp_prev): CUDA refuses a dynamic
+    // limit that adds up with them to more than smpbo ("invalid argument", the 19k prefill on an RTX 4090)
+    CUDA_SET_SHARED_MEMORY_LIMIT(mm_ids_helper<n_expert_used_template>, smpbo - 2*MM_IDS_HELPER_MAX_WARPS*sizeof(int));
 
     // a warp per 512 tokens: a small batch keeps one warp, as before
     const int n_warps = n_expert_used_template == 0 ? 1 : std::max(1, std::min(MM_IDS_HELPER_MAX_WARPS, n_tokens/512));
