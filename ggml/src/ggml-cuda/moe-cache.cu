@@ -5230,6 +5230,16 @@ struct moe_hosted_state {
     double cal_measured = 0.0, cal_model = 0.0;
     // served by the thread that waits for the stream (ggml_cuda_moe_hosted_wait)
     std::mutex serve_mu;
+#if !defined(GGML_USE_HIP)
+    // CUDA: and by a thread of its own while blocks launched outside a graph capture are pending (moe_hosted_server).
+    // The launching thread can block in a CUDA call that waits for the device (a full launch queue, a lazily loaded
+    // module, a first cuBLAS GEMM) while a block waits for its mailbox to be served: three hangs on an RTX 4090
+    std::thread server;
+    std::mutex server_mu;
+    std::condition_variable server_cv;
+    uint32_t server_pending = 0;   // blocks launched outside a capture whose publication is not served yet
+    std::atomic<bool> server_stop{false};
+#endif
     uint32_t last_seq = 0;
     std::vector<int32_t> cpu_rows, experts;
     std::vector<float> out, act;
@@ -6600,12 +6610,71 @@ static int moe_hosted_default_threads() {
             cores.insert(siblings);
         }
         if (!cores.empty()) {
-            return (int) cores.size();
+            // a container's CPU quota (cgroup v2 cpu.max: "quota period", or "max"): a rented GPU machine showed 48
+            // hardware threads, 24 cores, for a 16 vCPU quota, and a team of 24 spinning threads on 16 vCPU
+            int n = (int) cores.size();
+            std::ifstream q("/sys/fs/cgroup/cpu.max");
+            std::string quota;
+            long long period = 0;
+            if (q >> quota >> period && quota != "max" && period > 0) {
+                n = std::min(n, std::max(1, (int) (std::atoll(quota.c_str()) / period)));
+            }
+            return n;
         }
     }
 #endif
     return std::max(1, hw / 2);
 }
+
+#if !defined(GGML_USE_HIP)
+// CUDA: serves the mailbox while blocks launched outside a capture are pending; asleep otherwise. The thread that waits
+// for the stream serves it too (ggml_cuda_moe_hosted_wait): whoever holds serve_mu serves, the other one counts it
+static void moe_hosted_server(moe_hosted_state * st) {
+    ggml_cuda_set_device(st->device->logical);
+    uint32_t seen;
+    {
+        std::lock_guard<std::mutex> lock(st->serve_mu);
+        seen = st->last_seq;
+    }
+    for (;;) {
+        {
+            std::unique_lock<std::mutex> lock(st->server_mu);
+            st->server_cv.wait(lock, [st] { return st->server_stop || st->server_pending > 0; });
+            if (st->server_stop) {
+                return;
+            }
+        }
+        for (;;) {
+            if (st->server_stop.load(std::memory_order_relaxed)) {
+                return;
+            }
+            const uint32_t seq = __atomic_load_n(&st->h_mail->seq, __ATOMIC_ACQUIRE);
+            uint32_t advanced = 0;
+            {
+                std::unique_lock<std::mutex> serving(st->serve_mu, std::try_to_lock);
+                if (serving.owns_lock()) {
+                    if (seq != st->last_seq) {
+                        st->last_seq = seq;
+                        moe_hosted_serve_one(st, seq);
+                    }
+                    advanced = st->last_seq - seen;
+                    seen = st->last_seq;
+                }
+            }
+            if (advanced) {
+                std::lock_guard<std::mutex> lock(st->server_mu);
+                st->server_pending = st->server_pending > advanced ? st->server_pending - advanced : 0;
+                if (st->server_pending == 0 || st->server_stop) {
+                    break;
+                }
+            }
+#if defined(__x86_64__)
+            __builtin_ia32_pause();
+#endif
+        }
+    }
+}
+#endif // !defined(GGML_USE_HIP)
 
 static moe_hosted_state * moe_hosted_state_for(moe_cache_session & session, moe_cache_device & device) {
     std::lock_guard<std::mutex> lock(g_hosted_mu);
@@ -6653,6 +6722,9 @@ static moe_hosted_state * moe_hosted_state_for(moe_cache_session & session, moe_
             GGML_LOG_INFO("moe timeline: GPU wall clock %d kHz\n", rate_khz);
         }
     }
+#if !defined(GGML_USE_HIP)
+    st->server = std::thread(moe_hosted_server, st.get());
+#endif
     entry = std::move(st);
     return entry.get();
 }
@@ -6674,6 +6746,16 @@ static void moe_hosted_shutdown(moe_cache_session * session) {
         if (!st) {
             continue;
         }
+#if !defined(GGML_USE_HIP)
+        if (st->server.joinable()) {
+            {
+                std::lock_guard<std::mutex> lock(st->server_mu);
+                st->server_stop = true;
+            }
+            st->server_cv.notify_one();
+            st->server.join();
+        }
+#endif
         for (auto & layer : st->layers) {
             for (void * h : {(void *) layer->h_act, (void *) layer->h_act8, (void *) layer->h_ids, (void *) layer->h_plan, (void *) layer->h_res,
                              (void *) layer->h_flags}) {
@@ -6962,6 +7044,20 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
                                               (int32_t *) ids->data, ids->nb[1], layer->m_ids, n_used, n_tokens,
                                               st->d_seq, layer->d_expect, st->m_mail, (uint32_t) slot, layer->m_flags,
                                               layer->m_plan, layer->d_plan, 3 * rows, g_tl_m, rta);
+#if !defined(GGML_USE_HIP)
+    // a block launched now (not recorded into a graph) waits for its mailbox: the server thread serves it
+    {
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(stream, &capture) == cudaSuccess && capture == cudaStreamCaptureStatusNone) {
+            {
+                std::lock_guard<std::mutex> lock(st->server_mu);
+                st->server_pending++;
+            }
+            st->server_cv.notify_one();
+        }
+        (void) cudaGetLastError();
+    }
+#endif // !defined(GGML_USE_HIP)
     if (tk) {
         tp.logits = nullptr;
     }

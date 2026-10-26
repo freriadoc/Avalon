@@ -255,6 +255,14 @@ __attribute__((constructor)) static void ggml_hip_set_hw_queues() {
     setenv("ROCBLAS_DEVICE_MEMORY_SIZE", "65536", /*overwrite =*/ 0);
     setenv("HSA_SCRATCH_SINGLE_LIMIT", "1048576", /*overwrite =*/ 0);
 }
+#elif !defined(GGML_USE_MUSA) && !defined(_WIN32)
+// CUDA loads a module lazily, at the first launch of one of its kernels (the default since CUDA 12.2), and loading it
+// waits for the device: with a hosted MoE block waiting for the host thread to serve its mailbox, the first launch of a
+// kernel made meanwhile hung (cudaFuncGetAttributes -> cuLibraryGetModule, the first mul_mat_vec_f of the warm-up on an
+// RTX 4090). Every module loaded with the library instead; an explicit CUDA_MODULE_LOADING is kept.
+__attribute__((constructor)) static void ggml_cuda_set_module_loading() {
+    setenv("CUDA_MODULE_LOADING", "EAGER", /*overwrite =*/ 0);
+}
 #endif
 
 static ggml_cuda_device_info ggml_cuda_init() {
