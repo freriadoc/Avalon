@@ -638,6 +638,17 @@ static void moe_cache_budget_remove_participant(
     state.participants = std::max(state.participants - 1, 0);
 }
 
+// NVIDIA: at 400 MiB a 19k prefill ran out of memory once in a few servers (RTX 4090, 25 Oct.: an 8 MiB stream-k
+// temporary of MMQ from the VMM pool, the card full); at 1024 none did, and the peak left the whole reserve free (no
+// growth seen at 10 Hz, so a transient: cause not found). The reserve, explicit or not, is at least 1024 there.
+static size_t moe_cache_platform_reserve_bytes(size_t reserve_bytes) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    return reserve_bytes;
+#else
+    return std::max<size_t>(reserve_bytes, 1024ull * 1024 * 1024);
+#endif
+}
+
 static bool moe_cache_budget_register(moe_cache_session & session) {
     std::lock_guard<std::mutex> lock(g_budget_mu);
     std::vector<moe_cache_device *> registered;
@@ -646,10 +657,10 @@ static bool moe_cache_budget_register(moe_cache_session & session) {
         for (const auto & device_ptr : session.devices) {
             moe_cache_device & device = *device_ptr;
             moe_cache_physical_budget & state = g_physical_budgets[device.physical];
-            const size_t reserve_bytes = ggml_moe_cache_effective_reserve_bytes(
+            const size_t reserve_bytes = moe_cache_platform_reserve_bytes(ggml_moe_cache_effective_reserve_bytes(
                     session.config.reserve_explicit,
                     session.config.reserve_mb << 20,
-                    device.automatic_reserve_bytes);
+                    device.automatic_reserve_bytes));
             state.reserves.insert(reserve_bytes);
             state.participants++;
             device.budget_registered = true;
@@ -1593,10 +1604,10 @@ static int moe_cache_query_device(
     result->min_expert_bytes = config->min_expert_explicit
         ? config->min_expert_bytes
         : moe_cache_default_min_expert_bytes(cuda_device.cc);
-    result->recommended_reserve_bytes = ggml_moe_cache_effective_reserve_bytes(
+    result->recommended_reserve_bytes = moe_cache_platform_reserve_bytes(ggml_moe_cache_effective_reserve_bytes(
             config->reserve_explicit,
             config->reserve_bytes,
-            moe_cache_recommended_reserve_bytes(cuda_device.total_vram));
+            moe_cache_recommended_reserve_bytes(cuda_device.total_vram)));
     return 1;
 }
 
