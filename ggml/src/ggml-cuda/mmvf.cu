@@ -844,6 +844,16 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
         }
     }
 
+    // NVIDIA: no cuBLAS for a batch of up to MMVF_MAX_BATCH_SIZE columns. A hosted MoE block (up to 6 tokens) leaves a
+    // kernel waiting for the host to serve its mailbox, and a first cublasSgemm of a shape meanwhile loads a cuBLASLt
+    // module (cuLibraryLoadData) that waits for the device while holding a driver lock, which the mailbox's server
+    // thread then waits for in its cudaStreamQuery: the shared expert's gate of the 4-token graph that ends a fresh
+    // server's first prompt hung on an RTX 4090 (25 - 26 Oct.). These products are tiny
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && ne11 <= MMVF_MAX_BATCH_SIZE &&
+            (type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16)) {
+        return true;
+    }
+
     switch (type) {
         case GGML_TYPE_F32:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
