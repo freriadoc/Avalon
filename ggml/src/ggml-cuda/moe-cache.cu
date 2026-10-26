@@ -5238,6 +5238,7 @@ struct moe_hosted_state {
     std::mutex server_mu;
     std::condition_variable server_cv;
     uint32_t server_pending = 0;   // blocks launched outside a capture whose publication is not served yet
+    cudaStream_t server_stream = nullptr;   // the stream of the last of them: queried at each poll (moe_hosted_server)
     std::atomic<bool> server_stop{false};
 #endif
     uint32_t last_seq = 0;
@@ -5303,7 +5304,7 @@ static T * moe_hosted_device_ptr(T * host) {
     return cudaHostGetDevicePointer(&dev, host, 0) == cudaSuccess ? (T *) dev : nullptr;
 }
 
-// DIAGNOSTIC (GGML_CUDA_MOE_TIMELINE=N, HIP): a timeline of the hosted layers without a profiler, every N layers. The
+// DIAGNOSTIC (GGML_CUDA_MOE_TIMELINE=N; HIP: wall clock, CUDA: global timer): a timeline of the hosted layers without a profiler, every N layers. The
 // GPU writes its wall clock to mapped host memory, per layer (seq % MOE_TL_RING): [0] publication, [1] plan seen,
 // [2] the CPU rows' flag seen by the merge (0: no CPU row). The host keeps its own times: publication seen, plan
 // flag written, CPU rows' flag written. No clock synchronization: the relays (GPU -> host -> GPU) come out of
@@ -5319,6 +5320,10 @@ static int64_t moe_tl_now_ns() {
 static __device__ __forceinline__ unsigned long long moe_tl_clock() {
 #if defined(GGML_USE_HIP)
     return wall_clock64();
+#elif !defined(GGML_USE_MUSA)
+    unsigned long long t;   // CUDA: the global timer, in nanoseconds
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
 #else
     return 0;
 #endif
@@ -5957,6 +5962,17 @@ static int moe_hosted_plan(moe_hosted_state & st, moe_hosted_layer & layer, cons
 // Copies of expert tensors alone, for comparison (tests/pciebench): 6.2 us + bytes / 14.1 GB/s.
 static constexpr double moe_split_cpu_fixed_us = 2.0, moe_split_cpu_expert_us = 55.8, moe_split_cpu_row_us = 14.5;
 static constexpr double moe_split_cpu_copy_us = 5.2;
+// the per-expert and per-row terms were fitted with a CPU team of 8 threads (Ryzen 7 3800XT): they are divided among the
+// team's threads, the fixed term and the concurrent copies' (they read the same RAM) are not. The measured scale
+// (moe_split_calibrate) is left with the rest (clock, RAM): 8 threads give the fitted model as it was, a 20-thread team
+// of a 2.3 GHz EPYC a 0.4 x model that its scale lifts again (it measured 0.57 x without the team in the model)
+static constexpr double moe_split_cpu_fit_threads = 8.0;
+
+static double moe_split_cpu_model_us(int n_threads, int d, int r, int tensors) {
+    const double share = moe_split_cpu_fit_threads / std::max(1, n_threads);
+    return moe_split_cpu_fixed_us + (moe_split_cpu_expert_us * d + moe_split_cpu_row_us * r) * share +
+           moe_split_cpu_copy_us * tensors;
+}
 static constexpr double moe_split_copy_start_us = 9.1, moe_split_copy_tensor_us = 11.4;
 static constexpr double moe_cache_pcie_copy_efficiency = 13.6 / (8.0 * 16 * 128.0 / 130.0 / 8.0);
 static constexpr double moe_split_gpu_before_us = 23.3, moe_split_gpu_row_us = 2.97;
@@ -6015,9 +6031,9 @@ static int moe_hosted_split(moe_hosted_state * st, moe_hosted_layer * layer, int
             // the window's end: the later of the CPU rows and the GPU's work (the resident rows, the wait for the moved
             // experts, then the work queued behind it)
             const double scale = st->cpu_scale;
-            const auto cpu_time = [scale](int d, int r, int tensors) {
-                return d > 0 ? scale * (moe_split_cpu_fixed_us + moe_split_cpu_expert_us * d + moe_split_cpu_row_us * r +
-                                        moe_split_cpu_copy_us * tensors) : 0.0;
+            const int n_threads = st->n_threads;
+            const auto cpu_time = [scale, n_threads](int d, int r, int tensors) {
+                return d > 0 ? scale * moe_split_cpu_model_us(n_threads, d, r, tensors) : 0.0;
             };
             const double gpu_before = moe_split_gpu_before_us + moe_split_gpu_row_us * (rows - n_cpu);
             const auto window = [&](int d, int r, int moved_rows, int tensors, double copies) {
@@ -6175,8 +6191,7 @@ static void moe_split_calibrate(moe_hosted_state * st, const moe_hosted_layer * 
         d += !seen;
     }
     st->cal_measured += (double) us;
-    st->cal_model += moe_split_cpu_fixed_us + moe_split_cpu_expert_us * d + moe_split_cpu_row_us * n_cpu +
-                     moe_split_cpu_copy_us * st->split_tensors;
+    st->cal_model += moe_split_cpu_model_us(st->n_threads, d, n_cpu, st->split_tensors);
     if (st->cal_left == 0 && st->cal_model > 0.0) {
         st->cpu_scale = st->cal_measured / st->cal_model;
         MOE_CACHE_LOG("[moe-cache] CUDA%d split: CPU rows take %.2f x the model's time (%d layers, %.1f us per layer)\n",
@@ -6610,14 +6625,23 @@ static int moe_hosted_default_threads() {
             cores.insert(siblings);
         }
         if (!cores.empty()) {
-            // a container's CPU quota (cgroup v2 cpu.max: "quota period", or "max"): a rented GPU machine showed 48
-            // hardware threads, 24 cores, for a 16 vCPU quota, and a team of 24 spinning threads on 16 vCPU
+            // a container's CPU quota (cgroup v2 cpu.max: "quota period", or "max"; cgroup v1 cpu.cfs_quota_us and
+            // cpu.cfs_period_us, -1 for none): rented GPU machines showed 48 hardware threads, 24 cores, for 16 and
+            // 20.4 vCPU quotas, and a team of 24 spinning threads on them (MTP 70 t/s, 81 with 16 threads)
             int n = (int) cores.size();
-            std::ifstream q("/sys/fs/cgroup/cpu.max");
-            std::string quota;
-            long long period = 0;
-            if (q >> quota >> period && quota != "max" && period > 0) {
-                n = std::min(n, std::max(1, (int) (std::atoll(quota.c_str()) / period)));
+            long long quota = -1, period = 0;
+            std::ifstream q2("/sys/fs/cgroup/cpu.max");
+            std::string q2s;
+            if (q2 >> q2s >> period && q2s != "max") {
+                quota = std::atoll(q2s.c_str());
+            } else {
+                std::ifstream q1("/sys/fs/cgroup/cpu/cpu.cfs_quota_us"), p1("/sys/fs/cgroup/cpu/cpu.cfs_period_us");
+                if (!(q1 >> quota && p1 >> period)) {
+                    quota = -1;
+                }
+            }
+            if (quota > 0 && period > 0) {
+                n = std::min(n, std::max(1, (int) (quota / period)));
             }
             return n;
         }
@@ -6647,6 +6671,18 @@ static void moe_hosted_server(moe_hosted_state * st) {
         for (;;) {
             if (st->server_stop.load(std::memory_order_relaxed)) {
                 return;
+            }
+            // a driver call at each poll: on CUDA a device write to mapped host memory may become visible to the
+            // host only when the driver is entered (Strata's session loop found it, a query each iteration; the
+            // thread that waits for the stream polls the same way)
+            cudaStream_t poll_stream;
+            {
+                std::lock_guard<std::mutex> lock(st->server_mu);
+                poll_stream = st->server_stream;
+            }
+            if (poll_stream) {
+                (void) cudaStreamQuery(poll_stream);
+                (void) cudaGetLastError();
             }
             const uint32_t seq = __atomic_load_n(&st->h_mail->seq, __ATOMIC_ACQUIRE);
             uint32_t advanced = 0;
@@ -6714,6 +6750,8 @@ static moe_hosted_state * moe_hosted_state_for(moe_cache_session & session, moe_
         int rate_khz = 0;
 #if defined(GGML_USE_HIP)
         (void) hipDeviceGetAttribute(&rate_khz, hipDeviceAttributeWallClockRate, device.logical);
+#elif !defined(GGML_USE_MUSA)
+        rate_khz = 1000000;   // %globaltimer counts nanoseconds
 #endif
         if (rate_khz > 0 && (g_tl_h || moe_hosted_host_alloc((void **) &g_tl_h, MOE_TL_RING * 8 * sizeof(unsigned long long)))) {
             g_tl_m = moe_hosted_device_ptr(g_tl_h);
@@ -7052,6 +7090,7 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
             {
                 std::lock_guard<std::mutex> lock(st->server_mu);
                 st->server_pending++;
+                st->server_stream = stream;
             }
             st->server_cv.notify_one();
         }
