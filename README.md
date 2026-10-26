@@ -68,6 +68,23 @@ With MTP, Avalon generates **almost 50% faster than Strata at equivalent quantiz
 Measured the same night with the same protocol; Strata serves ISTA's IQ3_S model, the one our experts come from, with
 its own drafters on.
 
+### NVIDIA (CUDA), one rented RTX 4090
+
+The same code builds and runs with CUDA. Measured once, on a rented cloud machine: an **RTX 4090 24 GB** in PCIe 4.0
+x16, an **AMD EPYC 7352** (Zen 2, 24 cores, the container capped at ~20 of them, 1.5 – 2.3 GHz), CUDA 12.4, the
+same model and launcher plus `-bs` (the verification's argmax on the GPU, see [Run](#run)), MTP with 2 draft tokens,
+greedy, 512 tokens:
+
+| case | generation, MTP | prefill |
+|---|---|---|
+| 32k context, short prompt, warm cache | **120.5 t/s** (mean of 5 answers, 114.5 – 125.4) | — |
+| 32k context, after a 19k prompt | 110.6 t/s | 1,819 – 2,330 t/s |
+| 256k context, 131k filled | 106.6 t/s | 2,242 t/s |
+| 256k context, 250k filled | **99.5 t/s** | 2,280 t/s |
+
+One run per row (not medians), VRAM peak 22.9 GiB of 24. Generation without MTP was not measured there. It is a
+first measurement on a machine I do not own, not a tuned result: the kernels are still tuned for RDNA3.
+
 ## Quality
 
 Speed does not come from a smaller model. Perplexity, 8 × 4,096 tokens of external texts (*War and Peace*, *Les
@@ -128,6 +145,16 @@ cmake -B build -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1100 -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc) --target llama-server
 ```
 
+### Build (Linux, CUDA)
+
+Tested with CUDA 12.4 on an RTX 4090 (`89`; set your GPU's architecture). The installer is ROCm only for now.
+
+```bash
+git clone https://github.com/freriadoc/Avalon && cd Avalon
+cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89 -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc) --target llama-server
+```
+
 ## Run
 
 ```bash
@@ -142,6 +169,8 @@ cd Qwen3.8-Flash-Next-Avalon-GGUF
 Nothing else to set: `--fit` (on by default) places the dense weights on the GPU and the experts in RAM, the expert
 cache takes the rest of the VRAM, and the cache is prefilled from `moe-cache-ranking.bin` next to the model.
 `--parallel 1` matters: other slots would keep their part of the KV cache.
+On NVIDIA, add `-bs`: the target's argmax then runs on the GPU instead of over 248k logits on the CPU, 6% faster per
+step on the RTX 4090 (neutral on the RX 7900 XT).
 
 ### Two or more GPUs (experimental, untested)
 
@@ -165,8 +194,9 @@ prefill only uses the first GPU's PCIe link, so with two cards in x8 / x8 slots 
 - **One model.** Avalon is tuned for Qwen3.8-Flash-Next; the GGUF files above use types and a layout stock llama.cpp
   does not have. Other models run as in llama.cpp, without the expert cache work.
 - **One GPU measured.** Two or more: see above, experimental and untested.
-- **Tested on RDNA3 with ROCm 7.2 only.** The code goes through ggml-cuda, so CUDA should build, but nothing has been
-  measured on NVIDIA. Windows is untested.
+- **Tuned on RDNA3 with ROCm 7.2.** CUDA builds and was measured once, on a rented RTX 4090 (see
+  [NVIDIA](#nvidia-cuda-one-rented-rtx-4090)); its kernels are not tuned for NVIDIA yet, and the installer is ROCm only.
+  Windows is untested.
 - **Base:** llama.cpp master of Oct 3, 2026, plus the commits of Oct 3 – 11 picked one by one; later master changes
   are not in.
 
