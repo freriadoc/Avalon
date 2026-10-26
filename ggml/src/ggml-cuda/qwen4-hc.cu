@@ -475,19 +475,19 @@ static __global__ void qwen4_hc_k1_k2(const qwen4_hc_k1_args a1, const qwen4_hc_
     const int n_k1 = a1.hc * T;
     if ((int) blockIdx.x < n_k1) {
         qwen4_hc_combine_norm_body(a1, blockIdx.x % a1.hc, blockIdx.x / a1.hc);
-        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+        ggml_cuda_fence_release_device();
         __syncthreads();
         if (threadIdx.x == 0) {
             atomicAdd(&g_qwen4_hc_k12[0], 1u);
         }
     } else {
         if (threadIdx.x == 0) {
-            while (__hip_atomic_load(&g_qwen4_hc_k12[0], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) < (unsigned) n_k1) {
-                __builtin_amdgcn_s_sleep(1);
+            while (ggml_cuda_load_relaxed_device(&g_qwen4_hc_k12[0]) < (unsigned) n_k1) {
+                ggml_cuda_poll_pause();
             }
         }
         __syncthreads();
-        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+        ggml_cuda_fence_acquire_device();
         __shared__ float partial[QWEN4_HC_K12_ROWS][QWEN4_HC_K2_WARPS][T];
         const int g   = threadIdx.x / (QWEN4_HC_K2_WARPS*WARP_SIZE);
         const int row = ((int) blockIdx.x - n_k1) * QWEN4_HC_K12_ROWS + g;

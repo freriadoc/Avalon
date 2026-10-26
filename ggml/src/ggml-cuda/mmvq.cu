@@ -893,14 +893,14 @@ static __global__ void mul_mat_vec_q(
             const uint32_t ib = (uint32_t) row0 / QK8_1;
             unsigned * count = fusion.q8_count + ib;
             const float * dst0 = dst - row0;
-            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+            ggml_cuda_fence_release_device();
             unsigned prev = 0;
             if (threadIdx.x == 0) {
                 prev = atomicAdd(count, 1u);
             }
             prev = __shfl_sync(0xffffffff, prev, 0, warp_size);
             if (prev == blocks_per_q8 - 1 && threadIdx.x < QK8_1) {
-                __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+                ggml_cuda_fence_acquire_device();
 #pragma unroll
                 for (int j = 0; j < ncols_dst; ++j) {
                     const float xi = dst0[j*stride_col_dst + ib*QK8_1 + threadIdx.x];
@@ -1213,14 +1213,14 @@ static __global__ void mul_mat_vec_q_moe(
         constexpr int warps_per_q8 = QK8_1 / c_rows_per_block;
         const uint32_t ib = (uint32_t) row0 / QK8_1;
         unsigned * count = fusion.q8_count + (size_t) channel_dst*fusion.q8_stride + ib;
-        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+        ggml_cuda_fence_release_device();
         unsigned prev = 0;
         if (threadIdx.x == 0) {
             prev = atomicAdd(count, 1u);
         }
         prev = __shfl_sync(0xffffffff, prev, 0, warp_size);
         if (prev == warps_per_q8 - 1) {
-            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+            ggml_cuda_fence_acquire_device();
             // the code of quantize_q8_1, one lane per value (same reductions, same bits)
             if (threadIdx.x < QK8_1) {
                 const float xi = dst[channel_dst*stride_channel_dst + ib*QK8_1 + threadIdx.x];

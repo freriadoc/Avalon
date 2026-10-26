@@ -22,14 +22,14 @@ static int ggml_cuda_grid_barrier_max_blocks(int threads_per_block) {
 static __device__ __forceinline__ unsigned ggml_cuda_grid_barrier_start(const unsigned * gen_var) {
     __shared__ unsigned s_gen;
     if (threadIdx.x == 0) {
-        s_gen = __hip_atomic_load(gen_var, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        s_gen = ggml_cuda_load_relaxed_device(gen_var);
     }
     __syncthreads();
     return s_gen;
 }
 
 static __device__ __forceinline__ void ggml_cuda_grid_barrier(unsigned * count, unsigned * gen_var, unsigned & gen) {
-    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+    ggml_cuda_fence_release_device();
     __syncthreads();
     if (threadIdx.x == 0) {
         const unsigned target = gen + 1;
@@ -38,12 +38,12 @@ static __device__ __forceinline__ void ggml_cuda_grid_barrier(unsigned * count, 
             __threadfence();
             atomicExch(gen_var, target);
         } else {
-            while (__hip_atomic_load(gen_var, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) != target) {
-                __builtin_amdgcn_s_sleep(1);
+            while (ggml_cuda_load_relaxed_device(gen_var) != target) {
+                ggml_cuda_poll_pause();
             }
         }
     }
     gen++;
     __syncthreads();
-    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+    ggml_cuda_fence_acquire_device();
 }

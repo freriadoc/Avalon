@@ -5372,7 +5372,7 @@ static __global__ void k_pregate_logits(const wt * w, const float * act, float *
     for (int t = 0; t < max_tokens; t++) {
         float v = sum[t];
         for (int off = warpSize / 2; off > 0; off >>= 1) {
-            v += __shfl_xor(v, off);
+            v += __shfl_xor_sync(0xffffffff, v, off, warpSize);
         }
         if (lane == 0) {
             part[threadIdx.x / 128][warp_in_expert][t] = v;
@@ -5396,8 +5396,8 @@ static __global__ void k_pregate_topk(const float * logits, int n_expert, int n_
     for (int j = 0; j < k; j++) {
         float bv = v; int bi = e;
         for (int off = warpSize / 2; off > 0; off >>= 1) {
-            const float ov = __shfl_xor(bv, off);
-            const int   oi = __shfl_xor(bi, off);
+            const float ov = __shfl_xor_sync(0xffffffff, bv, off, warpSize);
+            const int   oi = __shfl_xor_sync(0xffffffff, bi, off, warpSize);
             if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
         }
         if (lane == 0) { wv[warp] = bv; wi[warp] = bi; }
@@ -5405,8 +5405,8 @@ static __global__ void k_pregate_topk(const float * logits, int n_expert, int n_
         if (warp == 0) {
             bv = lane < nwarps ? wv[lane] : -INFINITY; bi = lane < nwarps ? wi[lane] : -1;
             for (int off = warpSize / 2; off > 0; off >>= 1) {
-                const float ov = __shfl_xor(bv, off);
-                const int   oi = __shfl_xor(bi, off);
+                const float ov = __shfl_xor_sync(0xffffffff, bv, off, warpSize);
+                const int   oi = __shfl_xor_sync(0xffffffff, bi, off, warpSize);
                 if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
             }
             if (lane == 0) { wi[0] = bi; pred[2 + t * k + j] = bi; }
@@ -5500,7 +5500,7 @@ static __global__ void k_moe_hosted_enter(const float * act, float * h_act, bloc
     // the router's workgroups after the entry's MOE_HOSTED_ENTER_BLOCKS
     if ((int) blockIdx.x >= MOE_HOSTED_ENTER_BLOCKS) {
         moe_router_row(rt, (int) blockIdx.x - MOE_HOSTED_ENTER_BLOCKS);
-        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+        ggml_cuda_fence_release_device();
         __syncthreads();
         if (threadIdx.x == 0) {
             atomicAdd(rt.done, 1u);
@@ -5535,13 +5535,13 @@ static __global__ void k_moe_hosted_enter(const float * act, float * h_act, bloc
         if (blockIdx.x == 0) {
             if (rt.x) {   // the router's rows
                 if (threadIdx.x == 0) {
-                    while (__hip_atomic_load(rt.done, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) < (unsigned) rt.nrows) {
-                        __builtin_amdgcn_s_sleep(1);
+                    while (ggml_cuda_load_relaxed_device(rt.done) < (unsigned) rt.nrows) {
+                        ggml_cuda_poll_pause();
                     }
                     *rt.done = 0;   // for the next layer (stream-ordered)
                 }
                 __syncthreads();
-                __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+                ggml_cuda_fence_acquire_device();
             }
             const int warp = threadIdx.x / WARP_SIZE;
             const int t    = warp < n_tokens ? warp : n_tokens - 1;

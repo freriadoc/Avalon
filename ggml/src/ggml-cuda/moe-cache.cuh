@@ -4,6 +4,7 @@
 // Populates ggml_moe_cache (see ggml-backend-moe-cache.h).
 
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {

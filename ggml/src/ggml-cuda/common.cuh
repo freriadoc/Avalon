@@ -131,6 +131,42 @@ static __device__ __forceinline__ void ggml_cuda_syncwarp() {
 #endif // GGML_USE_HIP
 }
 
+// device-scope memory ordering between the blocks of a grid (flags polled by other blocks of the same kernel):
+// release before publishing, acquire after seeing the flag. HIP: agent-scope fences; CUDA: __threadfence
+static __device__ __forceinline__ void ggml_cuda_fence_release_device() {
+#if defined(GGML_USE_HIP)
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+#else
+    __threadfence();
+#endif // defined(GGML_USE_HIP)
+}
+
+static __device__ __forceinline__ void ggml_cuda_fence_acquire_device() {
+#if defined(GGML_USE_HIP)
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+#else
+    __threadfence();
+#endif // defined(GGML_USE_HIP)
+}
+
+// a relaxed device-scope load of a flag another block writes
+static __device__ __forceinline__ unsigned ggml_cuda_load_relaxed_device(const unsigned * p) {
+#if defined(GGML_USE_HIP)
+    return __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+#else
+    return *(const volatile unsigned *) p;
+#endif // defined(GGML_USE_HIP)
+}
+
+// a short pause in a polling loop (HIP: s_sleep 1, 64 clocks at most)
+static __device__ __forceinline__ void ggml_cuda_poll_pause() {
+#if defined(GGML_USE_HIP)
+    __builtin_amdgcn_s_sleep(1);
+#elif __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+    __nanosleep(32);
+#endif // defined(GGML_USE_HIP)
+}
+
 static __device__ __forceinline__ void ggml_cuda_pdl_sync() {
 #if defined(GGML_CUDA_USE_PDL) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
     cudaGridDependencySynchronize();
