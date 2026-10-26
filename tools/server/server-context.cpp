@@ -41,33 +41,39 @@
 constexpr int HTTP_POLLING_SECONDS = 1;
 
 // DIAGNOSTIC (LLAMA_SPEC_TIMING=1): wall time of the speculative step phases, every 200 steps:
-// work inside yield_to_queue, the yield handoff around it, and the rest of the step
+// work inside yield_to_queue, the yield handoff around it, the acceptance of the draft (the target's sampling over the
+// vocabulary, the sampler's clone), the checkpoints, the target's seq_rm, the accepted tokens' output, and the rest
 struct spec_timing {
     bool on = getenv("LLAMA_SPEC_TIMING") != nullptr;
     // a step's phases are counted with its length at the next step's start, and dropped when the slot is released
     // (the time to the next request is not a step)
-    int64_t work[3] = {}, yield[3] = {}, step = 0, t_last = 0; int n = 0;
+    // x: accept, checkpoints after the draft, the target's seq_rm, the accepted tokens' output (process_token)
+    int64_t work[3] = {}, yield[3] = {}, step = 0, t_last = 0, x[6] = {}, px[6] = {}; int n = 0;
     int64_t pw[3] = {}, py[3] = {};
     void add(int k, int64_t t0, int64_t w0, int64_t w1) {
         pw[k] += w1 - w0; py[k] += ggml_time_us() - t0 - (w1 - w0);
     }
+    void add_x(int k, int64_t t0) { px[k] += ggml_time_us() - t0; }
     void release() {
         t_last = 0;
+        for (int k = 0; k < 6; k++) { px[k] = 0; }
         for (int k = 0; k < 3; k++) { pw[k] = py[k] = 0; }
     }
     void step_start() {
         const int64_t t = ggml_time_us();
         if (t_last) {
             step += t - t_last; n++;
+            for (int k = 0; k < 6; k++) { x[k] += px[k]; }
             for (int k = 0; k < 3; k++) { work[k] += pw[k]; yield[k] += py[k]; }
         }
+        for (int k = 0; k < 6; k++) { px[k] = 0; }
         for (int k = 0; k < 3; k++) { pw[k] = py[k] = 0; }
         t_last = t;
         if (n && n % 200 == 0) {
             const double f = 1e-3 / n;
-            SRV_INF("spec timing: %d steps, %.2f ms/step: draft %.2f (+%.2f yield), decode %.2f (+%.2f), process %.2f (+%.2f), rest %.2f\n",
-                    n, step*f, work[0]*f, yield[0]*f, work[1]*f, yield[1]*f, work[2]*f, yield[2]*f,
-                    (step - work[0]-work[1]-work[2]-yield[0]-yield[1]-yield[2])*f);
+            SRV_INF("spec timing: %d steps, %.2f ms/step: draft %.2f (+%.2f yield), decode %.2f (+%.2f), process %.2f (+%.2f), accept %.2f (sample %.2f, spec accept %.2f), ckpt %.2f, seq_rm %.2f, output %.2f, rest %.2f\n",
+                    n, step*f, work[0]*f, yield[0]*f, work[1]*f, yield[1]*f, work[2]*f, yield[2]*f, x[0]*f, x[4]*f, x[5]*f, x[1]*f, x[2]*f, x[3]*f,
+                    (step - work[0]-work[1]-work[2]-yield[0]-yield[1]-yield[2]-x[0]-x[1]-x[2]-x[3])*f);
         }
     }
 };
@@ -3475,6 +3481,7 @@ private:
         }
 
         // make checkpoints if needed
+        const int64_t ct0 = ggml_time_us();
         iterate(drafting, [&](server_slot & slot) {
             auto & draft = slot.spec_draft;
             auto & ckpt  = slot.spec_ckpt;
@@ -3521,6 +3528,7 @@ private:
                 }
             }
         });
+        if (g_spec_timing.on && !drafting.empty()) g_spec_timing.add_x(1, ct0);
 
         // update the batch with the sampled/drafted tokens
         iterate(generating, [&](server_slot & slot) {
@@ -4478,6 +4486,7 @@ private:
             GGML_ASSERT(n_draft > 0);
 
             // verify and try to accept the draft
+            const int64_t at0 = ggml_time_us();
             {
                 // the sampler is restored only with the target's checkpoint, which a draft no longer than the recurrent
                 // states the context keeps does not take; the clone copies the candidates of the whole vocabulary
@@ -4503,7 +4512,9 @@ private:
                 } else if (use_rejection) {
                     accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_draft_q);
                 } else {
+                    const int64_t sa0 = ggml_time_us();
                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                    if (g_spec_timing.on) g_spec_timing.add_x(4, sa0);
                 }
                 slot.spec_i_batch.clear();
 
@@ -4550,10 +4561,13 @@ private:
                     SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
                 }
 
+                const int64_t ca0 = ggml_time_us();
                 common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+                if (g_spec_timing.on) g_spec_timing.add_x(5, ca0);
 
                 slot.spec_draft = std::move(accepted);
             }
+            if (g_spec_timing.on) g_spec_timing.add_x(0, at0);
 
             const auto ids = std::move(slot.spec_draft);
 
@@ -4584,8 +4598,11 @@ private:
             slot.sampled = ids.back(); // last accepted token
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
+            const int64_t rt0 = ggml_time_us();
             slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+            if (g_spec_timing.on) g_spec_timing.add_x(2, rt0);
 
+            const int64_t ot0 = ggml_time_us();
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
 
@@ -4606,6 +4623,7 @@ private:
                 }
             }
 
+            if (g_spec_timing.on) g_spec_timing.add_x(3, ot0);
             slot.print_timings_tg();
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
