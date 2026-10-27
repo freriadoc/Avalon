@@ -30,12 +30,15 @@ template <>      struct mm_ids_pow2<0> { static constexpr int value = 1; };
 // The upper and lower bounds for the ith expert in the compact src1 tensor are stored in expert_bounds[i:i+1].
 // One block per expert; each warp of the block scans a contiguous slice of the tokens into its own part of the shared
 // store, then the slices are written one after the other: the same order as one warp scanning all of them.
+// direct: the store does not fit the shared memory (4 bytes a token: ~16k tokens on RDNA3, ~25k on Ada); the slices are
+// scanned twice instead, once to count, once to write each entry at its place.
 #define MM_IDS_HELPER_MAX_WARPS 8
 template <int n_expert_used_template>
 __launch_bounds__(MM_IDS_HELPER_MAX_WARPS*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mm_ids_helper(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
-        const int n_tokens, const int n_expert_used_var, const int nchannels_y, const int si1, const int sis1, const bool write_inverse) {
+        const int n_tokens, const int n_expert_used_var, const int nchannels_y, const int si1, const int sis1, const bool write_inverse,
+        const bool direct) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     const int n_expert_used = n_expert_used_template == 0 ? n_expert_used_var : n_expert_used_template;
     const int expert = blockIdx.x;
@@ -54,6 +57,27 @@ static __global__ void mm_ids_helper(
     int nex_prev   = 0; // Number of columns for experts with a lower index.
     int it_compact = 0; // Running index for the compact slice of this expert.
 
+    // direct: this warp's first column once known, and whether the scan writes
+    int  col_base = 0;
+    bool emit     = !direct;
+    auto put = [&](const int itc, const int it, const int iex_used) {
+        if (!direct) {
+            store[itc] = mm_ids_helper_store(it, iex_used);
+            return;
+        }
+        const int col = col_base + itc;
+        ids_dst[col] = it*n_expert_used + iex_used;
+        if (write_inverse) {
+            ids_src1[it*n_expert_used + iex_used] = col;
+        } else {
+            ids_src1[col] = it*sis1 + iex_used % nchannels_y;
+        }
+    };
+
+    for (int pass = 0; pass < (direct ? 2 : 1); ++pass) {
+    if (pass == 1) {
+        it_compact = 0;
+    }
     if constexpr (n_expert_used_template == 0) {
         // Generic implementation:
         for (int it = it_beg; it < it_end; ++it) {
@@ -66,8 +90,8 @@ static __global__ void mm_ids_helper(
                 }
             }
 
-            if (iex_used != -1) {
-                store[it_compact] = mm_ids_helper_store(it, iex_used);
+            if (iex_used != -1 && emit) {
+                put(it_compact, it, iex_used);
             }
 
             if (warp_reduce_any<warp_size>(iex_used != -1)) {
@@ -112,8 +136,8 @@ static __global__ void mm_ids_helper(
                     }
                 }
 
-                if (iex_used != -1) {
-                    store[it_compact + it_compact_add_lower] = mm_ids_helper_store(it, iex_used);
+                if (iex_used != -1 && emit) {
+                    put(it_compact + it_compact_add_lower, it, iex_used);
                 }
 
                 // The thread with the highest index in the warp always has the sum over the whole warp, use it to increment all threads:
@@ -121,12 +145,24 @@ static __global__ void mm_ids_helper(
             }
         }
     }
+    if (pass == 1) {
+        break; // the counts are those of the first pass
+    }
     nex_prev = warp_reduce_sum<warp_size>(nex_prev);
     if (lane == 0) {
         warp_compact[warp] = it_compact;
         warp_prev[warp]    = nex_prev;
     }
     __syncthreads();
+    if (direct) {
+        int c = 0;
+        for (int w = 0; w < n_warps; ++w) {
+            c += warp_prev[w] + (w < warp ? warp_compact[w] : 0);
+        }
+        col_base = c;
+        emit     = true;
+    }
+    }
 
     // this expert's first column, and this warp's place in its compact slice
     int col0 = 0;
@@ -138,7 +174,7 @@ static __global__ void mm_ids_helper(
         n_compact += warp_compact[w];
     }
 
-    for (int itc = lane; itc < it_compact; itc += warp_size) {
+    for (int itc = lane; !direct && itc < it_compact; itc += warp_size) {
         const mm_ids_helper_store store_it = store[itc];
         const int it       = store_it.it();
         const int iex_used = store_it.iex_used();
@@ -184,10 +220,12 @@ static void launch_mm_ids_helper(
     const int slice   = (n_tokens + n_warps - 1) / n_warps;
     const dim3 num_blocks(n_experts, 1, 1);
     const dim3 block_size(n_warps*warp_size, 1, 1);
-    const size_t nbytes_shared = (size_t) n_warps*slice*sizeof(mm_ids_helper_store);
-    GGML_ASSERT(nbytes_shared <= smpbo);
+    // the static arrays take their part of the block's shared memory
+    const size_t nbytes_store  = (size_t) n_warps*slice*sizeof(mm_ids_helper_store);
+    const bool   direct        = nbytes_store > smpbo - 2*MM_IDS_HELPER_MAX_WARPS*sizeof(int);
+    const size_t nbytes_shared = direct ? 0 : nbytes_store;
     mm_ids_helper<n_expert_used_template><<<num_blocks, block_size, nbytes_shared, stream>>>
-        (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1, write_inverse);
+        (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1, write_inverse, direct);
 }
 
 void ggml_cuda_launch_mm_ids_helper(
