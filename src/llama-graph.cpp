@@ -151,6 +151,29 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
         ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
     }
 
+    if (h_src && h_src->src && !ubatch->embd) {
+        // rows [row0, row0 + n) of the batch: the target's rows one before, batch row 0 from the host
+        const size_t  row  = h->nb[1];
+        const int64_t r0   = h_src->row0;
+        GGML_ASSERT(h_src->src->ne[0] == h->ne[0] && h_src->src->type == h->type && ggml_is_contiguous(h_src->src));
+        GGML_ASSERT(r0 + n_tokens - 1 <= h_src->n_rows);
+        int64_t d0 = 0;
+        if (r0 == 0) {
+            ggml_backend_tensor_set(h, h_src->row_first, 0, row);
+            d0 = 1;
+        }
+        if (n_tokens > d0) {
+            ggml_tensor s = *h_src->src;
+            ggml_tensor d = *h;
+            s.data = (char *) s.data + (r0 + d0 - 1)*s.nb[1];
+            d.data = (char *) d.data + d0*row;
+            s.ne[1] = d.ne[1] = n_tokens - d0;
+            s.nb[2] = s.nb[3] = d.nb[2] = d.nb[3] = s.ne[1]*row;
+            s.view_src = d.view_src = nullptr;
+            ggml_backend_tensor_copy(&s, &d);
+        }
+    }
+
     // TODO: extend llama_ubatch to differentiate between token embeddings and hidden states
     //       for now, we assume that the hidden state is always provided as an embedding
     //       ref: https://github.com/ggml-org/llama.cpp/pull/23643

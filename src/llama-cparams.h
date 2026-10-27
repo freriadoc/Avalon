@@ -8,6 +8,17 @@
 
 #define LLAMA_MAX_SEQ 256
 
+struct ggml_tensor;
+
+// the MTP draft's hidden-state input copied on the device from the target's last decode (llama_set_mtp_h_from)
+// instead of passing through the batch: batch row i takes the target's row i - 1, row 0 the host row row_first
+struct llama_mtp_h_src {
+    const ggml_tensor * src = nullptr;   // the target's nextn rows [n_embd_out, n_rows]; NULL when unused
+    int64_t       n_rows    = 0;
+    const float * row_first = nullptr;
+    int64_t       row0      = 0;         // batch row of the ubatch whose inputs are being set
+};
+
 struct llama_cparams {
     uint32_t n_ctx;           // context size used during inference
     uint32_t n_ctx_seq;       // context for a single sequence
@@ -73,4 +84,6 @@ struct llama_cparams {
     void * cb_eval_user_data;
 
     llama_context * ctx_other;
+
+    llama_mtp_h_src * mtp_h_src = nullptr; // the context's own, stable across the copies of these parameters
 };

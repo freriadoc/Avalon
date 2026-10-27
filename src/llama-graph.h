@@ -166,6 +166,8 @@ public:
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
     ggml_tensor * h      = nullptr; // F32 [n_embd, n_batch]
 
+    const llama_mtp_h_src * h_src = nullptr; // h copied on the device when its source is set (the MTP draft)
+
     const int64_t n_embd = 0;
 };
 

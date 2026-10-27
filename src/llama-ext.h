@@ -110,6 +110,12 @@ LLAMA_API bool llama_share_moe_cache(struct llama_context * ctx, struct llama_co
 // chain multiple trained NextN heads. Default 0 (first head).
 LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
 
+// The next decode of ctx (an MTP draft) copies its hidden-state input on the device from tgt's last decode instead of
+// taking it from the batch: batch row i takes tgt's nextn row i - 1, row 0 the host row row_first (kept by the caller
+// until then); that batch carries tokens only. False, nothing set, when tgt's last decode cannot serve it (several
+// ubatches, nextn rows of the outputs only). Serves that one decode.
+LLAMA_API bool llama_set_mtp_h_from(struct llama_context * ctx, struct llama_context * tgt, const float * row_first);
+
 // Marks the entries that a joint decision head (clef) reads, the default is 0
 // See https://github.com/ggml-org/llama.cpp/pull/29831 for details
 // A run of entries with the same value is one span, spans must be separated by entries with value 0

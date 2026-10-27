@@ -121,6 +121,7 @@ struct llama_context {
     bool share_moe_cache(llama_context & owner);                                            // llama_share_moe_cache
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
+    bool set_mtp_h_from(llama_context & tgt, const float * row_first);                    // llama_set_mtp_h_from
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
@@ -313,6 +314,14 @@ private:
     // populated only when cparams.embeddings_nextn is enabled and the model graph
     // sets llm_graph_result::t_h_nextn
     buffer_view<float> embd_nextn = {nullptr, 0};
+
+    // the nextn rows of the last decode on the device when it was one ubatch with every row (an MTP draft reads them
+    // there, llama_set_mtp_h_from); valid until the next decode allocates its graph
+    const ggml_tensor * h_nextn_dev      = nullptr;
+    int64_t             h_nextn_dev_rows = 0;
+
+    // this context's hidden-state input read from another's device rows (cparams.mtp_h_src points here)
+    llama_mtp_h_src mtp_h_src;
 
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true

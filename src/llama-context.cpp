@@ -157,6 +157,7 @@ llama_context::llama_context(
     cparams.cb_eval_user_data = params.cb_eval_user_data;
 
     cparams.ctx_other = nullptr;
+    cparams.mtp_h_src = &mtp_h_src;
 
     // TODO: more generic
     if (model.arch == LLM_ARCH_GEMMA4_ASSISTANT) {
@@ -1434,6 +1435,15 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
 
+bool llama_context::set_mtp_h_from(llama_context & tgt, const float * row_first) {
+    if (!tgt.h_nextn_dev || !row_first) {
+        return false;
+    }
+    tgt.synchronize();
+    mtp_h_src = { tgt.h_nextn_dev, tgt.h_nextn_dev_rows, row_first, 0 };
+    return true;
+}
+
 void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -1943,6 +1953,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         return -1;
     }
 
+    // a hidden-state source set by llama_set_mtp_h_from serves this decode only
+    struct mtp_h_clear { llama_mtp_h_src & s; ~mtp_h_clear() { s = {}; } } mtp_h_guard { mtp_h_src };
+    if (mtp_h_src.src && (batch_inp.n_embd > 0 || (int64_t) batch_inp.tokens.size() > mtp_h_src.n_rows + 1)) {
+        LLAMA_LOG_ERROR("%s: a device hidden-state source needs a batch of tokens only, of at most %lld rows\n",
+                __func__, (long long) mtp_h_src.n_rows + 1);
+        return -1;
+    }
+    h_nextn_dev = nullptr;
+
     const auto & vocab   = model.vocab;
     const auto & hparams = model.hparams;
 
@@ -2105,6 +2124,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         ggml_status status;
 
+        mtp_h_src.row0 = n_tokens_prev;
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
 
         if (!res) {
@@ -2246,6 +2266,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
                 ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
                 extract_all_idxs = extract_all_idxs || !masked;
+                if (!masked && n_tokens_prev == 0 && (int64_t) ubatch.n_tokens == n_tokens_all) {
+                    h_nextn_dev      = t_h_nextn;
+                    h_nextn_dev_rows = n_rows;
+                }
             }
         }
 
@@ -4349,6 +4373,10 @@ void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool valu
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
     ctx->set_nextn_layer_offset(offset);
+}
+
+bool llama_set_mtp_h_from(llama_context * ctx, llama_context * tgt, const float * row_first) {
+    return ctx->set_mtp_h_from(*tgt, row_first);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

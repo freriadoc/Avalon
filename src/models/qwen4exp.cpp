@@ -601,6 +601,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_out(), n_tokens);
     ggml_set_input(inp->h);
     ggml_set_name(inp->h, "mtp_h_input");
+    inp->h_src = cparams.mtp_h_src;
 
     // a shared head without its own embeddings or LM head is built alone only for --fit to measure it, before the target
     // exists (llama_model_share_mtp_io): what the target's tensors would produce stands in, as inputs of the same shape

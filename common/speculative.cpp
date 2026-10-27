@@ -1651,15 +1651,35 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             } else {
                 batch.clear();
 
-                // deferred rows first, they precede this batch
+                // one sequence with nothing deferred before it: the target's rows stay on the device, the draft copies
+                // them there (llama_set_mtp_h_from); through the batch, 335 MB per 8192 rows went device -> host ->
+                // batch -> device, host time between two ubatches of the prefill
+                int n_seq_in = 0;
+                llama_seq_id seq_in = 0;
                 for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                    defer_add(seq_id);
+                    if (i_batch_beg[seq_id] >= 0) {
+                        n_seq_in++;
+                        seq_in = seq_id;
+                    }
+                }
+                static const bool h_dev_off = getenv("LLAMA_MTP_H_DEVICE") && atoi(getenv("LLAMA_MTP_H_DEVICE")) == 0;
+                const bool h_dev = !h_dev_off && !chain_heads && n_mtp_layers == 1 && n_seq_in == 1 && n_deferred() == 0 &&
+                    llama_set_mtp_h_from(ctx_dft, ctx_tgt, pending_h[seq_in].data());
+
+                // deferred rows first, they precede this batch
+                if (!h_dev) {
+                    for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                        defer_add(seq_id);
+                    }
                 }
 
                 for (int k = 0; k < n_tokens; ++k) {
                     const llama_seq_id seq_id = batch_in.tokens[k].seq_id;
 
                     const int32_t idx = batch.add(batch_in.tokens[k].id, batch_in.tokens[k].pos[0], seq_id, false);
+                    if (h_dev) {
+                        continue;
+                    }
 
                     const float * h_row = k == i_batch_beg[seq_id]
                         ? pending_h[seq_id].data()
@@ -1709,12 +1729,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 continue;
             }
 
-            const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+            // a verification keeps every row for accept(); a prompt batch only its last one (pending_h): copying
+            // the 8192 rows of a prompt batch took ~50 ms of host time between two ubatches of the prefill
+            const int32_t n_all  = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+            const int32_t n_rows = n_all > this->params.n_max + 1 ? 1 : n_all;
+            const int32_t i_beg  = i_batch_end[seq_id] - n_rows + 1;
             verify_h_rows[seq_id] = n_rows;
             verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
             for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_beg + i);
                 std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
             }
 
