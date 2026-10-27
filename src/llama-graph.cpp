@@ -151,12 +151,16 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
         ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
     }
 
-    if (h_src && h_src->src && !ubatch->embd) {
+    if (h_dev && h_src && h_src->src && !ubatch->embd) {
         // rows [row0, row0 + n) of the batch: the target's rows one before, batch row 0 from the host
         const size_t  row  = h->nb[1];
         const int64_t r0   = h_src->row0;
         GGML_ASSERT(h_src->src->ne[0] == h->ne[0] && h_src->src->type == h->type && ggml_is_contiguous(h_src->src));
         GGML_ASSERT(r0 + n_tokens - 1 <= h_src->n_rows);
+        // h lives on the GPU, out of the scheduler's input copies and their events: the draft's previous pass may still
+        // read memory this pass's allocation gives to h (another shape, another layout), so it ends first; the copy then
+        // goes on the draft's stream (the target synchronized in llama_set_mtp_h_from)
+        ggml_backend_synchronize(h_src->backend_dst);
         int64_t d0 = 0;
         if (r0 == 0) {
             ggml_backend_tensor_set(h, h_src->row_first, 0, row);
@@ -170,7 +174,7 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
             s.ne[1] = d.ne[1] = n_tokens - d0;
             s.nb[2] = s.nb[3] = d.nb[2] = d.nb[3] = s.ne[1]*row;
             s.view_src = d.view_src = nullptr;
-            ggml_backend_tensor_copy_async(h_src->backend_src, h_src->backend_dst, &s, &d);
+            ggml_backend_tensor_copy_async(h_src->backend_dst, h_src->backend_dst, &s, &d);
         }
     }
 
@@ -190,6 +194,8 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
     res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
     res &= (!params.ubatch.embd)  || (embd   && embd->ne[1]   == params.ubatch.n_tokens);
     res &= (!params.ubatch.embd)  || (h      && h->ne[1]      == params.ubatch.n_tokens);
+    // h on the GPU only for a device copy: a graph of one kind is not reused for the other
+    res &= h_dev == (h_src && h_src->src);
 
     return res;
 }

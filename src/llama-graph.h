@@ -167,6 +167,7 @@ public:
     ggml_tensor * h      = nullptr; // F32 [n_embd, n_batch]
 
     const llama_mtp_h_src * h_src = nullptr; // h copied on the device when its source is set (the MTP draft)
+    bool h_dev = false;                      // built for that copy: h on the GPU (graph_get_cb), not reused otherwise
 
     const int64_t n_embd = 0;
 };

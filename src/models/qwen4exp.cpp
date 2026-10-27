@@ -600,8 +600,15 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_out(), n_tokens);
     ggml_set_input(inp->h);
-    cb(inp->h, "mtp_h_input", -1);   // on the GPU (graph_get_cb): its rows come from the target's on the device
     inp->h_src = cparams.mtp_h_src;
+    // copied from the target's rows on the device: on the GPU (graph_get_cb); filled by the host otherwise, in host memory
+    // where the scheduler's input copies order its writes after the previous pass
+    inp->h_dev = inp->h_src && inp->h_src->src;
+    if (inp->h_dev) {
+        cb(inp->h, "mtp_h_input_dev", -1);
+    } else {
+        ggml_set_name(inp->h, "mtp_h_input");
+    }
 
     // a shared head without its own embeddings or LM head is built alone only for --fit to measure it, before the target
     // exists (llama_model_share_mtp_io): what the target's tensors would produce stands in, as inputs of the same shape
@@ -634,8 +641,13 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
         inp_kpool = build_inp_kpool(mctx_hyb);
     }
 
+    // a prompt batch with no output (process()): only the layer's cache writes are read later, by the draft's own passes
+    // (Strata's draft_kv): no query, no attention, nothing after; LLAMA_MTP_KV_ONLY=0 builds the whole layer
+    static const bool kv_only_off = getenv("LLAMA_MTP_KV_ONLY") && atoi(getenv("LLAMA_MTP_KV_ONLY")) == 0;
+    const bool kv_only = !kv_only_off && n_outputs == 0 && n_tokens > 8;
+
     ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_out_ids = kv_only ? nullptr : build_inp_out_ids();
 
     ggml_tensor * h_norm = build_norm(ggml_reshape_3d(ctx0, h, n_embd, hc, n_tokens), layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
     cb(h_norm, "mtp_hnorm", il);
@@ -658,6 +670,17 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     ggml_tensor * inject = nullptr;
     ggml_tensor * cur = build_hc_mix(res_hc, layer.hc_attn_norm, layer.hc_attn_down, layer.hc_attn_up, layer.hc_attn_inject, &inject, il);
+
+    if (kv_only) {
+        build_layer_attn(inp_hyb->get_attn(), mctx_hyb, inp_kpool, cur, inp_pos, sections, il, true);
+        // the selection's inputs, now unread, stay in the graph (leaves): an input left out is not allocated and its
+        // set_input would fail
+        if (inp_kpool) {
+            keep_kpool_inputs(inp_kpool);
+        }
+        return;
+    }
+
     cur    = build_layer_attn(inp_hyb->get_attn(), mctx_hyb, inp_kpool, cur, inp_pos, sections, il);
     res_hc = build_hc_combine(res_hc, cur, inject, il);
 
@@ -823,6 +846,15 @@ public:
     bool fixed = false;
 };
 
+void llama_model_qwen4exp::graph::keep_kpool_inputs(llm_graph_input_kpool * inp) {
+    for (ggml_tensor * t : { inp->pool_cells, inp->pool_idxs, inp->pool_mask, inp->tail_idxs, inp->pool_end, inp->cell_pos,
+                             inp->tok_pos, inp->tok_rank }) {
+        if (t) {
+            ggml_build_forward_expand(gf, t);
+        }
+    }
+}
+
 llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build_inp_kpool(const llama_memory_hybrid_idx_context * mctx_hyb) {
     const auto * mctx_idx = mctx_hyb->get_idx();
     GGML_ASSERT(mctx_idx != nullptr);
@@ -920,7 +952,8 @@ llama_model_qwen4exp::graph::qsa_sel llama_model_qwen4exp::graph::build_qsa_sel(
         ggml_tensor *                           inp_pos,
         ggml_tensor *                           kq_mask,
         int *                                   sections,
-        int                                     il) {
+        int                                     il,
+        bool                                    store_only) {
     const llama_kv_cache_context * mctx_idx = mctx_hyb->get_idx();
 
     const int64_t idx_dim = hparams.indexer_head_size;
@@ -937,7 +970,7 @@ llama_model_qwen4exp::graph::qsa_sel llama_model_qwen4exp::graph::build_qsa_sel(
     // the query's projection next to the key's when the selection needs it (below): a backend can run the two products of
     // the same input in one launch
     ggml_tensor * q_proj = nullptr;
-    if (!(std::min<int64_t>(n_pool, hparams.indexer_top_k / kpool) == n_pool && !inp_kpool->fixed)) {
+    if (!store_only && !(std::min<int64_t>(n_pool, hparams.indexer_top_k / kpool) == n_pool && !inp_kpool->fixed)) {
         q_proj = build_lora_mm(model.layers[il].index_q_proj, cur);
         ggml_build_forward_expand(gf, k_raw);
         ggml_build_forward_expand(gf, q_proj);
@@ -974,7 +1007,12 @@ llama_model_qwen4exp::graph::qsa_sel llama_model_qwen4exp::graph::build_qsa_sel(
     if (inp_kpool->cache_safe) {
         // write before the pool gather
         ggml_build_forward_expand(gf, kpool_cache.scatter_pooled(pooled_new, inp_kpool->new_pool_rep));
+        if (store_only) {
+            return {};
+        }
         pooled = kpool_cache.gather_pooled(inp_kpool->pool_cells);
+    } else if (store_only) {
+        return {};   // shared cells re-pool every pool: nothing stored
     } else {
         // shared cells re-pool every pool, in layout order
         GGML_ASSERT(n_new < n_pool);
@@ -1237,7 +1275,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
         ggml_tensor *             cur,
         ggml_tensor *             inp_pos,
         int *                     sections,
-        int                       il) {
+        int                       il,
+        bool                      kv_only) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
@@ -1246,7 +1285,39 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
 
     qsa_sel sel;
     if (qsa) {
-        sel = build_qsa_sel(mctx_hyb, inp_kpool, cur, inp_pos, inp->get_kq_mask(), sections, il);
+        sel = build_qsa_sel(mctx_hyb, inp_kpool, cur, inp_pos, inp->get_kq_mask(), sections, il, kv_only);
+    }
+
+    if (kv_only) {
+        // the cache writes of build_attn_qsa / build_attn, in the same order (the rotations and quantization into the
+        // cache fuse with them), without the query, the attention and the output
+        ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
+        cb(Kcur, "Kcur", il);
+        ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
+        cb(Vcur, "Vcur", il);
+        Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+        Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
+        cb(Kcur, "Kcur_normed", il);
+        Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+        Kcur = ggml_rope_multi(
+                ctx0, Kcur, inp_pos, nullptr,
+                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow
+                );
+        cb(Kcur, "Kcur", il);
+        cb(Vcur, "Vcur", il);
+        if (inp->self_k_rot) {
+            Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp->self_k_rot);
+        }
+        if (inp->self_v_rot) {
+            Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp->self_v_rot);
+        }
+        const auto * mctx_cur = inp->mctx;
+        ggml_build_forward_expand(gf, Vcur);
+        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, Vcur, inp->get_v_idxs(), il));
+        ggml_build_forward_expand(gf, Kcur);
+        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, Kcur, inp->get_k_idxs(), il));
+        return nullptr;
     }
 
     // Qwen3Next uses a single Q projection that outputs query + gate

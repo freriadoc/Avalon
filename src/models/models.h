@@ -2545,6 +2545,7 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * inject,
                             int   il);
 
+        // kv_only: the layer's cache writes alone (K, V, the indexer's keys), no query nor attention: returns nullptr
         ggml_tensor * build_layer_attn(
               llm_graph_input_attn_kv * inp_attn,
   const llama_memory_hybrid_idx_context * mctx_hyb,
@@ -2552,7 +2553,8 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
                             int * sections,
-                            int   il);
+                            int   il,
+                           bool   kv_only = false);
 
         // what build_qsa_sel leaves to the attention
         struct qsa_sel {
@@ -2580,8 +2582,11 @@ struct llama_model_qwen4exp : public llama_model_base {
 
         // the QSA layers share one set of k-pool inputs, see llama_memory_hybrid_idx
         llm_graph_input_kpool * build_inp_kpool(const llama_memory_hybrid_idx_context * mctx_hyb);
+        // its inputs kept in the graph when nothing reads them (an input left out is not allocated, its set_input fails)
+        void keep_kpool_inputs(llm_graph_input_kpool * inp);
 
         // QSA: the selection of the top blocks and the tail (see qsa_sel)
+        // store_only: the indexer's key writes alone (raw keys, re-pooled keys), no selection
         qsa_sel build_qsa_sel(
   const llama_memory_hybrid_idx_context * mctx_hyb,
           llm_graph_input_kpool * inp_kpool,
@@ -2589,7 +2594,8 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * inp_pos,
                     ggml_tensor * kq_mask,
                             int * sections,
-                            int   il);
+                            int   il,
+                           bool   store_only = false);
 
         ggml_tensor * build_layer_attn_linear(
              llm_graph_input_rs * inp,

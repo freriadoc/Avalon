@@ -2921,7 +2921,7 @@ llm_graph_cb llama_context::graph_get_cb() const {
         // layers are not offloaded the same way (the MTP draft): they belong on the GPU that runs the attention
         // and the MTP draft's hidden-state input: copied there from the target's rows on the device (llama_set_mtp_h_from); as
         // a host input it went device -> host, then back with the scheduler's copy (2 x 10 MB a 256-token pass)
-        if (strcmp(name, "qsa_pool_layout") == 0 || strcmp(name, "mtp_h_input") == 0) {
+        if (strcmp(name, "qsa_pool_layout") == 0 || strcmp(name, "mtp_h_input_dev") == 0) {
             for (const auto & backend : backends) {
                 if (ggml_backend_dev_type(ggml_backend_get_device(backend.get())) == GGML_BACKEND_DEVICE_TYPE_GPU &&
                         ggml_backend_supports_op(backend.get(), cur)) {
