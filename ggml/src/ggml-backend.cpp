@@ -2386,6 +2386,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     st_stats & st_s = sched_time ? st_map[sched] : st_unused;
     int64_t * st_in = st_s.in; int64_t * st_cp = st_s.cp; int64_t * st_n = st_s.n; int64_t & st_calls = st_s.calls; int64_t & st_total = st_s.total;
     const int64_t st_t_graph = sched_time ? ggml_time_us() : 0;
+    // DIAGNOSTIC (GGML_SCHED_PREFETCH_STATS=1): per graph that prefetches, the host time spent waiting for a slot's
+    // previous copy, finding the cache's residents, queueing the copies, and the bytes queued
+    static const bool pf_stats = getenv("GGML_SCHED_PREFETCH_STATS") && atoi(getenv("GGML_SCHED_PREFETCH_STATS"));
+    int64_t pf_t_graph = pf_stats ? ggml_time_us() : 0, pf_wait = 0, pf_res = 0, pf_issue = 0, pf_n = 0, pf_bytes = 0;
     int64_t st_t0 = 0;
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
@@ -2497,12 +2501,25 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                     sched->prefetch_table[slot] = (uint64_t *) malloc(GGML_SCHED_PREFETCH_TABLE_EXPERTS*sizeof(uint64_t));
                                 }
                                 // the previous copy from this slot's table is done
+                                int64_t pf_t = pf_stats ? ggml_time_us() : 0;
                                 if (sched->prefetch_used[slot]) {
                                     ggml_backend_event_synchronize(sched->prefetch_ready[slot]);
                                 }
+                                if (pf_stats) { const int64_t t = ggml_time_us(); pf_wait += t - pf_t; pf_t = t; }
                                 n_resident = ggml_moe_cache.prefill_residents(sched->moe_cache_session, split_backend,
                                     node, input, sched->prefetch_table[slot]);
+                                if (pf_stats) pf_res += ggml_time_us() - pf_t;
                                 sched->prefill_pinned = sched->prefill_pinned || n_resident > 0;
+                            }
+                            const int64_t pf_t_issue = pf_stats ? ggml_time_us() : 0;
+                            if (pf_stats) {
+                                int64_t n_copied = n_expert;
+                                if (n_resident > 0) {
+                                    n_copied = 0;
+                                    for (int64_t e = 0; e < n_expert; e++) n_copied += sched->prefetch_table[slot][e] == 0;
+                                }
+                                pf_n++;
+                                pf_bytes += n_copied*(packed_step ? (int64_t) packed_step : (int64_t) input->nb[2]);
                             }
                             if (n_resident <= 0 && packed_step) {
                                 ggml_sched_copy_packed_experts(sched->prefetch_backend, input_cpy, input, 0, n_expert, packed_step);
@@ -2563,6 +2580,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             }
                             ggml_backend_event_record(sched->prefetch_ready[slot], sched->prefetch_backend);
                             ggml_backend_event_wait(split_backend, sched->prefetch_ready[slot]);
+                            if (pf_stats) pf_issue += ggml_time_us() - pf_t_issue;
                             split_prefetch_slot = slot;
                             continue;
                         }
@@ -2798,6 +2816,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     }
 
     wait_user_inputs();
+
+    if (pf_stats && pf_n > 0) {
+        GGML_LOG_INFO("prefetch stats %p: %lld tensors, %.2f GB queued, host: slot wait %.1f ms, residents %.1f ms, "
+                "queueing %.1f ms, graph %.1f ms\n", (void *) sched, (long long) pf_n, pf_bytes / 1e9, pf_wait / 1e3,
+                pf_res / 1e3, pf_issue / 1e3, (ggml_time_us() - pf_t_graph) / 1e3);
+    }
 
     if (sched_time) {
         st_total += ggml_time_us() - st_t_graph;
