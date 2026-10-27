@@ -158,11 +158,12 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
         GGML_ASSERT(h_src->src->ne[0] == h->ne[0] && h_src->src->type == h->type && ggml_is_contiguous(h_src->src));
         GGML_ASSERT(r0 + n_tokens - 1 <= h_src->n_rows);
         // h lives on the GPU, out of the scheduler's input copies and their events: the draft's previous pass may still
-        // read memory this pass's allocation gives to h (another shape, another layout), so it ends first; the copy then
-        // goes on the draft's stream (the target synchronized in llama_set_mtp_h_from)
-        ggml_backend_synchronize(h_src->backend_dst);
+        // read memory this pass's allocation gives to h (another shape, another layout). The copy goes on the draft's
+        // stream, behind that pass (the target synchronized in llama_set_mtp_h_from); only the synchronous host write
+        // of batch row 0 waits for it, so that the host prepares the other passes while the GPU computes
         int64_t d0 = 0;
         if (r0 == 0) {
+            ggml_backend_synchronize(h_src->backend_dst);
             ggml_backend_tensor_set(h, h_src->row_first, 0, row);
             d0 = 1;
         }

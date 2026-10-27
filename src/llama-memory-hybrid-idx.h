@@ -232,7 +232,7 @@ public:
                          ggml_tensor * gather_mask, bool gather, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
                          const llama_ubatch * ubatch, ggml_tensor * new_pool_pos = nullptr,
                          ggml_tensor * pool_end = nullptr, ggml_tensor * cell_pos = nullptr, ggml_tensor * tok_pos = nullptr,
-                         ggml_tensor * tok_rank = nullptr, ggml_tensor * layout_meta = nullptr) const;
+                         ggml_tensor * tok_rank = nullptr, ggml_tensor * layout_meta = nullptr, bool store_only = false) const;
 
     // masks from positions are possible: one KV stream, one sequence in the ubatch. pool_end and tok_rank
     // then carry the order in which pools become visible (the rank of the pool's last member and of the

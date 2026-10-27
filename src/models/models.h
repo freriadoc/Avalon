@@ -2580,10 +2580,10 @@ struct llama_model_qwen4exp : public llama_model_base {
                           float   kq_scale,
                             int   il);
 
-        // the QSA layers share one set of k-pool inputs, see llama_memory_hybrid_idx
-        llm_graph_input_kpool * build_inp_kpool(const llama_memory_hybrid_idx_context * mctx_hyb);
-        // its inputs kept in the graph when nothing reads them (an input left out is not allocated, its set_input fails)
-        void keep_kpool_inputs(llm_graph_input_kpool * inp);
+        // the QSA layers share one set of k-pool inputs, see llama_memory_hybrid_idx; store_only: those of the key
+        // writes only (no selection), independent of n_kv
+        llm_graph_input_kpool * build_inp_kpool(const llama_memory_hybrid_idx_context * mctx_hyb, bool store_only = false);
+        void add_new_pool_inputs(llm_graph_input_kpool * inp, const llama_memory_hybrid_idx_context * mctx_hyb, uint32_t kpool);
 
         // QSA: the selection of the top blocks and the tail (see qsa_sel)
         // store_only: the indexer's key writes alone (raw keys, re-pooled keys), no selection

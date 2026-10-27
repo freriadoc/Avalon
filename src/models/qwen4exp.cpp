@@ -634,17 +634,17 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     // the draft memory has no recurrent layer, but its input still has to be allocated
     ggml_build_forward_expand(gf, inp_hyb->get_recr()->s_copy);
 
-    llm_graph_input_kpool * inp_kpool = nullptr;
-    if (mctx_hyb->get_idx() && hparams.indexer_kpool > 0) {
-        GGML_ASSERT(mctx_hyb->get_idx()->get_n_kv() == mctx_hyb->get_attn()->get_n_kv() &&
-                "the indexer cache must track the attention cache cell for cell");
-        inp_kpool = build_inp_kpool(mctx_hyb);
-    }
-
     // a prompt batch with no output (process()): only the layer's cache writes are read later, by the draft's own passes
     // (Strata's draft_kv): no query, no attention, nothing after; LLAMA_MTP_KV_ONLY=0 builds the whole layer
     static const bool kv_only_off = getenv("LLAMA_MTP_KV_ONLY") && atoi(getenv("LLAMA_MTP_KV_ONLY")) == 0;
     const bool kv_only = !kv_only_off && n_outputs == 0 && n_tokens > 8;
+
+    llm_graph_input_kpool * inp_kpool = nullptr;
+    if (mctx_hyb->get_idx() && hparams.indexer_kpool > 0) {
+        GGML_ASSERT(mctx_hyb->get_idx()->get_n_kv() == mctx_hyb->get_attn()->get_n_kv() &&
+                "the indexer cache must track the attention cache cell for cell");
+        inp_kpool = build_inp_kpool(mctx_hyb, kv_only);
+    }
 
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = kv_only ? nullptr : build_inp_out_ids();
@@ -673,11 +673,6 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     if (kv_only) {
         build_layer_attn(inp_hyb->get_attn(), mctx_hyb, inp_kpool, cur, inp_pos, sections, il, true);
-        // the selection's inputs, now unread, stay in the graph (leaves): an input left out is not allocated and its
-        // set_input would fail
-        if (inp_kpool) {
-            keep_kpool_inputs(inp_kpool);
-        }
         return;
     }
 
@@ -777,7 +772,7 @@ public:
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
         mctx->set_input_kpool(pool_cells, pool_idxs, pool_mask, tail_idxs, nullptr, false, new_pool_idxs, new_pool_rep,
-                              ubatch, new_pool_pos, pool_end, cell_pos, tok_pos, tok_rank, layout_meta);
+                              ubatch, new_pool_pos, pool_end, cell_pos, tok_pos, tok_rank, layout_meta, store_only);
     }
 
     bool can_reuse(const llm_graph_params & params) override {
@@ -789,6 +784,14 @@ public:
         }
 
         bool res = true;
+
+        if (store_only) {
+            // the key writes only: nothing depends on n_kv, a graph serves every pass of a prompt
+            res &= k_idxs->ne[0] == params.ubatch.n_tokens;
+            res &= n_new         == mctx->get_n_kpool_new();
+            res &= cache_safe    == mctx->get_kpool_cache_safe();
+            return res;
+        }
 
         res &= fixed == mctx->kpool_fixed(params.ubatch);
         if (fixed) {
@@ -844,29 +847,28 @@ public:
     bool cache_safe = true;
     // sized for the whole cache, independent of the context length (llama_memory_hybrid_idx_context::kpool_fixed)
     bool fixed = false;
+    // k_idxs and the blocks to re-pool only (build_inp_kpool)
+    bool store_only = false;
 };
 
-void llama_model_qwen4exp::graph::keep_kpool_inputs(llm_graph_input_kpool * inp) {
-    for (ggml_tensor * t : { inp->pool_cells, inp->pool_idxs, inp->pool_mask, inp->tail_idxs, inp->pool_end, inp->cell_pos,
-                             inp->tok_pos, inp->tok_rank }) {
-        if (t) {
-            ggml_build_forward_expand(gf, t);
-        }
-    }
-}
-
-llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build_inp_kpool(const llama_memory_hybrid_idx_context * mctx_hyb) {
+llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build_inp_kpool(
+        const llama_memory_hybrid_idx_context * mctx_hyb, bool store_only) {
     const auto * mctx_idx = mctx_hyb->get_idx();
     GGML_ASSERT(mctx_idx != nullptr);
 
     const uint32_t kpool  = hparams.indexer_kpool;
-    const bool     fixed  = mctx_hyb->kpool_fixed(ubatch);
+    const bool     fixed  = !store_only && mctx_hyb->kpool_fixed(ubatch);
     const uint32_t n_pool = fixed ? mctx_hyb->get_n_kpool_fixed() : mctx_hyb->get_n_kpool();
 
     auto inp = std::make_unique<llm_graph_input_kpool>(mctx_hyb, kpool);
-    inp->fixed = fixed;
+    inp->fixed      = fixed;
+    inp->store_only = store_only;
 
     inp->k_idxs     = mctx_idx->build_input_k_idxs(ctx0, ubatch);
+    if (store_only) {
+        add_new_pool_inputs(inp.get(), mctx_hyb, kpool);
+        return (llm_graph_input_kpool *) res->add_input(std::move(inp));
+    }
     // the top blocks plus the tail, padded to the K/V tile of the flash attention (256 cells): a gathered
     // attention over a multiple of it may group the heads of a K/V head (2051 -> 2304 cells, the extra slots
     // empty: RDNA3 tile kernel 28.8 -> 16.9 us per QSA layer while decoding)
@@ -927,6 +929,14 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
     }
 
     inp->n_kv       = fixed ? (uint32_t) inp->cell_pos->ne[0] : mctx_idx->get_n_kv();
+    add_new_pool_inputs(inp.get(), mctx_hyb, kpool);
+
+    return (llm_graph_input_kpool *) res->add_input(std::move(inp));
+}
+
+// the blocks this ubatch completes or regroups, re-pooled into the cache
+void llama_model_qwen4exp::graph::add_new_pool_inputs(llm_graph_input_kpool * inp, const llama_memory_hybrid_idx_context * mctx_hyb,
+                                                      uint32_t kpool) {
     inp->n_new      = mctx_hyb->get_n_kpool_new();
     inp->cache_safe = mctx_hyb->get_kpool_cache_safe();
 
@@ -939,8 +949,6 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
     }
     inp->new_pool_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*inp->n_new);
     ggml_set_input(inp->new_pool_pos);
-
-    return (llm_graph_input_kpool *) res->add_input(std::move(inp));
 }
 
 // QSA attends to the top blocks of compress_ratio cells plus the incomplete tail, like the glm5-next k-pool indexer
@@ -959,7 +967,7 @@ llama_model_qwen4exp::graph::qsa_sel llama_model_qwen4exp::graph::build_qsa_sel(
     const int64_t idx_dim = hparams.indexer_head_size;
     const int64_t n_idx_h = hparams.indexer_n_head;
     const int64_t kpool   = inp_kpool->kpool;
-    const int64_t n_pool  = inp_kpool->pool_cells->ne[0];
+    const int64_t n_pool  = store_only ? 0 : inp_kpool->pool_cells->ne[0];
     const int64_t n_new   = inp_kpool->n_new;
 
     GGML_ASSERT(hparams.dsv4_compress_ratios[il] == kpool);

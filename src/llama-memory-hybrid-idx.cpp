@@ -889,14 +889,17 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
         ggml_tensor * gather_mask, bool gather, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
         const llama_ubatch * ubatch, ggml_tensor * new_pool_pos,
         ggml_tensor * pool_end_t, ggml_tensor * cell_pos_t, ggml_tensor * tok_pos_t, ggml_tensor * tok_rank_t,
-        ggml_tensor * layout_meta) const {
+        ggml_tensor * layout_meta, bool store_only) const {
     GGML_ASSERT(mem != nullptr && mem->get_mem_idx() != nullptr);
     // the pool tables built on the device (kpool_layout_on_device): only their metadata is filled here
     const bool on_device = layout_meta != nullptr;
-    GGML_ASSERT(on_device || ggml_backend_buffer_is_host(pool_cells->buffer));
-    GGML_ASSERT(on_device || ggml_backend_buffer_is_host(pool_idxs->buffer));
+    // store_only: a graph that only writes the keys (pooled ones included) has no selection, hence no tables, masks or
+    // tail; only the blocks to re-pool are filled
+    const bool no_tables = on_device || store_only;
+    GGML_ASSERT(no_tables || ggml_backend_buffer_is_host(pool_cells->buffer));
+    GGML_ASSERT(no_tables || ggml_backend_buffer_is_host(pool_idxs->buffer));
     GGML_ASSERT(pool_mask == nullptr || ggml_backend_buffer_is_host(pool_mask->buffer));
-    GGML_ASSERT(ggml_backend_buffer_is_host(tail_idxs->buffer));
+    GGML_ASSERT(store_only || ggml_backend_buffer_is_host(tail_idxs->buffer));
 
     const uint32_t kpool = mem->get_kpool();
     const uint32_t n_kv  = get_idx()->get_n_kv();
@@ -905,7 +908,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     const auto & lay = mem->kpool_layout_get();
 
     const uint32_t n_tokens = ubatch->n_tokens;
-    const uint32_t n_pool   = (uint32_t) pool_cells->ne[0];
+    const uint32_t n_pool   = store_only ? 0 : (uint32_t) pool_cells->ne[0];
     const uint32_t n_new    = st.n_new;
     // the graph always pools at least one entry, padded to a stable bound, see kpool_build_state
     const uint32_t n_new_g  = st.n_new_g;
@@ -913,13 +916,13 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     const bool by_order = mem->get_kpool_by_order();
 
     // a fixed graph (kpool_fixed) has the tables of every pool the cache can hold, built on the device
-    GGML_ASSERT(n_pool == kpool_pad(st.n_pool_real) || (layout_meta != nullptr && n_pool > st.n_pool_real));
+    GGML_ASSERT(store_only || n_pool == kpool_pad(st.n_pool_real) || (layout_meta != nullptr && n_pool > st.n_pool_real));
     GGML_ASSERT(st.is_new.size() == st.n_pool_real);
     GGML_ASSERT(pool_mask == nullptr || (pool_mask->ne[0] == (int64_t) n_pool && pool_mask->ne[1] == (int64_t) n_tokens));
     // the tail may be wider than kpool - 1: the extra slots pad the selection and stay empty (sentinel)
-    GGML_ASSERT(tail_idxs->ne[0] >= (int64_t) kpool - 1 && tail_idxs->ne[1] == (int64_t) n_tokens);
-    const uint32_t n_tail_slots = (uint32_t) tail_idxs->ne[0];
-    GGML_ASSERT(pool_idxs->ne[0] == (int64_t) kpool && pool_idxs->ne[1] == (int64_t) n_pool);
+    GGML_ASSERT(store_only || (tail_idxs->ne[0] >= (int64_t) kpool - 1 && tail_idxs->ne[1] == (int64_t) n_tokens));
+    const uint32_t n_tail_slots = store_only ? 0 : (uint32_t) tail_idxs->ne[0];
+    GGML_ASSERT(store_only || (pool_idxs->ne[0] == (int64_t) kpool && pool_idxs->ne[1] == (int64_t) n_pool));
     GGML_ASSERT(st.cache_safe == (new_pool_rep != nullptr));
     GGML_ASSERT(ggml_backend_buffer_is_host(new_pool_idxs->buffer));
     GGML_ASSERT(new_pool_idxs->ne[0] == (int64_t) kpool && new_pool_idxs->ne[1] == (int64_t) n_new_g);
@@ -993,8 +996,8 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     std::vector<llama_pos> pool_end;
     pool_end.reserve(n_pool);
 
-    int32_t * pcell = on_device ? nullptr : (int32_t *) pool_cells->data;
-    int32_t * pidx  = on_device ? nullptr : (int32_t *) pool_idxs->data;
+    int32_t * pcell = no_tables ? nullptr : (int32_t *) pool_cells->data;
+    int32_t * pidx  = no_tables ? nullptr : (int32_t *) pool_idxs->data;
     int32_t * nidx  = (int32_t *) new_pool_idxs->data;
     int64_t * nrep  = new_pool_rep != nullptr ? (int64_t *) new_pool_rep->data : nullptr;
     int32_t * npos  = new_pool_pos != nullptr ? (int32_t *) new_pool_pos->data : nullptr;
@@ -1012,7 +1015,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
 
         // on the device the tables need only the new pools, the last ones there (kpool_layout_on_device)
         size_t pi0 = 0;
-        if (on_device) {
+        if (no_tables) {
             pi0 = sq.pools.size();
             while (pi0 > 0 && st.is_new[seq_pool_start[s] + pi0 - 1] == st.generation) {
                 --pi0;
@@ -1022,11 +1025,11 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
         for (size_t pi = pi0; pi < sq.pools.size(); ++pi) {
             const uint32_t j  = sq.pools[pi];
             const uint32_t ip = (uint32_t) pool_end.size();
-            GGML_ASSERT(ip + 1 < n_pool);
+            GGML_ASSERT(store_only || ip + 1 < n_pool);
 
             // The pooled key lives in the last member's row.
             const uint32_t rep = sq.cells[j + kpool - 1].second;
-            if (!on_device) {
+            if (!no_tables) {
                 pcell[ip] = (int32_t) gcell(sq, rep);
 
                 for (uint32_t k = 0; k < kpool; ++k) {
@@ -1085,7 +1088,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     }
     if (n_new_g > n_new && n_pad_first == 0) {
         std::vector<int64_t> reps;
-        if (on_device) {
+        if (no_tables) {
             for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
                 const auto & sq = lay.seqs[s];
                 for (const uint32_t j : sq.pools) {
@@ -1110,6 +1113,10 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
                 nrep[i] = pad_cell;
             }
         }
+    }
+
+    if (store_only) {
+        return;
     }
 
     const uint32_t n_pool_real = (uint32_t) pool_end.size();
