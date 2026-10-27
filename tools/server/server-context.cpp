@@ -4011,8 +4011,36 @@ private:
 
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
+                    // the prompt tokens up to the next forced break (the end, a checkpoint offset, the last user message) go in
+                    // ubatches of equal size, as few as n_ubatch allows: filled greedily, a short last ubatch costs nearly
+                    // as much as a full one when the experts are uploaded for each ubatch (prefetch), and the cost of a
+                    // ubatch, max(compute ~ tokens, upload), is convex in its size: 19k tokens at -ub 8192, 8192 / 2634 / 8188
+                    // become 5413 / 5413 / 8188. One ubatch per server batch then
+                    int32_t n_batch_cur = n_batch;
+                    {
+                        const int32_t pos   = slot.prompt.n_tokens();
+                        int32_t       stop  = slot.task->n_tokens();
+                        if (do_checkpoint) {
+                            for (int offset : {4 + n_ubatch, 4}) {
+                                const int32_t s = slot.task->n_tokens() - std::min(n_batch, offset);
+                                if (s > pos && s < stop) {
+                                    stop = s;
+                                }
+                            }
+                            if (last_user_pos > pos && last_user_pos < stop) {
+                                stop = last_user_pos;
+                            }
+                        }
+                        const int32_t g = std::min(n_batch, n_ubatch);
+                        const int32_t r = stop - pos;
+                        if (r > g) {
+                            const int32_t k = (r + g - 1) / g;
+                            n_batch_cur = std::min<int32_t>(n_batch, (int32_t) batch.size() + (r + k - 1) / k);
+                        }
+                    }
+
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch_cur) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
