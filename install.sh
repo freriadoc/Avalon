@@ -168,7 +168,7 @@ cat > "$BIN_DIR/avalon-server" <<EOF
 # Extra arguments go to llama-server (e.g. -c 65536 for a smaller context).
 cd "$MODEL_DIR"
 exec "$SERVER" -m Qwen3.8-Flash-Next-Avalon-IQ3KS-00001-of-00033.gguf \\
-  -c 262144 -b 8192 -ub 8192 -fa on -ctk q8_0 -ctv q4_0 --jinja --parallel 1 \\
+  -c 262144 -b 9536 -ub 9536 -fa on -ctk q8_0 -ctv q4_0 --jinja --parallel 1 \\
   -md MTP/mtp-Qwen3.8-Flash-Next-shared-IQ3K-IQ4NL-FR65k.gguf --spec-type draft-mtp \\
   --spec-draft-n-max 2 -ubd 256 -ctkd q8_0 -ctvd q8_0 \\
   --host "\${HOST:-127.0.0.1}" --port "\${PORT:-8080}" "\$@"
