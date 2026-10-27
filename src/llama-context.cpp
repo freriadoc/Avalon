@@ -2919,7 +2919,9 @@ llm_graph_cb llama_context::graph_get_cb() const {
         // the QSA pool tables built from the cells' positions (qwen4exp, kpool_layout_on_device): their inputs live in
         // host memory, which would put them on the CPU (a loop over every cell, then an upload) in a context whose
         // layers are not offloaded the same way (the MTP draft): they belong on the GPU that runs the attention
-        if (strcmp(name, "qsa_pool_layout") == 0) {
+        // and the MTP draft's hidden-state input: copied there from the target's rows on the device (llama_set_mtp_h_from); as
+        // a host input it went device -> host, then back with the scheduler's copy (2 x 10 MB a 256-token pass)
+        if (strcmp(name, "qsa_pool_layout") == 0 || strcmp(name, "mtp_h_input") == 0) {
             for (const auto & backend : backends) {
                 if (ggml_backend_dev_type(ggml_backend_get_device(backend.get())) == GGML_BACKEND_DEVICE_TYPE_GPU &&
                         ggml_backend_supports_op(backend.get(), cur)) {
