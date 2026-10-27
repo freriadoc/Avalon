@@ -53,6 +53,12 @@ to Unsloth's UD-IQ4_XS), greedy decoding, 512 tokens, median of 3 runs, MTP spec
 \* Maximum prefill, measured with a 32k prompt filling the 32k context. Prefill figures are without MTP (with MTP:
 1,544 / 1,387 / 1,273 t/s).
 
+**Oct 27 update, prefill with MTP:** the MTP draft now only writes its KV cache during prefill, reading the main model's
+hidden states on the GPU, and a prompt is split into batches of equal size (`-b` / `-ub 9536`) instead of leaving a
+short last batch that costs as much as a full one. A new 19k prompt in a 32k context goes from ~1,410 to **1,660 t/s
+(+18%)**; long prompts gain less (256k context, 131k filled: 1,439 to 1,485 t/s, +3%; 250k filled: 1,314 to 1,320 t/s;
+single runs). Generation is unchanged. The table above has not been re-measured yet.
+
 The full 256k context fits with the MTP draft model, the KV cache in q8_0 / q4_0 and the expert cache, under 19.7 GiB
 of VRAM.
 
