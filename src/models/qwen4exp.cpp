@@ -644,7 +644,16 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     e_norm = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, e_norm, n_embd, 1, n_tokens), n_embd, hc, n_tokens, 1);
     cb(e_norm, "mtp_enorm", il);
 
-    ggml_tensor * res_hc = build_lora_mm(layer.nextn.eh_proj, ggml_concat(ctx0, e_norm, h_norm, 0)); // [n_embd, hc, n_tokens]
+    ggml_tensor * eh_in = ggml_concat(ctx0, e_norm, h_norm, 0); // [2*n_embd, hc, n_tokens]
+    ggml_tensor * res_hc;
+    if (n_tokens > 8) {
+        // a prompt batch: one product over hc x n_tokens columns, the weights read once (as [.., hc, n_tokens] it was
+        // n_tokens products of hc columns, each reading the 14 MB of eh_proj: 2.9 ms a 256-token pass on an RX 7900 XT)
+        res_hc = ggml_reshape_3d(ctx0, build_lora_mm(layer.nextn.eh_proj, ggml_reshape_2d(ctx0, eh_in, 2*n_embd, hc*n_tokens)),
+                                 n_embd, hc, n_tokens);
+    } else {
+        res_hc = build_lora_mm(layer.nextn.eh_proj, eh_in); // [n_embd, hc, n_tokens]
+    }
     cb(res_hc, "mtp_eh_proj", il);
 
     ggml_tensor * inject = nullptr;
