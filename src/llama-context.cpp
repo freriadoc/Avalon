@@ -1439,8 +1439,19 @@ bool llama_context::set_mtp_h_from(llama_context & tgt, const float * row_first)
     if (!tgt.h_nextn_dev || !row_first) {
         return false;
     }
+    // this context's backend on the device of the target's rows
+    ggml_backend_dev_t dev = ggml_backend_get_device(tgt.h_nextn_backend);
+    ggml_backend_t dst = nullptr;
+    for (auto & b : backends) {
+        if (ggml_backend_get_device(b.get()) == dev) {
+            dst = b.get();
+        }
+    }
+    if (!dst) {
+        return false;
+    }
     tgt.synchronize();
-    mtp_h_src = { tgt.h_nextn_dev, tgt.h_nextn_dev_rows, row_first, 0 };
+    mtp_h_src = { tgt.h_nextn_dev, tgt.h_nextn_dev_rows, row_first, 0, tgt.h_nextn_backend, dst };
     return true;
 }
 
@@ -2266,8 +2277,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
                 ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
                 extract_all_idxs = extract_all_idxs || !masked;
-                if (!masked && n_tokens_prev == 0 && (int64_t) ubatch.n_tokens == n_tokens_all) {
+                // the whole batch in one ubatch, its rows in batch order
+                bool whole = !masked && n_tokens_prev == 0 && (int64_t) ubatch.n_tokens == n_tokens_all &&
+                    ubatch.data && ubatch.data->batch_idxs.size() == ubatch.n_tokens && ggml_is_contiguous(t_h_nextn);
+                for (uint32_t i = 0; whole && i < ubatch.n_tokens; ++i) {
+                    whole = ubatch.data->batch_idxs[i] == (int32_t) i;
+                }
+                if (whole) {
                     h_nextn_dev      = t_h_nextn;
+                    h_nextn_backend  = backend_h;
                     h_nextn_dev_rows = n_rows;
                 }
             }

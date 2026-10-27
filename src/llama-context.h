@@ -318,6 +318,8 @@ private:
     // the nextn rows of the last decode on the device when it was one ubatch with every row (an MTP draft reads them
     // there, llama_set_mtp_h_from); valid until the next decode allocates its graph
     const ggml_tensor * h_nextn_dev      = nullptr;
+    ggml_backend_t      h_nextn_backend  = nullptr;   // its backend: copies from it are queued on its stream, never
+                                                      // synchronous ones (a hosted MoE graph may wait for the host)
     int64_t             h_nextn_dev_rows = 0;
 
     // this context's hidden-state input read from another's device rows (cparams.mtp_h_src points here)

@@ -9,6 +9,7 @@
 #define LLAMA_MAX_SEQ 256
 
 struct ggml_tensor;
+typedef struct ggml_backend * ggml_backend_t;
 
 // the MTP draft's hidden-state input copied on the device from the target's last decode (llama_set_mtp_h_from)
 // instead of passing through the batch: batch row i takes the target's row i - 1, row 0 the host row row_first
@@ -17,6 +18,8 @@ struct llama_mtp_h_src {
     int64_t       n_rows    = 0;
     const float * row_first = nullptr;
     int64_t       row0      = 0;         // batch row of the ubatch whose inputs are being set
+    ggml_backend_t backend_src = nullptr; // the device copy is queued on the target's stream, the draft's waits for
+    ggml_backend_t backend_dst = nullptr; // it: no synchronous copy, a hosted MoE graph may be waiting for the host
 };
 
 struct llama_cparams {

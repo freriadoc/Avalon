@@ -170,7 +170,7 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
             s.ne[1] = d.ne[1] = n_tokens - d0;
             s.nb[2] = s.nb[3] = d.nb[2] = d.nb[3] = s.ne[1]*row;
             s.view_src = d.view_src = nullptr;
-            ggml_backend_tensor_copy(&s, &d);
+            ggml_backend_tensor_copy_async(h_src->backend_src, h_src->backend_dst, &s, &d);
         }
     }
 
