@@ -2832,7 +2832,10 @@ static void * moe_cache_session_create(
                 return;
             }
             const int physical = info.devices[logical].physical_device;
-            if (!seen_devices.insert(physical).second) {
+            // one cache per physical GPU; DIAGNOSTIC (GGML_MOE_CACHE_VIRTUAL_DEVICES=1, with GGML_CUDA_DEVICES and a
+            // --moe-cache budget): one per virtual device, to run the multi-GPU paths on a single GPU
+            static const bool per_virtual = getenv("GGML_MOE_CACHE_VIRTUAL_DEVICES") && atoi(getenv("GGML_MOE_CACHE_VIRTUAL_DEVICES")) != 0;
+            if (!seen_devices.insert(per_virtual ? logical : physical).second) {
                 return;
             }
 
@@ -6483,6 +6486,11 @@ static void moe_hosted_serve_one(moe_hosted_state * st, uint32_t seq) {
             }
         }
     }
+}
+
+bool ggml_cuda_moe_hosted_active() {
+    std::lock_guard<std::mutex> lock(g_hosted_mu);
+    return !g_hosted.empty();
 }
 
 // Wait for the stream (or the event) like cudaStreamSynchronize / cudaEventSynchronize, answering the
