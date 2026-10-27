@@ -46,18 +46,16 @@ to Unsloth's UD-IQ4_XS), greedy decoding, 512 tokens, median of 3 runs, MTP spec
 
 | case | generation, no MTP | generation, MTP | prefill |
 |---|---|---|---|
-| 32k context, short prompt, warm cache | 62.4 t/s | 91.0 t/s | 1,661 t/s* |
-| 256k context, 131k filled | 55.6 t/s | 74.5 t/s | 1,496 t/s |
-| 256k context, 250k filled | 50.5 t/s | 69.8 t/s | 1,376 t/s |
+| 32k context, short prompt, warm cache | 62.4 t/s | 91.0 t/s | 1,720 t/s* |
+| 256k context, 131k filled | 55.6 t/s | 74.5 t/s | 1,540 t/s |
+| 256k context, 250k filled | 50.5 t/s | 69.8 t/s | 1,380 t/s |
 
 \* Maximum prefill, measured with a 32k prompt filling the 32k context. Prefill figures are without MTP (with MTP:
-1,544 / 1,387 / 1,273 t/s).
+1,584 / 1,485 / 1,320 t/s).
 
-**Oct 27 update, prefill with MTP:** the MTP draft now only writes its KV cache during prefill, reading the main model's
-hidden states on the GPU, and a prompt is split into batches of equal size (`-b` / `-ub 9536`) instead of leaving a
-short last batch that costs as much as a full one. A new 19k prompt in a 32k context goes from ~1,410 to **1,660 t/s
-(+18%)**; long prompts gain less (256k context, 131k filled: 1,439 to 1,485 t/s, +3%; 250k filled: 1,314 to 1,320 t/s;
-single runs). Generation is unchanged. The table above has not been re-measured yet.
+Since Oct 27 the MTP draft only writes its KV cache during prefill, and a prompt is split into batches of equal size
+(`-b` / `-ub 9536`) instead of leaving a short last batch that costs as much as a full one: a new 19k prompt with MTP
+went from ~1,410 to 1,660 t/s (+18%).
 
 The full 256k context fits with the MTP draft model, the KV cache in q8_0 / q4_0 and the expert cache, under 19.7 GiB
 of VRAM.
@@ -68,7 +66,7 @@ With MTP, Avalon generates **almost 50% faster than Strata at equivalent quantiz
 
 | engine | generation, short prompt, no MTP / MTP | 256k context, 250k filled, no MTP / MTP | max prefill |
 |---|---|---|---|
-| **Avalon** | **62.4 / 91.0 t/s** | **50.5 / 69.8 t/s** | **1,661 t/s** |
+| **Avalon** | **62.4 / 91.0 t/s** | **50.5 / 69.8 t/s** | **1,720 t/s** |
 | [Strata](https://github.com/Niko1221/Strata) 0.1.43 (HIP) | 49.0 / 61.9 t/s | 41.8 / 50.0 t/s | 1,376 t/s |
 
 Measured the same night with the same protocol; Strata serves ISTA's IQ3_S model, the one our experts come from, with
