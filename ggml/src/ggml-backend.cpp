@@ -1113,6 +1113,8 @@ struct ggml_backend_sched {
     // has no events), see ggml_backend_sched_compute_splits
     ggml_backend_event_t user_inputs_done[GGML_SCHED_MAX_BACKENDS];
     bool                 user_inputs_done_tried[GGML_SCHED_MAX_BACKENDS];
+    // the backend's batched copy of small user inputs (registry proc "ggml_backend_set_tensors_async"), or null
+    bool (*set_tensors_async[GGML_SCHED_MAX_BACKENDS])(ggml_backend_t, int, ggml_tensor * const *, const ggml_tensor * const *);
     struct ggml_tensor ** graph_inputs;
     int n_graph_inputs;
     int graph_inputs_capacity;
@@ -2422,6 +2424,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        // small user inputs queued together, one launch for the split (set_tensors_async)
+        constexpr int    batch_max       = 32;
+        constexpr size_t batch_max_bytes = 64 << 10;
+        ggml_tensor *       batch_dst[batch_max];
+        const ggml_tensor * batch_src[batch_max];
+        int batch_n = 0;
+        auto batch_flush = [&]() {
+            if (batch_n > 0 && !sched->set_tensors_async[split_backend_id](split_backend, batch_n, batch_dst, batch_src)) {
+                for (int i = 0; i < batch_n; i++) {
+                    ggml_backend_tensor_set_async(split_backend, batch_dst[i], batch_src[i]->data, 0, ggml_nbytes(batch_src[i]));
+                }
+            }
+            batch_n = 0;
+        };
+
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
@@ -2449,10 +2466,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         dst_synced = true;
                     }
                 }
-                if (copy_async) {
+                if (copy_async && sched->set_tensors_async[split_backend_id] && ggml_nbytes(input) <= batch_max_bytes) {
+                    if (batch_n == batch_max) {
+                        batch_flush();
+                    }
+                    batch_dst[batch_n] = input_cpy;
+                    batch_src[batch_n] = input;
+                    batch_n++;
+                    user_inputs_queued = true;
+                } else if (copy_async) {
                     ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
                     user_inputs_queued = true;
                 } else {
+                    batch_flush();
                     if (user_inputs_queued) {
                         ggml_backend_synchronize(split_backend);
                         user_inputs_queued = false;
@@ -2725,6 +2751,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        batch_flush();
         if (copies_backend) {
             ggml_backend_synchronize(copies_backend);
         }
@@ -2921,6 +2948,12 @@ ggml_backend_sched_t ggml_backend_sched_new(
         sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
         sched->bufts_plain[b] = sched->bufts[b];
         GGML_ASSERT(ggml_backend_supports_buft(backends[b], sched->bufts[b]));
+        {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backends[b]);
+            ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            sched->set_tensors_async[b] = reg ? (bool (*)(ggml_backend_t, int, ggml_tensor * const *, const ggml_tensor * const *))
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_tensors_async") : nullptr;
+        }
 
         if (sched->n_copies > 1) {
             for (int c = 0; c < sched->n_copies; c++) {

@@ -2992,6 +2992,60 @@ static bool ggml_cuda_host_copy_by_kernel(void * dst, const void * src, size_t s
 }
 #endif
 
+// The scheduler's small inputs from pinned host memory (ggml_backend_cuda_host_buffer_type, mapped at the same address
+// on the device), copied by one kernel launch per split instead of one copy each (~30 per MTP step, ~1.9 us of host time
+// and a small blit kernel each). ggml_backend_set_tensors_async, through the registry's proc address
+#define GGML_CUDA_SET_TENSORS_MAX 32
+struct ggml_cuda_set_tensors_args {
+    const char * src[GGML_CUDA_SET_TENSORS_MAX];
+    char *       dst[GGML_CUDA_SET_TENSORS_MAX];
+    uint32_t     size[GGML_CUDA_SET_TENSORS_MAX];
+};
+static __global__ void k_ggml_cuda_set_tensors(const ggml_cuda_set_tensors_args a) {
+    const char * __restrict__ src = a.src[blockIdx.x];
+    char * __restrict__       dst = a.dst[blockIdx.x];
+    const uint32_t n = a.size[blockIdx.x];
+    uint32_t done = 0;
+    if ((((uintptr_t) src | (uintptr_t) dst) & 15) == 0) {
+        for (uint32_t i = threadIdx.x; i < n / 16; i += blockDim.x) {
+            ((int4 *) dst)[i] = ((const int4 *) src)[i];
+        }
+        done = n / 16 * 16;
+    }
+    for (uint32_t i = done + threadIdx.x; i < n; i += blockDim.x) {
+        dst[i] = src[i];
+    }
+}
+
+// n contiguous copies src[i] -> dst[i] (same sizes) on the backend's stream; false, nothing queued, when a source is not
+// in the CUDA host buffer type, a destination not in this device's buffer, or there are too many
+static bool ggml_backend_cuda_set_tensors_async(ggml_backend_t backend, int n, ggml_tensor * const * dst, const ggml_tensor * const * src) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    if (n <= 0 || n > GGML_CUDA_SET_TENSORS_MAX) {
+        return false;
+    }
+    ggml_backend_buffer_type_t host_buft = ggml_backend_cuda_host_buffer_type();
+    ggml_backend_buffer_type_t dev_buft  = ggml_backend_cuda_buffer_type(cuda_ctx->device);
+    ggml_cuda_set_tensors_args a;
+    for (int i = 0; i < n; i++) {
+        const ggml_tensor * s = src[i];
+        const ggml_tensor * d = dst[i];
+        ggml_backend_buffer_t sb = s->view_src ? s->view_src->buffer : s->buffer;
+        ggml_backend_buffer_t db = d->view_src ? d->view_src->buffer : d->buffer;
+        if (!sb || sb->buft != host_buft || !db || db->buft != dev_buft || ggml_nbytes(s) != ggml_nbytes(d) ||
+            ggml_nbytes(s) > UINT32_MAX) {
+            return false;
+        }
+        a.src[i]  = (const char *) s->data;
+        a.dst[i]  = (char *) d->data;
+        a.size[i] = (uint32_t) ggml_nbytes(s);
+    }
+    ggml_cuda_set_device(cuda_ctx->device);
+    k_ggml_cuda_set_tensors<<<n, 256, 0, cuda_ctx->stream()>>>(a);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
@@ -8213,6 +8267,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_set_weights_read_once") == 0) {
         return (void *)ggml_backend_cuda_set_weights_read_once;
+    }
+    if (strcmp(name, "ggml_backend_set_tensors_async") == 0) {
+        return (void *)ggml_backend_cuda_set_tensors_async;
     }
     return nullptr;
 }
