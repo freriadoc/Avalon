@@ -6020,6 +6020,16 @@ static int moe_hosted_split(moe_hosted_state * st, moe_hosted_layer * layer, int
             const void * key = layer->gate_w->data;
             const int idx = layer->pool_index;
             const double rate = st->pcie_bytes_per_us;   // bytes per microsecond
+            // a packed layer fills an entry in one copy (the fill's whole job): one copy and one tensor per moved expert
+            // in the model, not three (the model was fitted before the packing)
+            bool packed = false;
+            if (const moe_cache_layer * cl = moe_cache_layer_of(device, key)) {
+                packed = true;
+                for (int r = 0; r < MOE_ROLES; r++) {
+                    packed = packed && cl->stride[r] == pool->expert_size &&
+                        (const char *) cl->tensor[r] == (const char *) cl->tensor[0] + pool->role_offset[r];
+                }
+            }
             // a candidate: an expert of the CPU rows, its entry (absent: -1, or copying), the time of its three copies one
             // after another
             struct cand { int32_t e; int rows; int slot; double copies; int tensors; };
@@ -6031,12 +6041,15 @@ static int moe_hosted_split(moe_hosted_state * st, moe_hosted_layer * layer, int
                     if (x.e == e) { x.rows++; seen = true; }
                 }
                 if (!seen) {
-                    cand x = {e, 1, -1, 0.0, MOE_ROLES};
+                    cand x = {e, 1, -1, 0.0, packed ? 1 : MOE_ROLES};
                     const auto f = pool->map.find(moe_cache_key{key, e});
                     if (f != pool->map.end()) {
                         x.slot = f->second;
                     }
-                    for (int k = 0; k < MOE_ROLES; k++) {
+                    if (packed) {
+                        x.copies = moe_split_copy_tensor_us + pool->expert_size / rate;
+                    }
+                    for (int k = 0; k < MOE_ROLES && !packed; k++) {
                         x.copies += moe_split_copy_tensor_us + pool->role_bytes[k] / rate;
                     }
                     c.push_back(x);
@@ -6178,7 +6191,7 @@ static int moe_hosted_split(moe_hosted_state * st, moe_hosted_layer * layer, int
                 }
                 n_cpu = left;
                 st->split_moved += (int64_t) moved_experts.size();
-                st->split_tensors = MOE_ROLES * (int) moved_experts.size();
+                st->split_tensors = (packed ? 1 : MOE_ROLES) * (int) moved_experts.size();
                 session.cv.notify_all();
             }
         }
