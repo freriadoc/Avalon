@@ -957,12 +957,29 @@ static __device__ __forceinline__ const void * mmvq_global_ptr(uint64_t addr) {
 // entry_ptrs (the MoE cache): ids and gate_ids hold each routed row's entry address (64 bits, 0 for a row the cache does
 // not hold) instead of a matrix index, one row per block: the address is read by a scalar load and the blocks inside
 // the entry are counted in 32 bits, wherever the cache's ranges lie (the slab, memory lent by the KV cache).
+// entry_ptrs: under HIP one warp per block (RDNA3); on NVIDIA up to MMVQ_ENTRY_MAX_WARPS independent warps per block, each
+// on its own rows (an SM holds at most 24 blocks: one-warp blocks would leave half of its threads idle)
+#if defined(GGML_USE_HIP)
+#define MMVQ_ENTRY_MAX_WARPS 1
+#else
+#define MMVQ_ENTRY_MAX_WARPS 8
+#endif
+// warps per block of the entry_ptrs launches (GGML_CUDA_MMVQ_ENTRY_WARPS, NVIDIA: 1, 2, 4 or 8; default 4)
+static int mmvq_entry_warps() {
+    static const int w = [] {
+        const char * v = getenv("GGML_CUDA_MMVQ_ENTRY_WARPS");
+        const int n = v ? atoi(v) : 4;
+        return std::max(1, std::min(MMVQ_ENTRY_MAX_WARPS, n));
+    }();
+    return w;
+}
+
 // q8_out (entry_ptrs, one warp per block): the results also written as the q8_1 activation of down (fusion.q8_dst) by the
 // last warp to finish the rows of a q8_1 block (a counter per block, fusion.q8_count, reset by that warp), with the code
 // of quantize_q8_1 on the values in dst: no warp waits for another
 template <ggml_type type, int c_rows_per_block, bool has_fusion, bool has_clamp, bool flat_hits = false, bool entry_ptrs = false,
           bool flat_k = false, bool q8_out = false>
-__launch_bounds__((flat_hits ? 2 : entry_ptrs ? 1 : get_mmvq_mmid_max_batch_for_device<type>())*ggml_cuda_get_physical_warp_size(), 1)
+__launch_bounds__((flat_hits ? 2 : entry_ptrs ? MMVQ_ENTRY_MAX_WARPS : get_mmvq_mmid_max_batch_for_device<type>())*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_moe(
         const void * vx_ptr, const void * vy_ptr,
         const int32_t * ids_ptr, const int32_t * act_ids_ptr,
@@ -1044,7 +1061,10 @@ static __global__ void mul_mat_vec_q_moe(
             gate_scale = (const float *) fusion.gate_scale;
         }
     }
-    const int      row0        = c_rows_per_block*blockIdx.x;
+    const int      row0        = c_rows_per_block*(entry_ptrs ? blockIdx.x*blockDim.y + threadIdx.y : blockIdx.x);
+    if (entry_ptrs && row0 >= (int) nrows_x) {
+        return;   // a warp of the last block past the rows (entry_ptrs: no block-wide synchronization)
+    }
     const int      blocks_per_row_x = ncols_x / qk;
     constexpr int  blocks_per_iter  = vdr * warp_size / qi;
 
@@ -1362,8 +1382,9 @@ static void mul_mat_vec_q_moe_entries_launch(
         fa.q8_dst = q8_dst;
         fa.q8_stride = q8_stride;
         fa.q8_count = q8_count;
-        const dim3 block_nums(nrows_x / 2, n_hits);
-        const dim3 block_dims(warp_size, 1);
+        const int w = mmvq_entry_warps();
+        const dim3 block_nums((nrows_x / 2 + w - 1) / w, n_hits);
+        const dim3 block_dims(warp_size, w);
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
         ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, 2, has_gate, has_clamp, false, true, true, true>, launch_params,
             nullptr, vy, (const int32_t *) up_entries, act_ids, nullptr, (const int32_t *) gate_entries,
@@ -1382,8 +1403,9 @@ static void mul_mat_vec_q_moe_entries_launch(
     const auto launch = [&](auto rows_tag) {
         constexpr int rows_per_block = decltype(rows_tag)::value;
         constexpr bool flat = rows_per_block == 2;
-        const dim3 block_nums((nrows_x + rows_per_block - 1) / rows_per_block, n_hits);
-        const dim3 block_dims(warp_size, 1);
+        const int w = mmvq_entry_warps();
+        const dim3 block_nums(((nrows_x + rows_per_block - 1) / rows_per_block + w - 1) / w, n_hits);
+        const dim3 block_dims(warp_size, w);
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
         ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, has_gate, has_clamp, false, true, flat>, launch_params,
             nullptr, vy, (const int32_t *) up_entries, act_ids, nullptr, (const int32_t *) gate_entries,
