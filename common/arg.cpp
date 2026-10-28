@@ -2319,9 +2319,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_sampling());
     add_opt(common_arg(
         {"-bs", "--backend-sampling"},
-        "enable backend sampling (experimental) (default: disabled)",
-        [](common_params & params) {
-            params.sampling.backend_sampling = true;
+        {"-no-bs", "--no-backend-sampling"},
+        "sample on the backend (experimental) (default: enabled on NVIDIA GPUs, disabled otherwise)",
+        [](common_params & params, bool value) {
+            params.sampling.backend_sampling     = value;
+            params.sampling.backend_sampling_set = true;
         }
     ).set_sampling().set_env("LLAMA_ARG_BACKEND_SAMPLING"));
     add_opt(common_arg(

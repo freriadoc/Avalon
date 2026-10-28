@@ -1365,6 +1365,21 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                 params.sampling.logit_bias_eog.begin(), params.sampling.logit_bias_eog.end());
     }
 
+    // NVIDIA: the token is picked on the GPU by default (the verification's argmax on the CPU cost 1.8 ms per MTP step
+    // on an EPYC host, +6% per step with it on the GPU); neutral under ROCm, left off there
+    if (!params.sampling.backend_sampling_set) {
+        ggml_backend_dev_t gpu = params.devices.empty() ? nullptr : params.devices[0];
+        for (size_t i = 0; gpu == nullptr && i < ggml_backend_dev_count(); i++) {
+            if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                gpu = ggml_backend_dev_get(i);
+            }
+        }
+        if (gpu && strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(gpu)), "CUDA") == 0) {
+            params.sampling.backend_sampling = true;
+            LOG_INF("%s: backend sampling enabled (NVIDIA GPU; -no-bs to disable)\n", __func__);
+        }
+    }
+
     // init the backend samplers as part of the context creation
     pimpl->samplers.resize(cparams.n_seq_max);
     pimpl->samplers_seq_config.resize(cparams.n_seq_max);

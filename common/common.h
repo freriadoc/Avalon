@@ -296,7 +296,8 @@ struct common_params_sampling {
     std::string               reasoning_budget_message;        // message injected before end tag when budget exhausted
     bool                      reasoning_control = false;       // create the budget sampler on demand so reasoning can be ended at runtime
 
-    bool backend_sampling = false;
+    bool backend_sampling     = false;
+    bool backend_sampling_set = false; // -bs / -no-bs given; otherwise common_init_result enables it on NVIDIA GPUs
 
     // print the parameters into a string
     std::string print() const;
