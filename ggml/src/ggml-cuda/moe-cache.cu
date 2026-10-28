@@ -2459,7 +2459,8 @@ static bool moe_cache_pin_tensor(const moe_cache_session & session, moe_cache_de
             }
         }
     }
-    if (cudaHostRegister((void *) ib, ie - ib, cudaHostRegisterReadOnly | cudaHostRegisterPortable) != cudaSuccess) {
+    // mapped: the dispatcher's kernel copy reads a moved expert there (moe_split_copy_by_kernel)
+    if (cudaHostRegister((void *) ib, ie - ib, cudaHostRegisterReadOnly | cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
         (void) cudaGetLastError();
         return false;
     }
@@ -5191,6 +5192,11 @@ struct moe_hosted_layer {
     uint64_t * m_plan2 = nullptr;
     uint64_t * d_plan2 = nullptr;
     int split_pending = 0;          // SPLIT: its tensors still copying (session lock)
+    // SPLIT, kernel copy: [0] count, then per moved expert its packed entry in RAM (device address), its cache entry, its
+    // bytes; copied to the device by k_moe_split_wait, read by k_moe_split_fetch
+    uint64_t * h_fetch = nullptr;
+    uint64_t * m_fetch = nullptr;
+    uint64_t * d_fetch = nullptr;
     float * h_chk = nullptr;        // DIAGNOSTIC (GGML_CUDA_MOE_SPLIT_VERIFY=1): the GPU results of the moved rows (rows x n_embd)
     float * m_chk = nullptr;
     int32_t * h_pred = nullptr;     // PREGATE: [0] stamp (publication it belongs to), [1] count, then expert ids
@@ -5236,6 +5242,7 @@ struct moe_hosted_state {
     int n_threads = 1;
     double pcie_bytes_per_us = 13600.0;                      // SPLIT: host -> device copy rate (moe_cache_pcie_bytes_per_us)
     std::vector<moe_cache_pin> pins;                         // held by the last plan
+    std::vector<moe_cache_job> gpu_fills;                    // SPLIT, kernel copy: entries the last plan's layer fills
     int64_t split_moved = 0;                                 // SPLIT: experts moved to the GPU
     int split_tensors = 0;                                   // SPLIT: tensors copied for the last layer's moved experts
     // SPLIT: the CPU term of the dispatcher's model scaled to this machine (moe_split_calibrate), measured once
@@ -5637,9 +5644,13 @@ static __global__ void k_moe_hosted_enter(const float * act, float * h_act, bloc
 }
 
 // a block per row: the rows the CPU computed (down id -1) are copied in once they are ready
-// SPLIT: the moved expert arrived (or none was moved): its plan to the device
+// SPLIT, kernel copy: moved experts per layer at most (a list of 1 + 3 x this many words)
+#define MOE_SPLIT_FETCH_MAX 16
+
+// SPLIT: the moved expert arrived (or none was moved): its plan to the device, and the kernel copy's list
 static __global__ void k_moe_split_wait(const uint32_t * d_expect, const volatile uint32_t * flag,
                                         const volatile uint64_t * m_plan2, uint64_t * d_plan2, int n_plan,
+                                        const volatile uint64_t * m_fetch, uint64_t * d_fetch,
                                         volatile unsigned long long * tl) {
     if (threadIdx.x == 0) {
         const uint32_t expect = *d_expect;
@@ -5655,6 +5666,27 @@ static __global__ void k_moe_split_wait(const uint32_t * d_expect, const volatil
     __syncthreads();
     for (int i = threadIdx.x; i < n_plan; i += blockDim.x) {
         d_plan2[i] = m_plan2[i];
+    }
+    if (m_fetch) {
+        const int n_fetch = 1 + 3 * (int) min((uint64_t) MOE_SPLIT_FETCH_MAX, m_fetch[0]);
+        for (int i = threadIdx.x; i < n_fetch; i += blockDim.x) {
+            d_fetch[i] = m_fetch[i];
+        }
+    }
+}
+
+// SPLIT, kernel copy: the moved experts read from their packed entries in RAM (mapped) and written to their cache entries,
+// 16 bytes a thread, on the compute stream after the resident rows (the copy of Strata's PCIe share, fetch_blobs)
+static __global__ void k_moe_split_fetch(const uint64_t * __restrict__ d_fetch) {
+    const int n = (int) min((uint64_t) MOE_SPLIT_FETCH_MAX, d_fetch[0]);
+    const int64_t stride = (int64_t) gridDim.x * blockDim.x;
+    for (int k = 0; k < n; k++) {
+        const uint4 * src = (const uint4 *) d_fetch[1 + 3 * k];
+        uint4 * dst = (uint4 *) d_fetch[2 + 3 * k];
+        const int64_t m = (int64_t) (d_fetch[3 + 3 * k] / sizeof(uint4));
+        for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < m; i += stride) {
+            dst[i] = src[i];
+        }
     }
 }
 
@@ -5755,8 +5787,27 @@ static __global__ void k_moe_hosted_merge(const uint32_t * d_expect, const volat
     }
 }
 
-// Unpin the rows the GPU read for the last planned layer (session lock held).
+// Unpin the rows the GPU read for the last planned layer (session lock held). The GPU is past that layer (the next one's
+// publication, or the stream synchronized): the entries its kernel copy filled are valid, as the fill thread makes them.
 static void moe_hosted_unpin_locked(moe_hosted_state & st) {
+    for (const moe_cache_job & job : st.gpu_fills) {
+        moe_cache_device & device = *st.device;
+        if (job.pool < 0 || job.pool >= (int) device.pools.size() || !device.pools[job.pool]) {
+            continue;
+        }
+        moe_cache_pool & pool = *device.pools[job.pool];
+        if (job.slot < 0 || job.slot >= pool.n_slots) {
+            continue;
+        }
+        moe_cache_slot & slot = pool.slots[job.slot];
+        if (slot.state == moe_cache_slot_state::copying && slot.generation == job.generation && slot.key == job.key) {
+            slot.state = moe_cache_slot_state::valid;
+            moe_cache_lru_push_back(pool, job.slot);
+            device.demand_count.erase(job.key);
+            device.fills++;
+        }
+    }
+    st.gpu_fills.clear();
     for (const moe_cache_pin & pin : st.pins) {
         if (pin.pool && pin.slot >= 0 && pin.slot < pin.pool->n_slots && pin.pool->slots[pin.slot].readers > 0) {
             pin.pool->slots[pin.slot].readers--;
@@ -5992,6 +6043,24 @@ static constexpr double moe_cache_pcie_copy_efficiency = 13.6 / (8.0 * 16 * 128.
 static constexpr double moe_split_gpu_before_us = 23.3, moe_split_gpu_row_us = 2.97;
 static constexpr double moe_split_gpu_after_us = 66.4, moe_split_gpu_moved_row_us = 1.5;
 
+// SPLIT: a moved expert of a packed layer copied by k_moe_split_fetch on the compute stream, into the entry it is admitted
+// to (GGML_CUDA_MOE_SPLIT_COPY=kernel), or by the fill thread's DMA (=dma): no queue, one read of the entry, no flag to
+// wait for. Default: kernel on NVIDIA; DMA under HIP, where a kernel reading RAM slows the other queues' kernels
+static bool moe_split_copy_by_kernel() {
+    static const bool kernel = [] {
+        const char * v = getenv("GGML_CUDA_MOE_SPLIT_COPY");
+        if (v) {
+            return strcmp(v, "kernel") == 0;
+        }
+#if defined(GGML_USE_HIP)
+        return false;
+#else
+        return true;
+#endif
+    }();
+    return kernel;
+}
+
 static bool moe_split_enabled() {
     static const bool enabled = !getenv("GGML_CUDA_MOE_SPLIT") || atoi(getenv("GGML_CUDA_MOE_SPLIT")) != 0;
     return enabled;
@@ -6007,6 +6076,8 @@ static int moe_hosted_split(moe_hosted_state * st, moe_hosted_layer * layer, int
     for (int i = 0; i < 3 * rows; i++) {
         plan2[i] = 0;
     }
+    layer->h_fetch[0] = 0;
+    int n_fetch = 0;
     int jobs = 0;
     if (n_cpu > 0) {
         moe_cache_session & session = *st->session;
@@ -6020,6 +6091,7 @@ static int moe_hosted_split(moe_hosted_state * st, moe_hosted_layer * layer, int
             const void * key = layer->gate_w->data;
             const int idx = layer->pool_index;
             const double rate = st->pcie_bytes_per_us;   // bytes per microsecond
+            const bool by_kernel = moe_split_copy_by_kernel();
             // a packed layer fills an entry in one copy (the fill's whole job): one copy and one tensor per moved expert
             // in the model, not three (the model was fitted before the packing)
             bool packed = false;
@@ -6047,7 +6119,8 @@ static int moe_hosted_split(moe_hosted_state * st, moe_hosted_layer * layer, int
                         x.slot = f->second;
                     }
                     if (packed) {
-                        x.copies = moe_split_copy_tensor_us + pool->expert_size / rate;
+                        // kernel copy: the entry at the link's rate, no copy overhead nor queue
+                        x.copies = (by_kernel ? 0.0 : moe_split_copy_tensor_us) + pool->expert_size / rate;
                     }
                     for (int k = 0; k < MOE_ROLES && !packed; k++) {
                         x.copies += moe_split_copy_tensor_us + pool->role_bytes[k] / rate;
@@ -6063,8 +6136,9 @@ static int moe_hosted_split(moe_hosted_state * st, moe_hosted_layer * layer, int
                 return d > 0 ? scale * moe_split_cpu_model_us(n_threads, d, r, tensors) : 0.0;
             };
             const double gpu_before = moe_split_gpu_before_us + moe_split_gpu_row_us * (rows - n_cpu);
+            // kernel copy (packed layers): it runs after the resident rows on the same stream, so it adds to the GPU's path
             const auto window = [&](int d, int r, int moved_rows, int tensors, double copies) {
-                const double arrival = tensors > 0 ? moe_split_copy_start_us + copies : 0.0;
+                const double arrival = tensors == 0 ? 0.0 : by_kernel && packed ? gpu_before + copies : moe_split_copy_start_us + copies;
                 const double gpu_after = moe_split_gpu_after_us + moe_split_gpu_moved_row_us * moved_rows;
                 return std::max(cpu_time(d, r, tensors), std::max(gpu_before, arrival) + gpu_after);
             };
@@ -6158,8 +6232,30 @@ static int moe_hosted_split(moe_hosted_state * st, moe_hosted_layer * layer, int
                 }
                 pool->slots[x.slot].readers++;
                 st->pins.push_back({pool, x.slot});
-                moved.push_back(job);
                 const uint64_t entry = moe_cache_entry_addr(*pool, x.slot);
+                // kernel copy: a packed entry registered in place (mapped), aligned for 16-byte reads
+                const void * src_dev = nullptr;
+                if (moe_split_copy_by_kernel() && job.whole && n_fetch < MOE_SPLIT_FETCH_MAX && job.bytes % 16 == 0 &&
+                        (uintptr_t) job.source[0] % 16 == 0 && entry % 16 == 0) {
+                    const uintptr_t b = (uintptr_t) job.source[0], e = b + job.bytes;
+                    for (const auto & range : device.pinned) {
+                        if (b >= range.first && e <= range.second) {
+                            src_dev = moe_hosted_device_ptr((void *) job.source[0]);
+                            break;
+                        }
+                    }
+                }
+                if (src_dev) {
+                    layer->h_fetch[1 + 3 * n_fetch] = (uint64_t) (uintptr_t) src_dev;
+                    layer->h_fetch[2 + 3 * n_fetch] = entry;
+                    layer->h_fetch[3 + 3 * n_fetch] = job.bytes;
+                    n_fetch++;
+                    st->gpu_fills.push_back(job);
+                    // out of the fill queue's accounting, as the fill thread does when it takes a job
+                    device.queued_bytes = job.bytes <= device.queued_bytes ? device.queued_bytes - job.bytes : 0;
+                } else {
+                    moved.push_back(job);
+                }
                 for (int j = 0; j < n_cpu; j++) {
                     const int row = cpu_rows[j];
                     if (layer->h_ids[row] == x.e) {
@@ -6170,7 +6266,8 @@ static int moe_hosted_split(moe_hosted_state * st, moe_hosted_layer * layer, int
                 }
                 moved_experts.push_back(x.e);
             }
-            if (!moved.empty()) {
+            layer->h_fetch[0] = (uint64_t) n_fetch;
+            if (!moved_experts.empty()) {
                 for (auto & j : moved) {
                     j.split_flag = layer->h_flags + 24;
                     j.split_pending = &layer->split_pending;
@@ -6891,14 +6988,18 @@ static moe_hosted_layer * moe_hosted_register(moe_hosted_state & st, moe_cache_d
               moe_hosted_host_alloc((void **) &layer->h_flags, 128) &&
               moe_hosted_host_alloc((void **) &layer->h_pred, (2 + rows) * sizeof(int32_t)) &&
               moe_hosted_host_alloc((void **) &layer->h_plan2, 3 * rows * sizeof(uint64_t)) &&
+              moe_hosted_host_alloc((void **) &layer->h_fetch, (1 + 3 * MOE_SPLIT_FETCH_MAX) * sizeof(uint64_t)) &&
               moe_hosted_host_alloc((void **) &layer->h_chk, (size_t) rows * layer->n_embd * sizeof(float));
     ok = ok && (layer->m_act = moe_hosted_device_ptr(layer->h_act)) && (layer->m_act8 = (block_q8_0 *) moe_hosted_device_ptr(layer->h_act8)) &&
          (layer->m_ids = moe_hosted_device_ptr(layer->h_ids)) &&
          (layer->m_plan = moe_hosted_device_ptr(layer->h_plan)) && (layer->m_res = moe_hosted_device_ptr(layer->h_res)) &&
          (layer->m_flags = moe_hosted_device_ptr(layer->h_flags)) && (layer->m_pred = moe_hosted_device_ptr(layer->h_pred)) &&
-         (layer->m_plan2 = moe_hosted_device_ptr(layer->h_plan2)) && (layer->m_chk = moe_hosted_device_ptr(layer->h_chk));
+         (layer->m_plan2 = moe_hosted_device_ptr(layer->h_plan2)) && (layer->m_chk = moe_hosted_device_ptr(layer->h_chk)) &&
+         (layer->m_fetch = moe_hosted_device_ptr(layer->h_fetch));
     ok = ok && cudaMalloc((void **) &layer->d_plan, 3 * rows * sizeof(uint64_t)) == cudaSuccess &&
          cudaMalloc((void **) &layer->d_plan2, 3 * rows * sizeof(uint64_t)) == cudaSuccess &&
+         cudaMalloc((void **) &layer->d_fetch, (1 + 3 * MOE_SPLIT_FETCH_MAX) * sizeof(uint64_t)) == cudaSuccess &&
+         cudaMemset(layer->d_fetch, 0, sizeof(uint64_t)) == cudaSuccess &&
          cudaMalloc((void **) &layer->d_act_ids, rows * sizeof(int32_t)) == cudaSuccess &&
          cudaMalloc((void **) &layer->d_expect, sizeof(uint32_t)) == cudaSuccess;
     if (ok) {
@@ -7168,7 +7269,12 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
     if (split_on) {
         ctx.split_wait_queued = true;
         ctx.split_wait_captured = true;
-        k_moe_split_wait<<<1, 256, 0, stream>>>(layer->d_expect, layer->m_flags + 24, layer->m_plan2, layer->d_plan2, 3 * rows, g_tl_m);
+        const bool by_kernel = moe_split_copy_by_kernel();
+        k_moe_split_wait<<<1, 256, 0, stream>>>(layer->d_expect, layer->m_flags + 24, layer->m_plan2, layer->d_plan2, 3 * rows,
+                                                by_kernel ? layer->m_fetch : nullptr, layer->d_fetch, g_tl_m);
+        if (by_kernel) {
+            k_moe_split_fetch<<<192, 256, 0, stream>>>(layer->d_fetch);
+        }
         up_gate(layer->d_plan2);
         ggml_cuda_moe_cache_mmv(down->src[0]->type, q8_mid, layer->d_plan2 + 2 * rows, nullptr,
                                 (float *) down->data, n_ff, n_embd, rows, rows, stream);
