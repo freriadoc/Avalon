@@ -2424,7 +2424,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
-        // small user inputs queued together, one launch for the split (set_tensors_async)
+        // small user inputs queued together, one launch for the split (set_tensors_async); GGML_SCHED_BATCH_INPUTS=0: one
+        // copy each
+        static const bool batch_inputs = !getenv("GGML_SCHED_BATCH_INPUTS") || atoi(getenv("GGML_SCHED_BATCH_INPUTS")) != 0;
         constexpr int    batch_max       = 32;
         constexpr size_t batch_max_bytes = 64 << 10;
         ggml_tensor *       batch_dst[batch_max];
@@ -2466,7 +2468,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         dst_synced = true;
                     }
                 }
-                if (copy_async && sched->set_tensors_async[split_backend_id] && ggml_nbytes(input) <= batch_max_bytes) {
+                if (copy_async && batch_inputs && sched->set_tensors_async[split_backend_id] && ggml_nbytes(input) <= batch_max_bytes) {
                     if (batch_n == batch_max) {
                         batch_flush();
                     }
