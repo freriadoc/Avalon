@@ -76,7 +76,7 @@ its own drafters on.
 
 The same code builds and runs with CUDA. Measured once, on a rented cloud machine: an **RTX 4090 24 GB** in PCIe 4.0
 x16, an **AMD EPYC 7352** (Zen 2, 24 cores, the container capped at ~20 of them, 1.5 – 2.3 GHz), CUDA 12.4, the
-same model and launcher plus `-bs` (the verification's argmax on the GPU, see [Run](#run)), MTP with 2 draft tokens,
+same model and launcher with backend sampling (the verification's argmax on the GPU, see [Run](#run)), MTP with 2 draft tokens,
 greedy, 512 tokens:
 
 | case | generation, MTP | prefill |
@@ -173,8 +173,8 @@ cd Qwen3.8-Flash-Next-Avalon-GGUF
 Nothing else to set: `--fit` (on by default) places the dense weights on the GPU and the experts in RAM, the expert
 cache takes the rest of the VRAM, and the cache is prefilled from `moe-cache-ranking.bin` next to the model.
 `--parallel 1` matters: other slots would keep their part of the KV cache.
-On NVIDIA, add `-bs`: the target's argmax then runs on the GPU instead of over 248k logits on the CPU, 6% faster per
-step on the RTX 4090 (neutral on the RX 7900 XT).
+On NVIDIA, backend sampling is on by default: the target's argmax runs on the GPU instead of over 248k logits on the
+CPU, 6% faster per step on the RTX 4090 (neutral on the RX 7900 XT, where it stays off; `-bs` / `-no-bs` force it).
 
 ### Two or more GPUs (experimental, untested)
 
