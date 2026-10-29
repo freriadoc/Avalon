@@ -5548,6 +5548,51 @@ static __device__ void moe_router_row(const moe_router_args & a, const int row, 
     }
 }
 
+// The chunk list of a plan (MOE_GROUP_* in mmvq.cuh) from its up entries, already on the device and visible to the block
+// (written by it before a __syncthreads): one thread per routed row (rows <= MOE_GROUP_MAX_ROWS <= blockDim.x). A row
+// heads a chunk when the rows of its entry before it are a multiple of MOE_GROUP_COLS; chunks numbered in row order.
+static __device__ void moe_group_list(const uint64_t * up, int rows, int32_t * grp) {
+    __shared__ uint64_t s_entry[MOE_GROUP_MAX_ROWS];
+    __shared__ bool     s_head[MOE_GROUP_MAX_ROWS];
+    const int t = threadIdx.x;
+    uint64_t e = 0;
+    bool head = false;
+    if (t < rows) {
+        e = up[t];
+        s_entry[t] = e;
+    }
+    __syncthreads();
+    if (t < rows) {
+        int rank = 0;
+        for (int j = 0; j < t; j++) {
+            rank += s_entry[j] == e;
+        }
+        head = e != 0 && rank % MOE_GROUP_COLS == 0;
+        s_head[t] = head;
+    }
+    __syncthreads();
+    if (head) {
+        int c = 0;
+        for (int j = 0; j < t; j++) {
+            c += s_head[j];
+        }
+        int n = 0;
+        for (int j = t; j < rows && n < MOE_GROUP_COLS; j++) {
+            if (s_entry[j] == e) {
+                grp[1 + MOE_GROUP_MAX_ROWS + MOE_GROUP_COLS * c + n++] = j;
+            }
+        }
+        grp[1 + c] = n;
+    }
+    if (t == 0) {
+        int n = 0;
+        for (int j = 0; j < rows; j++) {
+            n += s_head[j];
+        }
+        grp[0] = n;
+    }
+}
+
 static __global__ void k_moe_hosted_enter(const float * act, float * h_act, block_q8_0 * h_act8, int64_t n_act,
                                           const float * tk_logits, float * tk_weights, float tk_clamp, float tk_scale,
                                           int32_t * ids, int64_t ids_nb1, int32_t * h_ids, int n_used, int n_tokens,
@@ -5686,6 +5731,12 @@ static __global__ void k_moe_hosted_enter(const float * act, float * h_act, bloc
     for (int i = threadIdx.x; i < n_plan; i += blockDim.x) {
         d_plan[i] = m_plan[i];
     }
+    // the plan's chunk list after it, for the grouped kernels (verification: several tokens)
+    const int rows = n_plan / 3;
+    if (n_tokens >= 2 && rows <= MOE_GROUP_MAX_ROWS) {
+        __syncthreads();
+        moe_group_list(d_plan, rows, (int32_t *) (d_plan + n_plan));
+    }
 }
 
 // a block per row: the rows the CPU computed (down id -1) are copied in once they are ready
@@ -5711,6 +5762,10 @@ static __global__ void k_moe_split_wait(const uint32_t * d_expect, const volatil
     __syncthreads();
     for (int i = threadIdx.x; i < n_plan; i += blockDim.x) {
         d_plan2[i] = m_plan2[i];
+    }
+    if (n_plan / 3 <= MOE_GROUP_MAX_ROWS) {
+        __syncthreads();
+        moe_group_list(d_plan2, n_plan / 3, (int32_t *) (d_plan2 + n_plan));
     }
     if (m_fetch) {
         const int n_fetch = 1 + 3 * (int) min((uint64_t) MOE_SPLIT_FETCH_MAX, m_fetch[0]);
@@ -7053,8 +7108,9 @@ static moe_hosted_layer * moe_hosted_register(moe_hosted_state & st, moe_cache_d
          (layer->m_flags = moe_hosted_device_ptr(layer->h_flags)) && (layer->m_pred = moe_hosted_device_ptr(layer->h_pred)) &&
          (layer->m_plan2 = moe_hosted_device_ptr(layer->h_plan2)) && (layer->m_chk = moe_hosted_device_ptr(layer->h_chk)) &&
          (layer->m_fetch = moe_hosted_device_ptr(layer->h_fetch));
-    ok = ok && cudaMalloc((void **) &layer->d_plan, 3 * rows * sizeof(uint64_t)) == cudaSuccess &&
-         cudaMalloc((void **) &layer->d_plan2, 3 * rows * sizeof(uint64_t)) == cudaSuccess &&
+    // each plan followed by its chunk list (moe_group_list)
+    ok = ok && cudaMalloc((void **) &layer->d_plan, 3 * rows * sizeof(uint64_t) + MOE_GROUP_WORDS * sizeof(int32_t)) == cudaSuccess &&
+         cudaMalloc((void **) &layer->d_plan2, 3 * rows * sizeof(uint64_t) + MOE_GROUP_WORDS * sizeof(int32_t)) == cudaSuccess &&
          cudaMalloc((void **) &layer->d_fetch, (1 + 3 * MOE_SPLIT_FETCH_MAX) * sizeof(uint64_t)) == cudaSuccess &&
          cudaMemset(layer->d_fetch, 0, sizeof(uint64_t)) == cudaSuccess &&
          cudaMalloc((void **) &layer->d_act_ids, rows * sizeof(int32_t)) == cudaSuccess &&
@@ -7318,21 +7374,26 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
     // up / gate / swiglu, and the q8_1 of the result for down written by the same kernel (GGML_CUDA_MOE_Q8_FUSED=0: a
     // quantization kernel after it)
     static const bool q8_fused = !getenv("GGML_CUDA_MOE_Q8_FUSED") || atoi(getenv("GGML_CUDA_MOE_Q8_FUSED")) != 0;
+    // the plan's chunk list (written after it by the kernel that copies it): the rows of one expert computed together
+    const auto groups_of = [&](const uint64_t * plan) -> const int32_t * {
+        return n_tokens >= 2 && rows <= MOE_GROUP_MAX_ROWS ? (const int32_t *) (plan + 3 * rows) : nullptr;
+    };
     const auto up_gate = [&](const uint64_t * plan) {
         if (q8_fused && n_ff % QK8_1 == 0) {
             ggml_cuda_moe_cache_mmv_fused(wtype, q8_act, plan, plan + rows, layer->d_act_ids, (float *) glu->data, n_embd, n_ff,
                                           rows, n_tokens, -INFINITY, INFINITY, -INFINITY, INFINITY, stream, q8_mid,
-                                          padded_ff / QK8_1, st->d_q8_count);
+                                          padded_ff / QK8_1, st->d_q8_count, groups_of(plan), (int) n_tokens);
             return;
         }
         ggml_cuda_moe_cache_mmv_fused(wtype, q8_act, plan, plan + rows, layer->d_act_ids, (float *) glu->data, n_embd, n_ff,
-                                      rows, n_tokens, -INFINITY, INFINITY, -INFINITY, INFINITY, stream);
+                                      rows, n_tokens, -INFINITY, INFINITY, -INFINITY, INFINITY, stream, nullptr, 0, nullptr,
+                                      groups_of(plan), (int) n_tokens);
         quantize_row_q8_1_cuda((const float *) glu->data, nullptr, q8_mid, wtype, n_ff, n_ff, (int64_t) rows * n_ff,
                                (int64_t) rows * n_ff, padded_ff, rows, 1, 1, stream);
     };
     up_gate(layer->d_plan);
     ggml_cuda_moe_cache_mmv(down->src[0]->type, q8_mid, layer->d_plan + 2 * rows, nullptr,
-                            (float *) down->data, n_ff, n_embd, rows, rows, stream);
+                            (float *) down->data, n_ff, n_embd, rows, rows, stream, groups_of(layer->d_plan), (int) n_tokens);
     // SPLIT: the rows of the expert moved to the GPU, once it arrived; the kernels skip every other row
     const bool split_on = moe_split_enabled() && n_tokens >= 2;
     if (split_on) {
@@ -7346,7 +7407,7 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
         }
         up_gate(layer->d_plan2);
         ggml_cuda_moe_cache_mmv(down->src[0]->type, q8_mid, layer->d_plan2 + 2 * rows, nullptr,
-                                (float *) down->data, n_ff, n_embd, rows, rows, stream);
+                                (float *) down->data, n_ff, n_embd, rows, rows, stream, groups_of(layer->d_plan2), (int) n_tokens);
         static const bool verify = getenv("GGML_CUDA_MOE_SPLIT_VERIFY") && atoi(getenv("GGML_CUDA_MOE_SPLIT_VERIFY")) > 0;
         if (verify) {
             k_moe_split_check<<<1, 256, 0, stream>>>(layer->d_expect, layer->d_plan2 + 2 * rows, (const float *) down->data,

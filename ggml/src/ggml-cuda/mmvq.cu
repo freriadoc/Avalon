@@ -1270,6 +1270,507 @@ static __global__ void mul_mat_vec_q_moe(
     }
 }
 
+// the dot products of mul_mat_vec_q_moe_grouped for nc columns (nc fixed: no test between them), warp-reduced
+template <ggml_type type, int c_rows_per_block, int c_ncols, int nc, bool has_gate, bool flat_k>
+static __device__ __forceinline__ void mmvq_grouped_dots(
+        const void * vx, const void * vgate, const block_q8_1 * const (&y)[c_ncols], const int row0, const uint32_t nrows_x,
+        const uint32_t stride_row_x, const uint32_t ncols_x,
+        float (&tmp)[c_ncols][c_rows_per_block], float (&tmp_gate)[c_ncols][c_rows_per_block]) {
+    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+    const int kbx_offset = row0*stride_row_x;
+    const int blocks_per_row_x = ncols_x / qk;
+    constexpr int blocks_per_iter = vdr * warp_size / qi;
+
+    if constexpr (flat_k) {
+        // the (row, chunk) pairs of the rows dealt to the lanes, as in mul_mat_vec_q_moe
+        constexpr int lanes_per_block = qi/vdr;
+        const int per_row   = blocks_per_row_x * lanes_per_block;
+        const int rows_here = min(c_rows_per_block, (int) nrows_x - row0);
+        int r = 0;
+        int c = threadIdx.x;
+        while (c >= per_row) {
+            c -= per_row;
+            ++r;
+        }
+        while (r < rows_here) {
+            const int kbx = c / lanes_per_block;
+            const int kqs = vdr * (c % lanes_per_block);
+            const int kby = kbx * (qk/QK8_1);
+            float v[nc];
+            float w[nc];
+#pragma unroll
+            for (int j = 0; j < nc; ++j) {
+                v[j] = vec_dot_q_cuda(vx, &y[j][kby], kbx_offset + r*stride_row_x + kbx, kqs);
+                w[j] = has_gate ? vec_dot_q_cuda(vgate, &y[j][kby], kbx_offset + r*stride_row_x + kbx, kqs) : 0.0f;
+            }
+#pragma unroll
+            for (int i = 0; i < c_rows_per_block; ++i) {
+                if (i == r) {
+#pragma unroll
+                    for (int j = 0; j < nc; ++j) {
+                        tmp[j][i] += v[j];
+                        tmp_gate[j][i] += w[j];
+                    }
+                }
+            }
+            c += warp_size;
+            while (c >= per_row) {
+                c -= per_row;
+                ++r;
+            }
+        }
+    } else {
+        for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+            const int kby = kbx * (qk/QK8_1);
+            const int kqs = vdr * (threadIdx.x % (qi/vdr));
+#pragma unroll
+            for (int i = 0; i < c_rows_per_block; ++i) {
+                if (uint32_t(row0 + i) < nrows_x) {
+#pragma unroll
+                    for (int j = 0; j < nc; ++j) {
+                        tmp[j][i] += vec_dot_q_cuda(vx, &y[j][kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                        if constexpr (has_gate) {
+                            tmp_gate[j][i] += vec_dot_q_cuda(vgate, &y[j][kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (int j = 0; j < nc; ++j) {
+#pragma unroll
+        for (int i = 0; i < c_rows_per_block; ++i) {
+            tmp[j][i] = warp_reduce_sum<warp_size>(tmp[j][i]);
+            if constexpr (has_gate) {
+                tmp_gate[j][i] = warp_reduce_sum<warp_size>(tmp_gate[j][i]);
+            }
+        }
+    }
+}
+
+// entry_ptrs grouped by expert (a verification of several tokens: an expert chosen by 2 or 3 of them has one routed row
+// per token): the chunks of the plan's list (groups, MOE_GROUP_* in mmvq.cuh), each computed by one warp that decodes the
+// weight blocks once for the chunk's rows. Grid rows stride over the chunks (their count is only known on the device):
+// no block starts for an absent row or a row of another chunk. Same results as mul_mat_vec_q_moe (same dot products,
+// same order of additions per row).
+template <ggml_type type, int c_rows_per_block, bool has_gate, bool has_clamp, bool flat_k, bool q8_out>
+__launch_bounds__(MMVQ_ENTRY_MAX_WARPS*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q_moe_grouped(
+        const uint64_t * __restrict__ up_entries, const uint64_t * __restrict__ gate_entries, const void * __restrict__ vy,
+        const int32_t * __restrict__ act_ids, const int32_t * __restrict__ groups,
+        const ggml_cuda_mm_fusion_args_device fusion, float * __restrict__ dst,
+        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x, const uint32_t stride_row_x,
+        const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
+        const float up_min, const float up_max, const float gate_min, const float gate_max) {
+    constexpr int c_ncols = MOE_GROUP_COLS;
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+    const int row0 = c_rows_per_block*(blockIdx.x*blockDim.y + threadIdx.y);
+    if (row0 >= (int) nrows_x) {
+        return;
+    }
+    ggml_cuda_pdl_sync();
+    const int n_chunks = groups[0];
+    for (int chunk = blockIdx.y; chunk < n_chunks; chunk += gridDim.y) {
+        const int nc = groups[1 + chunk];
+        uint32_t routes[c_ncols];
+#pragma unroll
+        for (int j = 0; j < c_ncols; ++j) {
+            routes[j] = groups[1 + MOE_GROUP_MAX_ROWS + c_ncols*chunk + (j < nc ? j : 0)];
+        }
+        const uint64_t up_entry = up_entries[routes[0]];
+        if (up_entry == 0) {
+            continue;   // grouped by their up entries, rows whose entry here (down) the cache does not hold
+        }
+        const void * vx = mmvq_global_ptr(up_entry);
+        const void * vgate = has_gate ? mmvq_global_ptr(gate_entries[routes[0]]) : nullptr;
+        const block_q8_1 * y[c_ncols];
+#pragma unroll
+        for (int j = 0; j < c_ncols; ++j) {
+            const uint32_t channel_y = act_ids ? act_ids[routes[j]] : fastmodulo(routes[j], nchannels_y);
+            y[j] = (const block_q8_1 *) vy + channel_y*stride_channel_y;
+        }
+        float tmp[c_ncols][c_rows_per_block] = {{0.0f}};
+        float tmp_gate[c_ncols][c_rows_per_block] = {{0.0f}};
+        // the column count fixed at compile time: straight-line dot products of one weight block, whose loads and
+        // decoding the compiler shares (behind a runtime test per column it re-decoded the block for each)
+        switch (nc) {
+            case 1:  mmvq_grouped_dots<type, c_rows_per_block, c_ncols, 1, has_gate, flat_k>(vx, vgate, y, row0, nrows_x, stride_row_x, ncols_x, tmp, tmp_gate); break;
+            case 2:  mmvq_grouped_dots<type, c_rows_per_block, c_ncols, 2, has_gate, flat_k>(vx, vgate, y, row0, nrows_x, stride_row_x, ncols_x, tmp, tmp_gate); break;
+            case 3:  mmvq_grouped_dots<type, c_rows_per_block, c_ncols, 3, has_gate, flat_k>(vx, vgate, y, row0, nrows_x, stride_row_x, ncols_x, tmp, tmp_gate); break;
+            default: mmvq_grouped_dots<type, c_rows_per_block, c_ncols, c_ncols, has_gate, flat_k>(vx, vgate, y, row0, nrows_x, stride_row_x, ncols_x, tmp, tmp_gate); break;
+        }
+
+        if (threadIdx.x < c_rows_per_block && uint32_t(row0 + threadIdx.x) < nrows_x) {
+#pragma unroll
+            for (int j = 0; j < c_ncols; ++j) {
+                if (j < nc) {
+                    float result = 0.0f;
+                    float gate_value = 0.0f;
+#pragma unroll
+                    for (int i = 0; i < c_rows_per_block; ++i) {
+                        if (threadIdx.x == i) {
+                            result = tmp[j][i];
+                            gate_value = tmp_gate[j][i];
+                        }
+                    }
+                    if constexpr (has_gate) {
+                        if constexpr (has_clamp) {
+                            result = fmaxf(fminf(result, up_max), up_min);
+                            gate_value = fmaxf(fminf(gate_value, gate_max), gate_min);
+                        }
+                        result *= ggml_cuda_op_silu_single(gate_value);
+                    }
+                    dst[routes[j]*stride_channel_dst + row0 + threadIdx.x] = result;
+                }
+            }
+        }
+
+        if constexpr (q8_out) {
+            // the q8_1 of each row's result for down, as in mul_mat_vec_q_moe (a counter per block of 32 values)
+            constexpr int warps_per_q8 = QK8_1 / c_rows_per_block;
+            const uint32_t ib = (uint32_t) row0 / QK8_1;
+            ggml_cuda_fence_release_device();
+#pragma unroll
+            for (int j = 0; j < c_ncols; ++j) {
+                if (j < nc) {
+                    unsigned * count = fusion.q8_count + (size_t) routes[j]*fusion.q8_stride + ib;
+                    unsigned prev = 0;
+                    if (threadIdx.x == 0) {
+                        prev = atomicAdd(count, 1u);
+                    }
+                    prev = __shfl_sync(0xffffffff, prev, 0, warp_size);
+                    if (prev == warps_per_q8 - 1) {
+                        ggml_cuda_fence_acquire_device();
+                        if (threadIdx.x < QK8_1) {
+                            const float xi = dst[routes[j]*stride_channel_dst + ib*QK8_1 + threadIdx.x];
+                            float amax = fabsf(xi);
+                            float sum = xi;
+                            amax = warp_reduce_max<QK8_1>(amax);
+                            sum  = warp_reduce_sum<QK8_1>(sum);
+                            const float  d = amax / 127.0f;
+                            const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+                            block_q8_1 * yq = (block_q8_1 *) fusion.q8_dst + (size_t) routes[j]*fusion.q8_stride + ib;
+                            yq->qs[threadIdx.x] = q;
+                            if (threadIdx.x == 0) {
+                                yq->ds = make_half2(d, sum);
+                                *count = 0;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    ggml_cuda_pdl_lc();
+    if constexpr (!has_clamp) {
+        GGML_UNUSED_VARS(up_min, up_max, gate_min, gate_max);
+    }
+}
+
+// vec_dot_iq2_s_q8_1 with the grid read from a copy (in shared memory: mul_mat_vec_q_moe_grouped_half, smem_grid)
+static __device__ __forceinline__ float vec_dot_iq2_s_q8_1_grid(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs,
+    const uint2 * __restrict__ grid) {
+
+    const block_iq2_s * bq2 = (const block_iq2_s *) vbq + kbx;
+
+    const int       qs_packed = get_int_b2(bq2->qs, iqs/2);
+    const uint8_t * qs        = (const uint8_t *) &qs_packed;
+
+    const int qh = bq2->qh[iqs/2];
+
+    const int       signs_packed_32 = get_int_b2(bq2->qs, QK_K/32 + iqs/2);
+    const uint8_t * signs_packed_8  = (const uint8_t *) &signs_packed_32;
+
+    const int ls0 = bq2->scales[iqs/2] & 0x0F;
+    const int ls1 = bq2->scales[iqs/2] >> 4;
+
+    int sumi0 = 0;
+    int sumi1 = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const uint2 g = grid[qs[l0/2] | ((qh << (8-l0)) & 0x300)];
+
+        // as vec_dot_iq2_s_q8_1
+        const uint32_t sb = signs_packed_8[l0/2];
+        const uint32_t one0 = ((sb & 0x0F) * 0x00204081u) & 0x01010101u;
+        const uint32_t one1 = ((sb >>   4) * 0x00204081u) & 0x01010101u;
+        const uint32_t signs0 = (one0 << 8) - one0;
+        const uint32_t signs1 = (one1 << 8) - one1;
+
+        const int grid_l = (g.x ^ signs0) + one0;
+        const int grid_h = (g.y ^ signs1) + one1;
+
+        const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
+        const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
+
+        if (l0 < 4) {
+            sumi0 = ggml_cuda_dp4a(grid_l, u0, sumi0);
+            sumi0 = ggml_cuda_dp4a(grid_h, u1, sumi0);
+        } else {
+            sumi1 = ggml_cuda_dp4a(grid_l, u0, sumi1);
+            sumi1 = ggml_cuda_dp4a(grid_h, u1, sumi1);
+        }
+    }
+    const int sumi = (__mul24(sumi0, ls0) + __mul24(sumi1, ls1) + (sumi0 + sumi1)/2)/4;
+
+    const float d = __half2float(bq2->d) * __low2float(bq8_1[iqs/2].ds);
+    return d * sumi;
+}
+
+// a weight block's dot product for mul_mat_vec_q_moe_grouped_half: IQ2_S with the grid in shared memory, else the type's
+template <ggml_type type, bool smem_grid>
+static __device__ __forceinline__ float mmvq_half_dot(const void * vx, const block_q8_1 * y, const int kbx, const int kqs,
+                                                      const uint2 * grid) {
+    if constexpr (smem_grid && type == GGML_TYPE_IQ2_S) {
+        return vec_dot_iq2_s_q8_1_grid(vx, y, kbx, kqs, grid);
+    } else {
+        GGML_UNUSED(grid);
+        return get_vec_dot_q_cuda(type)(vx, y, kbx, kqs);
+    }
+}
+
+// the per-lane dot products of mul_mat_vec_q_moe_grouped_half for nc columns (nc fixed: shared decoding), reduced over
+// the 16 lanes of the half-warp: acc for w0 (gate in split mode, else up), acc_g for w1 (gate; unused in split mode)
+template <ggml_type type, int c_ncols, int nc, bool two, bool smem_grid, int lanes = 16>
+static __device__ __forceinline__ void mmvq_half_dots(
+        const void * w0, const void * w1, const block_q8_1 * const (&y)[c_ncols], const int row_off, const int per_row,
+        const int t, const uint2 * grid, float (&acc)[c_ncols], float (&acc_g)[c_ncols]) {
+    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr int lanes_per_block = qi/vdr;
+    for (int c = t; c < per_row; c += lanes) {
+        const int kbx = c / lanes_per_block;
+        const int kqs = vdr * (c % lanes_per_block);
+        const int kby = kbx * (qk/QK8_1);
+#pragma unroll
+        for (int j = 0; j < nc; ++j) {
+            acc[j] += mmvq_half_dot<type, smem_grid>(w0, &y[j][kby], row_off + kbx, kqs, grid);
+            if constexpr (two) {
+                acc_g[j] += mmvq_half_dot<type, smem_grid>(w1, &y[j][kby], row_off + kbx, kqs, grid);
+            }
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < nc; ++j) {
+        acc[j] = warp_reduce_sum<lanes>(acc[j]);
+        if constexpr (two) {
+            acc_g[j] = warp_reduce_sum<lanes>(acc_g[j]);
+        }
+    }
+}
+
+// up / gate / SwiGLU of the grouped entries, and the q8_1 of the result for down (as mul_mat_vec_q_moe_grouped with
+// q8_out), a half-warp (16 lanes) per weight row instead of a warp per 2 rows (Strata's sub-warp rows: a row of K = 2560 is
+// 80 chunks, 5 per lane, no lane idle, no row selection per chunk). split_gu: the gate row in the warp's first half and the
+// up row in its second, combined by a shuffle (a warp per output row, twice as many warps); else each half does gate and
+// up of its own row (2 rows per warp). smem_grid: the IQ2_S grid (8 KiB) copied to shared memory by each block first.
+// GGML_CUDA_MOE_GU_MODE (1: half-warp, 2: half-warp split), GGML_CUDA_MOE_SMEM_GRID=1; warp size 32.
+template <ggml_type type, bool split_gu, bool smem_grid, bool has_clamp>
+__launch_bounds__(MMVQ_ENTRY_MAX_WARPS*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q_moe_grouped_half(
+        const uint64_t * __restrict__ up_entries, const uint64_t * __restrict__ gate_entries, const void * __restrict__ vy,
+        const int32_t * __restrict__ act_ids, const int32_t * __restrict__ groups,
+        const ggml_cuda_mm_fusion_args_device fusion, float * __restrict__ dst,
+        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x, const uint32_t stride_row_x,
+        const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
+        const float up_min, const float up_max, const float gate_min, const float gate_max) {
+    constexpr int c_ncols = MOE_GROUP_COLS;
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    static_assert(warp_size == 32, "a half-warp is 16 lanes");
+    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr bool use_grid = smem_grid && type == GGML_TYPE_IQ2_S;
+    constexpr int rows_per_warp = split_gu ? 1 : 2;
+
+    __shared__ uint2 s_grid[use_grid ? 1024 : 1];
+    if constexpr (use_grid) {
+        const int nt  = blockDim.x*blockDim.y;
+        const int tid = threadIdx.y*blockDim.x + threadIdx.x;
+        for (int i = tid; i < 1024; i += nt) {
+            s_grid[i] = ((const uint2 *) iq2s_grid)[i];
+        }
+        __syncthreads();
+    }
+
+    const int warp_row0 = rows_per_warp*(blockIdx.x*blockDim.y + threadIdx.y);
+    if (warp_row0 >= (int) nrows_x) {
+        return;
+    }
+    const int half = threadIdx.x / 16;
+    const int t    = threadIdx.x % 16;
+    const int row  = split_gu ? warp_row0 : warp_row0 + half;
+    const bool row_ok = row < (int) nrows_x;
+    const int per_row = row_ok ? (int) (ncols_x / qk) * (qi/vdr) : 0;   // the chunks of a row (none past the last row)
+    ggml_cuda_pdl_sync();
+    const int n_chunks = groups[0];
+    for (int chunk = blockIdx.y; chunk < n_chunks; chunk += gridDim.y) {
+        const int nc = groups[1 + chunk];
+        uint32_t routes[c_ncols];
+#pragma unroll
+        for (int j = 0; j < c_ncols; ++j) {
+            routes[j] = groups[1 + MOE_GROUP_MAX_ROWS + c_ncols*chunk + (j < nc ? j : 0)];
+        }
+        const uint64_t up_entry = up_entries[routes[0]];
+        if (up_entry == 0) {
+            continue;
+        }
+        const void * vx    = mmvq_global_ptr(up_entry);
+        const void * vgate = mmvq_global_ptr(gate_entries[routes[0]]);
+        const block_q8_1 * y[c_ncols];
+#pragma unroll
+        for (int j = 0; j < c_ncols; ++j) {
+            const uint32_t channel_y = act_ids ? act_ids[routes[j]] : fastmodulo(routes[j], nchannels_y);
+            y[j] = (const block_q8_1 *) vy + channel_y*stride_channel_y;
+        }
+        // split: the gate row in the first half, the up row in the second
+        const void * w0 = split_gu ? (half == 0 ? vgate : vx) : vx;
+        float acc[c_ncols]   = {0.0f};
+        float acc_g[c_ncols] = {0.0f};
+        const int row_off = row*stride_row_x;
+        switch (nc) {
+            case 1:  mmvq_half_dots<type, c_ncols, 1, !split_gu, use_grid>(w0, vgate, y, row_off, per_row, t, s_grid, acc, acc_g); break;
+            case 2:  mmvq_half_dots<type, c_ncols, 2, !split_gu, use_grid>(w0, vgate, y, row_off, per_row, t, s_grid, acc, acc_g); break;
+            case 3:  mmvq_half_dots<type, c_ncols, 3, !split_gu, use_grid>(w0, vgate, y, row_off, per_row, t, s_grid, acc, acc_g); break;
+            default: mmvq_half_dots<type, c_ncols, c_ncols, !split_gu, use_grid>(w0, vgate, y, row_off, per_row, t, s_grid, acc, acc_g); break;
+        }
+
+#pragma unroll
+        for (int j = 0; j < c_ncols; ++j) {
+            if (j < nc) {
+                float up_v;
+                float gate_v;
+                if constexpr (split_gu) {
+                    gate_v = __shfl_sync(0xffffffff, acc[j], 0,  warp_size);
+                    up_v   = __shfl_sync(0xffffffff, acc[j], 16, warp_size);
+                } else {
+                    up_v   = acc[j];
+                    gate_v = acc_g[j];
+                }
+                if (t == 0 && (!split_gu || half == 0) && row_ok) {
+                    if constexpr (has_clamp) {
+                        up_v   = fmaxf(fminf(up_v, up_max), up_min);
+                        gate_v = fmaxf(fminf(gate_v, gate_max), gate_min);
+                    }
+                    dst[routes[j]*stride_channel_dst + row] = up_v * ggml_cuda_op_silu_single(gate_v);
+                }
+            }
+        }
+
+        // the q8_1 of each row's result for down, as in mul_mat_vec_q_moe (a counter per block of 32 values)
+        constexpr int warps_per_q8 = QK8_1 / rows_per_warp;
+        const uint32_t ib = (uint32_t) warp_row0 / QK8_1;
+        ggml_cuda_fence_release_device();
+#pragma unroll
+        for (int j = 0; j < c_ncols; ++j) {
+            if (j < nc) {
+                unsigned * count = fusion.q8_count + (size_t) routes[j]*fusion.q8_stride + ib;
+                unsigned prev = 0;
+                if (threadIdx.x == 0) {
+                    prev = atomicAdd(count, 1u);
+                }
+                prev = __shfl_sync(0xffffffff, prev, 0, warp_size);
+                if (prev == warps_per_q8 - 1) {
+                    ggml_cuda_fence_acquire_device();
+                    const float xi = dst[routes[j]*stride_channel_dst + ib*QK8_1 + threadIdx.x];
+                    float amax = fabsf(xi);
+                    float sum = xi;
+                    amax = warp_reduce_max<QK8_1>(amax);
+                    sum  = warp_reduce_sum<QK8_1>(sum);
+                    const float  d = amax / 127.0f;
+                    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+                    block_q8_1 * yq = (block_q8_1 *) fusion.q8_dst + (size_t) routes[j]*fusion.q8_stride + ib;
+                    yq->qs[threadIdx.x] = q;
+                    if (threadIdx.x == 0) {
+                        yq->ds = make_half2(d, sum);
+                        *count = 0;
+                    }
+                }
+            }
+        }
+    }
+    ggml_cuda_pdl_lc();
+    if constexpr (!has_clamp) {
+        GGML_UNUSED_VARS(up_min, up_max, gate_min, gate_max);
+    }
+}
+
+// the down products of the grouped entries with `lanes` lanes per weight row (Strata's sub-warp rows: K = 640 is 40 chunks
+// of IQ4_NL, 5 per lane at 8 lanes, none idle; a warp per 4 rows runs a second pass over each row with 8 of its 32 lanes
+// busy). 32 / lanes rows per warp, the plan's chunk list as mul_mat_vec_q_moe_grouped. GGML_CUDA_MOE_DOWN_LANES (8 or 16).
+template <ggml_type type, int lanes>
+__launch_bounds__(MMVQ_ENTRY_MAX_WARPS*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q_moe_grouped_sub(
+        const uint64_t * __restrict__ entries, const void * __restrict__ vy, const int32_t * __restrict__ act_ids,
+        const int32_t * __restrict__ groups, float * __restrict__ dst,
+        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x, const uint32_t stride_row_x,
+        const uint32_t stride_channel_y, const uint32_t stride_channel_dst) {
+    constexpr int c_ncols = MOE_GROUP_COLS;
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    static_assert(warp_size == 32 && 32 % lanes == 0, "lanes divide a warp of 32");
+    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr int rows_per_warp = warp_size / lanes;
+
+    const int warp_row0 = rows_per_warp*(blockIdx.x*blockDim.y + threadIdx.y);
+    if (warp_row0 >= (int) nrows_x) {
+        return;
+    }
+    const int t   = threadIdx.x % lanes;
+    const int row = warp_row0 + threadIdx.x / lanes;
+    const bool row_ok = row < (int) nrows_x;
+    const int per_row = row_ok ? (int) (ncols_x / qk) * (qi/vdr) : 0;
+    ggml_cuda_pdl_sync();
+    const int n_chunks = groups[0];
+    for (int chunk = blockIdx.y; chunk < n_chunks; chunk += gridDim.y) {
+        const int nc = groups[1 + chunk];
+        uint32_t routes[c_ncols];
+#pragma unroll
+        for (int j = 0; j < c_ncols; ++j) {
+            routes[j] = groups[1 + MOE_GROUP_MAX_ROWS + c_ncols*chunk + (j < nc ? j : 0)];
+        }
+        const uint64_t entry = entries[routes[0]];
+        if (entry == 0) {
+            continue;   // grouped by their up entries, rows whose down entry the cache does not hold
+        }
+        const void * vx = mmvq_global_ptr(entry);
+        const block_q8_1 * y[c_ncols];
+#pragma unroll
+        for (int j = 0; j < c_ncols; ++j) {
+            const uint32_t channel_y = act_ids ? act_ids[routes[j]] : fastmodulo(routes[j], nchannels_y);
+            y[j] = (const block_q8_1 *) vy + channel_y*stride_channel_y;
+        }
+        float acc[c_ncols]   = {0.0f};
+        float acc_g[c_ncols] = {0.0f};
+        const int row_off = row*stride_row_x;
+        switch (nc) {
+            case 1:  mmvq_half_dots<type, c_ncols, 1, false, false, lanes>(vx, nullptr, y, row_off, per_row, t, nullptr, acc, acc_g); break;
+            case 2:  mmvq_half_dots<type, c_ncols, 2, false, false, lanes>(vx, nullptr, y, row_off, per_row, t, nullptr, acc, acc_g); break;
+            case 3:  mmvq_half_dots<type, c_ncols, 3, false, false, lanes>(vx, nullptr, y, row_off, per_row, t, nullptr, acc, acc_g); break;
+            default: mmvq_half_dots<type, c_ncols, c_ncols, false, false, lanes>(vx, nullptr, y, row_off, per_row, t, nullptr, acc, acc_g); break;
+        }
+        if (t == 0 && row_ok) {
+#pragma unroll
+            for (int j = 0; j < c_ncols; ++j) {
+                if (j < nc) {
+                    dst[routes[j]*stride_channel_dst + row] = acc[j];
+                }
+            }
+        }
+    }
+    ggml_cuda_pdl_lc();
+}
+
 template<ggml_type type>
 static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
@@ -1373,7 +1874,17 @@ static void mul_mat_vec_q_moe_entries_launch(
         const uint32_t stride_row_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
         const uint32_t n_hits, const int warp_size,
         const float up_min, const float up_max, const float gate_min, const float gate_max, cudaStream_t stream,
-        void * q8_dst = nullptr, uint32_t q8_stride = 0, unsigned * q8_count = nullptr) {
+        void * q8_dst = nullptr, uint32_t q8_stride = 0, unsigned * q8_count = nullptr,
+        const int32_t * groups = nullptr, const int max_group = 1) {
+    // the rows of an expert chosen by several tokens computed together (mul_mat_vec_q_moe_grouped), from 2 tokens, over the
+    // plan's chunk list (GGML_CUDA_MOE_GROUPED=0: a row per warp). Grid rows: two per routed expert of a token (2 n_hits /
+    // max_group; GGML_CUDA_MOE_GROUP_GRID=N sets it), each striding over the chunks. Default twice the experts of a token,
+    // about the distinct experts of a 3-token verification (19.5 of 30 rows): RX 7900 XT, GPU work of a layer's window
+    // 198 / 136 / 130 / 129 / 129 us for 1 / 5 / 10 / 20 / 30 grid rows
+    static const bool grouped_on = !getenv("GGML_CUDA_MOE_GROUPED") || atoi(getenv("GGML_CUDA_MOE_GROUPED")) != 0;
+    static const int group_grid = getenv("GGML_CUDA_MOE_GROUP_GRID") ? atoi(getenv("GGML_CUDA_MOE_GROUP_GRID")) : 0;
+    const bool grouped = grouped_on && groups && max_group >= 2 && n_hits <= MOE_GROUP_MAX_ROWS;
+    const uint32_t grid_y = !grouped ? n_hits : std::max(1u, std::min(n_hits, group_grid > 0 ? (uint32_t) group_grid : 2 * n_hits / max_group));
     if (q8_dst) {
         // up / gate / GLU and the q8_1 of the result for down: 2 rows per warp (flat_k), as below
         GGML_ASSERT(has_gate && nrows_x % QK8_1 == 0 && warp_size == QK8_1 && (int) (ncols_x / ggml_cuda_type_traits<type>::qk) >
@@ -1383,9 +1894,47 @@ static void mul_mat_vec_q_moe_entries_launch(
         fa.q8_stride = q8_stride;
         fa.q8_count = q8_count;
         const int w = mmvq_entry_warps();
-        const dim3 block_nums((nrows_x / 2 + w - 1) / w, n_hits);
+        const dim3 block_nums((nrows_x / 2 + w - 1) / w, grid_y);
         const dim3 block_dims(warp_size, w);
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+        // GGML_CUDA_MOE_GU_MODE: 1 a half-warp per row, 2 the same with gate and up as separate rows (mul_mat_vec_q_moe_grouped_half;
+        // the i-quants of the experts, 32-lane warps); GGML_CUDA_MOE_SMEM_GRID=1 adds the IQ2_S grid in shared memory
+        // defaults per platform, as measured: NVIDIA (RTX 4090) half-warp rows with the grid in shared memory, -1.7 % per step
+        // (2 pairs); RDNA3 (one-warp blocks: the grid copied for 2 rows) a warp per 2 rows
+#if defined(GGML_USE_HIP)
+        constexpr int gu_mode_default = 0;
+#else
+        constexpr int gu_mode_default = 1;
+#endif
+        static const int gu_mode = getenv("GGML_CUDA_MOE_GU_MODE") ? atoi(getenv("GGML_CUDA_MOE_GU_MODE")) : gu_mode_default;
+        static const bool smem_grid = getenv("GGML_CUDA_MOE_SMEM_GRID") ? atoi(getenv("GGML_CUDA_MOE_SMEM_GRID")) != 0 : gu_mode_default != 0;
+        constexpr bool half_types = type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_K || type == GGML_TYPE_IQ3_KS ||
+                                    type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ3_XXS;
+        if constexpr (half_types && has_gate) {
+            if (grouped && (gu_mode == 1 || gu_mode == 2) && warp_size == 32) {
+                const int rpw = gu_mode == 2 ? 1 : 2;
+                const dim3 hb((nrows_x / rpw + w - 1) / w, grid_y);
+                const ggml_cuda_kernel_launch_params hp = ggml_cuda_kernel_launch_params(hb, block_dims, 0, stream);
+                const auto go = [&](auto kern) {
+                    ggml_cuda_kernel_launch(kern, hp, up_entries, gate_entries, vy, act_ids, groups, fa, dst, ncols_x, nchannels_y,
+                        nrows_x, stride_row_x, stride_channel_y, stride_channel_dst, up_min, up_max, gate_min, gate_max);
+                };
+                if (gu_mode == 2) {
+                    smem_grid ? go(mul_mat_vec_q_moe_grouped_half<type, true, true, has_clamp>)
+                              : go(mul_mat_vec_q_moe_grouped_half<type, true, false, has_clamp>);
+                } else {
+                    smem_grid ? go(mul_mat_vec_q_moe_grouped_half<type, false, true, has_clamp>)
+                              : go(mul_mat_vec_q_moe_grouped_half<type, false, false, has_clamp>);
+                }
+                return;
+            }
+        }
+        if (grouped) {
+            ggml_cuda_kernel_launch(mul_mat_vec_q_moe_grouped<type, 2, has_gate, has_clamp, true, true>, launch_params,
+                up_entries, gate_entries, vy, act_ids, groups, fa, dst, ncols_x, nchannels_y, nrows_x,
+                stride_row_x, stride_channel_y, stride_channel_dst, up_min, up_max, gate_min, gate_max);
+            return;
+        }
         ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, 2, has_gate, has_clamp, false, true, true, true>, launch_params,
             nullptr, vy, (const int32_t *) up_entries, act_ids, nullptr, (const int32_t *) gate_entries,
             fa, dst, ncols_x, nchannels_y, nrows_x,
@@ -1404,9 +1953,33 @@ static void mul_mat_vec_q_moe_entries_launch(
         constexpr int rows_per_block = decltype(rows_tag)::value;
         constexpr bool flat = rows_per_block == 2;
         const int w = mmvq_entry_warps();
-        const dim3 block_nums(((nrows_x + rows_per_block - 1) / rows_per_block + w - 1) / w, n_hits);
+        const dim3 block_nums(((nrows_x + rows_per_block - 1) / rows_per_block + w - 1) / w, grid_y);
         const dim3 block_dims(warp_size, w);
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+        // GGML_CUDA_MOE_DOWN_LANES (8, 16): the down of the grouped entries with that many lanes per row
+        // (mul_mat_vec_q_moe_grouped_sub; i-quants and q2_0, 32-lane warps)
+        // default 8: RX 7900 XT, GPU work of a layer's window 128.5 -> 123.4 us, replay of 3 tokens -0.4 % (2 pairs); 0: a warp per 4 rows
+        static const int down_lanes = getenv("GGML_CUDA_MOE_DOWN_LANES") ? atoi(getenv("GGML_CUDA_MOE_DOWN_LANES")) : 8;
+        constexpr bool sub_types = type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_Q2_0;
+        if constexpr (sub_types && !has_gate) {
+            if (grouped && (down_lanes == 8 || down_lanes == 16) && warp_size == 32) {
+                const int rpw = 32 / down_lanes;
+                const dim3 sb((nrows_x + rpw*w - 1) / (rpw*w), grid_y);
+                const ggml_cuda_kernel_launch_params sp = ggml_cuda_kernel_launch_params(sb, block_dims, 0, stream);
+                const auto go = [&](auto kern) {
+                    ggml_cuda_kernel_launch(kern, sp, up_entries, vy, act_ids, groups, dst, ncols_x, nchannels_y, nrows_x,
+                        stride_row_x, stride_channel_y, stride_channel_dst);
+                };
+                down_lanes == 8 ? go(mul_mat_vec_q_moe_grouped_sub<type, 8>) : go(mul_mat_vec_q_moe_grouped_sub<type, 16>);
+                return;
+            }
+        }
+        if (grouped) {
+            ggml_cuda_kernel_launch(mul_mat_vec_q_moe_grouped<type, rows_per_block, has_gate, has_clamp, flat, false>,
+                launch_params, up_entries, gate_entries, vy, act_ids, groups, ggml_cuda_mm_fusion_args_device{}, dst, ncols_x,
+                nchannels_y, nrows_x, stride_row_x, stride_channel_y, stride_channel_dst, up_min, up_max, gate_min, gate_max);
+            return;
+        }
         ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, has_gate, has_clamp, false, true, flat>, launch_params,
             nullptr, vy, (const int32_t *) up_entries, act_ids, nullptr, (const int32_t *) gate_entries,
             ggml_cuda_mm_fusion_args_device{}, dst, ncols_x, nchannels_y, nrows_x,
@@ -2023,7 +2596,7 @@ void ggml_cuda_op_mul_mat_vec_q(
 template <ggml_type type>
 static void ggml_cuda_moe_cache_mmv_t(
         const char * act_q8, const uint64_t * entries_dev, const int32_t * act_ids_dev, float * dst_dev,
-        int64_t n_in, int64_t n_out, int64_t n_hits, int64_t act_rows, cudaStream_t stream) {
+        int64_t n_in, int64_t n_out, int64_t n_hits, int64_t act_rows, cudaStream_t stream, const int32_t * groups, int max_group) {
     const int64_t ts0 = ggml_type_size(type);
     const int64_t ne10_padded = GGML_PAD(n_in, MATRIX_ROW_PADDING);
     const int64_t s01 = ggml_row_size(type, n_in) / ts0;
@@ -2031,16 +2604,17 @@ static void ggml_cuda_moe_cache_mmv_t(
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     mul_mat_vec_q_moe_entries_launch<type, false, false>(
         entries_dev, nullptr, act_q8, act_ids_dev, dst_dev, n_in, init_fastdiv_values(act_rows), n_out,
-        s01, s11, n_out, n_hits, warp_size, 0.0f, 0.0f, 0.0f, 0.0f, stream);
+        s01, s11, n_out, n_hits, warp_size, 0.0f, 0.0f, 0.0f, 0.0f, stream, nullptr, 0, nullptr, groups, max_group);
 }
 
 void ggml_cuda_moe_cache_mmv(
     ggml_type type0, const char * act_q8, const uint64_t * entries_dev, const int32_t * act_ids_dev,
-    float * dst_dev, int64_t n_in, int64_t n_out, int64_t n_hits, int64_t act_rows, cudaStream_t stream) {
+    float * dst_dev, int64_t n_in, int64_t n_out, int64_t n_hits, int64_t act_rows, cudaStream_t stream, const int32_t * groups,
+    int max_group) {
 #define MOE_CACHE_MMV_CASE(type_name) \
         case type_name: \
             ggml_cuda_moe_cache_mmv_t<type_name>(act_q8, entries_dev, act_ids_dev, dst_dev, n_in, n_out, \
-                n_hits, act_rows, stream); \
+                n_hits, act_rows, stream, groups, max_group); \
             break
     switch (type0) {
         MOE_CACHE_MMV_CASE(GGML_TYPE_Q1_0);
@@ -2079,7 +2653,8 @@ static void ggml_cuda_moe_cache_mmv_fused_t(
         const char * act_q8, const uint64_t * up_entries_dev, const uint64_t * gate_entries_dev,
         const int32_t * act_ids_dev, float * dst_dev, int64_t n_in, int64_t n_out,
         int64_t n_hits, int64_t act_rows, float up_min, float up_max,
-        float gate_min, float gate_max, cudaStream_t stream, void * q8_dst, int64_t q8_stride, unsigned * q8_count) {
+        float gate_min, float gate_max, cudaStream_t stream, void * q8_dst, int64_t q8_stride, unsigned * q8_count,
+        const int32_t * groups, int max_group) {
     const int64_t ts0 = ggml_type_size(type);
     const int64_t ne10_padded = GGML_PAD(n_in, MATRIX_ROW_PADDING);
     const int64_t s01 = ggml_row_size(type, n_in) / ts0;
@@ -2089,11 +2664,11 @@ static void ggml_cuda_moe_cache_mmv_fused_t(
     if (up_min == -inf && up_max == inf && gate_min == -inf && gate_max == inf) {
         mul_mat_vec_q_moe_entries_launch<type, true, false>(
             up_entries_dev, gate_entries_dev, act_q8, act_ids_dev, dst_dev, n_in, init_fastdiv_values(act_rows), n_out,
-            s01, s11, n_out, n_hits, warp_size, up_min, up_max, gate_min, gate_max, stream, q8_dst, (uint32_t) q8_stride, q8_count);
+            s01, s11, n_out, n_hits, warp_size, up_min, up_max, gate_min, gate_max, stream, q8_dst, (uint32_t) q8_stride, q8_count, groups, max_group);
     } else {
         mul_mat_vec_q_moe_entries_launch<type, true, true>(
             up_entries_dev, gate_entries_dev, act_q8, act_ids_dev, dst_dev, n_in, init_fastdiv_values(act_rows), n_out,
-            s01, s11, n_out, n_hits, warp_size, up_min, up_max, gate_min, gate_max, stream, q8_dst, (uint32_t) q8_stride, q8_count);
+            s01, s11, n_out, n_hits, warp_size, up_min, up_max, gate_min, gate_max, stream, q8_dst, (uint32_t) q8_stride, q8_count, groups, max_group);
     }
 }
 
@@ -2102,11 +2677,12 @@ void ggml_cuda_moe_cache_mmv_fused(
         const uint64_t * gate_entries_dev, const int32_t * act_ids_dev,
         float * dst_dev, int64_t n_in, int64_t n_out, int64_t n_hits, int64_t act_rows,
         float up_min, float up_max, float gate_min, float gate_max,
-        cudaStream_t stream, void * q8_dst, int64_t q8_stride, unsigned * q8_count) {
+        cudaStream_t stream, void * q8_dst, int64_t q8_stride, unsigned * q8_count, const int32_t * groups, int max_group) {
 #define MOE_CACHE_MMV_FUSED_CASE(type_name) \
         case type_name: \
             ggml_cuda_moe_cache_mmv_fused_t<type_name>(act_q8, up_entries_dev, gate_entries_dev, act_ids_dev, \
-                dst_dev, n_in, n_out, n_hits, act_rows, up_min, up_max, gate_min, gate_max, stream, q8_dst, q8_stride, q8_count); \
+                dst_dev, n_in, n_out, n_hits, act_rows, up_min, up_max, gate_min, gate_max, stream, q8_dst, q8_stride, q8_count, \
+                groups, max_group); \
             break
     switch (type0) {
         MOE_CACHE_MMV_FUSED_CASE(GGML_TYPE_Q1_0);
