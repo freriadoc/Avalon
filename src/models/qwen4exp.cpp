@@ -6,6 +6,84 @@
 #include <algorithm>
 #include <cinttypes>
 
+// Small token batches (generation, an MTP verification): the token embedding rows gathered and dequantized by the host
+// into an f32 input instead of a get_rows node of the CPU backend (the table stays in RAM), and the PLE rows read by the
+// host after the graph's launch (Strata's way), while the GPU computes the layers before the PLE layer, which waits for
+// them (ggml-cuda's host rows): no CPU split, one GPU graph, and the PLE reads (~48 random rows of a 36 GiB table, ~0.2 ms)
+// off the critical path. The same values (the CPU get_rows dequantizes the same rows with the same function).
+// LLAMA_HOST_EMBD=0: both get_rows at the start of the graph.
+static constexpr int64_t QWEN4EXP_HOST_EMBD_MAX_TOKENS = 8;
+
+static void qwen4exp_gather_rows(const ggml_tensor * table, const int32_t * idx, int64_t n, std::vector<float> & buf,
+                                 ggml_tensor * dst) {
+    const int64_t ne0 = table->ne[0];
+    buf.resize((size_t) n * ne0);
+    const auto * tt = ggml_get_type_traits(table->type);
+    for (int64_t i = 0; i < n; ++i) {
+        GGML_ASSERT(idx[i] >= 0 && idx[i] < table->ne[1]);
+        const char * row = (const char *) table->data + (size_t) idx[i] * table->nb[1];
+        if (table->type == GGML_TYPE_F32) {
+            memcpy(buf.data() + i * ne0, row, ne0 * sizeof(float));
+        } else {
+            tt->to_float(row, buf.data() + i * ne0, ne0);
+        }
+    }
+    ggml_backend_tensor_set(dst, buf.data(), 0, buf.size() * sizeof(float));
+}
+
+static bool qwen4exp_host_table(const ggml_tensor * t) {
+    return t && t->data && t->buffer && ggml_backend_buffer_is_host(t->buffer) && ggml_is_matrix(t) &&
+           (t->type == GGML_TYPE_F32 || ggml_get_type_traits(t->type)->to_float != nullptr);
+}
+
+// the GPU backend's rows written after the launch (ggml-cuda: ggml_cuda_host_rows_*): the mapped buffer and the task
+struct qwen4exp_host_rows_procs {
+    void * (*buffer)(size_t) = nullptr;
+    void (*task)(void (*)(void *), void *) = nullptr;
+};
+static const qwen4exp_host_rows_procs & qwen4exp_host_rows() {
+    static const qwen4exp_host_rows_procs procs = [] {
+        qwen4exp_host_rows_procs p;
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+            if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU || !reg) {
+                continue;
+            }
+            p.buffer = (void * (*)(size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_rows_buffer");
+            p.task   = (void (*)(void (*)(void *), void *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_host_rows_task");
+            if (p.buffer && p.task) {
+                break;
+            }
+            p = {};
+        }
+        return p;
+    }();
+    return procs;
+}
+
+// the token embeddings of a host-gathered batch (see above)
+class llm_graph_input_qwen4exp_tok_host : public llm_graph_input_i {
+public:
+    explicit llm_graph_input_qwen4exp_tok_host(const llama_model & model) : model(model) {}
+    virtual ~llm_graph_input_qwen4exp_tok_host() = default;
+
+    void set_input(const llama_ubatch * ubatch) override {
+        GGML_ASSERT(ubatch->token && !ubatch->embd);
+        qwen4exp_gather_rows(model.tok_embd, ubatch->token, ubatch->n_tokens, buf, embd);
+    }
+
+    bool can_reuse(const llm_graph_params & params) override {
+        return params.ubatch.token && !params.ubatch.embd && embd->ne[1] == (int64_t) params.ubatch.n_tokens;
+    }
+
+    ggml_tensor * embd = nullptr;   // F32 [n_embd, n_tokens]
+
+    const llama_model & model;
+
+    std::vector<float> buf;
+};
+
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
 static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
     if (value == 0) {
@@ -467,14 +545,38 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
                 "the indexer cache must track the attention cache cell for cell");
     }
 
+    // small token batches: the embedding rows gathered by the host (llm_graph_input_qwen4exp_tok_host)
+    static const bool host_embd_on = !getenv("LLAMA_HOST_EMBD") || atoi(getenv("LLAMA_HOST_EMBD")) != 0;
+    const bool host_embd = host_embd_on && ubatch.token && !ubatch.embd && n_tokens <= QWEN4EXP_HOST_EMBD_MAX_TOKENS &&
+                           loras->empty() && hparams.n_embd_inp() == n_embd && hparams.f_embedding_scale == 0.0f &&
+                           qwen4exp_host_table(model.tok_embd) && hparams.ple_n_heads > 0 &&
+                           qwen4exp_host_table(model.per_layer_tok_embd) &&
+                           // the GPU backend waits for the rows, the hosted MoE serves its mailboxes (at most 64 routed rows)
+                           qwen4exp_host_rows().buffer && n_tokens * hparams.n_expert_used() <= 64 &&
+                           qwen4exp_host_rows().buffer((size_t) hparams.ple_head_dim * hparams.ple_n_heads * n_tokens * sizeof(float));
+
     ggml_tensor * ple_emb = nullptr;
     if (hparams.ple_n_heads > 0) {
-        ple_emb = build_inp_ple(mctx_hyb);
-        // make sure ple_emb and build_inp_embd are in the same graph split
-        ggml_build_forward_expand(gf, ple_emb);
+        ple_emb = build_inp_ple(mctx_hyb, host_embd);
+        if (!host_embd) {
+            // make sure ple_emb and build_inp_embd are in the same graph split
+            ggml_build_forward_expand(gf, ple_emb);
+        }
+        // else the PLE rows are read by the host after the launch while the GPU computes the layers before the PLE layer,
+        // which waits for them (Strata reads them after its graph's launch the same way)
     }
 
-    ggml_tensor * inpL = build_inp_embd(model.tok_embd);
+    ggml_tensor * inpL = nullptr;
+    if (host_embd) {
+        auto inp = std::make_unique<llm_graph_input_qwen4exp_tok_host>(model);
+        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_input(inp->embd);
+        inpL = inp->embd;
+        res->add_input(std::move(inp));
+        res->t_inp_embd = inpL;
+    } else {
+        inpL = build_inp_embd(model.tok_embd);
+    }
     cb(inpL, "model.input_embed", -1);
     ggml_build_forward_expand(gf, inpL);
 
@@ -500,6 +602,10 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         res->t_layer_inp[il] = res_hc;
 
         if (hparams.is_ple(il)) {
+            if (host_embd) {
+                ggml_build_forward_expand(gf, res_hc);    // the layers before it first
+                ggml_build_forward_expand(gf, ple_emb);
+            }
             res_hc = build_ple(inp->get_recr(), ple_emb, res_hc, il);
         }
 
@@ -1631,10 +1737,19 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override {
         mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
+        if (host_out) {
+            return params.ubatch.token && !params.ubatch.embd && host_out->ne[1] == (int64_t) params.ubatch.n_tokens;
+        }
         return rows->ne[0] == (int64_t) model.hparams.ple_n_heads * params.ubatch.n_tokens;
     }
 
-    ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
+    // the rows read by the host after the launch: written by the task into host_buf, waited for by the GPU (host_out)
+    static void host_task(void * user);
+
+    ggml_tensor * rows = nullptr;       // I32 [ple_n_heads * n_tokens]
+    ggml_tensor * host_out = nullptr;   // F32 [ple_head_dim * ple_n_heads, n_tokens], in place of rows
+    float * host_buf = nullptr;
+    std::vector<int32_t> host_idx;
 
     const llama_model & model;
 
@@ -1706,6 +1821,12 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
         }
     }
 
+    if (host_out) {
+        host_idx = idx;
+        qwen4exp_host_rows().task(host_task, this);
+        return;
+    }
+
     {
         ggml_tensor * ple = model.per_layer_tok_embd;
 
@@ -1716,6 +1837,24 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
     }
 
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
+}
+
+void llm_graph_input_qwen4exp_ple::host_task(void * user) {
+    auto * self = (llm_graph_input_qwen4exp_ple *) user;
+    const ggml_tensor * ple = self->model.per_layer_tok_embd;
+    if (self->model.can_prefetch.count(ple)) {
+        llama_prefetch_rows(ple, self->host_idx.data(), self->host_idx.size());
+    }
+    const auto * tt = ggml_get_type_traits(ple->type);
+    const int64_t ne0 = ple->ne[0];
+    for (size_t i = 0; i < self->host_idx.size(); ++i) {
+        const char * row = (const char *) ple->data + (size_t) self->host_idx[i] * ple->nb[1];
+        if (ple->type == GGML_TYPE_F32) {
+            memcpy(self->host_buf + i * ne0, row, ne0 * sizeof(float));
+        } else {
+            tt->to_float(row, self->host_buf + i * ne0, ne0);
+        }
+    }
 }
 
 // Read a conv history out of its own recurrent row and write the new tail back.
@@ -1776,11 +1915,24 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
 }
 
 ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
-        const llama_memory_hybrid_idx_context * mctx_hyb) {
+        const llama_memory_hybrid_idx_context * mctx_hyb, bool host) {
     const int64_t n_heads = hparams.ple_n_heads;
 
     // the attention cells see every ubatch regardless of the layer types
     auto ple_inp = std::make_unique<llm_graph_input_qwen4exp_ple>(model, mctx_hyb->get_attn());
+
+    if (host) {
+        // the rows read by the host after the launch: a node the GPU backend computes by waiting for them (its source,
+        // a leaf of the same shape, is not read)
+        const int64_t dim = hparams.ple_head_dim * n_heads;
+        ple_inp->host_buf = (float *) qwen4exp_host_rows().buffer((size_t) dim * n_tokens * sizeof(float));
+        GGML_ASSERT(ple_inp->host_buf);
+        ple_inp->host_out = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, dim, n_tokens);
+        ggml_tensor * emb = ggml_scale(ctx0, ple_inp->host_out, 1.0f);
+        ggml_set_name(emb, "ple_host_wait");
+        res->add_input(std::move(ple_inp));
+        return emb;
+    }
 
     ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
     ggml_set_input(ple_inp->rows);

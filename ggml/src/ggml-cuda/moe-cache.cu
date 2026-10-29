@@ -29,6 +29,20 @@ bool ggml_cuda_moe_hosted_wait(void * stream, void * event, int device) {
     return false;
 }
 
+void * ggml_cuda_host_rows_buffer(size_t bytes) {
+    (void) bytes;
+    return nullptr;
+}
+
+void ggml_cuda_host_rows_task(void (*fn)(void *), void * user) {
+    (void) fn; (void) user;
+}
+
+bool ggml_cuda_host_rows_node(ggml_backend_cuda_context & ctx, ggml_tensor * node) {
+    (void) ctx; (void) node;
+    return false;
+}
+
 #else
 
 #include "common.cuh"
@@ -5359,6 +5373,122 @@ static __device__ __forceinline__ void moe_hosted_pause() {
 #endif
 }
 
+// Rows a graph reads from the host (qwen4exp's PLE rows, read after the launch the way Strata does): the host writes them
+// into a mapped buffer while the GPU computes the layers before their first reader, a node named HOST_ROWS_NODE (any op, its
+// sources not read) whose kernel waits for the host's count of written batches and copies the rows into its output. The
+// writer is a task the graph's user registers before the compute (ggml_cuda_host_rows_task); the first wait for the GPU after
+// the launch runs it (moe_host_rows_run), before serving any mailbox.
+#define HOST_ROWS_NODE "ple_host_wait"
+#define HOST_ROWS_CAP  (1u << 20)
+static void * g_rows_h = nullptr;                // mapped host buffer, HOST_ROWS_CAP bytes
+static void * g_rows_m = nullptr;                // its device address
+static volatile uint32_t * g_rows_flag_h = nullptr;   // batches written by the host (mapped)
+static uint32_t * g_rows_flag_m = nullptr;
+static uint32_t * g_rows_ticket = nullptr;       // batches read by the GPU (device memory)
+static uint32_t g_rows_count = 0;
+static std::atomic<void (*)(void *)> g_rows_fn{nullptr};
+static void * g_rows_user = nullptr;
+
+void * ggml_cuda_host_rows_buffer(size_t bytes) {
+    // on by default where it was measured to pay (RX 7900 XT: replay of 3 tokens -0.5 %); an RTX 4090 lost to it in both
+    // rounds (17.43 / 17.23 against 17.45 / 17.64 ms per step): there the rows are read before the launch.
+    // GGML_CUDA_HOST_ROWS=1 / 0 forces it
+#if defined(GGML_USE_HIP)
+    constexpr bool on_default = true;
+#else
+    constexpr bool on_default = false;
+#endif
+    static const bool on = getenv("GGML_CUDA_HOST_ROWS") ? atoi(getenv("GGML_CUDA_HOST_ROWS")) != 0 : on_default;
+    if (!on || bytes > HOST_ROWS_CAP) {
+        return nullptr;
+    }
+    if (!g_rows_h) {
+        void * flag = nullptr;
+        if (!moe_hosted_host_alloc(&g_rows_h, HOST_ROWS_CAP) || !moe_hosted_host_alloc(&flag, 64) ||
+                cudaMalloc((void **) &g_rows_ticket, sizeof(uint32_t)) != cudaSuccess ||
+                cudaMemset(g_rows_ticket, 0, sizeof(uint32_t)) != cudaSuccess) {
+            (void) cudaGetLastError();
+            g_rows_h = nullptr;
+            return nullptr;
+        }
+        g_rows_flag_h = (volatile uint32_t *) flag;
+        g_rows_m      = moe_hosted_device_ptr(g_rows_h);
+        g_rows_flag_m = moe_hosted_device_ptr((uint32_t *) flag);
+        if (!g_rows_m || !g_rows_flag_m) {
+            g_rows_h = nullptr;
+            return nullptr;
+        }
+    }
+    return g_rows_h;
+}
+
+void ggml_cuda_host_rows_task(void (*fn)(void *), void * user) {
+    g_rows_user = user;
+    g_rows_fn.store(fn, std::memory_order_release);
+}
+
+// the pending task, then the count the GPU waits for
+static void moe_host_rows_run() {
+    void (*fn)(void *) = g_rows_fn.exchange(nullptr, std::memory_order_acq_rel);
+    if (!fn) {
+        return;
+    }
+    fn(g_rows_user);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+#if defined(__x86_64__)
+    __builtin_ia32_sfence();
+#endif
+    *g_rows_flag_h = ++g_rows_count;
+}
+
+// one block: the count waited for, the rows copied (volatile: the mapped memory changes between replays), the ticket moved
+static __global__ void k_host_rows_wait(const volatile uint32_t * flag, uint32_t * ticket, const volatile uint64_t * src,
+                                        uint64_t * dst, int n) {
+    __shared__ uint32_t want;
+    if (threadIdx.x == 0) {
+        want = ticket[0] + 1;
+        while ((int32_t) (*flag - want) < 0) {
+            moe_hosted_pause();
+        }
+        __threadfence_system();
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        dst[i] = src[i];
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        ticket[0] = want;
+    }
+}
+
+bool ggml_cuda_host_rows_node(ggml_backend_cuda_context & ctx, ggml_tensor * node) {
+    if (strcmp(node->name, HOST_ROWS_NODE) != 0) {
+        return false;
+    }
+    const size_t bytes = ggml_nbytes(node);
+    GGML_ASSERT(g_rows_h && bytes <= HOST_ROWS_CAP && bytes % sizeof(uint64_t) == 0 && ggml_is_contiguous(node));
+    // launched now rather than recorded into a graph (a first run, the warm-up): the host writes the rows first, the wait
+    // for the GPU that would run the task may come after a synchronization inside this graph's evaluation (CUDA: its
+    // blocks launched outside a capture are served by the server thread)
+#if defined(GGML_USE_HIP)
+    hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+    const bool now = hipStreamIsCapturing(ctx.stream(), &capture) == hipSuccess && capture == hipStreamCaptureStatusNone;
+#else
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    const bool now = cudaStreamIsCapturing(ctx.stream(), &capture) == cudaSuccess && capture == cudaStreamCaptureStatusNone;
+#endif
+    if (now) {
+        moe_host_rows_run();
+    }
+    (void) cudaGetLastError();
+    k_host_rows_wait<<<1, 1024, 0, ctx.stream()>>>(g_rows_flag_m, g_rows_ticket, (const volatile uint64_t *) g_rows_m,
+                                                   (uint64_t *) node->data, (int) (bytes / sizeof(uint64_t)));
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+
 // Entering a hosted block, in one kernel: the activations and the router's ids to mapped host memory
 // (written by a kernel: a copy node of the graph would wait in a copy engine's queue for the previous
 // layers, holding back the cache's fills on that engine), every block its share; the last block to
@@ -6720,6 +6850,8 @@ bool ggml_cuda_moe_hosted_active() {
 bool ggml_cuda_moe_hosted_wait(void * stream_ptr, void * event_ptr, int device) {
     cudaStream_t stream = (cudaStream_t) stream_ptr;
     cudaEvent_t event = (cudaEvent_t) event_ptr;
+    // the rows a launched graph waits for, before anything else (and without a hosted MoE: the wait would never end)
+    moe_host_rows_run();
     // one state per (session, device): every mailbox is served while waiting, whichever device the stream is on (with the
     // layers split over several GPUs, a block of one device may wait for its CPU rows while the host waits for another)
     constexpr int max_states = 8;

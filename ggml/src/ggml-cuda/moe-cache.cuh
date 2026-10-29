@@ -27,6 +27,12 @@ struct ggml_cgraph;
 // not start such a block.
 int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, struct ggml_cgraph * cgraph, int i);
 
+// rows a graph waits for, written by the host after the launch (see moe-cache.cu): the mapped buffer (nullptr if too large),
+// the task that writes it (run by the first wait for the GPU), the node that waits for it (true: the node was launched)
+void * ggml_cuda_host_rows_buffer(size_t bytes);
+void ggml_cuda_host_rows_task(void (*fn)(void *), void * user);
+bool ggml_cuda_host_rows_node(ggml_backend_cuda_context & ctx, struct ggml_tensor * node);
+
 // Copies the CPU rows of the last hosted block in, if 'node' reads its output (or always, node NULL:
 // end of the graph). Called before every node the graph evaluation computes.
 struct ggml_tensor;

@@ -6484,6 +6484,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                // rows written by the host after the launch (qwen4exp's PLE rows): a kernel waits for them
+                if (ggml_cuda_host_rows_node(*cuda_ctx, node)) {
+                    written(i, i);
+                    continue;
+                }
+
                 // weights in host memory: the scheduler left a MoE block of the cache on the GPU
                 if (node->op == GGML_OP_MUL_MAT_ID && node->src[0]->buffer &&
                         !ggml_backend_buft_is_cuda(node->src[0]->buffer->buft)) {
@@ -8272,6 +8278,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_set_tensors_async") == 0) {
         return (void *)ggml_backend_cuda_set_tensors_async;
+    }
+    if (strcmp(name, "ggml_backend_host_rows_buffer") == 0) {
+        return (void *)ggml_cuda_host_rows_buffer;
+    }
+    if (strcmp(name, "ggml_backend_host_rows_task") == 0) {
+        return (void *)ggml_cuda_host_rows_task;
     }
     return nullptr;
 }
