@@ -5237,6 +5237,7 @@ struct moe_hosted_state {
     char * d_q8_mid = nullptr;
     unsigned * d_q8_count = nullptr;   // the up / gate kernel's warps done per q8_1 block of d_q8_mid (zero between launches)
     unsigned * d_router_done = nullptr;   // the router's rows done (k_moe_hosted_enter), zero between layers
+    uint64_t * d_router_tagged = nullptr; // the router's rows, {layer tag, logit} (k_moe_hosted_enter)
     size_t q8_act_bytes = 0;
     size_t q8_mid_bytes = 0;
     int n_threads = 1;
@@ -5476,9 +5477,26 @@ struct moe_router_args {
     int ncols = 0;
     int nrows = 0;
     unsigned * done = nullptr;
+    uint64_t * tagged = nullptr;   // the rows' logits as {layer tag, value} words (no fence, no counter), else done
 };
 
-static __device__ void moe_router_row(const moe_router_args & a, const int row) {
+// a 64-bit word written or read in one access by another block (device scope, relaxed)
+static __device__ __forceinline__ void moe_store_relaxed_device(uint64_t * p, uint64_t v) {
+#if defined(GGML_USE_HIP)
+    __hip_atomic_store(p, v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+#else
+    *(volatile uint64_t *) p = v;
+#endif // defined(GGML_USE_HIP)
+}
+static __device__ __forceinline__ uint64_t moe_load_relaxed_device(const uint64_t * p) {
+#if defined(GGML_USE_HIP)
+    return __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+#else
+    return *(const volatile uint64_t *) p;
+#endif // defined(GGML_USE_HIP)
+}
+
+static __device__ void moe_router_row(const moe_router_args & a, const int row, const uint32_t tag) {
     constexpr int block_size = 256;
     constexpr int warp_size  = ggml_cuda_get_physical_warp_size();
     const int tid = threadIdx.x;
@@ -5522,7 +5540,11 @@ static __device__ void moe_router_row(const moe_router_args & a, const int row) 
         for (int j = 0; j < MOE_ROUTER_MAX_COLS; ++j) {
             v = j == tid ? sumf[j] : v;
         }
-        a.dst[tid*a.stride_col_dst + row] = v;
+        if (a.tagged) {
+            moe_store_relaxed_device(a.tagged + (int64_t) tid*a.nrows + row, (uint64_t) tag << 32 | __float_as_uint(v));
+        } else {
+            a.dst[tid*a.stride_col_dst + row] = v;
+        }
     }
 }
 
@@ -5533,9 +5555,17 @@ static __global__ void k_moe_hosted_enter(const float * act, float * h_act, bloc
                                           uint32_t slot, const volatile uint32_t * flag,
                                           const volatile uint64_t * m_plan, uint64_t * d_plan, int n_plan,
                                           volatile unsigned long long * tl, const moe_router_args rt) {
+    // this layer's publication number (d_seq[0] moves at the publication, after block 0 has read the router's rows): the
+    // tag of the router's rows
+    const uint32_t pub_tag = d_seq[0] + 1;
     // the router's workgroups after the entry's MOE_HOSTED_ENTER_BLOCKS
     if ((int) blockIdx.x >= MOE_HOSTED_ENTER_BLOCKS) {
-        moe_router_row(rt, (int) blockIdx.x - MOE_HOSTED_ENTER_BLOCKS);
+        moe_router_row(rt, (int) blockIdx.x - MOE_HOSTED_ENTER_BLOCKS, pub_tag);
+        if (rt.tagged) {
+            // no fence: a device-scope fence here waits for the entry blocks' writes to the host still in flight
+            // (twice the router's time on an RTX 4090)
+            return;
+        }
         ggml_cuda_fence_release_device();
         __syncthreads();
         if (threadIdx.x == 0) {
@@ -5544,16 +5574,20 @@ static __global__ void k_moe_hosted_enter(const float * act, float * h_act, bloc
         return;
     }
     const int n_blocks = MOE_HOSTED_ENTER_BLOCKS;
-    for (int64_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n_act; i += (int64_t) n_blocks * blockDim.x) {
+    // the activations to the host: without block 0 when it computes the top-k of a tagged router (its system fence
+    // would come before the top-k)
+    const int b0 = tk_logits && rt.tagged ? 1 : 0;
+    const int bx = (int) blockIdx.x - b0, n_copy = n_blocks - b0;
+    for (int64_t i = bx * blockDim.x + threadIdx.x; h_act && bx >= 0 && i < n_act; i += (int64_t) n_copy * blockDim.x) {
         h_act[i] = act[i];
     }
     // and quantized for the CPU's experts as quantize_q8_1 does (a group of 32 threads per block): the CPU starts
     // from these bytes without quantizing them again
     {
         const int lane   = threadIdx.x % QK8_0;
-        const int group  = (blockIdx.x * blockDim.x + threadIdx.x) / QK8_0;
-        const int groups = n_blocks * blockDim.x / QK8_0;
-        for (int64_t ib = group; ib < n_act / QK8_0; ib += groups) {
+        const int group  = (bx * (int) blockDim.x + (int) threadIdx.x) / QK8_0;
+        const int groups = n_copy * blockDim.x / QK8_0;
+        for (int64_t ib = group; bx >= 0 && ib < n_act / QK8_0; ib += groups) {
             const float xi   = act[ib * QK8_0 + lane];
             const float amax = warp_reduce_max<QK8_0>(fabsf(xi));
             const float d    = amax / 127.0f;
@@ -5569,7 +5603,18 @@ static __global__ void k_moe_hosted_enter(const float * act, float * h_act, bloc
         // the MoE top-k of the block's tokens (left to this kernel by ggml_cuda_topk_moe_defer): a warp per token in
         // block 0, then its ids to the host
         if (blockIdx.x == 0) {
-            if (rt.x) {   // the router's rows
+            if (rt.x && rt.tagged) {   // the router's rows, tagged with this layer
+                const int n = rt.ncols * rt.nrows;
+                for (int i = threadIdx.x; i < n; i += blockDim.x) {
+                    uint64_t w = moe_load_relaxed_device(rt.tagged + i);
+                    while ((uint32_t) (w >> 32) != pub_tag) {
+                        ggml_cuda_poll_pause();
+                        w = moe_load_relaxed_device(rt.tagged + i);
+                    }
+                    rt.dst[(i / rt.nrows) * rt.stride_col_dst + i % rt.nrows] = __uint_as_float((uint32_t) w);
+                }
+                __syncthreads();
+            } else if (rt.x) {   // the router's rows
                 if (threadIdx.x == 0) {
                     while (ggml_cuda_load_relaxed_device(rt.done) < (unsigned) rt.nrows) {
                         ggml_cuda_poll_pause();
@@ -6459,6 +6504,13 @@ static void moe_tl_account(moe_hosted_state * st, uint32_t seq) {
     }
 }
 
+// the activations to the host as F32 too (GGML_CUDA_MOE_HOSTED_F32=1), not only as q8_0 blocks: ~30 KB more over PCIe per
+// layer of 3 tokens, which the system fence before the publication waits for
+static bool moe_hosted_act_f32() {
+    static const bool on = getenv("GGML_CUDA_MOE_HOSTED_F32") && atoi(getenv("GGML_CUDA_MOE_HOSTED_F32")) != 0;
+    return on;
+}
+
 static void moe_hosted_serve_one(moe_hosted_state * st, uint32_t seq) {
     // DIAGNOSTIC (GGML_CUDA_MOE_HOSTED_STATS=N): every N layers, per layer: the GPU's time between the
     // CPU rows handed back and the next publication (merge + the next layer's GPU work; long gaps,
@@ -6512,12 +6564,16 @@ static void moe_hosted_serve_one(moe_hosted_state * st, uint32_t seq) {
         for (int j = 0; j < n_cpu; j++) {
             const int t = cpu_rows[j] / layer->n_used;
             ids[j] = layer->h_ids[cpu_rows[j]];
-            memcpy(act.data() + (size_t) j * layer->n_embd, layer->h_act + (size_t) t * layer->n_embd, layer->n_embd * sizeof(float));
             memcpy(st->act8.data() + (size_t) j * q8_row, (const char *) layer->h_act8 + (size_t) t * q8_row, q8_row);
+            if (moe_hosted_act_f32()) {
+                memcpy(act.data() + (size_t) j * layer->n_embd, layer->h_act + (size_t) t * layer->n_embd, layer->n_embd * sizeof(float));
+            }
         }
         out.resize((size_t) n_cpu * layer->n_embd);
         g_session_suppressed++;
-        ggml_moe_cache.cpu_experts(layer->gate_w, layer->up_w, layer->down_w, act.data(), st->act8.data(), ids.data(), 1, n_cpu,
+        // without the F32 rows, the generic path of cpu_experts takes them from the q8_0 blocks
+        ggml_moe_cache.cpu_experts(layer->gate_w, layer->up_w, layer->down_w, moe_hosted_act_f32() ? act.data() : nullptr,
+                                   st->act8.data(), ids.data(), 1, n_cpu,
                                    out.data(), st->n_threads);
         g_session_suppressed--;
         for (int j = 0; j < n_cpu; j++) {
@@ -6938,6 +6994,7 @@ static void moe_hosted_shutdown(moe_cache_session * session) {
         if (st->d_q8_mid) cudaFree(st->d_q8_mid);
         if (st->d_q8_count) cudaFree(st->d_q8_count);
         if (st->d_router_done) cudaFree(st->d_router_done);
+        if (st->d_router_tagged) cudaFree(st->d_router_tagged);
         // the pins of the last plan go with the pools the session is about to free
     }
 }
@@ -7205,12 +7262,24 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
             CUDA_CHECK(cudaMemsetAsync(st->d_router_done, 0, 64, stream));
         }
         rta.done = st->d_router_done;
+        // the rows tagged with the layer's publication number, which the kernel reads (GGML_CUDA_MOE_ROUTER_TAG=0: a counter
+        // after a fence)
+        static const bool router_tag = !getenv("GGML_CUDA_MOE_ROUTER_TAG") || atoi(getenv("GGML_CUDA_MOE_ROUTER_TAG")) != 0;
+        if (router_tag && rta.ncols <= MOE_ROUTER_MAX_COLS) {
+            if (!st->d_router_tagged) {
+                const size_t bytes = (size_t) MOE_ROUTER_MAX_COLS * TOPK_MOE_HOSTED_N_EXPERT * sizeof(uint64_t);
+                CUDA_CHECK(cudaMalloc((void **) &st->d_router_tagged, bytes));
+                CUDA_CHECK(cudaMemsetAsync(st->d_router_tagged, 0, bytes, stream));
+            }
+            rta.tagged = st->d_router_tagged;
+        }
         ctx.router_pending = nullptr;
         ctx.router_next = -1;
     } else {
         ggml_cuda_router_flush(ctx);
     }
-    k_moe_hosted_enter<<<MOE_HOSTED_ENTER_BLOCKS + (rta.x ? rta.nrows : 0), 256, 0, stream>>>((const float *) act->data, layer->m_act, layer->m_act8, (int64_t) n_tokens * n_embd,
+    k_moe_hosted_enter<<<MOE_HOSTED_ENTER_BLOCKS + (rta.x ? rta.nrows : 0), 256, 0, stream>>>((const float *) act->data,
+                                              moe_hosted_act_f32() ? layer->m_act : nullptr, layer->m_act8, (int64_t) n_tokens * n_embd,
                                               tk ? tp.logits : nullptr, tk ? tp.weights : nullptr, tp.clamp, tp.scale,
                                               (int32_t *) ids->data, ids->nb[1], layer->m_ids, n_used, n_tokens,
                                               st->d_seq, layer->d_expect, st->m_mail, (uint32_t) slot, layer->m_flags,

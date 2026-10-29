@@ -4807,7 +4807,13 @@ static void ggml_cpu_moe_experts(const struct ggml_tensor * gate_w, const struct
 
     struct ggml_tensor * a   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 1, n_tokens);
     struct ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, k, n_tokens);
-    memcpy(a->data, act, (size_t) n_embd * n_tokens * sizeof(float));
+    if (act) {
+        memcpy(a->data, act, (size_t) n_embd * n_tokens * sizeof(float));
+    } else {
+        // only the q8_0 blocks were given (the hosted MoE's activations, quantized by the GPU)
+        GGML_ASSERT(act_q8);
+        ggml_get_type_traits(GGML_TYPE_Q8_0)->to_float(act_q8, (float *) a->data, n_embd * n_tokens);
+    }
     memcpy(ids->data, experts, (size_t) n * sizeof(int32_t));
 
     struct ggml_tensor * g = ggml_mul_mat_id(ctx, (struct ggml_tensor *) gate_w, a, ids);
