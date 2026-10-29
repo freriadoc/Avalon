@@ -6696,6 +6696,63 @@ static bool moe_hosted_act_f32() {
     return on;
 }
 
+// GGML_CUDA_MOE_TAIL_SKIP=R (Strata's STRATA_ROUTE_TAIL_SKIP, the same rule; default 7 as Strata, 0 turns it off; changes
+// the output): a missed expert that every token of the pass routes only at rank R or lower (its position in the top-k, by
+// weight; R from 1 to 9) is neither moved to the GPU nor computed: its rows are zero, the other experts keep the weights the
+// router gave them (no renormalisation). The main model's layers only, as Strata (not the MTP draft's).
+// Returns the CPU rows kept; counted as Strata reports them (missed experts skipped, rows skipped).
+static int moe_hosted_tail_skip(moe_hosted_state & st, moe_hosted_layer & layer, int rows, int32_t * cpu_rows, int n_cpu) {
+    static const int rank = [] {
+        const char * v = getenv("GGML_CUDA_MOE_TAIL_SKIP");
+        const int r = v ? atoi(v) : 7;
+        return r > 0 && r < 10 ? r : 0;
+    }();
+    if (rank == 0 || n_cpu == 0) {
+        return n_cpu;
+    }
+    const moe_cache_device & device = *st.device;
+    if (layer.layer_number < device.main_first || layer.layer_number > device.main_last) {
+        return n_cpu;
+    }
+    static std::atomic<int64_t> n_experts{0}, n_rows{0};
+    const int32_t * ids = layer.h_ids;
+    const int n_used = layer.n_used;
+    // the missed experts (once each, by their first CPU row) routed only at rank R or lower
+    int32_t skip[moe_hosted_rows_max];
+    int n_skip = 0;
+    for (int j = 0; j < n_cpu; j++) {
+        const int32_t e = ids[cpu_rows[j]];
+        bool seen = false, tail = true;
+        for (int q = 0; q < rows; q++) {
+            if (ids[q] == e) {
+                seen = seen || q < cpu_rows[j];
+                tail = tail && q % n_used >= rank;
+            }
+        }
+        if (!seen && tail) {
+            skip[n_skip++] = e;
+        }
+    }
+    n_experts += n_skip;
+    int keep = 0;
+    for (int j = 0; j < n_cpu; j++) {
+        const int r = cpu_rows[j];
+        if (std::find(skip, skip + n_skip, ids[r]) == skip + n_skip) {
+            cpu_rows[keep++] = r;
+            continue;
+        }
+        memset(layer.h_res + (size_t) r * layer.n_embd, 0, layer.n_embd * sizeof(float));
+        n_rows++;
+    }
+    static std::atomic<int64_t> next_log{20000};
+    if (n_rows >= next_log) {
+        next_log += 20000;
+        GGML_LOG_INFO("[moe-cache] tail skip (rank >= %d): %lld missed experts skipped (%lld rows) since the start\n",
+                      rank, (long long) n_experts.load(), (long long) n_rows.load());
+    }
+    return keep;
+}
+
 static void moe_hosted_serve_one(moe_hosted_state * st, uint32_t seq) {
     // DIAGNOSTIC (GGML_CUDA_MOE_HOSTED_STATS=N): every N layers, per layer: the GPU's time between the
     // CPU rows handed back and the next publication (merge + the next layer's GPU work; long gaps,
@@ -6734,6 +6791,7 @@ static void moe_hosted_serve_one(moe_hosted_state * st, uint32_t seq) {
     const int rows = layer->n_used * n_tokens;
     layer->last_tokens = n_tokens;
     int n_cpu = moe_hosted_plan(*st, *layer, layer->h_ids, rows, layer->h_plan, cpu_rows.data(), &layer->h_flags[0], seq);
+    n_cpu = moe_hosted_tail_skip(*st, *layer, rows, cpu_rows.data(), n_cpu);
     const int64_t t_cal = st->cal_left > 0 && n_tokens >= 2 && moe_split_enabled() ? ggml_time_us() : 0;
     n_cpu = moe_hosted_split(st, layer, rows, n_tokens, seq, cpu_rows.data(), n_cpu);
     const int64_t t_plan = stats_every > 0 ? ggml_time_us() : 0;
