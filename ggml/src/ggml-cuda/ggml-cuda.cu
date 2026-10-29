@@ -3157,11 +3157,10 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 #ifdef GGML_CUDA_NO_PEER_COPY
             return false;
 #else
-            // without peer access (GGML_CUDA_P2P), the runtime may stage a peer copy through the host and block the host
-            // until the source stream is done, while that stream's hosted MoE blocks wait for the host's plan: the
+            // the runtime may block the host in a peer copy until the source stream is done (seen with and without
+            // GGML_CUDA_P2P, Avalon issue #1), while that stream's hosted MoE blocks wait for the host's plan: the
             // scheduler then synchronizes the source (ggml_cuda_moe_hosted_wait answers the blocks) and copies
-            static const bool p2p = getenv("GGML_CUDA_P2P") != nullptr;
-            if (!p2p && ggml_cuda_moe_hosted_active()) {
+            if (ggml_cuda_moe_hosted_active()) {
                 return false;
             }
             CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(dst), cuda_ctx_src->stream()));
