@@ -1420,7 +1420,17 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     GGML_ASSERT(ggml_nbytes(&t_meta) == ggml_nbytes(cur));
 
-    ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
+    // an expert tensor of a packed layer (its experts an entry apart) stays a view of the mapping only in host memory;
+    // placed on a device it is allocated contiguous (ggml_nbytes of the view spans the whole packed layer: three times
+    // the experts) and gathered expert by expert at load (load_all_data)
+    const bool packed_view = !ggml_is_contiguous(&t_meta);
+    ggml_tensor t_contig = t_meta;
+    if (packed_view) {
+        t_contig.nb[2] = t_contig.nb[1] * t_contig.ne[1];
+        t_contig.nb[3] = t_contig.nb[2] * t_contig.ne[2];
+    }
+
+    ggml_backend_buffer_type_t buft = buft_for_tensor(&t_contig);
     if (buft == nullptr) {
         return nullptr;
     }
@@ -1461,7 +1471,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     struct ggml_tensor * tensor = ggml_dup_tensor(ctx, &t_meta);
     ggml_set_name(tensor, ggml_get_name(&t_meta));
-    if (!ggml_is_contiguous(&t_meta)) {   // an expert tensor of a packed layer: its experts lie an entry apart
+    if (packed_view && ggml_backend_buft_is_host(buft)) {   // an expert tensor of a packed layer: its experts lie an entry apart
         for (int dim = 0; dim < GGML_MAX_DIMS; dim++) {
             tensor->nb[dim] = t_meta.nb[dim];
         }
@@ -1744,6 +1754,21 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
+
+        // an expert tensor of a packed layer placed on a device (create_tensor): contiguous there, its experts an entry
+        // apart in the file; gathered through a host buffer (packed layers need the mapping)
+        if (!ggml_is_contiguous(weight->tensor) && ggml_is_contiguous(cur)) {
+            GGML_ASSERT(use_mmap);
+            const uint8_t * src = (const uint8_t *) mappings.at(weight->idx)->addr() + weight->offs;
+            const size_t per_expert = cur->nb[2];
+            std::vector<no_init<uint8_t>> staged(n_size);
+            for (int64_t e = 0; e < cur->ne[2]; e++) {
+                memcpy(staged.data() + e * per_expert, src + e * weight->tensor->nb[2], per_expert);
+            }
+            ggml_backend_tensor_set(cur, staged.data(), 0, n_size);
+            size_done += n_size;
+            continue;
+        }
 
         const bool from_mapping = use_mmap || lazy.has(cur);
 
