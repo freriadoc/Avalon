@@ -1546,6 +1546,22 @@ private:
             batch.init(ctx_tgt, std::max(n_batch, params_base.n_parallel), n_embd);
         }
 
+        // a model larger than RAM lives in the page cache: every MiB the prompt cache allocates evicts model pages
+        // through direct reclaim, which stalls the server for seconds (and makes KFD evict the GPU queues)
+        if (!params_base.cache_ram_set && params_base.cache_ram_mib != 0) {
+            ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+            size_t ram_free = 0, ram_total = 0;
+            if (cpu) {
+                ggml_backend_dev_memory(cpu, &ram_free, &ram_total);
+            }
+            const uint64_t model_bytes = llama_model_size(model_tgt);
+            if (ram_total > 0 && model_bytes > ram_total) {
+                SRV_INF("model (%.1f GiB) is larger than RAM (%.1f GiB): prompt cache disabled, use `--cache-ram N` to force it\n",
+                        model_bytes / 1073741824.0, ram_total / 1073741824.0);
+                params_base.cache_ram_mib = 0;
+            }
+        }
+
         if (params_base.cache_ram_mib != 0) {
             if (params_base.cache_ram_mib < 0) {
                 SRV_TRC("prompt cache is enabled, size limit: %s\n", "no limit");
