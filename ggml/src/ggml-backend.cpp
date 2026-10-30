@@ -1446,10 +1446,13 @@ static bool ggml_backend_sched_is_hosted_moe(ggml_backend_sched_t sched, const s
 }
 
 // With a MoE cache session (GGML_MOE_GPU=0 turns it off), a MoE block gate / up / swiglu / down whose weights are
-// in host memory stays on the GPU for batches of up to 64 routed rows: the GPU computes the rows
+// in host memory stays on the GPU for batches of up to 8191 routed rows and 1024 tokens: the GPU computes the rows
 // the cache holds, a host thread the others (ggml_cuda_moe_hosted_block); no weight is copied.
 static void ggml_backend_sched_find_hosted_moe(ggml_backend_sched_t sched, const struct ggml_cgraph * graph) {
     static const bool enabled = !getenv("GGML_MOE_GPU") || atoi(getenv("GGML_MOE_GPU")) != 0;
+    // the routed rows of a hosted block (GGML_MOE_HOSTED_MAX_ROWS, as ggml-cuda's moe_hosted_max_rows)
+    static const int64_t max_rows = getenv("GGML_MOE_HOSTED_MAX_ROWS") ?
+        std::max(1, std::min(8192, atoi(getenv("GGML_MOE_HOSTED_MAX_ROWS")))) : 8191;
     if (sched->moe_hosted) {
         sched->moe_hosted->clear();
     }
@@ -1475,7 +1478,7 @@ static void ggml_backend_sched_find_hosted_moe(ggml_backend_sched_t sched, const
         if (!((gate == graph->nodes[i] && up == graph->nodes[i + 1]) || (gate == graph->nodes[i + 1] && up == graph->nodes[i])) ||
             !host_weights(gate) || !host_weights(up) || !host_weights(down) ||
             gate->src[2] != ids || up->src[2] != ids || gate->src[1] != up->src[1] ||
-            ids->ne[0] * ids->ne[1] > 64) {
+            ids->ne[0] * ids->ne[1] > max_rows || ids->ne[1] > 1024) {
             continue;
         }
         sched->moe_hosted->insert(gate);

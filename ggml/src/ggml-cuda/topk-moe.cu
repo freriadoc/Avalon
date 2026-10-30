@@ -231,7 +231,8 @@ bool ggml_cuda_topk_moe_defer(ggml_backend_cuda_context & ctx, const ggml_tensor
                               const ggml_cuda_topk_moe_args & args) {
     const int n_expert = logits->ne[0];
     if (args.sigmoid || args.sqrt_softplus || args.delayed_softmax || args.prob_bias || clamp == nullptr ||
-            n_expert != TOPK_MOE_HOSTED_N_EXPERT || ids->nb[1] != (size_t) n_expert * sizeof(int32_t)) {
+            n_expert != TOPK_MOE_HOSTED_N_EXPERT || ids->nb[1] != (size_t) n_expert * sizeof(int32_t) ||
+            logits->ne[1] * WARP_SIZE > 256) {   // a warp per token in one block of the entry kernel
         return false;
     }
     ggml_cuda_topk_moe_pending_flush(ctx);

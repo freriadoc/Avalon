@@ -5174,7 +5174,22 @@ static void moe_cache_restore(void * opaque, void * backend) {
 // The kernels keep the pools' base addresses of the capture: a plan made while they differ (pools
 // rebuilt) sends every row to the CPU.
 
-static constexpr int moe_hosted_rows_max = 64;
+// the buffers' routed rows: a block of up to moe_hosted_max_rows() (GGML_MOE_HOSTED_MAX_ROWS, default 8191) is hosted,
+// prompts of up to ~800 tokens included. A hosted block copies no weight: on the 7900 XT in PCIe 3.0 a prompt of 164 /
+// 692 / 853 tokens takes 0.62 / 1.89 / 2.24 s against ~3.05 s for the prefetch, which copies every expert whatever the
+// batch (1054 tokens: 3.17 against 3.07). Generation and the MTP verification use 10 to 30 rows. And at most
+// moe_hosted_tokens_max tokens (a context sharing the session, the MTP draft, may use fewer experts per token): the
+// activations' buffers are sized for them
+static constexpr int moe_hosted_rows_max = 8192;
+static constexpr int moe_hosted_tokens_max = 1024;
+static int moe_hosted_max_rows() {
+    static const int n = [] {
+        const char * v = getenv("GGML_MOE_HOSTED_MAX_ROWS");
+        const int r = v ? atoi(v) : moe_hosted_rows_max - 1;
+        return r < 1 ? 1 : (r > moe_hosted_rows_max ? moe_hosted_rows_max : r);
+    }();
+    return n;
+}
 
 struct moe_hosted_mailbox {
     uint32_t seq;
@@ -5249,6 +5264,18 @@ struct moe_hosted_state {
     std::unordered_map<uint32_t, int> pg_demand;             // PREGATE: predictions per (layer, expert)
     char * d_q8_act = nullptr;
     char * d_q8_mid = nullptr;
+    // the layers' activations, ids, plans and CPU results, shared like d_q8_act: the layers run one after the other on
+    // the stream, a layer's enter (which rewrites them) queued after the previous layer's merge (which waits for its
+    // CPU rows and reads its results). Sized once by the first layer (addresses captured in graphs)
+    float * h_act = nullptr;
+    block_q8_0 * h_act8 = nullptr;
+    float * h_res = nullptr;
+    int32_t * h_ids = nullptr;
+    uint64_t * h_plan = nullptr;
+    uint64_t * h_plan2 = nullptr;
+    uint64_t * d_plan = nullptr;
+    uint64_t * d_plan2 = nullptr;
+    int64_t sh_embd = 0;
     unsigned * d_q8_count = nullptr;   // the up / gate kernel's warps done per q8_1 block of d_q8_mid (zero between launches)
     unsigned * d_router_done = nullptr;   // the router's rows done (k_moe_hosted_enter), zero between layers
     uint64_t * d_router_tagged = nullptr; // the router's rows, {layer tag, logit} (k_moe_hosted_enter)
@@ -6531,8 +6558,8 @@ static int moe_hosted_split(moe_hosted_state * st, moe_hosted_layer * layer, int
 
 // SPLIT: one timed layer of the calibration (moe_split_cal_skip): its CPU time from the plan to the CPU rows' flag (what
 // the model was fitted on) against the model's for the rows left; at the end the scale is fixed and logged
-static void moe_split_calibrate(moe_hosted_state * st, const moe_hosted_layer * layer, const int32_t * cpu_rows, int n_cpu,
-                                int64_t us) {
+// (ids: the CPU rows' experts, copied before the flag; the layers' shared h_ids may already hold the next layer's)
+static void moe_split_calibrate(moe_hosted_state * st, const int32_t * ids, int n_cpu, int64_t us) {
     if (--st->cal_left >= moe_split_cal_layers) {
         return;
     }
@@ -6540,7 +6567,7 @@ static void moe_split_calibrate(moe_hosted_state * st, const moe_hosted_layer * 
     for (int j = 0; j < n_cpu; j++) {
         bool seen = false;
         for (int i = 0; i < j && !seen; i++) {
-            seen = layer->h_ids[cpu_rows[i]] == layer->h_ids[cpu_rows[j]];
+            seen = ids[i] == ids[j];
         }
         d += !seen;
     }
@@ -6799,6 +6826,10 @@ static void moe_hosted_serve_one(moe_hosted_state * st, uint32_t seq) {
     // the CPU rows in one call, one column each (k = 1) with its token's activations: exactly the
     // missed rows (a k-per-token layout padded the tokens with fewer misses: 8.1 rows computed for
     // 5.9, CPU time +12 % per layer); MUL_MAT_ID groups the rows of an expert, which is read once
+    if (n_cpu > 256) {
+        std::stable_sort(cpu_rows.begin(), cpu_rows.begin() + n_cpu,
+                         [&](int32_t a, int32_t b) { return layer->h_ids[a] < layer->h_ids[b]; });
+    }
     if (n_cpu > 0) {
         ids.resize(n_cpu);
         act.resize((size_t) n_cpu * layer->n_embd);
@@ -6814,10 +6845,16 @@ static void moe_hosted_serve_one(moe_hosted_state * st, uint32_t seq) {
         }
         out.resize((size_t) n_cpu * layer->n_embd);
         g_session_suppressed++;
-        // without the F32 rows, the generic path of cpu_experts takes them from the q8_0 blocks
-        ggml_moe_cache.cpu_experts(layer->gate_w, layer->up_w, layer->down_w, moe_hosted_act_f32() ? act.data() : nullptr,
-                                   st->act8.data(), ids.data(), 1, n_cpu,
-                                   out.data(), st->n_threads);
+        // without the F32 rows, the generic path of cpu_experts takes them from the q8_0 blocks; a prompt's block (more
+        // than 256 rows, the multi-row kernels' limit) in calls of 256 rows, its rows sorted by expert first
+        const int call_rows = 256;
+        for (int j0 = 0; j0 < n_cpu; j0 += call_rows) {
+            const int n = std::min(call_rows, n_cpu - j0);
+            ggml_moe_cache.cpu_experts(layer->gate_w, layer->up_w, layer->down_w,
+                                       moe_hosted_act_f32() ? act.data() + (size_t) j0 * layer->n_embd : nullptr,
+                                       st->act8.data() + (size_t) j0 * q8_row, ids.data() + j0, 1, n,
+                                       out.data() + (size_t) j0 * layer->n_embd, st->n_threads);
+        }
         g_session_suppressed--;
         for (int j = 0; j < n_cpu; j++) {
             memcpy(layer->h_res + (size_t) cpu_rows[j] * layer->n_embd, out.data() + (size_t) j * layer->n_embd,
@@ -6826,14 +6863,15 @@ static void moe_hosted_serve_one(moe_hosted_state * st, uint32_t seq) {
     }
     __atomic_store_n(&layer->h_flags[16], seq, __ATOMIC_RELEASE);
     if (t_cal > 0 && n_cpu > 0) {
-        moe_split_calibrate(st, layer, cpu_rows.data(), n_cpu, ggml_time_us() - t_cal);
+        moe_split_calibrate(st, ids.data(), n_cpu, ggml_time_us() - t_cal);
     }
     moe_hosted_admit_deferred(*st, *layer);
     if (!st->tl_host.empty()) {
         moe_tl_account(st, seq);
     }
 {
-        // DIAGNOSTIC (GGML_CUDA_MOE_SPLIT_VERIFY=1): the moved rows, CPU against GPU (relative L2 error per row)
+        // DIAGNOSTIC (GGML_CUDA_MOE_SPLIT_VERIFY=1): the moved rows, CPU against GPU (relative L2 error per row); read after
+        // the flag, the shared h_ids / h_plan2 / h_res may already hold the next layer's: a mismatch can be that
         static const bool verify = getenv("GGML_CUDA_MOE_SPLIT_VERIFY") && atoi(getenv("GGML_CUDA_MOE_SPLIT_VERIFY")) > 0;
         static int64_t vn = 0, vbad = 0;
         static double vsum = 0, vmax = 0;
@@ -7224,12 +7262,18 @@ static void moe_hosted_shutdown(moe_cache_session * session) {
             st->server.join();
         }
 #endif
+        for (void * h : {(void *) st->h_act, (void *) st->h_act8, (void *) st->h_res, (void *) st->h_ids, (void *) st->h_plan,
+                         (void *) st->h_plan2}) {
+            if (h) cudaFreeHost(h);
+        }
+        for (void * d : {(void *) st->d_plan, (void *) st->d_plan2}) {
+            if (d) cudaFree(d);
+        }
         for (auto & layer : st->layers) {
-            for (void * h : {(void *) layer->h_act, (void *) layer->h_act8, (void *) layer->h_ids, (void *) layer->h_plan, (void *) layer->h_res,
-                             (void *) layer->h_flags}) {
+            for (void * h : {(void *) layer->h_flags}) {
                 if (h) cudaFreeHost(h);
             }
-            for (void * d : {(void *) layer->d_plan, (void *) layer->d_act_ids, (void *) layer->d_expect}) {
+            for (void * d : {(void *) layer->d_act_ids, (void *) layer->d_expect}) {
                 if (d) cudaFree(d);
             }
         }
@@ -7280,28 +7324,43 @@ static moe_hosted_layer * moe_hosted_register(moe_hosted_state & st, moe_cache_d
         layer->down_base = device.pools[layer->down_pool_index]->gpu_base;
     }
     const int rows = moe_hosted_rows_max;
-    const int tokens = rows / n_used;
+    const int tokens = moe_hosted_tokens_max;
     GGML_ASSERT(layer->n_embd % QK8_0 == 0);
-    bool ok = moe_hosted_host_alloc((void **) &layer->h_act, (size_t) tokens * layer->n_embd * sizeof(float)) &&
-              moe_hosted_host_alloc((void **) &layer->h_act8, (size_t) tokens * (layer->n_embd / QK8_0) * sizeof(block_q8_0)) &&
-              moe_hosted_host_alloc((void **) &layer->h_ids, rows * sizeof(int32_t)) &&
-              moe_hosted_host_alloc((void **) &layer->h_plan, 3 * rows * sizeof(uint64_t)) &&
-              moe_hosted_host_alloc((void **) &layer->h_res, (size_t) rows * layer->n_embd * sizeof(float)) &&
-              moe_hosted_host_alloc((void **) &layer->h_flags, 128) &&
+    if (!st.h_res) {
+        st.sh_embd = layer->n_embd;
+        if (!moe_hosted_host_alloc((void **) &st.h_act, (size_t) tokens * layer->n_embd * sizeof(float)) ||
+            !moe_hosted_host_alloc((void **) &st.h_act8, (size_t) tokens * (layer->n_embd / QK8_0) * sizeof(block_q8_0)) ||
+            !moe_hosted_host_alloc((void **) &st.h_res, (size_t) rows * layer->n_embd * sizeof(float)) ||
+            !moe_hosted_host_alloc((void **) &st.h_ids, rows * sizeof(int32_t)) ||
+            !moe_hosted_host_alloc((void **) &st.h_plan, 3 * rows * sizeof(uint64_t)) ||
+            !moe_hosted_host_alloc((void **) &st.h_plan2, 3 * rows * sizeof(uint64_t)) ||
+            // each plan followed by its chunk list (moe_group_list)
+            cudaMalloc((void **) &st.d_plan, 3 * rows * sizeof(uint64_t) + MOE_GROUP_WORDS * sizeof(int32_t)) != cudaSuccess ||
+            cudaMalloc((void **) &st.d_plan2, 3 * rows * sizeof(uint64_t) + MOE_GROUP_WORDS * sizeof(int32_t)) != cudaSuccess) {
+            GGML_ABORT("MoE block hosted by the GPU: allocation failed");
+        }
+    }
+    GGML_ASSERT(layer->n_embd == st.sh_embd);
+    layer->h_act = st.h_act;
+    layer->h_act8 = st.h_act8;
+    layer->h_res = st.h_res;
+    layer->h_ids = st.h_ids;
+    layer->h_plan = st.h_plan;
+    layer->h_plan2 = st.h_plan2;
+    layer->d_plan = st.d_plan;
+    layer->d_plan2 = st.d_plan2;
+    bool ok = moe_hosted_host_alloc((void **) &layer->h_flags, 128) &&
               moe_hosted_host_alloc((void **) &layer->h_pred, (2 + rows) * sizeof(int32_t)) &&
-              moe_hosted_host_alloc((void **) &layer->h_plan2, 3 * rows * sizeof(uint64_t)) &&
               moe_hosted_host_alloc((void **) &layer->h_fetch, (1 + 3 * MOE_SPLIT_FETCH_MAX) * sizeof(uint64_t)) &&
-              moe_hosted_host_alloc((void **) &layer->h_chk, (size_t) rows * layer->n_embd * sizeof(float));
+              moe_hosted_host_alloc((void **) &layer->h_chk, (size_t) (getenv("GGML_CUDA_MOE_SPLIT_VERIFY") ? rows : 1) *
+                                    layer->n_embd * sizeof(float));
     ok = ok && (layer->m_act = moe_hosted_device_ptr(layer->h_act)) && (layer->m_act8 = (block_q8_0 *) moe_hosted_device_ptr(layer->h_act8)) &&
          (layer->m_ids = moe_hosted_device_ptr(layer->h_ids)) &&
          (layer->m_plan = moe_hosted_device_ptr(layer->h_plan)) && (layer->m_res = moe_hosted_device_ptr(layer->h_res)) &&
          (layer->m_flags = moe_hosted_device_ptr(layer->h_flags)) && (layer->m_pred = moe_hosted_device_ptr(layer->h_pred)) &&
          (layer->m_plan2 = moe_hosted_device_ptr(layer->h_plan2)) && (layer->m_chk = moe_hosted_device_ptr(layer->h_chk)) &&
          (layer->m_fetch = moe_hosted_device_ptr(layer->h_fetch));
-    // each plan followed by its chunk list (moe_group_list)
-    ok = ok && cudaMalloc((void **) &layer->d_plan, 3 * rows * sizeof(uint64_t) + MOE_GROUP_WORDS * sizeof(int32_t)) == cudaSuccess &&
-         cudaMalloc((void **) &layer->d_plan2, 3 * rows * sizeof(uint64_t) + MOE_GROUP_WORDS * sizeof(int32_t)) == cudaSuccess &&
-         cudaMalloc((void **) &layer->d_fetch, (1 + 3 * MOE_SPLIT_FETCH_MAX) * sizeof(uint64_t)) == cudaSuccess &&
+    ok = ok && cudaMalloc((void **) &layer->d_fetch, (1 + 3 * MOE_SPLIT_FETCH_MAX) * sizeof(uint64_t)) == cudaSuccess &&
          cudaMemset(layer->d_fetch, 0, sizeof(uint64_t)) == cudaSuccess &&
          cudaMalloc((void **) &layer->d_act_ids, rows * sizeof(int32_t)) == cudaSuccess &&
          cudaMalloc((void **) &layer->d_expect, sizeof(uint32_t)) == cudaSuccess;
@@ -7321,16 +7380,13 @@ static moe_hosted_layer * moe_hosted_register(moe_hosted_state & st, moe_cache_d
         const size_t act_bytes = (size_t) tokens * (GGML_PAD(layer->n_embd, MATRIX_ROW_PADDING) / QK8_1) * sizeof(block_q8_1);
         const size_t mid_bytes = (size_t) rows * (GGML_PAD(layer->n_ff, MATRIX_ROW_PADDING) / QK8_1) * sizeof(block_q8_1);
         if (!st.d_q8_act) {
-            // sized for the worst count of tokens (one expert used per token): a context sharing the session (the
-            // MTP draft) may use fewer experts per token than the first block, hence more tokens per block
-            const size_t act_max = (size_t) rows * (GGML_PAD(layer->n_embd, MATRIX_ROW_PADDING) / QK8_1) * sizeof(block_q8_1);
-            if (cudaMalloc((void **) &st.d_q8_act, act_max) != cudaSuccess ||
+            if (cudaMalloc((void **) &st.d_q8_act, act_bytes) != cudaSuccess ||
                 cudaMalloc((void **) &st.d_q8_mid, mid_bytes) != cudaSuccess ||
                 cudaMalloc((void **) &st.d_q8_count, mid_bytes / sizeof(block_q8_1) * sizeof(unsigned)) != cudaSuccess ||
                 cudaMemset(st.d_q8_count, 0, mid_bytes / sizeof(block_q8_1) * sizeof(unsigned)) != cudaSuccess) {
                 GGML_ABORT("MoE block hosted by the GPU: allocation failed");
             }
-            st.q8_act_bytes = act_max;
+            st.q8_act_bytes = act_bytes;
             st.q8_mid_bytes = mid_bytes;
         }
         // addresses captured in graphs: one embedding and expert width per session
@@ -7444,7 +7500,7 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
     const int n_used = (int) ids->ne[0];
     const int n_tokens = (int) ids->ne[1];
     const int rows = n_used * n_tokens;
-    if (up->src[1] != act || up->src[2] != ids || down->src[2] != ids || rows > moe_hosted_rows_max ||
+    if (up->src[1] != act || up->src[2] != ids || down->src[2] != ids || rows > moe_hosted_max_rows() || n_tokens > moe_hosted_tokens_max ||
         act->type != GGML_TYPE_F32 || act->ne[1] != 1 || !ggml_is_contiguous(act) || !ggml_is_contiguous(glu) ||
         !ggml_is_contiguous(down) || gate->src[0]->type != up->src[0]->type) {
         return -1;
