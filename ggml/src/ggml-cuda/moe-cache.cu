@@ -5174,8 +5174,7 @@ static void moe_cache_restore(void * opaque, void * backend) {
 // The kernels keep the pools' base addresses of the capture: a plan made while they differ (pools
 // rebuilt) sends every row to the CPU.
 
-// the buffers' routed rows: a block of up to moe_hosted_max_rows() (GGML_MOE_HOSTED_MAX_ROWS, default 8191 on ROCm, 64 on
-// NVIDIA, where a block of more than 128 rows hangs the GPU on the first request, 30 Oct., cause not found) is hosted,
+// the buffers' routed rows: a block of up to moe_hosted_max_rows() (GGML_MOE_HOSTED_MAX_ROWS, default 8191) is hosted,
 // prompts of up to ~800 tokens included. A hosted block copies no weight: on the 7900 XT in PCIe 3.0 a prompt of 164 /
 // 692 / 853 tokens takes 0.62 / 1.89 / 2.24 s against ~3.05 s for the prefetch, which copies every expert whatever the
 // batch (1054 tokens: 3.17 against 3.07). Generation and the MTP verification use 10 to 30 rows. And at most
@@ -5186,11 +5185,7 @@ static constexpr int moe_hosted_tokens_max = 1024;
 static int moe_hosted_max_rows() {
     static const int n = [] {
         const char * v = getenv("GGML_MOE_HOSTED_MAX_ROWS");
-#if defined(GGML_USE_HIP)
         const int r = v ? atoi(v) : moe_hosted_rows_max - 1;
-#else
-        const int r = v ? atoi(v) : 64;
-#endif
         return r < 1 ? 1 : (r > moe_hosted_rows_max ? moe_hosted_rows_max : r);
     }();
     return n;
@@ -5306,7 +5301,6 @@ struct moe_hosted_state {
     std::mutex server_mu;
     std::condition_variable server_cv;
     uint32_t server_pending = 0;   // blocks launched outside a capture whose publication is not served yet
-    cudaStream_t server_stream = nullptr;   // the stream of the last of them: queried at each poll (moe_hosted_server)
     std::atomic<bool> server_stop{false};
 #endif
     uint32_t last_seq = 0;
@@ -7145,18 +7139,10 @@ static void moe_hosted_server(moe_hosted_state * st) {
             if (st->server_stop.load(std::memory_order_relaxed)) {
                 return;
             }
-            // a driver call at each poll: on CUDA a device write to mapped host memory may become visible to the
-            // host only when the driver is entered (Strata's session loop found it, a query each iteration; the
-            // thread that waits for the stream polls the same way)
-            cudaStream_t poll_stream;
-            {
-                std::lock_guard<std::mutex> lock(st->server_mu);
-                poll_stream = st->server_stream;
-            }
-            if (poll_stream) {
-                (void) cudaStreamQuery(poll_stream);
-                (void) cudaGetLastError();
-            }
+            // no driver call here: a first cuBLAS product of a shape (more than 8 columns, in a hosted prompt block)
+            // loads a cuBLASLt module (cuLibraryLoadData) that waits for the device while holding a driver lock;
+            // a cudaStreamQuery each poll then waited for that lock while the device waited for this mailbox
+            // (RTX 4090, 30 Oct.: a fresh server's first request hung with blocks of more than 128 rows)
             const uint32_t seq = __atomic_load_n(&st->h_mail->seq, __ATOMIC_ACQUIRE);
             uint32_t advanced = 0;
             {
@@ -7599,7 +7585,6 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
             {
                 std::lock_guard<std::mutex> lock(st->server_mu);
                 st->server_pending++;
-                st->server_stream = stream;
             }
             st->server_cv.notify_one();
         }
