@@ -204,6 +204,8 @@ struct ggml_moe_cache_api {
                         const int32_t * experts, int k, int n_tokens, float * out, int n_threads);
     // before the cache sizes itself on the free memory: create the queues and scratch later work needs
     void (*prepare_queues)(void * session, const struct ggml_cgraph * graph);
+    // the routed rows of the largest MoE block the backend hosts (the scheduler leaves no larger one on the GPU)
+    int  (*hosted_max_rows)(void);
 };
 
 GGML_API struct ggml_moe_cache_api ggml_moe_cache;

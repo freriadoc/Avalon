@@ -5174,7 +5174,8 @@ static void moe_cache_restore(void * opaque, void * backend) {
 // The kernels keep the pools' base addresses of the capture: a plan made while they differ (pools
 // rebuilt) sends every row to the CPU.
 
-// the buffers' routed rows: a block of up to moe_hosted_max_rows() (GGML_MOE_HOSTED_MAX_ROWS, default 8191) is hosted,
+// the buffers' routed rows: a block of up to moe_hosted_max_rows() (GGML_MOE_HOSTED_MAX_ROWS, default 8191 on ROCm, 64 on
+// NVIDIA, where a block of more than 128 rows hangs the GPU on the first request, 30 Oct., cause not found) is hosted,
 // prompts of up to ~800 tokens included. A hosted block copies no weight: on the 7900 XT in PCIe 3.0 a prompt of 164 /
 // 692 / 853 tokens takes 0.62 / 1.89 / 2.24 s against ~3.05 s for the prefetch, which copies every expert whatever the
 // batch (1054 tokens: 3.17 against 3.07). Generation and the MTP verification use 10 to 30 rows. And at most
@@ -5185,7 +5186,11 @@ static constexpr int moe_hosted_tokens_max = 1024;
 static int moe_hosted_max_rows() {
     static const int n = [] {
         const char * v = getenv("GGML_MOE_HOSTED_MAX_ROWS");
+#if defined(GGML_USE_HIP)
         const int r = v ? atoi(v) : moe_hosted_rows_max - 1;
+#else
+        const int r = v ? atoi(v) : 64;
+#endif
         return r < 1 ? 1 : (r > moe_hosted_rows_max ? moe_hosted_rows_max : r);
     }();
     return n;
@@ -7745,6 +7750,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.begin = moe_cache_begin;
     ggml_moe_cache.assign = moe_cache_assign;
     ggml_moe_cache.prepare_queues = moe_cache_prepare_queues;
+    ggml_moe_cache.hosted_max_rows = moe_hosted_max_rows;
     ggml_moe_cache.plan = nullptr;   // nodes are served by the hosted MoE only (moe_cache_begin)
     ggml_moe_cache.dispatch = nullptr;   // nodes are served by the hosted MoE only (moe_cache_begin)
     ggml_moe_cache.collect = nullptr;   // nodes are served by the hosted MoE only (moe_cache_begin)
