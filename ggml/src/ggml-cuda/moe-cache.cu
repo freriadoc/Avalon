@@ -7630,6 +7630,15 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
     up_gate(layer->d_plan);
     ggml_cuda_moe_cache_mmv(down->src[0]->type, q8_mid, layer->d_plan + 2 * rows, nullptr,
                             (float *) down->data, n_ff, n_embd, rows, rows, stream, groups_of(layer->d_plan), (int) n_tokens);
+#if defined(GGML_USE_HIP)
+    // any hosted block: until the stream is synchronized, its copies to and from pinned host memory (the graph's
+    // outputs) are made by a kernel, as for the dispatcher's wait. ROCr keeps one SDMA ring per engine: an output copy
+    // that waits for this graph blocks the ring, the cache's fills queued behind it wait too, and the plan of a pass's
+    // first layer waits for the previous pass's fills while the GPU waits for that plan (hung at 16k, 1-token passes,
+    // a fill in flight and 130 queued; all copies by kernel, GPU_FORCE_BLIT_COPY_SIZE=8192: no hang)
+    ctx.split_wait_queued = true;
+    ctx.split_wait_captured = true;
+#endif
     // SPLIT: the rows of the expert moved to the GPU, once it arrived; the kernels skip every other row
     const bool split_on = moe_split_enabled() && n_tokens >= 2;
     if (split_on) {
