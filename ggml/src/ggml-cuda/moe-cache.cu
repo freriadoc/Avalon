@@ -605,6 +605,8 @@ struct moe_cache_device {
 
     cudaStream_t compute_stream = nullptr;
     ggml_backend_cuda_context * backend_ctx = nullptr; // the context of the scheduler that created the session
+    std::vector<ggml_backend_cuda_context *> borrowers;   // contexts that have borrowed, in order
+    bool sdma_fresh_streams = false;   // the main context's streams were replaced for the first request (gfx1030 SDMA re-grant)
     cudaStream_t fill_stream = nullptr;                // the fill worker's stream, created and dispatched before sizing
     std::vector<char *> owned_regions;    // extra regions this device allocated itself (tests)
 
@@ -6289,6 +6291,40 @@ static void * moe_cache_borrow(void * opaque, void * backend, size_t bytes) {
         MOE_CACHE_LOG("[moe-cache] CUDA%d borrow: no pool can lend %zu MiB in one piece\n",
                 device->physical, bytes >> 20);
         return nullptr;
+    }
+
+    // gfx1030 driver bug: a stream whose VirtualGPU is granted an SDMA engine it held before
+    // (a re-grant) loses the next dispatch that loads a code object on it (GPU 0%, the host
+    // spins in libhsa ~46 days); a fresh VirtualGPU's first grant never does. The MTP draft
+    // ctx takes the main ctx's engine at load, so the first request's input H2D is the main's
+    // re-grant and the prefill's first lazy load is lost. Replace the borrowing context's
+    // streams at the first request: the recreated streams are fresh VirtualGPUs, so the H2D
+    // takes a first grant; later requests re-grant the fresh VirtualGPUs, but by then every
+    // code object the stream launches is loaded.
+    {
+        ggml_backend_cuda_context * ctx = ((ggml_backend_cuda_context *)((ggml_backend_t) backend)->context);
+        const bool already = std::find(device->borrowers.begin(), device->borrowers.end(), ctx) != device->borrowers.end();
+        if (!already) {
+            device->borrowers.push_back(ctx);
+        }
+        bool graphs = false;
+#if defined(USE_CUDA_GRAPH)
+        graphs = ctx->any_cuda_graph_has_instance();
+#endif
+        if (already && device->borrowers.size() >= 2 && !device->sdma_fresh_streams && !graphs) {
+            device->sdma_fresh_streams = true;
+            ggml_cuda_set_device(ctx->device);
+            for (int s = 0; s < GGML_CUDA_MAX_STREAMS; s++) {
+                if (ctx->streams[ctx->device][s] != nullptr && cudaStreamDestroy(ctx->streams[ctx->device][s]) == cudaSuccess) {
+                    ctx->streams[ctx->device][s] = nullptr;   // ctx->stream() recreates it
+                    if (ctx->cublas_handles[ctx->device][s] != nullptr) {
+                        (void) cublasSetStream(ctx->cublas_handles[ctx->device][s], ctx->stream(ctx->device, s));
+                    }
+                }
+            }
+            MOE_CACHE_LOG("[moe-cache] CUDA%d: first request - fresh context streams (gfx1030 SDMA re-grant)\n",
+                    device->physical);
+        }
     }
 
     // let the fills already decided land; nobody enqueues while we wait
