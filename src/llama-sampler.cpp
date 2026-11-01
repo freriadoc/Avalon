@@ -736,9 +736,15 @@ static bool llama_sampler_chain_backend_init(
         uint32_t                     n_outputs_max_per_seq) {
     auto * chain = (llama_sampler_chain *) smpl->ctx;
 
-    GGML_ASSERT(chain->is_init == false && "llama_sampler_chain_backend_init() called twice");
+    if (chain->is_init) {
+        GGML_ASSERT(chain->init_buft == buft && chain->init_n_outputs == n_outputs_max_per_seq &&
+                    "llama_sampler_chain_backend_init() called twice with other arguments");
+        return chain->init_res;
+    }
 
     chain->is_init = true;
+    chain->init_buft = buft;
+    chain->init_n_outputs = n_outputs_max_per_seq;
 
     bool res = true;
     bool backend_prefix = true;
@@ -767,6 +773,7 @@ static bool llama_sampler_chain_backend_init(
     auto probe = llama_sampler_backend_probe_graph(smpl, 128*1024, GGML_DEFAULT_GRAPH_SIZE, false);
     chain->n_nodes = llama_sampler_backend_probe_n_nodes(probe);
 
+    chain->init_res = res;
     return res;
 }
 
@@ -873,6 +880,9 @@ struct llama_sampler * llama_sampler_chain_init(struct llama_sampler_chain_param
         /* .ctx   = */ new llama_sampler_chain {
             /* .params               = */ params,
             /* .is_init              = */ false,
+            /* .init_buft            = */ nullptr,
+            /* .init_n_outputs       = */ 0,
+            /* .init_res             = */ false,
             /* .n_nodes              = */ 0,
             /* .samplers             = */ {},
             /* .cur                  = */ {},

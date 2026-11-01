@@ -744,6 +744,7 @@ void llama_context::sched_reserve() {
     }
     gf_res_small.clear();
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
+    sampling.samplers_reserved = sampling.samplers;
     gf_res_prev_active = nullptr;
 
     const bool moe_cache_eligible = llama_model_has_cacheable_moe_weights(
@@ -1490,6 +1491,14 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
         return true;
     }
 
+    // the sampler this sequence already has: the reservation and the graphs stand
+    if (sampler) {
+        const auto it = sampling.samplers.find(seq_id);
+        if (it != sampling.samplers.end() && it->second == sampler) {
+            return true;
+        }
+    }
+
     LLAMA_LOG_DEBUG("%s: seq_id = %d, sampler = %p\n", __func__, (int) seq_id, (void *) sampler);
 
     if (sampler && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
@@ -1518,7 +1527,12 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
         sampling.samplers[seq_id] = sampler;
 
-        sched_need_reserve = true;
+        // the reservation made with this very sampler still holds (a server slot gives its shared greedy chain back at
+        // each request, having taken it off at the previous one's release)
+        const auto it = sampling.samplers_reserved.find(seq_id);
+        if (it == sampling.samplers_reserved.end() || it->second != sampler) {
+            sched_need_reserve = true;
+        }
 
         return true;
     }
@@ -1537,7 +1551,8 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
     sampling.samplers.erase(seq_id);
 
-    sched_need_reserve = true;
+    // no reservation to take a sampler off: the graph without it is smaller than the one reserved (its own graphs are
+    // rebuilt, their sampler maps differ)
 
     return true;
 }

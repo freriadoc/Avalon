@@ -14,6 +14,10 @@ struct llama_sampler_chain {
 
     // has .backend_init() been called?
     bool is_init = false;
+    // the arguments and result of the backend init: a chain shared by requests is given to its context again
+    ggml_backend_buffer_type_t init_buft = nullptr;
+    uint32_t init_n_outputs = 0;
+    bool init_res = false;
 
     uint32_t n_nodes = 0;
 
