@@ -1442,11 +1442,28 @@ json oaicompat_chat_params_parse(
             reasoning_budget = opt.reasoning_budget;
         }
 
+        std::string reasoning_message = json_value(body, "reasoning_budget_message", opt.reasoning_budget_message);
+
+        // Room for the answer (Strata's answer_room, MIT): max_tokens counts the thinking too, so a long thinking cut off
+        // by it left no answer. From max_tokens 1024 on, the thinking is closed early enough to leave the answer a
+        // quarter of it (at least 512 tokens, at most half); a budget of the request's own is lowered to that too.
+        // "answer_room": false in the request turns it off.
+        const int n_max = json_value(body, "max_completion_tokens", json_value(body, "max_tokens", json_value(body, "n_predict", -1)));
+        if (n_max >= 1024 && json_value(body, "answer_room", true)) {
+            const int room = n_max - std::min(std::max(512, n_max / 4), n_max / 2);
+            if (reasoning_budget < 0 || reasoning_budget > room) {
+                reasoning_budget = room;
+                if (reasoning_message.empty()) {
+                    reasoning_message = "\n\nI have thought about this long enough; time to give my answer.";
+                }
+            }
+        }
+
         if (!out_session.thinking_end_tags().empty()) {
             llama_params["reasoning_budget_tokens"] = reasoning_budget;
             llama_params["reasoning_budget_start_tag"] = out_session.thinking_start_tag();
             llama_params["reasoning_budget_end_tags"] = out_session.thinking_end_tags();
-            llama_params["reasoning_budget_message"] = json_value(body, "reasoning_budget_message", opt.reasoning_budget_message);
+            llama_params["reasoning_budget_message"] = reasoning_message;
             llama_params["reasoning_control"] = json_value(body, "reasoning_control", false);
         }
     }

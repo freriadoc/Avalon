@@ -437,11 +437,7 @@ struct common_sampler * common_sampler_init(
         params.backend_sampling = false;
     }
 
-    if (rbudget && params.backend_sampling) {
-        LOG_WRN("%s: backend sampling is not compatible with reasoning budget, disabling\n", __func__);
-
-        params.backend_sampling = false;
-    }
+    // a reasoning budget keeps backend sampling: common_sampler_sample returns the token it forces itself
 
     auto * result = new common_sampler {
         /* .params  = */ params,
@@ -456,7 +452,7 @@ struct common_sampler * common_sampler_init(
     };
 
     // the other samplers of the chain leave the argmax in place at these settings; a temperature <= 0 keeps it alone
-    if (grmr == nullptr && rbudget == nullptr && params.mirostat == 0 && params.n_probs == 0 &&
+    if (grmr == nullptr && params.mirostat == 0 && params.n_probs == 0 &&
         params.temp <= 0.0f && params.dynatemp_range == 0.0f &&
         params.penalty_repeat == 1.0f && params.penalty_freq == 0.0f && params.penalty_present == 0.0f &&
         params.dry_multiplier == 0.0f && params.xtc_probability == 0.0f && params.typ_p >= 1.0f &&
@@ -731,6 +727,14 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
     const auto tm = gsmpl->tm();
 
+    // the reasoning budget forcing its message and end tag: that token, whatever was sampled
+    if (const llama_token forced = common_reasoning_budget_forced_token(gsmpl->rbudget); forced != LLAMA_TOKEN_NULL) {
+        gsmpl->cur.resize(1);
+        gsmpl->cur[0] = llama_token_data{forced, 0.0f, 1.0f};
+        gsmpl->cur_p  = { gsmpl->cur.data(), 1, 0, true };
+        return forced;
+    }
+
     // greedy: one scan of the (sparsely biased) logits, in index order, instead of a candidate per vocabulary entry
     // run through the chain
     if (gsmpl->greedy_argmax && llama_get_sampled_token_ith(ctx, idx) == LLAMA_TOKEN_NULL &&
@@ -786,7 +790,6 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
             LOG_DBG("%s: Backend sampler selected token: '%d'. Will not run any CPU samplers\n", __func__, id);
 
             GGML_ASSERT(!gsmpl->grmr    && "using grammar in combination with backend sampling is not supported");
-            GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
 
             for (size_t i = 0; i < cur_p.size; ++i) {
                 if (cur_p.data[i].id == id) {
