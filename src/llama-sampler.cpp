@@ -1093,6 +1093,9 @@ static void llama_sampler_greedy_backend_apply(
     }
 
     data->sampled = curl;
+    // the token is chosen: nothing reads these logits (greedy is the chain's last sampler only without n_probs), and as
+    // an output they were copied to the host, n_vocab floats per row (1 MB for Qwen3.8)
+    data->logits = nullptr;
 }
 
 static struct llama_sampler_i llama_sampler_greedy_i = {

@@ -11572,6 +11572,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {1024, 12, 1, 1}));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {2000, 10, 1, 1}));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {5438,  3, 1, 1}));
+    // a vocabulary's logits (Qwen3.8: 248320): the two-stage kernel
+    test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {248320, 3, 1, 1}));
+    test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {40000,  1, 1, 1}));
 
     for (int ne3 : {1, 3}) { // CUDA backward pass only supports ne3 == 1
         test_cases.emplace_back(new test_repeat(GGML_TYPE_F32, {10, 5, 4, ne3}, {1, 1, 1, 1}));

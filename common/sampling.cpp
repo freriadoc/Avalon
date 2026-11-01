@@ -175,6 +175,11 @@ struct common_sampler {
     // sampling is the argmax of the biased logits, scanned once (buun, 3a6c97465); biases sorted by token, summed
     bool greedy_argmax = false;
     std::vector<llama_logit_bias> greedy_bias;
+
+    // the chain the backend runs (backend sampling), when it differs from chain: greedy alone where greedy_argmax holds
+    // without biases (the chain's top-k of 40 then ran on the GPU before its argmax: a radix top-k of the 248k logits,
+    // ~36 us a row on RDNA3)
+    struct llama_sampler * chain_backend = nullptr;
 };
 
 std::string common_params_sampling::print() const {
@@ -496,6 +501,10 @@ struct common_sampler * common_sampler_init(
             }
             bias.resize(n);
         }
+        if (result->greedy_argmax && result->greedy_bias.empty()) {
+            result->chain_backend = llama_sampler_chain_init(llama_sampler_chain_default_params());
+            llama_sampler_chain_add(result->chain_backend, llama_sampler_init_greedy());
+        }
     }
 
     return result;
@@ -509,6 +518,7 @@ void common_sampler_free(struct common_sampler * gsmpl) {
     llama_sampler_free(gsmpl->grmr);
     llama_sampler_free(gsmpl->rbudget);
     llama_sampler_free(gsmpl->chain);
+    llama_sampler_free(gsmpl->chain_backend);
 
     delete gsmpl;
 }
@@ -583,6 +593,7 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .t_total_us    = */ 0,
         /* .greedy_argmax = */ gsmpl->greedy_argmax,
         /* .greedy_bias   = */ gsmpl->greedy_bias,
+        /* .chain_backend = */ gsmpl->chain_backend ? llama_sampler_clone(gsmpl->chain_backend) : nullptr,
     };
 }
 
@@ -658,6 +669,14 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     }
 
     return gsmpl->chain;
+}
+
+struct llama_sampler * common_sampler_get_backend(const struct common_sampler * gsmpl) {
+    if (!gsmpl) {
+        return nullptr;
+    }
+
+    return gsmpl->chain_backend ? gsmpl->chain_backend : gsmpl->chain;
 }
 
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
