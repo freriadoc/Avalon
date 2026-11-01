@@ -77,9 +77,10 @@ fi
 ram_gib=$(( $(awk '/^MemTotal:/ {print $2}' /proc/meminfo) / 1048576 ))
 echo "RAM $ram_gib GiB"
 # The model (~89 GiB) is memory-mapped: what does not fit in RAM is read again from the disk. Measured on the reference
-# machine with the server's RAM capped at 28 GB (a 32 GB machine): generation -2 to -6 %, prefill of a new 19k prompt
-# -31 % (889 against 1,283 t/s). Not measured below that.
-[ $ram_gib -ge 28 ] || fail "$ram_gib GiB of RAM: Avalon is measured with 32 GB or more (the model is memory-mapped, ~89 GiB)"
+# machine with the server's RAM capped at 14 GB (a 16 GB machine): MTP generation 90.3 against 99.0 t/s on a short
+# prompt; with 28 GB (a 32 GB machine) the prefill of a new 19k prompt -31 % (889 against 1,283 t/s). Not measured below.
+[ $ram_gib -ge 14 ] || fail "$ram_gib GiB of RAM: Avalon is measured with 16 GB or more (the model is memory-mapped, ~89 GiB)"
+[ $ram_gib -ge 28 ] || warn "$ram_gib GiB of RAM: generation stays close, new long prompts are slower (read again from the disk)"
 if [ "${SKIP_MODEL:-0}" != 1 ]; then
     mkdir -p "$MODEL_DIR"
     have=$(du -sk "$MODEL_DIR" 2>/dev/null | cut -f1)
