@@ -770,22 +770,16 @@ public:
     const llama_memory_hybrid_iswa_context * mctx;
 };
 
-class llm_graph_result;
-
 class llm_graph_input_sampling : public llm_graph_input_i {
 public:
-    llm_graph_input_sampling(std::map<llama_seq_id, llama_sampler *> samplers, const llm_graph_result * owner) :
-        samplers(std::move(samplers)), owner(owner) { }
+    llm_graph_input_sampling(std::map<llama_seq_id, llama_sampler *> samplers) :
+        samplers(std::move(samplers)) { }
     virtual ~llm_graph_input_sampling() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
     bool can_reuse(const llm_graph_params & params) override;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
-
-    // the graph built with these samplers: a sampler with graph inputs keeps those of the last graph it was built
-    // into, so another graph kept since (a small graph of another batch shape) cannot run with it again
-    const llm_graph_result * owner;
 };
 
 //
