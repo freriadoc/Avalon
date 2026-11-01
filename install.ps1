@@ -68,10 +68,11 @@ $ramGiB = [math]::Floor((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemo
 Write-Host "RAM $ramGiB GiB"
 if ($ramGiB -lt 28) { Fail "$ramGiB GiB of RAM: Avalon is measured with 32 GB or more (the model is memory-mapped, ~89 GiB)" }
 
-# GPU: RDNA3 discrete (gfx1100 measured, the Windows port ran on a 7900 XTX); the exact target comes from hipInfo later
+# GPU: RDNA3 (gfx1100 measured, the Windows port ran on a 7900 XTX) or RDNA4 (reported working on Linux by a user, a
+# Radeon AI PRO R9700, not measured here); the exact target comes from hipInfo later
 $gpus = @(Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match 'Radeon' } | ForEach-Object { $_.Name })
 if ($gpus.Count -eq 0) { Fail 'no AMD Radeon GPU found' } else { Write-Host ("GPU " + ($gpus -join ', ')) }
-if (-not ($gpus -match 'RX 7[0-9]{3}')) { Warn 'no Radeon RX 7000 (RDNA3) found by name: Avalon''s kernels target gfx1100 / gfx1101 / gfx1102' }
+if (-not ($gpus -match 'RX 7[0-9]{3}|RX 9[0-9]{3}|R9[0-9]{3}')) { Warn 'no Radeon RX 7000 / RX 9000 / AI PRO R9000 (RDNA3 / RDNA4) found by name: Avalon''s kernels target gfx1100 - gfx1102 and gfx1200 / gfx1201' }
 
 # VRAM: the driver's 64-bit size in the display class keys (Win32_VideoController.AdapterRAM stops at 4 GB)
 $vramMiB = 0
@@ -181,13 +182,14 @@ if (-not $targets) {
         $env:Path = "$hip\bin;$env:Path"
         $arch = @((& $hipInfo 2>$null) | Select-String -Pattern 'gfx[0-9a-f]+' -AllMatches | ForEach-Object { $_.Matches.Value } | Sort-Object -Unique)
     }
-    foreach ($g in @('gfx1100', 'gfx1101', 'gfx1102')) { if ($arch -contains $g) { $targets = $g; break } }
+    foreach ($g in @('gfx1100', 'gfx1101', 'gfx1102', 'gfx1201', 'gfx1200')) { if ($arch -contains $g) { $targets = $g; break } }
     if (-not $targets) {
-        Fail ("no RDNA3 discrete GPU found by hipInfo (it reports: {0}). Avalon's kernels target gfx1100 / gfx1101 / gfx1102" -f ($(if ($arch) { $arch -join ' ' } else { 'nothing' })))
+        Fail ("no RDNA3 / RDNA4 discrete GPU found by hipInfo (it reports: {0}). Avalon's kernels target gfx1100 - gfx1102 and gfx1200 / gfx1201" -f ($(if ($arch) { $arch -join ' ' } else { 'nothing' })))
         $targets = if ($arch) { $arch[0] } else { 'gfx1100' }
     }
 }
 if ($targets -eq 'gfx1100') { Write-Host "GPU target $targets (RX 7900 XT / XTX: the measured target)" }
+elseif ($targets -match '^gfx120[01]$') { Warn "GPU target $targets (RDNA4): reported working on Linux by a user (R9700), not measured here nor on Windows; some prompt kernels are RDNA3-only" }
 else { Warn "GPU target ${targets}: should work, not measured (Avalon is tuned on a gfx1100)" }
 
 # ---------------------------------------------------------------------------------------------------------------------
