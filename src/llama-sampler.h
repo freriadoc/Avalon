@@ -40,6 +40,9 @@ struct llama_sampler_chain {
 };
 
 uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler);
+// whether a backend sampler of the chain sets graph inputs (backend_set_input): those inputs are tensors of the last
+// graph it was built into
+bool llama_sampler_backend_has_inputs(const llama_sampler * sampler);
 void llama_sampler_backend_begin(llama_sampler * sampler);
 
 struct llama_sampler * llama_sampler_init_dry_testing(

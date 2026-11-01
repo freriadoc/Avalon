@@ -902,6 +902,21 @@ uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler) {
     return chain->n_nodes;
 }
 
+bool llama_sampler_backend_has_inputs(const llama_sampler * sampler) {
+    GGML_ASSERT(sampler != nullptr);
+    if (sampler->iface != &llama_sampler_chain_i) {
+        return sampler->iface->backend_set_input != nullptr;
+    }
+
+    const auto * chain = (const llama_sampler_chain *) sampler->ctx;
+    for (const auto & entry : chain->samplers) {
+        if (entry.is_backend && entry.ptr->iface->backend_set_input) {
+            return true;
+        }
+    }
+    return false;
+}
+
 llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_context * ctx, int32_t idx) {
     const llama_token   sampled_token  = llama_get_sampled_token_ith     (ctx, idx);
     const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);

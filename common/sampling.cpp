@@ -505,15 +505,25 @@ struct common_sampler * common_sampler_init(
             bias.resize(n);
         }
         if (result->greedy_argmax) {
-            // greedy on the backend (after the sparse biases, if any). Without biases, one chain shared by all requests
-            // (greedy keeps no state, nor any graph input): a context given the sampler it already has neither reserves
-            // its scheduler again nor rebuilds its graphs (a new chain each request cost ~0.3 s before its first token:
-            // the worst-case reservation, then every small graph rebuilt). With biases, a chain of the request's own:
-            // the bias sampler keeps the input tensors of the last graph it was built into, which a shared chain would
-            // carry over to graphs since freed (the small graphs of each batch shape are kept, llama_context)
+            // greedy on the backend (after the sparse biases, if any), one chain per set of biases shared by all
+            // requests (greedy keeps no state; the bias sampler's inputs are its biases): a context given the sampler
+            // it already has neither reserves its scheduler again nor rebuilds its graphs (a new chain each request
+            // cost ~0.3 s before its first token: the worst-case reservation, then every small graph rebuilt). Past
+            // 16 sets, a chain of the request's own.
             static std::mutex mtx;
-            static llama_sampler * shared = nullptr;
+            static std::vector<std::pair<std::vector<llama_logit_bias>, llama_sampler *>> shared;
             const auto & bias = result->greedy_bias;
+            const auto same = [&](const std::vector<llama_logit_bias> & b) {
+                if (b.size() != bias.size()) {
+                    return false;
+                }
+                for (size_t i = 0; i < b.size(); i++) {
+                    if (b[i].token != bias[i].token || b[i].bias != bias[i].bias) {
+                        return false;
+                    }
+                }
+                return true;
+            };
             const auto make = [&]() {
                 llama_sampler * c = llama_sampler_chain_init(llama_sampler_chain_default_params());
                 if (!bias.empty()) {
@@ -522,13 +532,18 @@ struct common_sampler * common_sampler_init(
                 llama_sampler_chain_add(c, llama_sampler_init_greedy());
                 return c;
             };
-            if (bias.empty()) {
-                std::lock_guard<std::mutex> lock(mtx);
-                if (!shared) {
-                    shared = make();
+            std::lock_guard<std::mutex> lock(mtx);
+            for (const auto & e : shared) {
+                if (same(e.first)) {
+                    result->chain_backend = e.second;
+                    break;
                 }
-                result->chain_backend = shared;
-            } else {
+            }
+            if (!result->chain_backend && shared.size() < 16) {
+                shared.push_back({ bias, make() });
+                result->chain_backend = shared.back().second;
+            }
+            if (!result->chain_backend) {
                 result->chain_backend       = make();
                 result->chain_backend_owned = true;
             }

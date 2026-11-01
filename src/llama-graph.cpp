@@ -1,5 +1,8 @@
 #include "llama-graph.h"
 
+#include <mutex>
+#include <unordered_map>
+
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-batch.h"
@@ -1433,6 +1436,10 @@ void llm_graph_input_sampling::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+// the graph each backend sampler with graph inputs was last built into (its input tensors are that graph's)
+static std::mutex g_sampler_graph_mtx;
+static std::unordered_map<const llama_sampler *, const llm_graph_result *> g_sampler_graph;
+
 bool llm_graph_input_sampling::can_reuse(const llm_graph_params & params) {
     if (samplers.size() != params.samplers.size()) {
         return false;
@@ -1440,6 +1447,14 @@ bool llm_graph_input_sampling::can_reuse(const llm_graph_params & params) {
 
     for (const auto & [seq_id, sampler] : params.samplers) {
         if (samplers[seq_id] != sampler) {
+            return false;
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(g_sampler_graph_mtx);
+    for (const auto & [seq_id, sampler] : samplers) {
+        const auto it = g_sampler_graph.find(sampler);
+        if (it != g_sampler_graph.end() && it->second != owner) {
             return false;
         }
     }
@@ -4069,8 +4084,16 @@ void llm_graph_context::build_sampling() const {
     std::array<ggml_tensor *, 2> outs;
     outs[0] = res->t_logits;
 
-    auto inp_sampling = std::make_unique<llm_graph_input_sampling>(samplers);
+    auto inp_sampling = std::make_unique<llm_graph_input_sampling>(samplers, res);
     res->add_input(std::move(inp_sampling));
+    {
+        std::lock_guard<std::mutex> lock(g_sampler_graph_mtx);
+        for (const auto & [seq_id, sampler] : samplers) {
+            if (llama_sampler_backend_has_inputs(sampler)) {
+                g_sampler_graph[sampler] = res;
+            }
+        }
+    }
 
     std::map<llama_seq_id, std::vector<uint32_t>> sampling_rows;
     uint32_t n_rows = 0;
