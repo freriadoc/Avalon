@@ -21,7 +21,8 @@ desktop most people would call old.
 The model is ~89 GiB; the GPU holds ~4.6 GiB of dense weights plus a cache of 9 – 14 GiB of experts, the rest stays in
 RAM. **32 GB of RAM is enough**: the model is memory-mapped, and what does not fit is read again from the disk. With
 the server's RAM capped at 28 GB (a 32 GB machine), the MTP best case went from 91.2 to 89.0 t/s and the prefill of a new
-19k prompt from 1,283 to 889 t/s; with 58 GB generation was within 5% of 96 GB.
+19k prompt from 1,283 to 889 t/s; with 58 GB generation was within 5% of 96 GB. The disk there is an NVMe SSD at
+~3 GB/s (PCIe 3.0); a SATA SSD was not measured, and with less RAM the prefill of new prompts depends on it.
 
 ## Two ideas behind Avalon
 
@@ -88,6 +89,21 @@ greedy, 512 tokens:
 
 One run per row (not medians), VRAM peak 22.9 GiB of 24. Generation without MTP was not measured there. It is a
 first measurement on a machine I do not own, not a tuned result: the kernels are still tuned for RDNA3.
+
+### Reported by users (not verified here)
+
+Numbers posted by people running Avalon on their own machines, with the conditions they gave; their protocols differ
+from the tables above.
+
+| machine | what they measured |
+|---|---|
+| **Radeon AI PRO R9700 32 GB** (RDNA4, gfx1201), an older 6-core Xeon, 64 GB RAM, Linux | 262k context, MTP: Avalon **86.6 t/s** (85 – 93), prefill 4k / 16k / 32k 1,522 / 1,906 / 1,803 t/s; Strata on the same machine 31.0 t/s (UD-IQ4_XS; 33.8 with IQ3), prefill 988 / 1,837 / 1,872 t/s |
+| **RX 7900 XTX 24 GB**, PCIe 4.0 (X570), 64 GB DDR4, Linux | 131k context, `-ub 19072`, `GGML_SCHED_PREFETCH_EXPERTS=6`: prefill 2,024 – 2,043 t/s, generation 112.9 – 122.8 t/s (median 116.5) |
+| **RX 7900 XTX 24 GB**, Ryzen 7 5800X3D, 64 GB RAM, **Windows 11** ([ppkrol's port](https://github.com/ppkrol/Avalon_windows)) | 32k context, MTP, the file cache warm: 83.6 – 92.2 t/s; the first requests after a start are slower while the 64 GB fill |
+| **Radeon Pro W7800 48 GB** (RDNA3, 70 CUs) | one card 58 t/s without MTP, 87 with; two cards (all experts in VRAM) 46 and 70: compute-bound once the experts no longer come from RAM, not tuned for it |
+
+The R9700 row is the first one on RDNA4: Strata's own R9700 figures come from its maintainers' machine (DDR5, PCIe 5.0,
+125 – 251 GB of RAM), a different desk from this Xeon.
 
 ## Quality
 
@@ -201,9 +217,11 @@ prefill only uses the first GPU's PCIe link, so with two cards in x8 / x8 slots 
 - **One GPU measured.** Two or more: see above, experimental and untested.
 - **Tuned on RDNA3 with ROCm 7.2.** CUDA builds and was measured once, on a rented RTX 4090 (see
   [NVIDIA](#nvidia-cuda-one-rented-rtx-4090)); its kernels are not tuned for NVIDIA yet, and the installer is ROCm only.
-  Windows is untested.
-- **Base:** llama.cpp master of Oct 3, 2026, plus the commits of Oct 3 – 11 picked one by one; later master changes
-  are not in.
+  RDNA4 runs ([reported](#reported-by-users-not-verified-here) on an R9700), not measured here; the chunked prompt GDN
+  kernel is RDNA3-only.
+- **Windows:** ported by [ppkrol](https://github.com/ppkrol/Avalon_windows) (HIP SDK 7.2, measured on a 7900 XTX, see
+  [above](#reported-by-users-not-verified-here)) and merged here; a Windows installer is being tested.
+- **Base:** llama.cpp master up to Oct 31, 2026 (merged that day, a few commits left out for speed or overlap).
 
 ## Credits
 
