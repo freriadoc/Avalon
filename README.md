@@ -2,9 +2,9 @@
 
 # Avalon
 
-**91 tokens/s on an AMD RX 7900 XT (PCIe 3.0, Ryzen 7 3800XT, 64 GB DDR4) for Qwen3.8-Flash-Next (125B MoE).**
+**98 tokens/s on an AMD RX 7900 XT (PCIe 3.0, Ryzen 7 3800XT, 64 GB DDR4) for Qwen3.8-Flash-Next (125B MoE).**
 
-**32 GB of RAM is enough:** the 89 GiB model is bigger than RAM and VRAM combined, and still runs at 89 tokens/s.
+**16 GB of RAM is enough:** with the server capped at 14 GB, the 89 GiB model still runs at 90 tokens/s.
 
 Avalon is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) built for one model,
 [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) (512 experts, 10 active, 48 layers), on one
@@ -14,15 +14,16 @@ desktop most people would call old.
 | part | what we have | why it matters |
 |---|---|---|
 | CPU | **AMD Ryzen 7 3800XT** (Zen 2, Ryzen 3000 family, 2019), 8 cores | computes the experts that are not on the GPU |
-| RAM | **DDR4-3200, dual channel** (33 – 35 GB/s measured), 64 GB (32 GB is enough) | every expert missing from the GPU is read from here |
+| RAM | **DDR4-3200, dual channel** (33 – 35 GB/s measured), 64 GB (16 GB is enough) | every expert missing from the GPU is read from here |
 | GPU | **AMD Radeon RX 7900 XT 20 GB** (RDNA3, 2022), **ROCm**, no NVIDIA, no CUDA | holds the dense weights, the KV cache and a cache of the hottest experts |
 | bus | **PCIe 3.0 x16** (~14 GB/s), on a B450 board | every expert copied to the GPU goes through it |
 
 The model is ~89 GiB; the GPU holds ~4.6 GiB of dense weights plus a cache of 9 – 14 GiB of experts, the rest stays in
-RAM. **32 GB of RAM is enough**: the model is memory-mapped, and what does not fit is read again from the disk. With
-the server's RAM capped at 28 GB (a 32 GB machine), the MTP best case went from 91.2 to 89.0 t/s and the prefill of a new
-19k prompt from 1,283 to 889 t/s; with 58 GB generation was within 5% of 96 GB. The disk there is an NVMe SSD at
-~3 GB/s (PCIe 3.0); a SATA SSD was not measured, and with less RAM the prefill of new prompts depends on it.
+RAM. **16 GB of RAM is enough**: the model is memory-mapped, and what does not fit is read again from the disk. With
+the server's RAM capped at 14 GB (a 16 GB machine), the MTP best case was 90.3 t/s and 93.4 t/s after a 19k prompt
+(98.99 / 98.5 uncapped, same series); with 28 GB (a 32 GB machine), 89.0 t/s. The disk there is an NVMe SSD, a Kingston
+FURY Renegade (PCIe 4.0) running at PCIe 3.0, ~3 GB/s; a SATA SSD was not measured, and with less RAM the prefill of new
+prompts depends on it.
 
 ## Two ideas behind Avalon
 
@@ -43,52 +44,50 @@ driver; the AI is the engine, and the rest of the car.
 ## Speed
 
 [IQ3_KS hybrid](https://huggingface.co/freriadoc/Qwen3.8-Flash-Next-Avalon-GGUF) (2 – 4-bit experts, perplexity close
-to Unsloth's UD-IQ4_XS), greedy decoding, 512 tokens, median of 3 runs, MTP speculative decoding with 2 draft tokens:
+to Unsloth's UD-IQ4_XS), greedy decoding, 512 tokens, MTP speculative decoding with 2 draft tokens; best case: mean of 3
+answers, the other rows: median of 2 runs (Nov 1):
 
-| case | generation, no MTP | generation, MTP | prefill |
+| case | generation, no MTP | generation, MTP | prefill, no MTP / MTP |
 |---|---|---|---|
-| 32k context, short prompt, warm cache | 62.4 t/s | 91.0 t/s | 1,613 t/s* |
-| 256k context, 131k filled | 55.6 t/s | 74.5 t/s | 1,449 t/s |
-| 256k context, 250k filled | 50.5 t/s | 69.8 t/s | 1,319 t/s |
+| 32k context, short prompt, warm cache | 66.1 t/s | **98.4 t/s** | — |
+| 32k context, 32k filled | 62.3 t/s | 88.0 t/s | 1,854 / 1,680 t/s |
+| 256k context, 131k filled | 60.5 t/s | 88.0 t/s | 1,693 / 1,521 t/s |
+| 256k context, 250k filled | 57.3 t/s | 81.1 t/s | 1,491 / 1,342 t/s |
 
-\* Maximum prefill, measured with a 32k prompt filling the 32k context. Prefill figures are without MTP (with MTP:
-1,591 / 1,380 / 1,173 t/s).
-
-Since Oct 27 the MTP draft only writes its KV cache during prefill, and a prompt is split into batches of equal size
-(`-b` / `-ub 9536`) instead of leaving a short last batch that costs as much as a full one: a new 19k prompt with MTP
-went from ~1,410 to 1,660 t/s (+18%).
+Missed experts that every token of a verification routes only at rank 7 or lower are skipped, as Strata does (on by
+default; `GGML_CUDA_MOE_TAIL_SKIP=0` turns it off). Without it: 62.8 / 90.7 t/s on a short prompt, 51.2 / 71.0 t/s at
+250k filled, prefill within 3%. GSM8K is the same with and without (see [Quality](#quality)).
 
 The full 256k context fits with the MTP draft model, the KV cache in q8_0 / q4_0 and the expert cache, under 19.7 GiB
 of VRAM.
 
 ### Same machine, Strata
 
-With MTP, Avalon generates **almost 50% faster than Strata at equivalent quantization** (+47% for short prompt):
+With MTP, Avalon generates **44% faster than Strata** on a short prompt and 30% faster at 250k filled:
 
-| engine | generation, short prompt, no MTP / MTP | 256k context, 250k filled, no MTP / MTP | max prefill |
+| engine | short prompt, no MTP / MTP | 256k context, 250k filled, no MTP / MTP | max prefill |
 |---|---|---|---|
-| **Avalon** | **62.4 / 91.0 t/s** | **50.5 / 69.8 t/s** | **1,613 t/s** |
-| [Strata](https://github.com/Niko1221/Strata) 0.1.43 (HIP) | 49.0 / 61.9 t/s | 41.8 / 50.0 t/s | 1,376 t/s |
+| **Avalon** | **66.1 / 98.4 t/s** | **57.3 / 81.1 t/s** | **1,854 t/s** |
+| [Strata](https://github.com/Niko1221/Strata) v0.2.9 (HIP) | 51.1 / 68.4 t/s | 48.3 / 62.6 t/s | 1,453 t/s |
 
-Measured the same night with the same protocol; Strata serves ISTA's IQ3_S model, the one our experts come from, with
-its own drafters on.
+Same day, same protocol, both with the tail skip on; Strata serves ISTA's IQ3_S model, the one our experts come from,
+with its own drafters on.
 
 ### NVIDIA (CUDA), one rented RTX 4090
 
-The same code builds and runs with CUDA. Measured once, on a rented cloud machine: an **RTX 4090 24 GB** in PCIe 4.0
-x16, an **AMD EPYC 7352** (Zen 2, 24 cores, the container capped at ~20 of them, 1.5 – 2.3 GHz), CUDA 12.4, the
-same model and launcher with backend sampling (the verification's argmax on the GPU, see [Run](#run)), MTP with 2 draft tokens,
-greedy, 512 tokens:
+The same code builds and runs with CUDA. Measured on one rented machine, both engines one after the other: an **RTX
+4090 24 GB** in PCIe 4.0 x16, an **AMD EPYC 7443** (24 cores), MTP with 2 draft tokens (Strata: its own MTP and suffix
+drafters), greedy, 512 tokens (Nov 1):
 
-| case | generation, MTP | prefill |
+| case | Avalon | Strata v0.2.9 |
 |---|---|---|
-| 32k context, short prompt, warm cache | **120.5 t/s** (mean of 5 answers, 114.5 – 125.4) | — |
-| 32k context, after a 19k prompt | 110.6 t/s | 1,819 – 2,330 t/s |
-| 256k context, 131k filled | 106.6 t/s | 2,242 t/s |
-| 256k context, 250k filled | **99.5 t/s** | 2,280 t/s |
+| 32k context, short prompt, MTP | **141.9 t/s** | 141.4 t/s |
+| 32k context, short prompt, no MTP | 98.0 t/s | 101.5 t/s (suffix drafter only) |
+| 32k context, after a 19k prompt, MTP / prefill | **137.7 t/s** / 3,113 t/s | 130.8 t/s / 3,422 t/s |
+| 256k context, 128k filled, MTP / prefill | **132.6 t/s** / 3,130 t/s | 123.6 t/s / 4,312 t/s |
+| 256k context, 250k filled, MTP / prefill | 123.8 t/s / 2,986 t/s | 128.5 t/s / 4,319 t/s |
 
-One run per row (not medians), VRAM peak 22.9 GiB of 24. Generation without MTP was not measured there. It is a
-first measurement on a machine I do not own, not a tuned result: the kernels are still tuned for RDNA3.
+VRAM peak ~23.5 GiB of 24 for both. The kernels are still tuned for RDNA3; Strata's prefill is faster on this card.
 
 ### Reported by users (not verified here)
 
@@ -98,7 +97,7 @@ from the tables above.
 | machine | what they measured |
 |---|---|
 | **Radeon AI PRO R9700 32 GB** (RDNA4, gfx1201), an older 6-core Xeon, 64 GB RAM, Linux | 262k context, MTP: Avalon **86.6 t/s** (85 – 93), prefill 4k / 16k / 32k 1,522 / 1,906 / 1,803 t/s; Strata on the same machine 31.0 t/s (UD-IQ4_XS; 33.8 with IQ3), prefill 988 / 1,837 / 1,872 t/s |
-| **RX 7900 XTX 24 GB**, PCIe 4.0 (X570), 64 GB DDR4, Linux | 131k context, `-ub 19072`, `GGML_SCHED_PREFETCH_EXPERTS=6`: prefill 2,024 – 2,043 t/s, generation 112.9 – 122.8 t/s (median 116.5) |
+| **RX 7900 XTX 24 GB**, Ryzen 9 5900X, PCIe 4.0 (X570), 64 GB DDR4-3200, Linux | 131k context, `-ub 19072`, `GGML_SCHED_PREFETCH_EXPERTS=6`: prefill 2,024 – 2,043 t/s, generation 112.9 – 122.8 t/s (median 116.5); a later version with `--moe-cache-cpu-overlap 2`: prefill 2,113 – 2,130 t/s |
 | **RX 7900 XTX 24 GB**, Ryzen 7 5800X3D, 64 GB RAM, **Windows 11** ([ppkrol's port](https://github.com/ppkrol/Avalon_windows)) | 32k context, MTP, the file cache warm: 83.6 – 92.2 t/s; the first requests after a start are slower while the 64 GB fill |
 | **Radeon Pro W7800 48 GB** (RDNA3, 70 CUs) | one card 58 t/s without MTP, 87 with; two cards (all experts in VRAM) 46 and 70: compute-bound once the experts no longer come from RAM, not tuned for it |
 
@@ -122,7 +121,11 @@ Misérables*, SQLite and CPython sources; lower is better):
 The hybrid keeps ISTA's experts and requantizes the up/gate tensors of 27 layers from the original BF16 weights with an
 importance matrix: it beats the IQ3_S model Strata runs on all three texts and comes close to Unsloth's UD-IQ4_XS. The
 KV cache in q8_0 / q4_0 adds 0.016 of KL divergence over f16 at 32 – 64k of context (same English text, measured on an
-earlier quantization of the model). The MTP draft head agrees with the model on 80.7% of the positions of a fixed text.
+earlier quantization of the model). The MTP draft head agrees with the model on 80.7% of the positions of a fixed text (teacher-forced); in greedy
+generation its acceptance follows the text: 0.55 – 0.65 on prose, up to ~0.95 on code or copied passages.
+
+GSM8K (the first 200 problems of the test set, greedy, 4,096 tokens at most): **Avalon 196 / 200 (98.0%), Strata 196 /
+200 (98.0%)** on ISTA's IQ3_S.
 
 ## What makes it fast
 
@@ -145,7 +148,7 @@ curl -fsSL https://raw.githubusercontent.com/freriadoc/Avalon/main/install.sh | 
 ```
 
 The installer checks the machine (Linux, AVX2, ROCm 7.x, an RDNA3 GPU, or RDNA4: reported working on a Radeon AI PRO
-R9700, not measured here; 32 GB of RAM or more, ~98 GiB of disk), builds
+R9700, not measured here; 16 GB of RAM or more, ~98 GiB of disk), builds
 `llama-server` for the detected GPU, downloads the model and its MTP head (~89 GiB, resumable), verifies every file
 against its SHA-256 on Hugging Face and installs an `avalon-server` launcher in `~/.local/bin` with the command of
 [Run](#run). Settings (environment): `AVALON_DIR`, `MODEL_DIR`, `BIN_DIR`, `AMDGPU_TARGETS`, `SKIP_MODEL=1` (build
@@ -215,7 +218,7 @@ prefill only uses the first GPU's PCIe link, so with two cards in x8 / x8 slots 
 - **One model.** Avalon is tuned for Qwen3.8-Flash-Next; the GGUF files above use types and a layout stock llama.cpp
   does not have. Other models run as in llama.cpp, without the expert cache work.
 - **One GPU measured.** Two or more: see above, experimental and untested.
-- **Tuned on RDNA3 with ROCm 7.2.** CUDA builds and was measured once, on a rented RTX 4090 (see
+- **Tuned on RDNA3 with ROCm 7.2.** CUDA builds and was measured on rented RTX 4090s (see
   [NVIDIA](#nvidia-cuda-one-rented-rtx-4090)); its kernels are not tuned for NVIDIA yet, and the installer is ROCm only.
   RDNA4 runs ([reported](#reported-by-users-not-verified-here) on an R9700), not measured here; the chunked prompt GDN
   kernel is RDNA3-only.
