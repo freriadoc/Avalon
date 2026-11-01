@@ -155,6 +155,21 @@ only), `FORCE=1`; see the top of `install.sh`. Then:
 avalon-server          # OpenAI-compatible API on http://127.0.0.1:8080; extra arguments go to llama-server
 ```
 
+### Windows (experimental)
+
+Double-click `install.cmd` in a clone, or in PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/freriadoc/Avalon/main/install.ps1 | iex
+```
+
+It makes the same checks, installs what it lacks with winget (Git, Python 3, Visual Studio 2022 Build Tools with the
+MSVC 14.44 toolset, CMake and Ninja; the AMD HIP SDK 7.2 is not on winget: the installer opens its download page and
+stops, run it again once installed), builds `llama-server` with the HIP SDK's clang, downloads and verifies the model
+and writes `avalon-server.cmd` with an "Avalon server" shortcut on the desktop. The Windows port is by
+[ppkrol](https://github.com/ppkrol/Avalon_windows) (RX 7900 XTX, 64 GB: ~87 t/s with MTP once the file cache is warm);
+the installer itself is new and has not been run by anyone yet.
+
 ## Build (Linux, ROCm)
 
 By hand, without the installer. Tested with ROCm 7.2.4 on gfx1100 (RX 7900 XT / XTX).
@@ -216,7 +231,8 @@ prefill only uses the first GPU's PCIe link, so with two cards in x8 / x8 slots 
   does not have. Other models run as in llama.cpp, without the expert cache work.
 - **One GPU measured.** Two or more: see above, experimental and untested.
 - **Tuned on RDNA3 with ROCm 7.2.** CUDA builds and was measured once, on a rented RTX 4090 (see
-  [NVIDIA](#nvidia-cuda-one-rented-rtx-4090)); its kernels are not tuned for NVIDIA yet, and the installer is ROCm only.
+  [NVIDIA](#nvidia-cuda-one-rented-rtx-4090)); its kernels are not tuned for NVIDIA yet, and the installers are ROCm / HIP
+  SDK only.
   RDNA4 runs ([reported](#reported-by-users-not-verified-here) on an R9700), not measured here; the chunked prompt GDN
   kernel is RDNA3-only.
 - **Windows:** ported by [ppkrol](https://github.com/ppkrol/Avalon_windows) (HIP SDK 7.2, measured on a 7900 XTX, see
