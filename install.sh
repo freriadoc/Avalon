@@ -45,20 +45,22 @@ case "$rocm_ver" in
     *)   fail "ROCm $rocm_ver found; Avalon is tested with ROCm 7.2.4 only" ;;
 esac
 
-# GPU: RDNA3 discrete (gfx1100 measured; gfx1101 / gfx1102 should work); APUs and older generations are refused
+# GPU: RDNA3 (gfx1100 measured; gfx1101 / gfx1102 should work) or RDNA4 (gfx1200 / gfx1201: reported working by a user,
+# a Radeon AI PRO R9700, not measured here); APUs and older generations are refused
 if [ -z "${AMDGPU_TARGETS:-}" ]; then
     gfx=$("$ROCM/bin/rocminfo" 2>/dev/null | grep -oE '\bgfx[0-9a-f]+\b' | sort -u | tr '\n' ' ' || true)
-    for g in gfx1100 gfx1101 gfx1102; do
+    for g in gfx1100 gfx1101 gfx1102 gfx1201 gfx1200; do
         case " $gfx " in *" $g "*) AMDGPU_TARGETS=$g; break ;; esac
     done
     if [ -z "${AMDGPU_TARGETS:-}" ]; then
-        fail "no RDNA3 discrete GPU found (rocminfo reports: ${gfx:-nothing}). Avalon's kernels target gfx1100 / gfx1101 / gfx1102"
+        fail "no RDNA3 / RDNA4 discrete GPU found (rocminfo reports: ${gfx:-nothing}). Avalon's kernels target gfx1100 - gfx1102 and gfx1200 / gfx1201"
         AMDGPU_TARGETS=${gfx%% *}
     fi
 fi
 case "$AMDGPU_TARGETS" in
-    gfx1100) echo "GPU $AMDGPU_TARGETS (RX 7900 XT / XTX: the measured target)" ;;
-    *)       warn "GPU $AMDGPU_TARGETS: should work, not measured (Avalon is tuned on a gfx1100)" ;;
+    gfx1100)         echo "GPU $AMDGPU_TARGETS (RX 7900 XT / XTX: the measured target)" ;;
+    gfx1200|gfx1201) warn "GPU $AMDGPU_TARGETS (RDNA4): reported working by a user (R9700), not measured here; some prompt kernels are RDNA3-only" ;;
+    *)               warn "GPU $AMDGPU_TARGETS: should work, not measured (Avalon is tuned on a gfx1100)" ;;
 esac
 
 vram_mib=0

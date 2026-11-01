@@ -128,7 +128,8 @@ earlier quantization of the model). The MTP draft head agrees with the model on 
 curl -fsSL https://raw.githubusercontent.com/freriadoc/Avalon/main/install.sh | bash
 ```
 
-The installer checks the machine (Linux, AVX2, ROCm 7.x, an RDNA3 GPU, 32 GB of RAM or more, ~98 GiB of disk), builds
+The installer checks the machine (Linux, AVX2, ROCm 7.x, an RDNA3 GPU, or RDNA4: reported working on a Radeon AI PRO
+R9700, not measured here; 32 GB of RAM or more, ~98 GiB of disk), builds
 `llama-server` for the detected GPU, downloads the model and its MTP head (~89 GiB, resumable), verifies every file
 against its SHA-256 on Hugging Face and installs an `avalon-server` launcher in `~/.local/bin` with the command of
 [Run](#run). Settings (environment): `AVALON_DIR`, `MODEL_DIR`, `BIN_DIR`, `AMDGPU_TARGETS`, `SKIP_MODEL=1` (build
