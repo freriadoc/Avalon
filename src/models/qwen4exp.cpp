@@ -1275,6 +1275,25 @@ llama_model_qwen4exp::graph::qsa_sel llama_model_qwen4exp::graph::build_qsa_sel(
     const size_t  slice_bytes = (size_t) 512 << 20;
     const int64_t n_slice     = std::max<int64_t>(1, (int64_t) (slice_bytes / (n_kv*ggml_type_size(GGML_TYPE_F16))));
     qsa_sel res_d;
+    // the tile mask: the indexer's scores still by slices (its [n_pool, n_t] F32 grows like the dense mask), their
+    // selections joined, then one mask by tiles of 16 queries for one flash attention (ggml-cuda's sparse kernel reads
+    // it with its lists, no dense mask); LLAMA_QSA_TILES=0 keeps the dense slices
+    static const bool qsa_tiles = [] { const char * e = getenv("LLAMA_QSA_TILES"); return !e || atoi(e) != 0; }();
+    if (qsa_tiles && n_slice < n_tokens && pos_mode && cparams.flash_attn && n_tokens > 8) {
+        ggml_tensor * sel_all   = nullptr;
+        ggml_tensor * score_all = nullptr;
+        for (int64_t t0 = 0; t0 < n_tokens; t0 += n_slice) {
+            const slice_sel ss = select(t0, std::min(n_slice, n_tokens - t0));
+            sel_all   = sel_all   ? ggml_concat(ctx0, sel_all,   ss.sel_idx,   1) : ss.sel_idx;
+            score_all = score_all ? ggml_concat(ctx0, score_all, ss.top_score, 1) : ss.top_score;
+            // queued now, so that the next slice can reuse this one's scores
+            ggml_build_forward_expand(gf, sel_all);
+            ggml_build_forward_expand(gf, score_all);
+        }
+        res_d.tiles = ggml_qsa_select_tiles(ctx0, sel_all, score_all, inp_kpool->cell_pos, inp_kpool->tok_pos, (int32_t) kpool, 16);
+        cb(res_d.tiles, "indexer_sel_tiles", il);
+        return res_d;
+    }
     if (n_slice < n_tokens && (pos_mode || kq_mask->ne[2]*kq_mask->ne[3] == 1)) {
         res_d.dense_slice = dense;
         res_d.n_slice     = n_slice;
@@ -1355,14 +1374,35 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         return cur;
     }
 
+    if (sel.tiles) {
+        // one flash attention for all the queries, by the tile mask; a q8_0 K and a q4_0 V stay as they are: ggml-cuda
+        // gathers them quantized from 64k cells (no f16 copy), below converts them once in the flash attention's node
+        const bool kv_direct = k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q4_0;
+        if (ggml_is_quantized(k->type) && !kv_direct) {
+            k = ggml_cast(ctx0, k, GGML_TYPE_F16);
+        }
+        if (ggml_is_quantized(v->type) && !kv_direct) {
+            v = ggml_cast(ctx0, v, GGML_TYPE_F16);
+        }
+        ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, sel.tiles, nullptr, nullptr, n_sel, kq_scale, il);
+        cb(cur, "kqv_out", il);
+
+        if (inp->self_v_rot) {
+            cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+        }
+        return cur;
+    }
+
     if (sel.dense_slice) {
         // the queries by slices, each with its own dense mask (see build_qsa_sel). Flash attention
         // converts a quantized K/V to f16 into a buffer counted in its node, once per launch (512 MiB at
-        // 256k): convert them once for the layer, every slice reads the copies
-        if (ggml_is_quantized(k->type)) {
+        // 256k): convert them once for the layer, every slice reads the copies. From 64k cells a q8_0 K and a
+        // q4_0 V stay as they are: ggml-cuda's sparse gather reads them directly (no copy: 512 MiB at 256k)
+        const bool kv_direct = k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q4_0 && k->ne[2] >= 65536;
+        if (ggml_is_quantized(k->type) && !kv_direct) {
             k = ggml_cast(ctx0, k, GGML_TYPE_F16);
         }
-        if (ggml_is_quantized(v->type)) {
+        if (ggml_is_quantized(v->type) && !kv_direct) {
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
         }
         const int64_t n_tok = q->ne[2];

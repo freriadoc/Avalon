@@ -2628,6 +2628,9 @@ struct llama_model_qwen4exp : public llama_model_base {
             // (n_slice queries) so that no tensor of the selection exceeds a fixed size
             std::function<ggml_tensor * (int64_t t0, int64_t n)> dense_slice;
             int64_t n_slice = 0;
+            // or, for the flash attention of all the queries at once, the mask by tiles of 16 queries
+            // (ggml_qsa_select_tiles: each tile's list of chosen cells, each query's mask at the list's positions)
+            ggml_tensor * tiles = nullptr;
         };
 
         // self-attention over the cells the QSA selection keeps
