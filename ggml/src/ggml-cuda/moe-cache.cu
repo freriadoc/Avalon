@@ -424,7 +424,12 @@ struct moe_cache_scratch {
 // stream does not synchronize with them.
 static constexpr cudaStream_t moe_cache_zone_stream = nullptr;
 
+// a pool lends at most this share of its slab (moe_cache_pool_lendable)
+static constexpr int moe_cache_lend_percent = 95;
+
 struct moe_cache_device {
+    // the largest piece one pool lends while the prefetch holds its zones, set once with the zones (moe_cache_largest_lend)
+    std::atomic<size_t> largest_lend_bytes{0};
     moe_cache_device(int logical, int physical) : logical(logical), physical(physical) {}
 
     int logical;
@@ -3905,6 +3910,20 @@ static void moe_cache_setup_zone(moe_cache_device & device, size_t zone_bytes, i
                 device.physical, ggml_type_name((ggml_type)pool.wtype), count[i], slice[i], region0,
                 ((size_t)count[i] * slice[i] * pool.expert_size) >> 20, pool.zone_begin);
     }
+    {
+        size_t best = 0;
+        for (const auto & pool_ptr : device.pools) {
+            const moe_cache_pool & pool = *pool_ptr;
+            if (pool.ranges.empty() || !pool.expert_size) {
+                continue;
+            }
+            const int region0 = pool.ranges[0].count;
+            const int zone    = pool.zone_end > pool.zone_begin ? pool.zone_end - pool.zone_begin : 0;
+            const int lend    = (int) ((int64_t) region0 * moe_cache_lend_percent / 100) - zone;
+            best = std::max(best, (size_t) std::max(lend, 0) * pool.expert_size);
+        }
+        device.largest_lend_bytes.store(best);
+    }
     if (equipped < n_zones) {
         MOE_CACHE_LOG("[moe-cache] CUDA%d zone: only %d of %d prefetch slots reserved%s\n",
                 device.physical, equipped, n_zones,
@@ -4891,7 +4910,6 @@ static int moe_cache_lend(void * opaque, void * backend, size_t bytes, void ** z
 // How much of a pool may be lent out at once, prefetch zone included. The cache is
 // bypassed while the memory is lent (it is lent for a prefill), so this floor only has
 // to keep the pool usable for the single-token nodes of the last layer.
-static constexpr int moe_cache_lend_percent = 95;
 
 // How far a pool may be lent beyond the least-lent one that could also take the block.
 // Measured over the real chunk list at two cache sizes: at 5 or 10 points the early
@@ -4917,6 +4935,15 @@ static int moe_cache_pool_lendable(const moe_cache_pool & pool) {
     const int floor = region0 - (int)((int64_t)region0 * moe_cache_lend_percent / 100);
     const int low = moe_cache_pool_lend_low(pool);
     return low > floor ? low - floor : 0;
+}
+
+static size_t moe_cache_largest_lend(void * opaque, void * backend) {
+    moe_cache_session * session = (moe_cache_session *) opaque;
+    if (!session) {
+        return 0;
+    }
+    moe_cache_device * device = moe_cache_device_for_backend(*session, backend);
+    return device && !device->dead.load() ? device->largest_lend_bytes.load() : 0;
 }
 
 // Seat a whole list of chunks at once: every assignment of the chunks to the pools that
@@ -7823,6 +7850,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.assign = moe_cache_assign;
     ggml_moe_cache.prepare_queues = moe_cache_prepare_queues;
     ggml_moe_cache.hosted_max_rows = moe_hosted_max_rows;
+    ggml_moe_cache.largest_lend = moe_cache_largest_lend;
     ggml_moe_cache.plan = nullptr;   // nodes are served by the hosted MoE only (moe_cache_begin)
     ggml_moe_cache.dispatch = nullptr;   // nodes are served by the hosted MoE only (moe_cache_begin)
     ggml_moe_cache.collect = nullptr;   // nodes are served by the hosted MoE only (moe_cache_begin)

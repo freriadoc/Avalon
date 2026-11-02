@@ -733,7 +733,7 @@ void llama_context::sched_reserve() {
     const int64_t t_start_us = ggml_time_us();
 
     const uint32_t n_seqs = cparams.n_seq_max;
-    const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+    uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
     const size_t max_nodes = this->graph_max_nodes(n_tokens);
 
@@ -848,6 +848,16 @@ void llama_context::sched_reserve() {
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
                 set_moe_cache();
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
+            }
+            // A batch's tensors grow with it: on a small card no pool of the MoE cache may hold one of them in one
+            // piece (the routed experts' outputs before their weighted sum, n_embd x n_expert_used x n_ubatch: 931 MiB
+            // at 9536 on a 12 GB card), and nothing else has room. The batch is halved until the graph fits;
+            // the prompt is then split into more batches (slower prefill), generation is unchanged.
+            while (!gf && cparams.n_ubatch > 512) {
+                cparams.n_ubatch = std::max<uint32_t>(512, cparams.n_ubatch / 2 / 256 * 256);
+                n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+                LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying with n_ubatch = %u\n", __func__, cparams.n_ubatch);
+                gf = graph_reserve(n_tokens, n_seqs, std::min(n_tokens, cparams.n_outputs_max), mctx.get());
             }
             if (!gf) {
                 throw std::runtime_error("failed to allocate compute pp buffers");

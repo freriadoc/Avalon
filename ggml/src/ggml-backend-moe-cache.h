@@ -206,6 +206,9 @@ struct ggml_moe_cache_api {
     void (*prepare_queues)(void * session, const struct ggml_cgraph * graph);
     // the routed rows of the largest MoE block the backend hosts (the scheduler leaves no larger one on the GPU)
     int  (*hosted_max_rows)(void);
+    // the largest piece one pool of the backend's device can lend now, 0 when not known (the compute buffers borrowed
+    // from the cache are asked in chunks no larger: a small card's pools are smaller than the default chunk)
+    size_t (*largest_lend)(void * session, void * backend);
 };
 
 GGML_API struct ggml_moe_cache_api ggml_moe_cache;

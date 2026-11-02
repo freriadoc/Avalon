@@ -1183,7 +1183,6 @@ struct ggml_backend_cuda_borrowed_buffer_type_context {
 };
 
 static size_t ggml_backend_cuda_borrowed_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
-    GGML_UNUSED(buft);
     // the cache lends contiguous runs of one pool: ask ggml-alloc for chunks it can serve
     static const size_t max_chunk = [] () -> size_t {
         const char * text = getenv("GGML_SCHED_BORROW_CHUNK_MB");
@@ -1195,6 +1194,15 @@ static size_t ggml_backend_cuda_borrowed_buffer_type_get_max_size(ggml_backend_b
         // 237 MiB but 77 %. Measured, not derived: the best value moves with the graph.
         return (value > 0 ? (size_t)value : 1024) << 20;
     }();
+    // on a small card no pool lends that much in one piece (12 GB at 131k: the largest ~900 MiB): chunks of what
+    // the largest pool can lend now, rounded down to 64 MiB, 256 MiB at least (a single larger tensor keeps a chunk
+    // of its own: ggml-alloc never splits a tensor)
+    const auto * ctx = (const ggml_backend_cuda_borrowed_buffer_type_context *) buft->context;
+    const size_t lend = ggml_moe_cache.largest_lend ? ggml_moe_cache.largest_lend(ctx->session, ctx->backend) : 0;
+    if (lend > 0) {
+        const size_t mib64 = (size_t) 64 << 20;
+        return std::min(max_chunk, std::max<size_t>((size_t) 256 << 20, lend / mib64 * mib64));
+    }
     return max_chunk;
 }
 
