@@ -196,6 +196,18 @@ cache takes the rest of the VRAM, and the cache is prefilled from `moe-cache-ran
 On NVIDIA, backend sampling is on by default: the target's argmax runs on the GPU instead of over 248k logits on the
 CPU, 6% faster per step on the RTX 4090 (neutral on the RX 7900 XT, where it stays off; `-bs` / `-no-bs` force it).
 
+### With Lemonade (untested)
+
+[Lemonade](https://github.com/lemonade-sdk/lemonade) can run Avalon's `llama-server` in place of its own ROCm build:
+start `lemond` with `LEMONADE_LLAMACPP_ROCM_BIN=/path/to/Avalon/build/bin/llama-server` (for the systemd service, in
+its environment), list the model where it is with `lemonade config set extra_models_dir=/path/to/models` (the 33 parts
+are one model; `lemonade list` gives its name), and give it Avalon's settings in `recipe_options.json`: `"ctx_size":
+262144`, `"llamacpp_backend": "rocm"` and `"llamacpp_args": "-b 9536 -ub 9536 -fa on -ctk q8_0 -ctv q4_0 -md
+/path/to/models/Qwen3.8-Flash-Next-Avalon-GGUF/MTP/mtp-Qwen3.8-Flash-Next-shared-IQ3K-IQ4NL-FR65k.gguf --spec-type
+draft-mtp --spec-draft-n-max 2 -ubd 256 -ctkd q8_0 -ctvd q8_0"`. Lemonade adds the model, the context, the port,
+`--jinja` and `--parallel 1` itself and no `-ngl`, so `--fit` keeps placing the model. Not tried yet: if you do, please
+open an issue with what worked or not.
+
 ### Two or more GPUs (experimental, untested)
 
 ```bash
