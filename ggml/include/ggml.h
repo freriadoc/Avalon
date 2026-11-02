@@ -2722,6 +2722,9 @@ extern "C" {
         GGML_QSA_SELECT_POOL_MEMBERS = 4,
         GGML_QSA_SELECT_POOL_REP     = 5,
         GGML_QSA_SELECT_POOL_END     = 6,
+        // the cells a tile of queries chose, for a sparse flash attention (ggml_qsa_select_tiles)
+        GGML_QSA_SELECT_TILE_ROWS    = 7,
+        GGML_QSA_SELECT_TILE_MASK    = 8,
     };
 
     GGML_API struct ggml_tensor * ggml_qsa_select(
@@ -2732,6 +2735,21 @@ extern "C" {
             struct ggml_tensor     * tok_pos,
             int32_t                  kpool,
             enum ggml_qsa_select_mode mode);
+
+    // The selection of QSA_SELECT gathered per tile of ncols queries, for a sparse flash attention that reads it as it is
+    // (no dense [n_kv, n_t] mask): the result is the tile mask F16 [n_list, ncols, n_tiles], query j of tile t at
+    // position i of its tile's list: the visibility of that cell if the query chose it, -inf otherwise. Its src[4] is the
+    // lists, I32 [n_list*n_tiles + n_tiles]: tile t's cells (sorted, each once) from n_list*t, padded with the last one
+    // complemented (~c, negative), then the live count of every tile. n_list: min(n_kv, ncols*n_sel) rounded up to 256.
+    // The queries of a partial last tile see nothing; sel, top_score, vis and tok_pos as for ggml_qsa_select.
+    GGML_API struct ggml_tensor * ggml_qsa_select_tiles(
+            struct ggml_context    * ctx,
+            struct ggml_tensor     * sel,
+            struct ggml_tensor     * top_score,
+            struct ggml_tensor     * vis,
+            struct ggml_tensor     * tok_pos,
+            int32_t                  kpool,
+            int32_t                  ncols);
 
     // the k-pool layout of one sequence whose positions are contiguous, from the positions of its cells (the tables
     // the QSA indexer and selection read, built on the device instead of on the host every graph)

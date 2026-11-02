@@ -70,8 +70,178 @@ static __global__ void k_qsa_pool_layout(const int32_t * __restrict__ cell_pos, 
     }
 }
 
+// ggml_qsa_select_tiles. The lists: a block per tile, the tile's chosen cells marked in a bitmap of the context in
+// shared memory (32 KiB at 256k cells), then read in cell order (a scan of the words' counts) into the sorted list.
+static constexpr int qsa_tiles_threads = 512;
+static constexpr int qsa_tiles_max_kv  = 480 << 10;   // the bitmap: 60 KiB, under the 64 KiB of a block with the scan's
+
+template <bool by_pos>
+static __global__ void k_qsa_tile_rows(const int32_t * __restrict__ sel, const float * __restrict__ top_score,
+        int32_t * __restrict__ lists, const int64_t n_sel, const int64_t n_top, const int64_t n_kv, const int32_t kpool,
+        const int64_t s_sel, const int64_t s_score, const int64_t n_t, const int32_t ncols, const int64_t n_list, const int64_t n_tiles) {
+    extern __shared__ uint32_t bits[];
+    __shared__ int32_t warp_sums[qsa_tiles_threads / 32];
+    __shared__ int32_t base;
+    const int64_t tile = blockIdx.x;
+    const int n_words = (int) ((n_kv + 31) / 32);
+    for (int w = threadIdx.x; w < n_words; w += blockDim.x) {
+        bits[w] = 0;
+    }
+    if (threadIdx.x == 0) {
+        base = 0;
+    }
+    __syncthreads();
+    const int64_t t0 = tile*ncols;
+    const int64_t t1 = min(n_t, t0 + ncols);
+    for (int64_t t = t0; t < t1; t++) {
+        for (int64_t j = threadIdx.x; j < n_sel; j += blockDim.x) {
+            const int32_t c = sel[t*s_sel + j];
+            if (c >= 0 && c < n_kv && (j >= n_top*kpool || top_score[t*s_score + j/kpool] != -INFINITY)) {
+                atomicOr(&bits[c >> 5], 1u << (c & 31));
+            }
+        }
+    }
+    __syncthreads();
+    int32_t * l = lists + n_list*tile;
+    // the words in order, a chunk of blockDim.x at a time: the count before each word from a block scan
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    for (int w0 = 0; w0 < n_words; w0 += blockDim.x) {
+        const int w = w0 + threadIdx.x;
+        const uint32_t word = w < n_words ? bits[w] : 0u;
+        const int cnt = __popc(word);
+        int incl = cnt;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const int v = __shfl_up_sync(0xFFFFFFFF, incl, o, 32);
+            if (lane >= o) {
+                incl += v;
+            }
+        }
+        if (lane == 31) {
+            warp_sums[warp] = incl;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            int acc = 0;
+            for (int k = 0; k < (int) (blockDim.x / 32); k++) {
+                const int v = warp_sums[k];
+                warp_sums[k] = acc;
+                acc += v;
+            }
+        }
+        __syncthreads();
+        int pos = base + warp_sums[warp] + incl - cnt;
+        uint32_t rest = word;
+        while (rest) {
+            const int b = __ffs(rest) - 1;
+            rest &= rest - 1;
+            if (pos < n_list) {
+                l[pos] = w*32 + b;
+            }
+            pos++;
+        }
+        __syncthreads();
+        if (threadIdx.x == blockDim.x - 1) {
+            base += warp_sums[warp] + incl;
+        }
+        __syncthreads();
+    }
+    const int32_t count = min((int64_t) base, n_list);
+    const int32_t pad = ~(count > 0 ? l[count - 1] : 0);
+    for (int64_t i = count + threadIdx.x; i < n_list; i += blockDim.x) {
+        l[i] = pad;
+    }
+    if (threadIdx.x == 0) {
+        lists[n_list*n_tiles + tile] = count;
+    }
+    GGML_UNUSED(by_pos);
+}
+
+// The tile mask: a block per (tile, query), the row at -inf, then each chosen cell at its place in the tile's list
+template <bool by_pos>
+static __global__ void k_qsa_tile_mask(const int32_t * __restrict__ sel, const float * __restrict__ top_score,
+        const void * __restrict__ vis, const int32_t * __restrict__ tok_pos, const int32_t * __restrict__ lists,
+        half * __restrict__ dst, const int64_t n_sel, const int64_t n_top, const int64_t n_kv, const int32_t kpool,
+        const int64_t s_sel, const int64_t s_score, const int64_t s_mask, const int64_t n_t, const int32_t ncols,
+        const int64_t n_list, const int64_t n_tiles) {
+    const int64_t tile = blockIdx.x;
+    const int     j    = blockIdx.y;
+    half * m = dst + (tile*ncols + j)*n_list;
+    for (int64_t i = threadIdx.x; i < n_list; i += blockDim.x) {
+        m[i] = __float2half(-INFINITY);
+    }
+    __syncthreads();
+    const int64_t t = tile*ncols + j;
+    if (t >= n_t) {
+        return;
+    }
+    const int32_t * l = lists + n_list*tile;
+    const int32_t count = lists[n_list*n_tiles + tile];
+    for (int64_t s = threadIdx.x; s < n_sel; s += blockDim.x) {
+        const int32_t c = sel[t*s_sel + s];
+        if (!(c >= 0 && c < n_kv && (s >= n_top*kpool || top_score[t*s_score + s/kpool] != -INFINITY))) {
+            continue;
+        }
+        int lo = 0, hi = count;
+        while (lo < hi) {
+            const int mid = (lo + hi) / 2;
+            if (l[mid] < c) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if (lo < count && l[lo] == c) {
+            m[lo] = qsa_visibility<by_pos>(vis, tok_pos, s_mask, t, c);
+        }
+    }
+}
+
+static void qsa_select_tiles(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const int32_t mode   = ggml_get_op_params_i32(dst, 1);
+    const int32_t kpool  = ggml_get_op_params_i32(dst, 0);
+    const int32_t ncols  = ggml_get_op_params_i32(dst, 2);
+    const int64_t n_list = ggml_get_op_params_i32(dst, 3);
+    const ggml_tensor * sel       = dst->src[0];
+    const ggml_tensor * top_score = dst->src[1];
+    const ggml_tensor * vis       = dst->src[2];
+    const ggml_tensor * tok_pos   = dst->src[3];
+    const bool    by_pos  = vis->type == GGML_TYPE_I32;
+    const int64_t n_kv    = vis->ne[0];
+    const int64_t n_t     = sel->ne[1];
+    const int64_t n_tiles = (n_t + ncols - 1) / ncols;
+    const int64_t s_sel   = sel->nb[1] / sizeof(int32_t);
+    const int64_t s_score = top_score->nb[1] / sizeof(float);
+    const int64_t s_mask  = by_pos ? 0 : vis->nb[1] / sizeof(half);
+    cudaStream_t stream = ctx.stream();
+    if (mode == GGML_QSA_SELECT_TILE_ROWS) {
+        GGML_ASSERT(n_kv <= qsa_tiles_max_kv);
+        const size_t smem = ((n_kv + 31) / 32) * sizeof(uint32_t);
+        static bool smem_raised = false;
+        if (!smem_raised) {
+            CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<const void *>(k_qsa_tile_rows<false>), cudaFuncAttributeMaxDynamicSharedMemorySize, (qsa_tiles_max_kv/32)*sizeof(uint32_t)));
+            CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<const void *>(k_qsa_tile_rows<true>),  cudaFuncAttributeMaxDynamicSharedMemorySize, (qsa_tiles_max_kv/32)*sizeof(uint32_t)));
+            smem_raised = true;
+        }
+        const auto kernel = by_pos ? k_qsa_tile_rows<true> : k_qsa_tile_rows<false>;
+        kernel<<<(unsigned) n_tiles, qsa_tiles_threads, smem, stream>>>((const int32_t *) sel->data, (const float *) top_score->data,
+            (int32_t *) dst->data, sel->ne[0], top_score->ne[0], n_kv, kpool, s_sel, s_score, n_t, ncols, n_list, n_tiles);
+    } else {
+        const dim3 grid((unsigned) n_tiles, (unsigned) ncols, 1);
+        const auto kernel = by_pos ? k_qsa_tile_mask<true> : k_qsa_tile_mask<false>;
+        kernel<<<grid, 256, 0, stream>>>((const int32_t *) sel->data, (const float *) top_score->data, vis->data,
+            tok_pos ? (const int32_t *) tok_pos->data : nullptr, (const int32_t *) dst->src[4]->data, (half *) dst->data,
+            sel->ne[0], top_score->ne[0], n_kv, kpool, s_sel, s_score, s_mask, n_t, ncols, n_list, n_tiles);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void ggml_cuda_op_qsa_select(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int32_t mode   = ggml_get_op_params_i32(dst, 1);
+    if (mode >= GGML_QSA_SELECT_TILE_ROWS) {
+        qsa_select_tiles(ctx, dst);
+        return;
+    }
     if (mode >= GGML_QSA_SELECT_POOL_MEMBERS) {
         const int32_t kpool  = ggml_get_op_params_i32(dst, 0);
         const int64_t n_kv   = dst->src[2]->ne[0];

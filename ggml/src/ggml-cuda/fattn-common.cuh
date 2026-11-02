@@ -1108,7 +1108,14 @@ void launch_fattn(
     int32_t n_kv_max = 0;
     size_t  n_lists  = 0;
     size_t  KV_max_n = 0;
-    if (use_sparse) {
+    // a tile mask of ggml_qsa_select_tiles brings its lists (src[4]): no compaction, the mask is read at list positions
+    const bool mask_tiles = use_sparse && mask && mask->op == GGML_OP_QSA_SELECT &&
+        ggml_get_op_params_i32(mask, 1) == GGML_QSA_SELECT_TILE_MASK;
+    if (mask_tiles) {
+        GGML_ASSERT(mask->ne[1] == ncols1 && mask->ne[2] == ntiles_x && Q->ne[3] == 1 && mask->ne[0] % nbatch_fa == 0);
+        n_kv_max = mask->ne[0];
+        n_lists  = size_t(ntiles_x);
+    } else if (use_sparse) {
         GGML_ASSERT(mask != nullptr);
         const int32_t n_kv_max_query = ggml_get_op_params_i32(KQV, 4);
         GGML_ASSERT(n_kv_max_query > 0);
@@ -1163,7 +1170,8 @@ void launch_fattn(
         };
 
         const int  max_blocks   = max_blocks_per_sm*nsm;
-        const bool use_stream_k = should_use_stream_k(cc, ntiles_dst, max_blocks, Q->ne[0]);
+        // a tile mask: no stream-k (the kernel orders its tiles by head group within a query tile, the fixup does not)
+        const bool use_stream_k = !mask_tiles && should_use_stream_k(cc, ntiles_dst, max_blocks, Q->ne[0]);
 
         blocks_num.x = ntiles_dst;
         blocks_num.y = 1;
@@ -1256,7 +1264,8 @@ void launch_fattn(
     ggml_cuda_pool_alloc<int>    KV_max(pool);
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
     ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
-    int    * KV_max_ptr       = KV_max_n       == 0 ? nullptr : scratch ? (int    *) (scratch + scratch_l.KV_max)       : KV_max.alloc(KV_max_n);
+    int    * KV_max_ptr       = mask_tiles ? (int *) mask->src[4]->data :
+                                KV_max_n       == 0 ? nullptr : scratch ? (int    *) (scratch + scratch_l.KV_max)       : KV_max.alloc(KV_max_n);
     float  * dst_tmp_ptr      = dst_tmp_n      == 0 ? nullptr : scratch ? (float  *) (scratch + scratch_l.dst_tmp)      : dst_tmp.alloc(dst_tmp_n);
     float2 * dst_tmp_meta_ptr = dst_tmp_meta_n == 0 ? nullptr : scratch ? (float2 *) (scratch + scratch_l.dst_tmp_meta) : dst_tmp_meta.alloc(dst_tmp_meta_n);
 
@@ -1334,7 +1343,7 @@ void launch_fattn(
         }
     }
 
-    if (use_sparse) {
+    if (use_sparse && !mask_tiles) {
         ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max_ptr, KV_max_ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max, main_stream);
     }
 

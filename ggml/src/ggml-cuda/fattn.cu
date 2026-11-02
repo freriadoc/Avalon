@@ -166,6 +166,44 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
 #endif // defined(GGML_USE_MUSA)
 }
 
+bool ggml_cuda_flash_attn_ext_mma_f16_kv_quant_sparse(const int cc, const ggml_tensor * dst) {
+#if defined(GGML_USE_MUSA)
+    GGML_UNUSED_VARS(cc, dst);
+    return false;
+#else
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    if (!ggml_cuda_flash_attn_ext_mma_f16_kv_quant(dst) || mask == nullptr || K->ne[2] == 0 || Q->ne[2] % K->ne[2] != 0) {
+        return false;
+    }
+    float max_bias = 0.0f, logit_softcap = 0.0f;
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    const int gqa_ratio = Q->ne[2] / K->ne[2];
+    const bool rdna = GGML_CUDA_CC_IS_RDNA(cc) && amd_wmma_available(cc);
+    const bool nv   = GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && ggml_cuda_highest_compiled_arch(cc) != GGML_CUDA_CC_TURING;
+    // the dispatch's path to (256, 256, 16, 4): the GQA tile of 4 (ratio 4 or 12), more than 8 queries, a padded K/V
+    for (const ggml_tensor * t : {Q, mask}) {
+        for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
+            if (t->nb[i] % 16 != 0) {
+                return false;
+            }
+        }
+    }
+    // a tile mask of ggml_qsa_select_tiles ([n_list, 16, n_tiles]) brings its lists, no n_kv_max
+    const bool tiles = mask->op == GGML_OP_QSA_SELECT && ggml_get_op_params_i32(mask, 1) == GGML_QSA_SELECT_TILE_MASK;
+    return (rdna || nv) && max_bias == 0.0f && logit_softcap == 0.0f && (tiles || ggml_get_op_params_i32(dst, 4) > 0) &&
+        // from 64k cells: below, a tile's union covers much of the context, each row would be dequantized by most
+        // tiles (19k: prefill -8 % against the f16 copy; 251k: +1.6 %)
+        K->ne[1] >= 65536 &&
+        gqa_ratio % 4 == 0 && gqa_ratio % 8 != 0 && Q->ne[1] > 8 && Q->ne[3] == 1 &&
+        K->ne[1] % FATTN_KQ_STRIDE == 0 &&
+        (tiles ? mask->ne[1] == 16 : mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1);
+#endif // defined(GGML_USE_MUSA)
+}
+
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -640,6 +678,18 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_NONE;
     }
 
+    // a tile mask of ggml_qsa_select_tiles: only the sparse MMA kernel of (256, 256, 16, 4) reads it
+    if (mask && mask->op == GGML_OP_QSA_SELECT && ggml_get_op_params_i32(mask, 1) == GGML_QSA_SELECT_TILE_MASK) {
+        const bool rdna = GGML_CUDA_CC_IS_RDNA(cc) && amd_wmma_available(cc);
+        const bool nv   = GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) &&
+            ggml_cuda_highest_compiled_arch(cc) != GGML_CUDA_CC_TURING && cc != GGML_CUDA_CC_VOLTA;
+        float logit_softcap = 0.0f;
+        memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+        const bool ok = (rdna || nv) && gqa_opt_applies && logit_softcap == 0.0f && K->ne[0] == 256 && V->ne[0] == 256 &&
+            gqa_ratio % 4 == 0 && gqa_ratio % 8 != 0 && Q->ne[1] > 8 && Q->ne[3] == 1 && mask->ne[1] == 16;
+        return ok ? BEST_FATTN_KERNEL_MMA_F16 : BEST_FATTN_KERNEL_NONE;
+    }
+
     if (mask && mask->ne[2] != 1) {
         return BEST_FATTN_KERNEL_NONE;
     }
@@ -750,10 +800,15 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
-        case BEST_FATTN_KERNEL_MMA_F16:
             need_f16_K = true;
             need_f16_V = true;
             break;
+        case BEST_FATTN_KERNEL_MMA_F16: {
+            // the quantized sparse gather needs no f16 copy
+            const bool kv_quant_sparse = ggml_cuda_flash_attn_ext_mma_f16_kv_quant_sparse(ggml_cuda_info().devices[device].cc, dst);
+            need_f16_K = !kv_quant_sparse;
+            need_f16_V = !kv_quant_sparse;
+        } break;
         case BEST_FATTN_KERNEL_VEC: {
             const bool f16_fallback = ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) == nullptr;
             need_f16_K = K->type == GGML_TYPE_F32 || f16_fallback;

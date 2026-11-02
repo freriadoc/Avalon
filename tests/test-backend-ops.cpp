@@ -4840,18 +4840,18 @@ struct test_qwen4_hc_reduce_norm : public test_dsv4_hc {
         ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n_tokens);
         ggml_set_name(weights, "weights");
         ggml_tensor * gated = ggml_mul(ctx, sh, ggml_sigmoid(ctx, logit));
-        ggml_build_forward_expand(gf, gated);
+        if (gf) { ggml_build_forward_expand(gf, gated); }
         ggml_tensor * weighted = ggml_mul(ctx, experts, weights);
-        ggml_build_forward_expand(gf, weighted);
+        if (gf) { ggml_build_forward_expand(gf, weighted); }
         std::vector<ggml_tensor *> views;
         for (int64_t k = 0; k < n_used; ++k) {
             views.push_back(ggml_view_2d(ctx, weighted, n_embd, n_tokens, weighted->nb[2], k*weighted->nb[1]));
-            ggml_build_forward_expand(gf, views.back());
+            if (gf) { ggml_build_forward_expand(gf, views.back()); }
         }
         ggml_tensor * moe = views[0];
         for (int64_t k = 1; k < n_used; ++k) {
             moe = ggml_add(ctx, moe, views[k]);
-            ggml_build_forward_expand(gf, moe);
+            if (gf) { ggml_build_forward_expand(gf, moe); }
         }
         ggml_tensor * block = ggml_add(ctx, moe, gated);
 
@@ -5867,6 +5867,131 @@ struct test_qsa_select : public test_case {
                     x = rng() % 6 == 0 ? -1 : (int32_t) (rng() % (2*n_kv));   // some empty cells
                 }
                 ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// QSA selection by tiles of ncols queries (ggml_qsa_select_tiles): the sorted union of the cells a tile chose, then
+// each query's mask at its tile's list positions; with flash = true, the flash attention that reads that tile mask
+// (one KV head, GQA 12, D = 256: the shape of qwen4exp's QSA layers)
+struct test_qsa_select_tiles : public test_case {
+    const int64_t   n_kv;
+    const int64_t   n_top;
+    const int64_t   kpool;
+    const int64_t   n_t;
+    const int64_t   ncols;
+    const bool      by_pos;
+    const bool      flash;
+    const ggml_type type_K;
+    const ggml_type type_V;
+    const int64_t   n_head_kv;
+    const bool      kv_perm;
+    const float     q_scale; // > 1: peaked attention scores, as a model's
+
+    std::string vars() override {
+        return VARS_TO_STR12(n_kv, n_top, kpool, n_t, ncols, by_pos, flash, type_K, type_V, n_head_kv, kv_perm, q_scale);
+    }
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return flash ? "FLASH_ATTN_QSA_TILES" : "QSA_SELECT_TILES"; }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    test_qsa_select_tiles(int64_t n_kv = 4096, int64_t n_top = 64, int64_t kpool = 4, int64_t n_t = 37, int64_t ncols = 16,
+            bool by_pos = true, bool flash = false, ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16,
+            int64_t n_head_kv = 1, bool kv_perm = false, float q_scale = 1.0f)
+        : n_kv(n_kv), n_top(n_top), kpool(kpool), n_t(n_t), ncols(ncols), by_pos(by_pos), flash(flash),
+          type_K(type_K), type_V(type_V), n_head_kv(n_head_kv), kv_perm(kv_perm), q_scale(q_scale) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_sel = n_top*kpool + kpool - 1;
+        ggml_tensor * sel   = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_sel, n_t);
+        ggml_tensor * score = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_top, n_t);
+        ggml_set_name(sel, "sel");
+        ggml_set_name(score, "score");
+        ggml_tensor * vis;
+        ggml_tensor * tok = nullptr;
+        if (by_pos) {
+            vis = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_kv);
+            tok = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_t);
+            ggml_set_name(vis, "cell_pos");
+            ggml_set_name(tok, "tok_pos");
+        } else {
+            vis = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, n_t);
+            ggml_set_name(vis, "kq_mask");
+        }
+        ggml_tensor * m = ggml_qsa_select_tiles(ctx, sel, score, vis, tok, (int32_t) kpool, (int32_t) ncols);
+        if (!flash) {
+            return m;
+        }
+        const int64_t d = 256, n_head = 12;
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d, n_t, n_head*n_head_kv, 1);
+        // kv_perm: the KV cache's layout, the heads of a cell adjacent (a permuted view, as the model passes them)
+        ggml_tensor * k = kv_perm ? ggml_new_tensor_4d(ctx, type_K, d, n_head_kv, n_kv, 1) : ggml_new_tensor_4d(ctx, type_K, d, n_kv, n_head_kv, 1);
+        ggml_tensor * v = kv_perm ? ggml_new_tensor_4d(ctx, type_V, d, n_head_kv, n_kv, 1) : ggml_new_tensor_4d(ctx, type_V, d, n_kv, n_head_kv, 1);
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+        if (kv_perm) {
+            k = ggml_permute(ctx, k, 0, 2, 1, 3);
+            v = ggml_permute(ctx, v, 0, 2, 1, 3);
+        }
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf((float) d), 0.0f, 0.0f);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234);
+        // a few pools of nearby cells per query, as a selection names them: tiles share part of their cells
+        std::vector<int32_t> hot(n_top*4);
+        for (auto & h : hot) {
+            h = (int32_t) (rng() % (n_kv/kpool));
+        }
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "sel") == 0) {
+                std::vector<int32_t> v(ggml_nelements(t));
+                const int64_t n_sel = t->ne[0];
+                for (int64_t q = 0; q < t->ne[1]; q++) {
+                    for (int64_t p = 0; p < n_top; p++) {
+                        const int32_t pool = rng() % 2 ? hot[rng() % hot.size()] : (int32_t) (rng() % (n_kv/kpool));
+                        for (int64_t c = 0; c < kpool; c++) {
+                            v[q*n_sel + p*kpool + c] = rng() % 16 == 0 ? (int32_t) n_kv : pool*(int32_t) kpool + (int32_t) c;
+                        }
+                    }
+                    for (int64_t j = n_top*kpool; j < n_sel; j++) {   // the tail: the last cells, one missing
+                        v[q*n_sel + j] = j == n_sel - 1 ? -1 : (int32_t) (n_kv - 1 - (j - n_top*kpool));
+                    }
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "score") == 0) {
+                std::vector<float> v(ggml_nelements(t));
+                for (auto & x : v) {
+                    x = rng() % 8 == 0 ? -INFINITY : (float) (rng() % 100);   // some invisible pools
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "kq_mask") == 0) {
+                std::vector<ggml_fp16_t> v(ggml_nelements(t));
+                for (auto & x : v) {
+                    x = ggml_fp32_to_fp16(rng() % 3 == 0 ? -INFINITY : 0.0f);
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "cell_pos") == 0) {
+                std::vector<int32_t> v(ggml_nelements(t));
+                for (int64_t c = 0; c < n_kv; c++) {
+                    v[c] = rng() % 16 == 0 ? -1 : (int32_t) c;   // some empty cells
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "tok_pos") == 0) {
+                std::vector<int32_t> v(ggml_nelements(t));
+                for (int64_t i = 0; i < n_t; i++) {
+                    v[i] = (int32_t) (n_kv - n_t + i);   // the last queries: most cells visible, the tail causal
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "q") == 0) {
+                init_tensor_uniform(t, -q_scale, q_scale);
             } else {
                 init_tensor_uniform(t);
             }
@@ -13205,6 +13330,32 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 32768, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 32768, 67, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
 
+    // the prefill tile gathering a q8_0 K and a q4_0 V without an f16 copy (qwen4exp's cache); 67: a partial last tile
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 65536, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false,  512));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 65536, 67, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 2048));
+    // the tile mask of ggml_qsa_select_tiles read by the sparse kernel: f16 K/V, and q8_0 / q4_0 gathered as they are
+    test_cases.emplace_back(new test_qsa_select_tiles(4096,  64,  4, 37, 16, true, true));
+    test_cases.emplace_back(new test_qsa_select_tiles(65536, 512, 4, 64, 16, true, true));
+    test_cases.emplace_back(new test_qsa_select_tiles(65536, 512, 4, 67, 16, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
+    test_cases.emplace_back(new test_qsa_select_tiles(65536, 512, 4, 200, 16, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
+    test_cases.emplace_back(new test_qsa_select_tiles(65536, 512, 4, 200, 16, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2));
+    test_cases.emplace_back(new test_qsa_select_tiles(65536, 512, 4, 1000, 16, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2));
+    test_cases.emplace_back(new test_qsa_select_tiles(65536, 512, 4, 1000, 16, true, true, GGML_TYPE_F16, GGML_TYPE_F16, 2));
+    test_cases.emplace_back(new test_qsa_select_tiles(40960, 512, 4, 2048, 16, true, true, GGML_TYPE_F16, GGML_TYPE_F16, 2));
+    // the q8_0 / q4_0 gather of ggml-cuda (from 64k cells), up to qwen4exp's shapes
+    test_cases.emplace_back(new test_qsa_select_tiles(131072, 512, 4, 200, 16, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2));
+    test_cases.emplace_back(new test_qsa_select_tiles(150016, 512, 4, 333, 16, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2));
+    test_cases.emplace_back(new test_qsa_select_tiles(262144, 2048, 4, 2048, 16, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2));
+    // peaked scores (a model's attention): the f16 accumulation of V must hold
+    test_cases.emplace_back(new test_qsa_select_tiles(262144, 2048, 4, 2048, 16, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, true, 8.0f));
+    test_cases.emplace_back(new test_qsa_select_tiles(40960, 512, 4, 2048, 16, true, true, GGML_TYPE_F16, GGML_TYPE_F16, 2, true, 8.0f));
+    // the KV cache's layout (permuted views): the direct gather, and below 64k cells the copy to f16
+    test_cases.emplace_back(new test_qsa_select_tiles(150016, 512, 4, 333, 16, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, true));
+    test_cases.emplace_back(new test_qsa_select_tiles(40960, 512, 4, 333, 16, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, true));
+    test_cases.emplace_back(new test_qsa_select_tiles(40960, 512, 4, 333, 16, true, true, GGML_TYPE_F16, GGML_TYPE_F16, 2, true));
+    test_cases.emplace_back(new test_qsa_select_tiles(49152, 512, 4, 8192, 16, true, false));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {12, 1}, 65536, 200, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 2048));
+
     // sparse mask + quantized cache
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 4096,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 512));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 512));
@@ -13434,6 +13585,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     for (bool by_pos : { false, true }) {
+        test_cases.emplace_back(new test_qsa_select_tiles(4096, 64, 4, 37, 16, by_pos));
+        test_cases.emplace_back(new test_qsa_select_tiles(65536, 512, 4, 67, 16, by_pos));
         test_cases.emplace_back(new test_qsa_select_pooled(256,  32,  16, 4, 3,   1, by_pos));
         test_cases.emplace_back(new test_qsa_select_pooled(4096, 512, 256, 4, 255, 3, by_pos));
     }
@@ -13575,6 +13728,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // dense flash attention of a prefill (qwen4exp's QSA layer: 2 KV heads, GQA 12, D = 256)
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 16384, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}));
+    // qwen4exp QSA prefill, tile mask (ggml_qsa_select_tiles): f16 K/V against q8_0 / q4_0 dequantized in the gather
+    for (int64_t n_kv : { 131072, 262144 }) {
+        test_cases.emplace_back(new test_qsa_select_tiles(n_kv, 512, 4, 2048, 16, true, true, GGML_TYPE_F16,  GGML_TYPE_F16,  2));
+        test_cases.emplace_back(new test_qsa_select_tiles(n_kv, 512, 4, 2048, 16, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2));
+    }
+    // a whole ubatch of the 256k configuration
+    test_cases.emplace_back(new test_qsa_select_tiles(262144, 512, 4, 9536, 16, true, true, GGML_TYPE_F16,  GGML_TYPE_F16,  2));
+    test_cases.emplace_back(new test_qsa_select_tiles(262144, 512, 4, 9536, 16, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2));
 
     // qwen4exp QSA attention while decoding / verifying: 2 KV heads x GQA 12, D 256; dense scan (quantized KV, 256
     // cells) and gathered cells (f16, 2051)

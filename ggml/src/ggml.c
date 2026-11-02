@@ -5579,8 +5579,10 @@ struct ggml_tensor * ggml_flash_attn_ext(
         GGML_ASSERT(ggml_is_contiguous(mask));
         //GGML_ASSERT(ggml_can_repeat_rows(mask, qk));
 
-        GGML_ASSERT(q->ne[2] % mask->ne[2] == 0);
-        GGML_ASSERT(q->ne[3] % mask->ne[3] == 0);
+        // a tile mask of ggml_qsa_select_tiles: [n_list, ncols, n_tiles], one sequence
+        const bool tiles = mask->op == GGML_OP_QSA_SELECT && ggml_get_op_params_i32(mask, 1) == GGML_QSA_SELECT_TILE_MASK;
+        GGML_ASSERT(tiles || q->ne[2] % mask->ne[2] == 0);
+        GGML_ASSERT(tiles ? q->ne[3] == 1 : q->ne[3] % mask->ne[3] == 0);
     }
 
     if (max_bias > 0.0f) {
@@ -5599,6 +5601,10 @@ struct ggml_tensor * ggml_flash_attn_ext(
     result->src[1] = k;
     result->src[2] = v;
     result->src[3] = mask;
+    // a tile mask's lists are read by the attention too: a source of its own keeps them alive until it ran
+    if (mask && mask->op == GGML_OP_QSA_SELECT && ggml_get_op_params_i32(mask, 1) == GGML_QSA_SELECT_TILE_MASK) {
+        result->src[5] = mask->src[4];
+    }
 
     return result;
 }
@@ -6543,6 +6549,48 @@ struct ggml_tensor * ggml_qsa_select(
     result->src[1] = top_score;
     result->src[2] = vis;
     result->src[3] = tok_pos;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_qsa_select_tiles(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * sel,
+        struct ggml_tensor  * top_score,
+        struct ggml_tensor  * vis,
+        struct ggml_tensor  * tok_pos,
+        int32_t               kpool,
+        int32_t               ncols) {
+    GGML_ASSERT(ncols > 0);
+    // the rows first: QSA_SELECT's checks, then the tile layout
+    struct ggml_tensor * rows = ggml_qsa_select(ctx, sel, top_score, vis, tok_pos, kpool, GGML_QSA_SELECT_ROWS);
+    const int64_t n_t     = rows->ne[1];
+    const int64_t n_kv    = vis->ne[0];
+    const int64_t n_tiles = (n_t + ncols - 1) / ncols;
+    const int64_t n_list  = GGML_PAD(MIN(n_kv, (int64_t) ncols*sel->ne[0]), 256);
+
+    struct ggml_tensor * lists = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_list*n_tiles + n_tiles);
+    ggml_set_op_params_i32(lists, 0, kpool);
+    ggml_set_op_params_i32(lists, 1, (int32_t) GGML_QSA_SELECT_TILE_ROWS);
+    ggml_set_op_params_i32(lists, 2, ncols);
+    ggml_set_op_params_i32(lists, 3, (int32_t) n_list);
+    lists->op     = GGML_OP_QSA_SELECT;
+    lists->src[0] = sel;
+    lists->src[1] = top_score;
+    lists->src[2] = vis;
+    lists->src[3] = tok_pos;
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, n_list, ncols, n_tiles);
+    ggml_set_op_params_i32(result, 0, kpool);
+    ggml_set_op_params_i32(result, 1, (int32_t) GGML_QSA_SELECT_TILE_MASK);
+    ggml_set_op_params_i32(result, 2, ncols);
+    ggml_set_op_params_i32(result, 3, (int32_t) n_list);
+    result->op     = GGML_OP_QSA_SELECT;
+    result->src[0] = sel;
+    result->src[1] = top_score;
+    result->src[2] = vis;
+    result->src[3] = tok_pos;
+    result->src[4] = lists;
 
     return result;
 }

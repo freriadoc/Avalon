@@ -8955,6 +8955,30 @@ void ggml_compute_forward_top_k(
     }
 }
 
+// a tile mask of ggml_qsa_select_tiles read as the dense mask row of query iq1 (n_kv cells): its tile's list scattered
+// over -inf (the reference path; ggml-cuda's sparse gather reads the tiles as they are)
+static bool ggml_fa_mask_is_tiles(const ggml_tensor * mask) {
+    return mask && mask->op == GGML_OP_QSA_SELECT && ggml_get_op_params_i32(mask, 1) == GGML_QSA_SELECT_TILE_MASK;
+}
+
+static const ggml_fp16_t * ggml_fa_mask_tiles_row(const ggml_tensor * mask, int64_t iq1, int64_t n_kv, std::vector<ggml_fp16_t> & buf) {
+    const int64_t ncols   = mask->ne[1];
+    const int64_t n_list  = mask->ne[0];
+    const int64_t n_tiles = mask->ne[2];
+    const int64_t tile = iq1 / ncols;
+    const int32_t * lists  = (const int32_t *) mask->src[4]->data;
+    const int32_t * l      = lists + n_list*tile;
+    const int64_t   count  = lists[n_list*n_tiles + tile];
+    const ggml_fp16_t * m  = (const ggml_fp16_t *) ((const char *) mask->data + tile*mask->nb[2] + (iq1 % ncols)*mask->nb[1]);
+    buf.assign(n_kv, GGML_CPU_FP32_TO_FP16(-INFINITY));
+    for (int64_t i = 0; i < count; i++) {
+        if (l[i] >= 0 && l[i] < n_kv) {
+            buf[l[i]] = m[i];
+        }
+    }
+    return buf.data();
+}
+
 static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const ggml_compute_params * params,
         ggml_tensor * dst,
@@ -9062,7 +9086,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             memset(VKQ32, 0, DV*sizeof(float));
         }
 
-        const ggml_fp16_t * mp = mask ? (ggml_fp16_t *)((char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : NULL;
+        thread_local std::vector<ggml_fp16_t> mask_tiles_row;
+        const ggml_fp16_t * mp = ggml_fa_mask_is_tiles(mask) ? ggml_fa_mask_tiles_row(mask, iq1, k->ne[1], mask_tiles_row) :
+            mask ? (ggml_fp16_t *)((char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : NULL;
 
         // k indices
         const int ik3 = iq3 / rk3;
@@ -9343,7 +9369,9 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
             if (mask) {
                 bool can_skip = true;
                 for (int tq = 0; tq < tile_rows; tq++) {
-                    const ggml_fp16_t * mp_row = (const ggml_fp16_t *)((const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]);
+                    thread_local std::vector<ggml_fp16_t> mask_tiles_row;
+                    const ggml_fp16_t * mp_row = ggml_fa_mask_is_tiles(mask) ? ggml_fa_mask_tiles_row(mask, iq1 + tq, k->ne[1], mask_tiles_row) :
+                        (const ggml_fp16_t *)((const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]);
                     for (int tk = 0; tk < kv_tile; tk++) {
                         mask32[tq * KV_TILE_SZ + tk] = slope * GGML_CPU_FP16_TO_FP32(mp_row[ic + tk]);
                         if (mask32[tq * KV_TILE_SZ + tk] != -INFINITY) {
@@ -12627,8 +12655,95 @@ static void ggml_compute_forward_qsa_pool_layout(ggml_tensor * dst) {
     }
 }
 
+// ggml_qsa_select_tiles: the lists (TILE_ROWS) or the tile mask (TILE_MASK) of the tiles of ncols queries
+static void ggml_compute_forward_qsa_select_tiles(ggml_tensor * dst) {
+    const int32_t mode   = ggml_get_op_params_i32(dst, 1);
+    const int32_t kpool  = ggml_get_op_params_i32(dst, 0);
+    const int32_t ncols  = ggml_get_op_params_i32(dst, 2);
+    const int64_t n_list = ggml_get_op_params_i32(dst, 3);
+    const ggml_tensor * sel       = dst->src[0];
+    const ggml_tensor * top_score = dst->src[1];
+    const ggml_tensor * vis       = dst->src[2];
+    const ggml_tensor * tok_pos   = dst->src[3];
+    const bool    by_pos  = vis->type == GGML_TYPE_I32;
+    const int64_t n_kv    = vis->ne[0];
+    const int64_t n_t     = sel->ne[1];
+    const int64_t n_sel   = sel->ne[0];
+    const int64_t n_top   = top_score->ne[0];
+    const int64_t n_tiles = (n_t + ncols - 1) / ncols;
+    const ggml_fp16_t neg_inf = GGML_CPU_FP32_TO_FP16(-INFINITY);
+    const ggml_fp16_t zero    = GGML_CPU_FP32_TO_FP16(0.0f);
+    // the live cells query t chose
+    auto chosen = [&](int64_t t, auto && f) {
+        const int32_t * s_row  = (const int32_t *) ((const char *) sel->data + t*sel->nb[1]);
+        const float   * sc_row = (const float *)   ((const char *) top_score->data + t*top_score->nb[1]);
+        for (int64_t j = 0; j < n_sel; j++) {
+            const int32_t c = s_row[j];
+            if (c >= 0 && c < n_kv && (j >= n_top*kpool || sc_row[j/kpool] != -INFINITY)) {
+                f(c);
+            }
+        }
+    };
+    auto visibility = [&](int64_t t, int32_t c) {
+        if (!by_pos) {
+            return ((const ggml_fp16_t *) ((const char *) vis->data + t*vis->nb[1]))[c];
+        }
+        const int32_t pc = ((const int32_t *) vis->data)[c];
+        return pc >= 0 && pc <= ((const int32_t *) tok_pos->data)[t] ? zero : neg_inf;
+    };
+    if (mode == GGML_QSA_SELECT_TILE_ROWS) {
+        int32_t * lists  = (int32_t *) dst->data;
+        int32_t * counts = lists + n_list*n_tiles;
+        std::vector<int32_t> cells;
+        for (int64_t tile = 0; tile < n_tiles; tile++) {
+            cells.clear();
+            for (int64_t t = tile*ncols; t < std::min<int64_t>(n_t, (tile + 1)*ncols); t++) {
+                chosen(t, [&](int32_t c) { cells.push_back(c); });
+            }
+            std::sort(cells.begin(), cells.end());
+            cells.erase(std::unique(cells.begin(), cells.end()), cells.end());
+            GGML_ASSERT((int64_t) cells.size() <= n_list);
+            int32_t * l = lists + n_list*tile;
+            const int64_t count = (int64_t) cells.size();
+            std::copy(cells.begin(), cells.end(), l);
+            const int32_t pad = ~(count > 0 ? cells[count - 1] : 0);
+            for (int64_t i = count; i < n_list; i++) {
+                l[i] = pad;
+            }
+            counts[tile] = (int32_t) count;
+        }
+        return;
+    }
+    // TILE_MASK: each query's chosen cells found in its tile's list
+    const int32_t * lists  = (const int32_t *) dst->src[4]->data;
+    const int32_t * counts = lists + n_list*n_tiles;
+    for (int64_t tile = 0; tile < n_tiles; tile++) {
+        const int32_t * l = lists + n_list*tile;
+        const int64_t count = counts[tile];
+        for (int64_t j = 0; j < ncols; j++) {
+            ggml_fp16_t * m = (ggml_fp16_t *) ((char *) dst->data + tile*dst->nb[2] + j*dst->nb[1]);
+            for (int64_t i = 0; i < n_list; i++) {
+                m[i] = neg_inf;
+            }
+            const int64_t t = tile*ncols + j;
+            if (t >= n_t) {
+                continue;
+            }
+            chosen(t, [&](int32_t c) {
+                const int32_t * it = std::lower_bound(l, l + count, c);
+                GGML_ASSERT(it != l + count && *it == c);
+                m[it - l] = visibility(t, c);
+            });
+        }
+    }
+}
+
 void ggml_compute_forward_qsa_select(const ggml_compute_params * params, ggml_tensor * dst) {
     if (params->ith != 0) {
+        return;
+    }
+    if (ggml_get_op_params_i32(dst, 1) >= GGML_QSA_SELECT_TILE_ROWS) {
+        ggml_compute_forward_qsa_select_tiles(dst);
         return;
     }
     if (ggml_get_op_params_i32(dst, 1) >= GGML_QSA_SELECT_POOL_MEMBERS) {
