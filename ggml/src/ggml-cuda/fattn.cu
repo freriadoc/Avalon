@@ -273,6 +273,13 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
     const int gqa_ratio = Q->ne[2] / K->ne[2];
 
+    // a tile mask of ggml_qsa_select_tiles: only (256, 256, 16, 4) reads it (ggml_cuda_get_best_fattn_kernel checked
+    // the ratio), not the 8 that NVIDIA's rule below picks for a ratio of 12
+    if (mask && mask->op == GGML_OP_QSA_SELECT && ggml_get_op_params_i32(mask, 1) == GGML_QSA_SELECT_TILE_MASK) {
+        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 4>(ctx, dst);
+        return;
+    }
+
     // On Volta the GQA optimizations aren't as impactful vs. minimizing wasted compute:
     if (cc == GGML_CUDA_CC_VOLTA) {
         if (use_gqa_opt && gqa_ratio % 8 == 0) {
