@@ -453,6 +453,7 @@ struct moe_cache_device {
     // the expert tensors registered in place (page-rounded ranges, one per tensor): fills copied straight from the
     // weights by the SDMA engine, without the memcpy to the stage
     std::vector<std::pair<uintptr_t, uintptr_t>> pinned;
+    bool pin_full = false;   // KFD's limit was reached: nothing more is registered
     std::unordered_map<moe_cache_key, moe_cache_demand, moe_cache_key_hash> demand_count;
     uint64_t freq_demands = 0;   // LFU: demands since the last aging
     uint64_t renewed_demands = 0;   // LFU: demands since the content was renewed (lfu_ramp)
@@ -2541,6 +2542,46 @@ static bool moe_cache_pin_enabled() {
     return enabled;
 }
 
+// KFD charges a registered range against its system memory limit until the mapping itself goes away: hipHostUnregister
+// keeps it (ROCm caches the registration), and a refused registration stays half done ("already allocated by SVM"), the
+// copies that later read the range hang. Mapping the same file pages again at the same address (MAP_FIXED, as llama.cpp
+// maps the model: shared, read-only) drops the old mapping with its registration and its charge; the contents, the
+// address and the page cache are unchanged. Linux only, where the limit is.
+static bool moe_cache_remap_range(uintptr_t ib, uintptr_t ie) {
+#if defined(__linux__)
+    FILE * maps = fopen("/proc/self/maps", "r");
+    if (!maps) {
+        return false;
+    }
+    char line[4096];
+    bool done = false;
+    while (!done && fgets(line, sizeof(line), maps)) {
+        unsigned long long start = 0, end = 0, offset = 0;
+        char path[4096] = {};
+        if (sscanf(line, "%llx-%llx %*s %llx %*s %*s %4095[^\n]", &start, &end, &offset, path) < 4 ||
+            path[0] != '/' || ib < start || ie > end) {
+            continue;
+        }
+        const int fd = open(path, O_RDONLY);
+        if (fd >= 0) {
+            void * p = mmap((void *) ib, ie - ib, PROT_READ, MAP_SHARED | MAP_FIXED, fd, (off_t) (offset + (ib - start)));
+            close(fd);
+            if (p == (void *) ib) {
+                (void) posix_madvise(p, ie - ib, POSIX_MADV_RANDOM);
+                done = true;
+            }
+        }
+        break;
+    }
+    fclose(maps);
+    return done;
+#else
+    GGML_UNUSED(ib);
+    GGML_UNUSED(ie);
+    return false;
+#endif
+}
+
 // one expert tensor registered in place (its range rounded outwards to pages), false if ROCm refuses it. Portable: with
 // several GPUs a range registered for one device's cache is also copied by another (the first GPU's prefetch copies
 // every layer); a range another device of the session registered is not registered again
@@ -2559,6 +2600,8 @@ static bool moe_cache_pin_tensor(const moe_cache_session & session, moe_cache_de
     // mapped: the dispatcher's kernel copy reads a moved expert there (moe_split_copy_by_kernel)
     if (cudaHostRegister((void *) ib, ie - ib, cudaHostRegisterReadOnly | cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
         (void) cudaGetLastError();
+        (void) moe_cache_remap_range(ib, ie);   // the half-done registration goes with the old mapping
+        device.pin_full = true;
         return false;
     }
     device.pinned.push_back({ib, ie});
@@ -2588,14 +2631,33 @@ static void moe_cache_pin_experts(const moe_cache_session & session, moe_cache_d
             merged.push_back(r);
         }
     }
+    // until KFD's limit (about RAM - RAM/64 - 1.5 GiB for all processes: 48.6 GiB of experts here, more than a 32 or
+    // 48 GB machine allows) refuses one; then 1 GiB of the last ones is given back (unregistered and mapped again) to
+    // the pinned buffers allocated after this. The others are copied through a staging buffer, as with
+    // GGML_CUDA_MOE_PIN=0
     for (const auto & r : merged) {
         moe_cache_seen_tensor whole;
         whole.bytes = r.second - r.first;
-        fail += !moe_cache_pin_tensor(session, device, (const void *) r.first, whole, bytes);
+        if (!moe_cache_pin_tensor(session, device, (const void *) r.first, whole, bytes)) {
+            break;
+        }
+    }
+    if (device.pin_full) {
+        size_t freed = 0;
+        while (freed < ((size_t) 1 << 30) && !device.pinned.empty()) {
+            const auto r = device.pinned.back();
+            (void) cudaHostUnregister((void *) r.first);
+            (void) moe_cache_remap_range(r.first, r.second);
+            freed += r.second - r.first;
+            bytes -= r.second - r.first;
+            device.pinned.pop_back();
+        }
+        fail = merged.size() - device.pinned.size();
     }
     std::sort(device.pinned.begin(), device.pinned.end());
-    MOE_CACHE_LOG("[moe-cache] CUDA%d pin: %zu expert tensors registered (%zu MiB) in %.1f s, %zu failed\n",
-            device.physical, device.pinned.size(), bytes >> 20, (ggml_time_us() - t0) / 1e6, fail);
+    MOE_CACHE_LOG("[moe-cache] CUDA%d pin: %zu expert tensors registered (%zu MiB) in %.1f s, %zu left out%s\n",
+            device.physical, device.pinned.size(), bytes >> 20, (ggml_time_us() - t0) / 1e6, fail,
+            device.pin_full ? " (KFD's system memory limit reached)" : "");
 }
 
 static void moe_cache_build_pending(
@@ -2747,7 +2809,7 @@ static int moe_cache_discover_pool(
         layer.n_expert = layer.n_expert ? std::min(layer.n_expert, n_expert) : n_expert;
         device.layer_of[host_base] = layer_number;
         device.visits_since_new_tensor = 0;
-        if (device.pools_built && !device.pinned.empty()) {
+        if (device.pools_built && !device.pinned.empty() && !device.pin_full) {
             // a tensor of a scheduler sharing the session (MTP draft), shown after the pools were built: registered
             // like the others, still before its first graph (registering synchronizes every stream)
             size_t bytes = 0;

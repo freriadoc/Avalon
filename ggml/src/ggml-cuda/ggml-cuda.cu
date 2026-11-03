@@ -235,6 +235,11 @@ static int ggml_cuda_parse_id(const char * devName) {
 // under 1 MiB (with the 140 MiB scratch of the first kernel that used any: 234.5 -> 48 MiB). 1 MiB is under the device-wide size of any kernel that spills (16 B x 86016 lanes = 1.3 MiB), so every
 // one is sized on its dispatch; ggml_cuda_prime_queues repeats the largest dispatch before the MoE cache is sized. An
 // explicit HSA_SCRATCH_SINGLE_LIMIT is kept.
+//
+// ROCclr pins the host pages of a copy from pageable memory larger than GPU_PINNED_MIN_XFER_SIZE (128 MiB: the prefetch
+// of an expert tensor not registered in place) for the time of the copy, against KFD's system memory limit; when that
+// limit is full (a 32 or 48 GB machine, or another process), the pin waits forever (ROCm/legacy-rocm-build#6582).
+// Never pinning sends those copies through ROCclr's staging buffer. An explicit GPU_PINNED_MIN_XFER_SIZE is kept.
 __attribute__((constructor)) static void ggml_hip_set_hw_queues() {
 #ifdef _WIN32
     const auto set_default = [](const char * name, const char * value) {
@@ -245,10 +250,12 @@ __attribute__((constructor)) static void ggml_hip_set_hw_queues() {
     set_default("GPU_MAX_HW_QUEUES", "8");
     set_default("ROCBLAS_DEVICE_MEMORY_SIZE", "65536");
     set_default("HSA_SCRATCH_SINGLE_LIMIT", "1048576");
+    set_default("GPU_PINNED_MIN_XFER_SIZE", "1048576");
 #else
     setenv("GPU_MAX_HW_QUEUES", "8", /*overwrite =*/ 0);
     setenv("ROCBLAS_DEVICE_MEMORY_SIZE", "65536", /*overwrite =*/ 0);
     setenv("HSA_SCRATCH_SINGLE_LIMIT", "1048576", /*overwrite =*/ 0);
+    setenv("GPU_PINNED_MIN_XFER_SIZE", "1048576", /*overwrite =*/ 0);
 #endif
 }
 #elif !defined(GGML_USE_MUSA) && !defined(_WIN32)
