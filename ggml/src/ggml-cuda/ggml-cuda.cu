@@ -3235,6 +3235,13 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
+    // a stream never created has nothing queued: creating it to wait on it would cost a hardware queue, which ROCm 10.1
+    // keeps after the stream is gone (from 8 compute queues in a process, MES oversubscribes and the GPU stays busy idle)
+    if (cuda_ctx->streams[cuda_ctx->device][cuda_ctx->curr_stream_no] == nullptr) {
+        cuda_ctx->split_wait_queued = false;
+        return;
+    }
+
     // a hosted MoE block may be waiting for this thread to compute its missed experts
     if (!ggml_cuda_moe_hosted_wait((void *) cuda_ctx->stream(), nullptr, cuda_ctx->device)) {
         CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));

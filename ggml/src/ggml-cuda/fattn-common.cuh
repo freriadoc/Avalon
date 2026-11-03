@@ -1088,7 +1088,6 @@ void launch_fattn(
     GGML_ASSERT(!mask || mask->type == GGML_TYPE_F16);
 
     ggml_cuda_pool & pool = ctx.pool();
-    cudaStream_t main_stream = ctx.stream();
     const int id  = ggml_cuda_get_device();
     const int cc  = ggml_cuda_info().devices[id].cc;
     const int nsm = ggml_cuda_info().devices[id].nsm;
@@ -1248,6 +1247,8 @@ void launch_fattn(
         }
         return;
     }
+    // not before the size query: a context that only answers it would create a stream (a hardware queue) for nothing
+    cudaStream_t main_stream = ctx.stream();
     const ggml_tensor * scratch_t = dst->src[GGML_SCHED_SCRATCH_SRC];
     char * scratch = scratch_l.size > 0 && scratch_t && scratch_t->data && ggml_nbytes(scratch_t) >= scratch_l.size ?
         (char *) scratch_t->data : nullptr;
