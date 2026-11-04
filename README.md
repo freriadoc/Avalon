@@ -4,7 +4,8 @@
 
 **98 tokens/s on an AMD RX 7900 XT (PCIe 3.0, Ryzen 7 3800XT, 64 GB DDR4) for Qwen3.8-Flash-Next (125B MoE).**
 
-**16 GB of RAM is enough:** with the server capped at 14 GB, the 89 GiB model still runs at 90 tokens/s.
+**16 GB of RAM is enough:** the 89 GiB model runs at ~49 tokens/s with 16 GB and ~88 with 32 GB, thanks to Avalon's own
+RAM cache of experts ([below](#the-ram-cache-of-experts)).
 
 Avalon is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) built for one model,
 [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) (512 experts, 10 active, 48 layers), on one
@@ -14,17 +15,14 @@ desktop most people would call old.
 | part | what we have | why it matters |
 |---|---|---|
 | CPU | **AMD Ryzen 7 3800XT** (Zen 2, Ryzen 3000 family, 2019), 8 cores | computes the experts that are not on the GPU |
-| RAM | **DDR4-3200, dual channel** (33 – 35 GB/s measured), 64 GB (16 GB is enough) | every expert missing from the GPU is read from here |
+| RAM | **DDR4-3200, dual channel** (33 – 35 GB/s measured), 64 GB (16 GB works) | every expert missing from the GPU is read from here |
 | GPU | **AMD Radeon RX 7900 XT 20 GB** (RDNA3, 2022), **ROCm**, no NVIDIA, no CUDA | holds the dense weights, the KV cache and a cache of the hottest experts |
 | bus | **PCIe 3.0 x16** (~14 GB/s), on a B450 board | every expert copied to the GPU goes through it |
 
 The model is ~89 GiB; the GPU holds ~4.6 GiB of dense weights plus a cache of 9 – 14 GiB of experts, the rest stays in
-RAM. **16 GB of RAM is enough**: the model is memory-mapped, and what does not fit is read again from the disk. With
-the server's RAM capped at 14 GB (a 16 GB machine), the MTP best case was 90.3 t/s and 93.4 t/s after a 19k prompt
-(98.99 / 98.5 uncapped, same series). With 28 GB and the GPU driver's limit on registered memory of a 32 GB machine
-(both simulated), the expert arena gives 87 – 92 t/s (12 servers) and ~1,075 t/s for the prefill of a new 19k prompt.
-The disk there is an NVMe SSD, a Kingston FURY Renegade (PCIe 4.0) running at PCIe 3.0, ~3 GB/s; a SATA SSD was not
-measured, and with less RAM the prefill of new prompts depends on it.
+RAM, and with less RAM than the experts take (~49 GiB) Avalon reads the missing ones from the disk itself. The disk
+here is an NVMe SSD, a Kingston FURY Renegade (PCIe 4.0) running at PCIe 3.0, ~3.7 GB/s; a SATA SSD was not measured,
+and with less RAM the speed depends on it. Numbers with less RAM: [The RAM cache of experts](#the-ram-cache-of-experts).
 
 ## Two ideas behind Avalon
 
@@ -61,6 +59,44 @@ default; `GGML_CUDA_MOE_TAIL_SKIP=0` turns it off). Without it: 62.8 / 90.7 t/s 
 
 The full 256k context fits with the MTP draft model, the KV cache in q8_0 / q4_0 and the expert cache, under 19.7 GiB
 of VRAM.
+
+### The RAM cache of experts
+
+The experts take ~49 GiB. llama.cpp maps the model file and leaves them to the kernel's page cache, and Avalon
+registers them with the GPU driver so that the expert cache copies them without a staging buffer. Two things go wrong
+with that when RAM gets short:
+- the page cache is shared: any other program (a browser, a build) can push experts out, and they come back from the
+  disk at the next page fault, in the middle of a token;
+- the GPU driver limits the memory registered by all processes to RAM − RAM/64 − 1.5 GiB. On a 16 or 32 GB machine
+  most experts cannot be registered; the GPU then copies them from plain memory, which the driver locks on the fly
+  under the same limit, and a long prompt ends in a crash.
+
+So Avalon keeps its experts in RAM it owns, instead of the page cache, and the two are never mixed. At start it looks
+at the RAM it can take (and the driver's limit):
+- **every expert fits** (64 GB here): they are read once with O_DIRECT into Avalon's own memory, at the same
+  addresses, and registered in place. Nothing else can evict them, and the server is at full speed ~20 s after a start
+  from a cold disk;
+- **they do not fit**: an arena of slots, registered once, as large as the RAM allows (~23 GiB at 32 GB, ~9 GiB at
+  16 GB), filled at start with the hottest experts of the shipped ranking and kept by LRU. An expert the CPU or a
+  prompt needs that the arena does not hold is read into a slot from the disk with O_DIRECT; the GPU's expert cache is
+  filled from the arena only. During a prompt, part of the arena is lent to the prefill's reads and restored before
+  the answer starts, as the GPU cache lends VRAM to the compute buffers. The idea of a RAM tier of hot experts under
+  the GPU cache comes from buun's expert store.
+
+`GGML_CUDA_MOE_ARENA_MB=0` restores the old behavior (Linux; on Windows it is still the default).
+
+Measured here with less RAM simulated: the server in a memory cgroup of 14 or 28 GB, and the driver's registration
+limit lowered to the one of a 16 or 32 GB machine (MTP, 32k context, short prompt, 5 answers of 512 tokens per server):
+
+| RAM | short prompt | after a 19k prompt | prefill of a new 19k prompt | before (page cache) |
+|---|---|---|---|---|
+| 64 GB | 99.1 t/s | 93.9 t/s | 1,735 t/s | same speed, ready ~3 s later after a start |
+| 32 GB | 85.5 – 88.6 t/s (9 servers) | 40.6 – 49.5 t/s | 1,062 – 1,092 t/s | crash at the 19k prompt |
+| 16 GB | 48.8 – 50.3 t/s (9 servers) | 30.1 – 38.1 t/s | 475 – 501 t/s | 13 – 17 t/s, crash at the 19k prompt |
+
+The numbers this README gave before for 16 and 32 GB (90 and 89 t/s) were measured with the memory cgroup only: the
+driver's limit was still the one of the 64 GB machine, so every expert could be registered, which a real 16 or 32 GB
+machine refuses.
 
 ### Same machine, Strata
 
@@ -136,9 +172,9 @@ GSM8K (the first 200 problems of the test set, greedy, 4,096 tokens at most): **
 - **Hosted MoE**: the GPU keeps each MoE block, computes the cached experts while the CPU computes the missing ones,
   and moves one or two missing experts to the GPU when that finishes sooner (all inside the HIP graph).
 - **Expert prefetch** during prefill on 4 slots borrowed from the cache, cached experts read in place.
-- **Expert arena in RAM** (buun's idea of a RAM tier under the GPU cache) when the experts do not all fit in RAM: slots
-  of registered memory read from the disk with O_DIRECT instead of the page cache, part of them lent to the prefill and
-  restored before generation. When they all fit, they are registered in place, loaded with O_DIRECT.
+- **A RAM cache of experts** of Avalon's own instead of the page cache ([above](#the-ram-cache-of-experts)): all the
+  experts loaded with O_DIRECT when they fit, else an arena of registered slots (buun's idea of a RAM tier), part of it
+  lent to the prefill.
 - **Sparse attention (QSA) for long contexts**: masks built on the GPU, gathered cells for generation, split kept
   across speculative steps.
 - **MTP speculative decoding** with a small draft head (cut LM head over 65k frequent tokens) that shares the main
