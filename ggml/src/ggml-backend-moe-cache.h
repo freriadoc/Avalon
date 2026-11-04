@@ -157,6 +157,13 @@ struct ggml_moe_cache_api {
     int  (*prefill_residents)(void * session, void * backend, const struct ggml_tensor * node,
                               const struct ggml_tensor * w, uint64_t * addrs);
     void (*prefill_table)(const void * w_data, const uint64_t * table);
+    // Prefill, the experts the prefetch copies (resident[e] == 0): srcs[e] is the host address of w's part of expert e in
+    // the expert arena (read there with O_DIRECT first when the arena does not hold it), NULL to copy it from w.
+    // *pad: the bytes after an arena expert's part that are its pad (MMQ's reads past the last row). Called for prefetch
+    // slot 'slot' once its previous copies are done: the arena slots that call used are released then (all of them by
+    // prefill_unpin). Returns the number of experts taken from the arena.
+    int  (*prefill_sources)(void * session, void * backend, const struct ggml_tensor * w, const uint64_t * resident,
+                            const void ** srcs, size_t * pad, int slot);
     void (*prefill_unpin)(void * session);
     int  (*lend)(void * session, void * backend, size_t bytes, void ** zones, int n_zones);
     void (*restore)(void * session, void * backend);
@@ -199,9 +206,11 @@ struct ggml_moe_cache_api {
     // it and hands the missed experts to a host thread); never called from a graph compute thread.
     // act_q8 (optional): the same activations already quantized as q8_0 blocks of 32 with the bytes of
     // the GPU's q8_1, one row per token: the CPU then does not quantize them.
+    // src (optional, k = 1): per row, its expert's gate, up and down in the expert arena, NULL for the tensor's.
     void (*cpu_experts)(const struct ggml_tensor * gate_w, const struct ggml_tensor * up_w,
                         const struct ggml_tensor * down_w, const float * act, const void * act_q8,
-                        const int32_t * experts, int k, int n_tokens, float * out, int n_threads);
+                        const int32_t * experts, const void * const * src, int k, int n_tokens, float * out,
+                        int n_threads);
     // before the cache sizes itself on the free memory: create the queues and scratch later work needs
     void (*prepare_queues)(void * session, const struct ggml_cgraph * graph);
     // the routed rows of the largest MoE block the backend hosts (the scheduler leaves no larger one on the GPU)

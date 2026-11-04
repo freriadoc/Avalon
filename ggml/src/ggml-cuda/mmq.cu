@@ -394,6 +394,9 @@ void ggml_cuda_mul_mat_q(
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1, ids_dst, expert_bounds,
             ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
         CUDA_CHECK(cudaGetLastError());
+        if (int * counts = ggml_cuda_moe_prefill_counts(src0->name, (int) ne02)) {
+            ggml_cuda_moe_count_rows(expert_bounds, counts, (int) ne02, stream);
+        }
     }
 
     const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block +

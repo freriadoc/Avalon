@@ -2542,6 +2542,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 if (pf_stats) pf_res += ggml_time_us() - pf_t;
                                 sched->prefill_pinned = sched->prefill_pinned || n_resident > 0;
                             }
+                            // the experts to copy that the MoE cache's expert arena holds (or reads now with O_DIRECT): copied
+                            // from there, one by one
+                            static thread_local std::vector<const void *> arena_src;
+                            size_t arena_pad = 0;
+                            int n_arena = 0;
+                            if (n_resident >= 0 && ggml_moe_cache.prefill_sources) {
+                                arena_src.assign(n_expert, nullptr);
+                                n_arena = ggml_moe_cache.prefill_sources(sched->moe_cache_session, split_backend, input,
+                                    n_resident > 0 ? sched->prefetch_table[slot] : nullptr, arena_src.data(), &arena_pad, slot);
+                            }
                             const int64_t pf_t_issue = pf_stats ? ggml_time_us() : 0;
                             if (pf_stats) {
                                 int64_t n_copied = n_expert;
@@ -2552,22 +2562,38 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 pf_n++;
                                 pf_bytes += n_copied*(packed_step ? (int64_t) packed_step : (int64_t) input->nb[2]);
                             }
-                            if (n_resident <= 0 && packed_step) {
+                            if (n_resident <= 0 && n_arena == 0 && packed_step) {
                                 ggml_sched_copy_packed_experts(sched->prefetch_backend, input_cpy, input, 0, n_expert, packed_step);
-                            } else if (n_resident <= 0) {
+                            } else if (n_resident <= 0 && n_arena == 0) {
                                 ggml_backend_tensor_set_async(sched->prefetch_backend, input_cpy, input->data, 0, ggml_nbytes(input));
                             } else {
                                 // runs of copied experts; MMQ reads a little past an expert's last row (up to 512
                                 // values): the next expert's first bytes come along when it is not copied
-                                const uint64_t * res = sched->prefetch_table[slot];
+                                const uint64_t * res = n_resident > 0 ? sched->prefetch_table[slot] : nullptr;
                                 const size_t expert_size = input->nb[2];
                                 for (int64_t e0 = 0; e0 < n_expert; ) {
-                                    if (res[e0]) {
+                                    if (res && res[e0]) {
+                                        e0++;
+                                        continue;
+                                    }
+                                    if (n_arena > 0 && arena_src[e0]) {
+                                        // from the arena: the expert's part with what MMQ reads past its last row (a
+                                        // packed expert's step; else the part's pad, up to 512 bytes), the last without
+                                        const uint8_t * src = (const uint8_t *) arena_src[e0];
+                                        const bool last = e0 + 1 == n_expert;
+                                        if (packed_step) {
+                                            ggml_backend_tensor_set_async(sched->prefetch_backend, input_cpy, src, e0*packed_step,
+                                                last ? input->nb[1]*input->ne[1] : packed_step);
+                                        } else {
+                                            const size_t tail = last ? 0 : std::min<size_t>({expert_size, 512, arena_pad});
+                                            ggml_backend_tensor_set_async(sched->prefetch_backend, input_cpy, src, e0*expert_size,
+                                                expert_size + tail);
+                                        }
                                         e0++;
                                         continue;
                                     }
                                     int64_t e1 = e0;
-                                    while (e1 < n_expert && !res[e1]) {
+                                    while (e1 < n_expert && !(res && res[e1]) && !(n_arena > 0 && arena_src[e1])) {
                                         e1++;
                                     }
                                     if (packed_step) {

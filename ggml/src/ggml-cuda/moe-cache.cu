@@ -54,6 +54,7 @@ bool ggml_cuda_host_rows_node(ggml_backend_cuda_context & ctx, ggml_tensor * nod
 #include "ggml-backend-impl.h"
 #include "ggml-cuda.h"
 #include "../ggml-backend-moe-cache.h"
+#include "moe-arena.h"
 
 // EXL3 weights are not part of this tree: every path below that tests for them is dead.
 static inline bool ggml_type_is_exl3(ggml_type) { return false; }
@@ -80,6 +81,7 @@ static inline bool ggml_type_is_exl3(ggml_type) { return false; }
 #include <new>
 #include <set>
 #include <string>
+#include <functional>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -161,6 +163,9 @@ struct moe_cache_key_hash {
         return (size_t)value;
     }
 };
+
+// ARENA: one per expert shape (moe-arena.h)
+using moe_expert_arena = moe_arena<moe_cache_key, moe_cache_key_hash>;
 
 struct moe_cache_slot {
     moe_cache_key key;
@@ -320,6 +325,10 @@ struct moe_cache_job {
     uint32_t * split_flag = nullptr;
     int * split_pending = nullptr;
     uint32_t split_seq = 0;
+    // ARENA: the arena slot the fill copies from, held (a reader) from the admission to the end of the copy; -1 when
+    // the arena is off or the expert is registered in place
+    int arena_hold = -1;
+    moe_expert_arena * arena = nullptr;   // the arena of arena_hold
 };
 
 // SPLIT: one tensor of the moved expert done (copied, failed or cancelled): the last one raises the flag
@@ -427,6 +436,73 @@ static constexpr cudaStream_t moe_cache_zone_stream = nullptr;
 // a pool lends at most this share of its slab (moe_cache_pool_lendable)
 static constexpr int moe_cache_lend_percent = 95;
 
+// ARENA: threads for the CPU path's O_DIRECT reads (an NVMe drive needs several reads in flight for its rate)
+struct moe_arena_readers {
+    std::mutex mu;
+    std::condition_variable cv, done_cv;
+    std::deque<std::function<void()>> q;
+    bool stop = false;
+    std::vector<std::thread> threads;
+
+    explicit moe_arena_readers(int n) {
+        for (int i = 0; i < n; i++) {
+            threads.emplace_back([this] {
+                for (;;) {
+                    std::function<void()> f;
+                    {
+                        std::unique_lock<std::mutex> lock(mu);
+                        cv.wait(lock, [this] { return stop || !q.empty(); });
+                        if (q.empty()) {
+                            return;
+                        }
+                        f = std::move(q.front());
+                        q.pop_front();
+                    }
+                    f();
+                }
+            });
+        }
+    }
+    ~moe_arena_readers() {
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            stop = true;
+        }
+        cv.notify_all();
+        for (auto & t : threads) {
+            t.join();
+        }
+    }
+    // runs the tasks on the threads ahead of what post() queued (the CPU rows and the prefill wait for them), returns
+    // when they are done
+    void run(std::vector<std::function<void()>> & tasks) {
+        if (tasks.empty()) {
+            return;
+        }
+        int left = (int) tasks.size();
+        std::unique_lock<std::mutex> lock(mu);
+        for (auto it = tasks.rbegin(); it != tasks.rend(); ++it) {
+            q.push_front([this, &left, f = std::move(*it)] {
+                f();
+                std::lock_guard<std::mutex> l(mu);
+                if (--left == 0) {
+                    done_cv.notify_all();
+                }
+            });
+        }
+        cv.notify_all();
+        done_cv.wait(lock, [&] { return left == 0; });
+    }
+    // a task behind the others, not waited for (a restoration's reads)
+    void post(std::function<void()> f) {
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            q.push_back(std::move(f));
+        }
+        cv.notify_one();
+    }
+};
+
 struct moe_cache_device {
     // the largest piece one pool lends while the prefetch holds its zones, set once with the zones (moe_cache_largest_lend)
     std::atomic<size_t> largest_lend_bytes{0};
@@ -454,6 +530,24 @@ struct moe_cache_device {
     // weights by the SDMA engine, without the memcpy to the stage
     std::vector<std::pair<uintptr_t, uintptr_t>> pinned;
     bool pin_full = false;   // KFD's limit was reached: nothing more is registered
+    // PIN, direct load (moe_cache_pin_load_direct): the expert ranges made anonymous memory filled from the files with
+    // O_DIRECT before they are registered; each one's file and offset, to map it back if KFD refuses it
+    bool pin_direct = false;
+    bool arena_off = false, pin_off = false;   // GGML_CUDA_MOE_ARENA_MB=auto's choice (moe_cache_build_pending)
+    struct pin_file { uintptr_t start, end; std::string path; uint64_t offset; };
+    std::vector<pin_file> pin_files;
+    // the expert arena (moe-arena.h, GGML_CUDA_MOE_ARENA_MB): one per expert shape (index of shapes, null for a shape
+    // without one), its slots under the session lock; one mapping, registered in pieces of whole slots of each
+    std::vector<std::unique_ptr<moe_expert_arena>> arenas;
+    char * arena_base = nullptr;
+    size_t arena_mapped = 0;                              // bytes mapped
+    std::vector<std::pair<char *, size_t>> arena_pieces;   // the registered pieces
+    // the mappings of the model files behind the expert tensors: [start, end) is the file from offset, read with O_DIRECT
+    struct arena_file { uintptr_t start, end; int fd; uint64_t offset; };
+    std::vector<arena_file> arena_files;
+    std::map<std::string, int> arena_fds;   // the files opened with O_DIRECT, by path
+    uint64_t arena_gen = 0;   // bumped by a prefill's lending: a restoration's reads still queued give up
+    std::unique_ptr<moe_arena_readers> arena_readers;   // the CPU path's O_DIRECT reads, in parallel
     std::unordered_map<moe_cache_key, moe_cache_demand, moe_cache_key_hash> demand_count;
     uint64_t freq_demands = 0;   // LFU: demands since the last aging
     uint64_t renewed_demands = 0;   // LFU: demands since the content was renewed (lfu_ramp)
@@ -628,6 +722,8 @@ struct moe_cache_session {
     std::unordered_map<const void *, active_source> active_sources;
     // entries a prefill graph reads in place (moe_cache_prefill_residents), until moe_cache_prefill_unpin
     std::vector<std::pair<moe_cache_pool *, int>> prefill_pins;
+    // ARENA: the arena slots a prefetch slot's copies read, by prefetch slot (moe_cache_prefill_sources)
+    std::map<int, std::vector<std::pair<moe_expert_arena *, int>>> prefill_arena_pins;
 };
 
 struct moe_cache_pin {
@@ -1738,6 +1834,9 @@ static void moe_cache_prepare_queues(void * opaque, const struct ggml_cgraph * g
     }
 }
 
+static bool moe_arena_load(const moe_cache_device & d, moe_expert_arena & a, int s, const moe_cache_job & j,
+                           const moe_cache_pool & p);
+
 static void moe_cache_worker(moe_cache_session * session, moe_cache_device * device) {
     char * stage = nullptr;
     size_t stage_capacity = 0;
@@ -1782,16 +1881,18 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
             }
         }
     };
-    // the job's three copies, each from the weights or from the staging buffer
-    const auto copy_job = [&](const moe_cache_job & j, const moe_cache_pool * p, char * dst, const char * buf) {
+    // the job's three copies, each from the weights, from the staging buffer or from the expert's arena slot (parts)
+    const auto copy_job = [&](const moe_cache_job & j, const moe_cache_pool * p, char * dst, const char * buf,
+                              const char * const * parts) {
         cudaError_t err = cudaSuccess;
         if (j.whole) {   // a packed layer: the expert's up, gate, down and pads in one copy
-            const void * src = pinned(j.source[0], j.bytes) ? j.source[0] : (const void *) buf;
+            const void * src = parts ? (const void *) parts[0] : pinned(j.source[0], j.bytes) ? j.source[0] : (const void *) buf;
             err = cudaMemcpyAsync(dst, src, j.bytes, cudaMemcpyHostToDevice, stream);
         }
         for (int r = 0; r < MOE_ROLES && err == cudaSuccess && !j.whole; r++) {
             const size_t bytes = j.role_bytes[r] + (j.pad_follows[r] ? p->role_pad[r] : 0);
-            const void * src = pinned(j.source[r], bytes) ? j.source[r] : (const void *) (buf + p->role_offset[r]);
+            const void * src = parts ? (const void *) parts[r] :
+                pinned(j.source[r], bytes) ? j.source[r] : (const void *) (buf + p->role_offset[r]);
             err = cudaMemcpyAsync(dst + p->role_offset[r], src, bytes, cudaMemcpyHostToDevice, stream);
             if (err == cudaSuccess && p->role_pad[r] && !j.pad_follows[r]) {   // the last expert: its own first bytes
                 err = cudaMemcpyAsync(dst + p->role_offset[r] + p->role_bytes[r], src, p->role_pad[r], cudaMemcpyHostToDevice, stream);
@@ -1897,7 +1998,7 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
         } else {
             bufs[0] = stage;
             stage_job(cur, cur_pool, bufs[b]);
-            error = copy_job(cur, cur_pool, cur_dst, bufs[b]);
+            error = copy_job(cur, cur_pool, cur_dst, bufs[b], nullptr);
         }
         for (;;) {
             moe_cache_job next;
@@ -1938,7 +2039,7 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
             cur = next;
             cur_pool = next_pool;
             cur_dst = next_dst;
-            error = copy_job(cur, cur_pool, cur_dst, bufs[b]);
+            error = copy_job(cur, cur_pool, cur_dst, bufs[b], nullptr);
         }
         {
             std::lock_guard<std::mutex> lock(session->mu);
@@ -2003,6 +2104,8 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
 
         cudaError_t error = cudaSuccess;
         ggml_cuda_set_device(device->logical);
+        int arena_slot = -1;
+        bool arena_read = false;
 
         if (device->dead.load() || moe_cache_fail(*session, "insert")) {
             error = cudaErrorUnknown;
@@ -2037,15 +2140,21 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
             if (session->config.serial_fill) {
                 fill_lock.lock();
             }
-            if (error == cudaSuccess && stage && stage_capacity >= job.bytes) {
+            // ARENA: copied from the expert's slot, held since its admission
+            arena_slot = job.arena ? job.arena_hold : -1;
+            arena_read = arena_slot >= 0;
+            const char * const * parts = arena_slot >= 0 ? job.arena->slots[arena_slot].part : nullptr;
+            if (error == cudaSuccess && (arena_slot >= 0 || (stage && stage_capacity >= job.bytes))) {
                 // DIAGNOSTIC (GGML_CUDA_MOE_FILL_STATS=1): per 2000 fills, time in the copy to the staging
                 // buffer, in the copy to the device and its wait (of which the call), between fills
                 static const bool ft = getenv("GGML_CUDA_MOE_FILL_STATS") != nullptr;
                 static int64_t f_n = 0, f_cpy = 0, f_dma = 0, f_idle = 0, f_last = 0;
                 const int64_t t0 = ft ? ggml_time_us() : 0;
-                stage_job(job, pool, stage);
+                if (arena_slot < 0) {
+                    stage_job(job, pool, stage);
+                }
                 const int64_t t1 = ft ? ggml_time_us() : 0;
-                error = copy_job(job, pool, destination, stage);
+                error = copy_job(job, pool, destination, stage, parts);
                 static int64_t f_call = 0;
                 const int64_t t1b = ft ? ggml_time_us() : 0;
                 if (error == cudaSuccess) {
@@ -2095,6 +2204,10 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
             for (int r = 0; r < MOE_ROLES; r++) {
                 device->inflight_source[r] = nullptr;
                 device->inflight_bytes[r] = 0;
+            }
+            if (arena_read) {
+                job.arena->release(arena_slot);
+                job.arena->hits++;
             }
 
             if (pool && job.slot >= 0 && job.slot < pool->n_slots) {
@@ -2523,6 +2636,7 @@ static void moe_cache_setup_zone(moe_cache_device & device, size_t zone_bytes, i
 static void moe_cache_attach_test_region(moe_cache_device & device);
 static void moe_cache_attach_kv(moe_cache_session & session, moe_cache_device & device);
 static void moe_cache_preload(const moe_cache_session & session, moe_cache_device & device);
+static void moe_cache_arena_seed(moe_cache_device & device);
 static void moe_cache_profile_save_heat(moe_cache_session & session);
 
 // Every expert tensor registered in place (hipHostRegister, read-only; GGML_CUDA_MOE_PIN=0 disables), once the
@@ -2582,6 +2696,28 @@ static bool moe_cache_remap_range(uintptr_t ib, uintptr_t ie) {
 #endif
 }
 
+// a range back to its file's pages: one loaded directly (anonymous now, its file recorded), else through /proc/self/maps
+static bool moe_cache_remap_any(const moe_cache_device & device, uintptr_t ib, uintptr_t ie) {
+#if defined(__linux__)
+    for (const auto & f : device.pin_files) {
+        if (ib >= f.start && ie <= f.end) {
+            const int fd = open(f.path.c_str(), O_RDONLY);
+            if (fd < 0) {
+                return false;
+            }
+            void * p = mmap((void *) ib, ie - ib, PROT_READ, MAP_SHARED | MAP_FIXED, fd, (off_t) (f.offset + (ib - f.start)));
+            close(fd);
+            if (p != (void *) ib) {
+                return false;
+            }
+            (void) posix_madvise(p, ie - ib, POSIX_MADV_RANDOM);
+            return true;
+        }
+    }
+#endif
+    return moe_cache_remap_range(ib, ie);
+}
+
 // one expert tensor registered in place (its range rounded outwards to pages), false if ROCm refuses it. Portable: with
 // several GPUs a range registered for one device's cache is also copied by another (the first GPU's prefetch copies
 // every layer); a range another device of the session registered is not registered again
@@ -2600,13 +2736,126 @@ static bool moe_cache_pin_tensor(const moe_cache_session & session, moe_cache_de
     // mapped: the dispatcher's kernel copy reads a moved expert there (moe_split_copy_by_kernel)
     if (cudaHostRegister((void *) ib, ie - ib, cudaHostRegisterReadOnly | cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
         (void) cudaGetLastError();
-        (void) moe_cache_remap_range(ib, ie);   // the half-done registration goes with the old mapping
+        (void) moe_cache_remap_any(device, ib, ie);   // the half-done registration goes with the old mapping
         device.pin_full = true;
         return false;
     }
     device.pinned.push_back({ib, ie});
     bytes += ie - ib;
     return true;
+}
+
+// PIN, direct load: each expert range (merged, page-aligned) replaced by anonymous memory at the same address (MAP_FIXED)
+// and filled from its file with O_DIRECT by reader threads (GGML_CUDA_MOE_ARENA_READERS, 8), in 64 MiB pieces; left[i]
+// reaches 0 when range i is filled (loaded[i] false on a failed read), load_cv notified. The experts' host copy is then
+// this memory, not the page cache (the same bytes, the same addresses). A range not inside one file mapping stays as it
+// is. Returns the bytes read
+static size_t moe_cache_pin_load_direct(moe_cache_device & device, const std::vector<std::pair<uintptr_t, uintptr_t>> & merged,
+                                        std::vector<std::atomic<int>> & left, std::vector<char> & loaded,
+                                        std::vector<std::thread> & readers, std::mutex & mu, std::condition_variable & cv) {
+#if defined(__linux__)
+    struct mapping { uintptr_t start, end; uint64_t offset; std::string path; };
+    std::vector<mapping> maps_;
+    {
+        FILE * maps = fopen("/proc/self/maps", "r");
+        char line[4096];
+        while (maps && fgets(line, sizeof(line), maps)) {
+            unsigned long long start = 0, end = 0, offset = 0;
+            char path[4096] = {};
+            if (sscanf(line, "%llx-%llx %*s %llx %*s %*s %4095[^\n]", &start, &end, &offset, path) == 4 && path[0] == '/') {
+                maps_.push_back({(uintptr_t) start, (uintptr_t) end, (uint64_t) offset, path});
+            }
+        }
+        if (maps) {
+            fclose(maps);
+        }
+    }
+    struct piece { size_t range; uintptr_t at; size_t len; int fd; uint64_t off; };
+    std::vector<piece> pieces;
+    std::map<std::string, int> fds;
+    size_t total = 0;
+    const size_t piece_bytes = (size_t) 64 << 20;
+    for (size_t i = 0; i < merged.size(); i++) {
+        left[i].store(0);
+        const auto & r = merged[i];
+        const mapping * m = nullptr;
+        for (const auto & x : maps_) {
+            if (r.first >= x.start && r.second <= x.end) {
+                m = &x;
+                break;
+            }
+        }
+        if (!m) {
+            continue;
+        }
+        auto it = fds.find(m->path);
+        if (it == fds.end()) {
+            it = fds.emplace(m->path, open(m->path.c_str(), O_RDONLY | O_DIRECT)).first;
+        }
+        if (it->second < 0) {
+            continue;
+        }
+        void * p = mmap((void *) r.first, r.second - r.first, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE, -1, 0);
+        if (p != (void *) r.first) {
+            continue;   // MAP_FIXED failing leaves the old mapping
+        }
+        const uint64_t off = m->offset + (r.first - m->start);
+        device.pin_files.push_back({r.first, r.second, m->path, off});
+        int n = 0;
+        for (uintptr_t a = r.first; a < r.second; a += piece_bytes, n++) {
+            pieces.push_back({i, a, std::min(piece_bytes, (size_t) (r.second - a)), it->second, off + (a - r.first)});
+        }
+        left[i].store(n);
+        total += r.second - r.first;
+    }
+    static const int n_threads = getenv("GGML_CUDA_MOE_ARENA_READERS") ? std::max(1, atoi(getenv("GGML_CUDA_MOE_ARENA_READERS"))) : 8;
+    auto next = std::make_shared<std::atomic<size_t>>(0);
+    auto files = std::make_shared<std::map<std::string, int>>(std::move(fds));
+    auto jobs = std::make_shared<std::vector<piece>>(std::move(pieces));
+    auto open_readers = std::make_shared<std::atomic<int>>(n_threads);
+    for (int t = 0; t < n_threads; t++) {
+        readers.emplace_back([&, next, files, jobs, open_readers] {
+            for (size_t k; (k = next->fetch_add(1)) < jobs->size();) {
+                const piece & q = (*jobs)[k];
+                size_t got = 0;
+                bool eof = false;
+                while (got < q.len) {
+                    const ssize_t n = pread(q.fd, (char *) q.at + got, q.len - got, (off_t) (q.off + got));
+                    if (n < 0 && errno == EINTR) {
+                        continue;
+                    }
+                    eof = n == 0;
+                    if (n <= 0) {
+                        break;
+                    }
+                    got += (size_t) n;
+                }
+                // short only at the end of the file, where the range's last page goes past it (zeros there, as mapped)
+                const bool ok = got == q.len || (eof && got > 0);
+                std::lock_guard<std::mutex> lock(mu);
+                if (!ok) {
+                    loaded[q.range] = 0;
+                }
+                if (left[q.range].fetch_sub(1) == 1) {
+                    cv.notify_all();
+                }
+            }
+            if (open_readers->fetch_sub(1) == 1) {
+                for (const auto & f : *files) {
+                    if (f.second >= 0) {
+                        close(f.second);
+                    }
+                }
+            }
+        });
+    }
+    return total;
+#else
+    GGML_UNUSED(device); GGML_UNUSED(merged); GGML_UNUSED(left); GGML_UNUSED(loaded); GGML_UNUSED(readers);
+    GGML_UNUSED(mu); GGML_UNUSED(cv);
+    return 0;
+#endif
 }
 
 static void moe_cache_pin_experts(const moe_cache_session & session, moe_cache_device & device) {
@@ -2631,15 +2880,49 @@ static void moe_cache_pin_experts(const moe_cache_session & session, moe_cache_d
             merged.push_back(r);
         }
     }
+    // direct load (device.pin_direct): reader threads fill the ranges, each registered as soon as it is filled
+    std::vector<std::atomic<int>> left(merged.size());
+    std::vector<char> loaded(merged.size(), 1);
+    std::vector<std::thread> readers;
+    std::mutex load_mu;
+    std::condition_variable load_cv;
+    size_t direct_bytes = 0;
+    if (device.pin_direct) {
+        direct_bytes = moe_cache_pin_load_direct(device, merged, left, loaded, readers, load_mu, load_cv);
+    }
     // until KFD's limit (about RAM - RAM/64 - 1.5 GiB for all processes: 48.6 GiB of experts here, more than a 32 or
     // 48 GB machine allows) refuses one; then 1 GiB of the last ones is given back (unregistered and mapped again) to
     // the pinned buffers allocated after this. The others are copied through a staging buffer, as with
     // GGML_CUDA_MOE_PIN=0
-    for (const auto & r : merged) {
+    for (size_t i = 0; i < merged.size(); i++) {
+        const auto & r = merged[i];
+        if (!readers.empty()) {
+            std::unique_lock<std::mutex> lock(load_mu);
+            load_cv.wait(lock, [&] { return left[i].load() == 0; });
+        }
+        if (!loaded[i]) {
+            (void) moe_cache_remap_any(device, r.first, r.second);   // a failed read: the file's pages again
+            continue;
+        }
         moe_cache_seen_tensor whole;
         whole.bytes = r.second - r.first;
         if (!moe_cache_pin_tensor(session, device, (const void *) r.first, whole, bytes)) {
             break;
+        }
+    }
+    for (auto & t : readers) {
+        t.join();
+    }
+    if (device.pin_full && device.pin_direct) {
+        // the ranges after the refused one were filled but are not registered: their file's pages again, the RAM back
+        for (const auto & r : merged) {
+            bool registered = false;
+            for (const auto & q : device.pinned) {
+                registered = registered || (r.first >= q.first && r.second <= q.second);
+            }
+            if (!registered) {
+                (void) moe_cache_remap_any(device, r.first, r.second);
+            }
         }
     }
     if (device.pin_full) {
@@ -2647,7 +2930,7 @@ static void moe_cache_pin_experts(const moe_cache_session & session, moe_cache_d
         while (freed < ((size_t) 1 << 30) && !device.pinned.empty()) {
             const auto r = device.pinned.back();
             (void) cudaHostUnregister((void *) r.first);
-            (void) moe_cache_remap_range(r.first, r.second);
+            (void) moe_cache_remap_any(device, r.first, r.second);
             freed += r.second - r.first;
             bytes -= r.second - r.first;
             device.pinned.pop_back();
@@ -2655,9 +2938,531 @@ static void moe_cache_pin_experts(const moe_cache_session & session, moe_cache_d
         fail = merged.size() - device.pinned.size();
     }
     std::sort(device.pinned.begin(), device.pinned.end());
-    MOE_CACHE_LOG("[moe-cache] CUDA%d pin: %zu expert tensors registered (%zu MiB) in %.1f s, %zu left out%s\n",
+    MOE_CACHE_LOG("[moe-cache] CUDA%d pin: %zu expert tensors registered (%zu MiB) in %.1f s, %zu left out%s%s\n",
             device.physical, device.pinned.size(), bytes >> 20, (ggml_time_us() - t0) / 1e6, fail,
-            device.pin_full ? " (KFD's system memory limit reached)" : "");
+            device.pin_full ? " (KFD's system memory limit reached)" : "",
+            device.pin_direct ? (" (read with O_DIRECT: " + std::to_string(direct_bytes >> 20) + " MiB)").c_str() : "");
+}
+
+// The expert arena (moe-arena.h), GGML_CUDA_MOE_ARENA_MB=N: N MiB of anonymous memory
+// registered once, now, before the expert tensors are (it comes first under KFD's limit). One arena per expert shape,
+// its slots the size of that shape's expert read with O_DIRECT; never more slots than the shape has experts. When the
+// size cannot hold them all, it is shared out by the shapes' bytes (as the VRAM cache's budget). Registered in pieces of
+// whole slots (~1 GiB), the shapes in turn, until KFD refuses one; the refused piece and the rest are unmapped, which
+// drops a half-done registration with its charge.
+// auto (SIZE_MAX), the default on Linux: see moe_cache_build_pending; 0: none, the experts registered in place from the
+// page cache (the default elsewhere: the arena and the direct load read /proc and use O_DIRECT)
+static size_t moe_cache_arena_mb() {
+    const char * v = getenv("GGML_CUDA_MOE_ARENA_MB");
+#if defined(__linux__)
+    const size_t dflt = SIZE_MAX;
+#else
+    const size_t dflt = 0;
+#endif
+    static const size_t mb = !v ? dflt : strcmp(v, "auto") == 0 ? SIZE_MAX : (size_t) atoll(v);
+    return mb;
+}
+
+// a number from a file: its first line ("max": SIZE_MAX), or the value after key; SIZE_MAX if absent
+static size_t moe_arena_read_number(const std::string & path, const char * key) {
+    std::ifstream file(path);
+    std::string line;
+    while (std::getline(file, line)) {
+        if (!key) {
+            return line == "max" ? SIZE_MAX : (size_t) strtoull(line.c_str(), nullptr, 10);
+        }
+        if (line.compare(0, strlen(key), key) == 0) {
+            return (size_t) strtoull(line.c_str() + strlen(key), nullptr, 10);
+        }
+    }
+    return SIZE_MAX;
+}
+
+// GGML_CUDA_MOE_ARENA_MB=auto (buun's rule for his RAM tier): the memory free to take now, less a margin
+// (GGML_CUDA_MOE_ARENA_MARGIN_MB, 4096): the smaller of MemAvailable and, under every cgroup v2 limit above this
+// process, the limit less what cannot be reclaimed without swap (anonymous, shared, kernel; the page cache can be)
+static size_t moe_cache_arena_auto_bytes() {
+    size_t room = moe_arena_read_number("/proc/meminfo", "MemAvailable:");
+    room = room == SIZE_MAX ? SIZE_MAX : room << 10;
+    std::ifstream cg("/proc/self/cgroup");
+    std::string line;
+    while (std::getline(cg, line)) {
+        if (line.compare(0, 3, "0::") != 0) {
+            continue;
+        }
+        std::string dir = "/sys/fs/cgroup" + line.substr(3);
+        while (dir.size() > strlen("/sys/fs/cgroup")) {
+            const size_t limit = moe_arena_read_number(dir + "/memory.max", nullptr);
+            if (limit != SIZE_MAX) {
+                size_t used = 0;
+                for (const char * key : {"anon ", "shmem ", "kernel "}) {
+                    const size_t b = moe_arena_read_number(dir + "/memory.stat", key);
+                    used += b == SIZE_MAX ? 0 : b;
+                }
+                room = std::min(room, used < limit ? limit - used : 0);
+            }
+            dir.resize(dir.rfind('/'));
+        }
+    }
+    const char * m = getenv("GGML_CUDA_MOE_ARENA_MARGIN_MB");
+    const size_t margin = (m ? (size_t) atoll(m) : 4096) << 20;
+    return room != SIZE_MAX && room > margin ? room - margin : 0;
+}
+
+// ARENA: what a restoration brings back once generation starts. GGML_CUDA_MOE_ARENA_RESTORE=prompt: the experts the
+// prompt routed most rows to (counted on the device during its prefill, ggml_cuda_moe_prefill_counts), else (evicted,
+// the default) the experts the prefill's zone evicted, hottest first
+static bool moe_arena_restore_prompt() {
+    static const bool prompt = getenv("GGML_CUDA_MOE_ARENA_RESTORE") && !strcmp(getenv("GGML_CUDA_MOE_ARENA_RESTORE"), "prompt");
+    return prompt;
+}
+
+// the prefill's row counts: one row of n experts per layer number, on the device (one device)
+static std::atomic<int *> g_prefill_counts{nullptr};
+static int g_prefill_counts_n = 0, g_prefill_counts_rows = 0;
+
+int * ggml_cuda_moe_prefill_counts(const char * w_name, int n_expert) {
+    int * d = g_prefill_counts.load(std::memory_order_acquire);
+    if (!d || !w_name || n_expert != g_prefill_counts_n) {
+        return nullptr;
+    }
+    const char * b = strstr(w_name, "blk.");
+    int layer = -1, end = 0;
+    if (!b || sscanf(b, "blk.%d.%n", &layer, &end) != 1 || strncmp(b + end, "ffn_gate_exps", 13) != 0 ||
+            layer < 0 || layer >= g_prefill_counts_rows) {
+        return nullptr;
+    }
+    return d + (size_t) layer * n_expert;
+}
+
+static __global__ void k_moe_count_rows(const int * __restrict__ bounds, int * __restrict__ counts, int n) {
+    const int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e < n) {
+        counts[e] += bounds[e + 1] - bounds[e];
+    }
+}
+
+void ggml_cuda_moe_count_rows(const int * expert_bounds, int * counts, int n_expert, void * stream) {
+    k_moe_count_rows<<<(n_expert + 255) / 256, 256, 0, (cudaStream_t) stream>>>(expert_bounds, counts, n_expert);
+}
+
+// ARENA: the mappings of the model files behind the expert tensors seen so far, each file opened with O_DIRECT once;
+// again for a layer shown later (the MTP draft's, from its own file), before its first graph (the readers do not run then)
+static void moe_arena_open_files(moe_cache_device & device) {
+#if defined(__linux__)
+    FILE * maps = fopen("/proc/self/maps", "r");
+    char line[4096];
+    while (maps && fgets(line, sizeof(line), maps)) {
+        unsigned long long start = 0, end = 0, offset = 0;
+        char path[4096] = {};
+        if (sscanf(line, "%llx-%llx %*s %llx %*s %*s %4095[^\n]", &start, &end, &offset, path) < 4 || path[0] != '/') {
+            continue;
+        }
+        bool known = false;
+        for (const auto & f : device.arena_files) {
+            known = known || (f.start <= (uintptr_t) start && (uintptr_t) end <= f.end);   // merged ranges hold their pieces
+        }
+        bool experts = false;
+        for (const auto & t : device.seen_tensors) {
+            const uintptr_t b = (uintptr_t) t.first;
+            experts = experts || (b < end && b + t.second.bytes > start);
+        }
+        if (known || !experts) {
+            continue;
+        }
+        auto it = device.arena_fds.find(path);
+        if (it == device.arena_fds.end()) {
+            it = device.arena_fds.emplace(path, open(path, O_RDONLY | O_DIRECT)).first;
+        }
+        if (it->second >= 0) {
+            device.arena_files.push_back({(uintptr_t) start, (uintptr_t) end, it->second, (uint64_t) offset});
+        }
+    }
+    if (maps) {
+        fclose(maps);
+    }
+    std::sort(device.arena_files.begin(), device.arena_files.end(),
+              [](const moe_cache_device::arena_file & a, const moe_cache_device::arena_file & b) { return a.start < b.start; });
+    // one file shows as several consecutive mappings where a madvise split it (the lazy PLE table, the experts left out
+    // of the prefetch): merged, or an expert across a split would be in none of them
+    std::vector<moe_cache_device::arena_file> merged;
+    for (const auto & f : device.arena_files) {
+        if (!merged.empty() && merged.back().fd == f.fd && merged.back().end == f.start &&
+                merged.back().offset + (merged.back().end - merged.back().start) == f.offset) {
+            merged.back().end = f.end;
+        } else {
+            merged.push_back(f);
+        }
+    }
+    device.arena_files = std::move(merged);
+#else
+    GGML_UNUSED(device);
+#endif
+}
+
+static void moe_cache_arena_create(moe_cache_device & device) {
+    size_t want = moe_cache_arena_mb() == SIZE_MAX ? moe_cache_arena_auto_bytes() : moe_cache_arena_mb() << 20;
+    if (want == 0 || device.arena_base) {
+        return;
+    }
+    // a slot holds an expert read with O_DIRECT: each tensor (with its pad) in the page-aligned span around it, or a
+    // packed expert in one
+    struct sub { int shape; size_t slot; uint64_t experts; size_t bytes = 0, piece = 0, done = 0; char * base = nullptr; };
+    std::vector<sub> subs;
+    double need = 0;
+    for (size_t k = 0; k < device.shapes.size(); k++) {
+        const moe_cache_shape & shape = device.shapes[k];
+        if (shape.n_layers > 0 && shape.n_entries > 0) {
+            size_t roles = 0;
+            for (int r = 0; r < MOE_ROLES; r++) {
+                roles += GGML_PAD(shape.role_bytes[r] + shape.role_pad[r] + 4096, 4096);
+            }
+            subs.push_back({(int) k, std::max(roles, (size_t) GGML_PAD(shape.expert_size + 4096, 4096)), shape.n_entries});
+            need += (double) subs.back().slot * subs.back().experts;
+        }
+    }
+    if (subs.empty()) {
+        return;
+    }
+    // under KFD's limit for registered memory (RAM - RAM/64 - 1.5 GiB for all processes), less 2 GiB for what ROCm
+    // locks itself (a copy from pageable memory) and the pinned buffers allocated later
+    {
+        const size_t total = moe_arena_read_number("/proc/meminfo", "MemTotal:");
+        if (total != SIZE_MAX) {
+            const size_t ram = total << 10;
+            const size_t kfd = ram - ram / 64 - ((size_t) 3 << 29) - ((size_t) 2 << 30);
+            want = std::min(want, kfd);
+        }
+    }
+    // the shares by bytes, each at least one layer and a half of its experts (a prefill holds a layer's experts while it
+    // copies them: below that, a shape's zone cannot take them, they are copied from the mapping), taken from the shapes
+    // above their floor. MEASURED: the two one-layer shapes at 243 slots of 512 experts, ~1 450 copies from the mapping
+    // per 19k prompt
+    std::vector<uint64_t> n_of(subs.size()), floor_of(subs.size());
+    double above = 0;
+    size_t total = 0;
+    for (size_t k = 0; k < subs.size(); k++) {
+        const sub & x = subs[k];
+        const moe_cache_shape & sh = device.shapes[x.shape];
+        const double per_layer = sh.n_layers > 0 ? (double) sh.n_entries / sh.n_layers : 0.0;
+        floor_of[k] = std::min<uint64_t>(x.experts, (uint64_t) std::ceil(1.5 * per_layer));
+        n_of[k] = want >= need ? x.experts : (uint64_t) ((double) want * x.slot * x.experts / need / x.slot);
+        n_of[k] = std::max(n_of[k], floor_of[k]);
+        total += (size_t) n_of[k] * x.slot;
+        above += (double) (n_of[k] - floor_of[k]) * x.slot;
+    }
+    if (total > want && above > 0) {
+        const double cut = std::min(1.0, (double) (total - want) / above);
+        for (size_t k = 0; k < subs.size(); k++) {
+            n_of[k] -= (uint64_t) std::ceil(cut * (double) (n_of[k] - floor_of[k]));
+        }
+    }
+    size_t bytes = 0;
+    for (size_t k = 0; k < subs.size(); k++) {
+        sub & x = subs[k];
+        x.bytes = (size_t) n_of[k] * x.slot;
+        x.piece = std::max<size_t>(1, ((size_t) 1 << 30) / x.slot) * x.slot;   // a copy reads one registration
+        bytes += x.bytes;
+    }
+    if (bytes == 0) {
+        return;
+    }
+#if defined(__linux__)
+    const int64_t t0 = ggml_time_us();
+    moe_arena_open_files(device);
+    if (device.arena_files.empty()) {
+        MOE_CACHE_LOG("[moe-cache] CUDA%d arena: no model file opened with O_DIRECT, no arena\n", device.physical);
+        return;
+    }
+    void * p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (p == MAP_FAILED) {
+        MOE_CACHE_LOG("[moe-cache] CUDA%d arena: mmap of %zu MiB failed\n", device.physical, bytes >> 20);
+        return;
+    }
+    ggml_cuda_set_device(device.logical);
+    char * base = (char *) p;
+    {
+        char * cur = base;
+        for (sub & x : subs) {
+            x.base = cur;
+            cur += x.bytes;
+        }
+    }
+    // DIAGNOSTIC GGML_CUDA_MOE_ARENA_MAPPED=0: not mapped into the GPU's address space (only SDMA copies read it)
+    static const bool mapped = !getenv("GGML_CUDA_MOE_ARENA_MAPPED") || atoi(getenv("GGML_CUDA_MOE_ARENA_MAPPED")) != 0;
+    bool refused = false;
+    for (bool more = true; more && !refused;) {
+        more = false;
+        for (sub & x : subs) {
+            if (x.done == x.bytes) {
+                continue;
+            }
+            const size_t n = std::min(x.piece, x.bytes - x.done);
+            if (cudaHostRegister(x.base + x.done, n, cudaHostRegisterPortable | (mapped ? cudaHostRegisterMapped : 0)) != cudaSuccess) {
+                (void) cudaGetLastError();
+                refused = true;
+                break;
+            }
+            device.arena_pieces.push_back({x.base + x.done, n});
+            x.done += n;
+            more = more || x.done < x.bytes;
+        }
+    }
+    size_t done = 0;
+    int n_slots = 0;
+    device.arenas.clear();
+    device.arenas.resize(device.shapes.size());
+    // GGML_CUDA_MOE_ARENA_EVICT=0: once full, an arena keeps its experts
+    const bool evict = !getenv("GGML_CUDA_MOE_ARENA_EVICT") || atoi(getenv("GGML_CUDA_MOE_ARENA_EVICT")) != 0;
+    // DIAGNOSTIC GGML_CUDA_MOE_ARENA_IDLE=1: registered, never used
+    const bool idle = getenv("GGML_CUDA_MOE_ARENA_IDLE") && atoi(getenv("GGML_CUDA_MOE_ARENA_IDLE")) != 0;
+    std::string shapes;
+    for (sub & x : subs) {
+        if (x.done < x.bytes) {
+            (void) munmap(x.base + x.done, x.bytes - x.done);   // the refused piece's half-done registration goes with it
+        }
+        const int n = (int) (x.done / x.slot);
+        if (n > 0) {
+            auto a = std::make_unique<moe_expert_arena>();
+            a->init(x.base, x.slot, idle ? 0 : n);
+            a->evict = evict;
+            // the zone lent to a prefill: the experts it reads that the arena does not hold, for the layers it has in
+            // flight (a read slot is held until its prefetch slot is used again, 4 tensors later: about 2.3 layers),
+            // up to the whole arena of a small shape (restored after). MEASURED: 2 layers capped at half the arena
+            // left ~2 700 reads per 19k prompt to the mapping
+            const moe_cache_shape & sh = device.shapes[x.shape];
+            const double per_layer = sh.n_layers > 0 ? (double) sh.n_entries / sh.n_layers : 0.0;
+            const double absent = x.experts > 0 ? 1.0 - std::min(1.0, (double) n / x.experts) : 0.0;
+            a->zone_slots = std::min(n, (int) std::ceil(2.5 * per_layer * absent));
+            device.arenas[x.shape] = std::move(a);
+        }
+        done += x.done;
+        n_slots += n;
+        char b[96];
+        snprintf(b, sizeof(b), "%s%d x %zu KiB (%llu experts)", shapes.empty() ? "" : ", ", n, x.slot >> 10,
+                 (unsigned long long) x.experts);
+        shapes += b;
+    }
+    if (n_slots == 0) {
+        for (const auto & piece : device.arena_pieces) {
+            (void) cudaHostUnregister(piece.first);
+        }
+        device.arena_pieces.clear();
+        device.arenas.clear();
+        (void) munmap(base, bytes);
+        MOE_CACHE_LOG("[moe-cache] CUDA%d arena: nothing registered (KFD's system memory limit)\n", device.physical);
+        return;
+    }
+    device.arena_base = base;
+    device.arena_mapped = bytes;
+    static const int n_readers = getenv("GGML_CUDA_MOE_ARENA_READERS") ? std::max(1, atoi(getenv("GGML_CUDA_MOE_ARENA_READERS"))) : 8;
+    device.arena_readers.reset(new moe_arena_readers(n_readers));
+    if (moe_arena_restore_prompt() && !g_prefill_counts.load() && !device.layers.empty()) {
+        int rows = 0, n = 0;
+        for (const auto & [number, layer] : device.layers) {
+            rows = std::max(rows, number + 1);
+            n = std::max(n, (int) layer.n_expert);
+        }
+        int * d = nullptr;
+        if (cudaMalloc((void **) &d, (size_t) rows * n * sizeof(int)) == cudaSuccess &&
+                cudaMemset(d, 0, (size_t) rows * n * sizeof(int)) == cudaSuccess) {
+            g_prefill_counts_n = n;
+            g_prefill_counts_rows = rows;
+            g_prefill_counts.store(d, std::memory_order_release);
+        } else {
+            (void) cudaGetLastError();
+        }
+    }
+    MOE_CACHE_LOG("[moe-cache] CUDA%d arena: %d slots (%zu MiB of %zu asked, %.0f MiB hold every expert) registered in %.2f s%s: %s\n",
+            device.physical, n_slots, done >> 20, want >> 20, need / 1048576.0, (ggml_time_us() - t0) / 1e6,
+            refused ? " (KFD's system memory limit reached)" : "", shapes.c_str());
+#else
+    GGML_UNUSED(device);
+#endif
+}
+
+static void moe_cache_arena_free(moe_cache_device & device) {
+    device.arena_readers.reset();   // first: the restoration's reads still queued run (or give up) before the unmapping
+    if (int * d = g_prefill_counts.exchange(nullptr)) {
+        (void) cudaFree(d);
+    }
+    for (const auto & f : device.arena_fds) {
+        if (f.second >= 0) {
+            close(f.second);
+        }
+    }
+    device.arena_fds.clear();
+    device.arena_files.clear();
+    if (!device.arena_base) {
+        return;
+    }
+    moe_expert_arena t;   // the counters, summed
+    for (const auto & a : device.arenas) {
+        if (a) {
+            t.writes += a->writes; t.cpu_loads += a->cpu_loads; t.prefill_loads += a->prefill_loads;
+            t.load_failures += a->load_failures; t.hits += a->hits; t.cpu_hits += a->cpu_hits;
+            t.evictions += a->evictions; t.busy += a->busy; t.refused += a->refused;
+            t.zone_busy += a->zone_busy; t.restored += a->restored; t.zone_slots += a->zone_slots;
+        }
+    }
+    MOE_CACHE_LOG("[moe-cache] CUDA%d arena: %llu reads with O_DIRECT (%llu for the CPU, %llu for prefills, %llu failed), "
+            "%llu fills from it, %llu CPU experts from it, %llu evictions, %llu busy, %llu admissions refused (not in it); "
+            "prefill zone %d slots, %llu reads with it full, %llu restored\n", device.physical,
+            (unsigned long long) t.writes, (unsigned long long) t.cpu_loads, (unsigned long long) t.prefill_loads,
+            (unsigned long long) t.load_failures, (unsigned long long) t.hits,
+            (unsigned long long) t.cpu_hits, (unsigned long long) t.evictions, (unsigned long long) t.busy,
+            (unsigned long long) t.refused, t.zone_slots, (unsigned long long) t.zone_busy, (unsigned long long) t.restored);
+    for (const auto & piece : device.arena_pieces) {
+        (void) cudaHostUnregister(piece.first);
+    }
+    device.arena_pieces.clear();
+#if defined(__linux__)
+    (void) munmap(device.arena_base, device.arena_mapped);
+#endif
+    device.arena_base = nullptr;
+    device.arenas.clear();
+    device.arena_readers.reset();
+}
+
+// ARENA: the arena of a layer's shape, null when none is in use
+static moe_expert_arena * moe_arena_of(const moe_cache_device & d, const moe_cache_layer * cl) {
+    if (!cl || cl->shape < 0 || cl->shape >= (int) d.arenas.size()) {
+        return nullptr;
+    }
+    moe_expert_arena * a = d.arenas[cl->shape].get();
+    return a && a->active() ? a : nullptr;
+}
+
+// a job's host side: the expert's tensors in the weights (one range for a packed layer)
+static void moe_cache_job_sources(const moe_cache_layer & layer, const moe_cache_pool & pool, int32_t expert,
+                                  moe_cache_job & job) {
+    job.whole = true;
+    for (int r = 0; r < MOE_ROLES; r++) {
+        job.source[r] = (const char *) layer.tensor[r] + (size_t) expert * layer.stride[r];
+        // the pad copied from the next expert's first bytes when they follow (stride = bytes)
+        job.pad_follows[r] = expert + 1 < layer.n_expert && layer.stride[r] == layer.bytes[r];
+        job.role_bytes[r] = layer.bytes[r];
+        job.whole = job.whole && layer.stride[r] == pool.expert_size &&
+            (const char *) job.source[r] == (const char *) job.source[0] + pool.role_offset[r];
+    }
+    job.bytes = pool.expert_size;
+}
+
+// ARENA: the host ranges a job reads (one for a packed layer, else one per tensor with its pad)
+static int moe_arena_ranges(const moe_cache_job & j, const moe_cache_pool & p, const char ** src, size_t * n) {
+    if (j.whole) {
+        src[0] = (const char *) j.source[0];
+        n[0] = j.bytes;
+        return 1;
+    }
+    for (int r = 0; r < MOE_ROLES; r++) {
+        src[r] = (const char *) j.source[r];
+        n[r] = j.role_bytes[r] + (j.pad_follows[r] ? p.role_pad[r] : 0);
+    }
+    return MOE_ROLES;
+}
+
+// ARENA: a job's expert read from the model file with O_DIRECT into arena slot s (taken, being written): each range as
+// the page-aligned span around it, the slot's part[] at its first byte. False on any failure (the slot is then aborted)
+static bool moe_arena_load(const moe_cache_device & d, moe_expert_arena & ar, int s, const moe_cache_job & j,
+                           const moe_cache_pool & p) {
+#if defined(__linux__)
+    const char * src[MOE_ROLES];
+    size_t n[MOE_ROLES];
+    const int nr = moe_arena_ranges(j, p, src, n);
+    char * cur = ar.ptr(s);
+    char * const end = cur + ar.slot_bytes;
+    const char * part[MOE_ROLES] = {};
+    for (int r = 0; r < nr; r++) {
+        const uintptr_t a = (uintptr_t) src[r];
+        auto f = std::upper_bound(d.arena_files.begin(), d.arena_files.end(), a,
+                                  [](uintptr_t x, const moe_cache_device::arena_file & y) { return x < y.start; });
+        if (f != d.arena_files.begin() && a >= (f - 1)->start && a < (f - 1)->end && a + n[r] > (f - 1)->end) {
+            // the last expert of a file: its entry's pad goes past the file's mapping (zeros there, as mapped)
+            const size_t inside = (size_t) ((f - 1)->end - a);
+            memset(cur + (a & 4095) + inside, 0, std::min(n[r] - inside, (size_t) (end - (cur + (a & 4095) + inside))));
+            n[r] = inside;
+        }
+        if (f == d.arena_files.begin() || a + n[r] > (--f)->end) {
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1) < 4) {
+                GGML_LOG_WARN("[moe-cache] arena: read of %p (%zu bytes) failed: in no model file opened with O_DIRECT\n",
+                              (const void *) a, n[r]);
+            }
+            return false;
+        }
+        const uint64_t off = f->offset + (a - f->start);
+        const uint64_t aligned = off & ~(uint64_t) 4095;
+        const size_t lead = (size_t) (off - aligned);
+        const size_t len = GGML_PAD(lead + n[r], 4096);
+        if (cur + len > end) {
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1) < 4) {
+                GGML_LOG_WARN("[moe-cache] arena: read of %p failed: %zu bytes past its slot of %zu\n",
+                              (const void *) a, (size_t) (cur + len - end), ar.slot_bytes);
+            }
+            return false;
+        }
+        size_t got = 0;
+        while (got < len) {
+            const ssize_t k = pread(f->fd, cur + got, len - got, (off_t) (aligned + got));
+            if (k < 0 && errno == EINTR) {
+                continue;
+            }
+            if (k <= 0) {
+                break;   // the end of the file: the span's tail is past it
+            }
+            got += (size_t) k;
+        }
+        if (got < lead + n[r]) {
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1) < 4) {
+                GGML_LOG_WARN("[moe-cache] arena: read of %p failed: %zu of %zu bytes at file offset %llu (errno %d)\n",
+                              (const void *) a, got, lead + n[r], (unsigned long long) aligned, errno);
+            }
+            return false;
+        }
+        part[r] = cur + lead;
+        cur += len;
+    }
+    auto & x = ar.slots[s];
+    for (int r = 0; r < MOE_ROLES; r++) {
+        x.part[r] = j.whole ? part[0] + p.role_offset[r] : part[r];
+    }
+    return true;
+#else
+    GGML_UNUSED(d); GGML_UNUSED(ar); GGML_UNUSED(s); GGML_UNUSED(j); GGML_UNUSED(p);
+    return false;
+#endif
+}
+
+// whether every expert range fits both the arena's room (moe_cache_arena_auto_bytes) and KFD's limit for registered
+// memory (RAM - RAM/64 - 1.5 GiB for all processes), less 1 GiB for the pinned buffers allocated later
+static bool moe_cache_experts_fit(const moe_cache_device & device) {
+    std::vector<std::pair<uintptr_t, uintptr_t>> ranges;
+    for (const auto & t : device.seen_tensors) {
+        const uintptr_t b = (uintptr_t) t.first;
+        ranges.push_back({b & ~(uintptr_t) 4095, GGML_PAD(b + t.second.bytes, 4096)});
+    }
+    std::sort(ranges.begin(), ranges.end());
+    size_t bytes = 0;
+    uintptr_t end = 0;
+    for (const auto & r : ranges) {
+        const uintptr_t b = std::max(r.first, end);
+        bytes += r.second > b ? r.second - b : 0;
+        end = std::max(end, r.second);
+    }
+    const size_t total = moe_arena_read_number("/proc/meminfo", "MemTotal:");
+    if (total == SIZE_MAX) {
+        return false;
+    }
+    const size_t ram = total << 10;
+    const size_t kfd = ram - ram / 64 - ((size_t) 3 << 29);
+    const size_t room = moe_cache_arena_auto_bytes();
+    const bool fit = bytes + ((size_t) 1 << 30) <= kfd && bytes <= room;
+    MOE_CACHE_LOG("[moe-cache] CUDA%d experts: %zu MiB, room %zu MiB, KFD limit ~%zu MiB: %s\n", device.physical,
+            bytes >> 20, room >> 20, kfd >> 20, fit ? "registered in place, read with O_DIRECT" : "the arena");
+    return fit;
 }
 
 static void moe_cache_build_pending(
@@ -2691,7 +3496,24 @@ static void moe_cache_build_pending(
         return;
     }
 
-    moe_cache_pin_experts(session, device);
+    // GGML_CUDA_MOE_ARENA_MB=auto: every expert registered in place and read with O_DIRECT (moe_cache_pin_load_direct)
+    // when they all fit (the arena's room and KFD's limit), else the arena of slots without registration in place.
+    // GGML_CUDA_MOE_PIN_DIRECT=1: the direct load with the in-place registration whatever the size
+    {
+        const char * d = getenv("GGML_CUDA_MOE_PIN_DIRECT");
+        device.pin_direct = d && atoi(d) != 0;
+        if (moe_cache_arena_mb() == SIZE_MAX && moe_cache_pin_enabled()) {
+            device.pin_direct = moe_cache_experts_fit(device);
+            device.arena_off = device.pin_direct;
+            device.pin_off = !device.pin_direct;
+        }
+    }
+    if (!device.arena_off) {
+        moe_cache_arena_create(device);
+    }
+    if (!device.pin_off) {
+        moe_cache_pin_experts(session, device);
+    }
 
     const size_t scratch_reserve =
         moe_cache_scratch_total(device.scratch_reserve);
@@ -2763,6 +3585,7 @@ static void moe_cache_build_pending(
     moe_cache_setup_zone(device, moe_cache_zone_bytes(session), session.lend_zones);
     moe_cache_attach_test_region(device);
     moe_cache_attach_kv(session, device);
+    moe_cache_arena_seed(device);
     moe_cache_preload(session, device);
 }
 
@@ -2808,6 +3631,9 @@ static int moe_cache_discover_pool(
         layer.type[role] = wtype;
         layer.n_expert = layer.n_expert ? std::min(layer.n_expert, n_expert) : n_expert;
         device.layer_of[host_base] = layer_number;
+        if (!device.arenas.empty()) {
+            moe_arena_open_files(device);   // a layer shown after the arena was built: its file too
+        }
         device.visits_since_new_tensor = 0;
         if (device.pools_built && !device.pinned.empty() && !device.pin_full) {
             // a tensor of a scheduler sharing the session (MTP draft), shown after the pools were built: registered
@@ -3109,6 +3935,9 @@ static void moe_cache_cancel_queue_locked(
     for (auto it = q->begin(); it != q->end();) {
         if (all || moe_cache_job_overlaps(*it, base, size)) {
             moe_cache_split_done_locked(*it);   // a GPU waiting for it must not wait forever
+            if (it->arena) {
+                it->arena->release(it->arena_hold);
+            }
             device.queued_bytes = it->bytes <= device.queued_bytes
                 ? device.queued_bytes - it->bytes : 0;
             if (it->pool >= 0 && it->pool < (int)device.pools.size()) {
@@ -3134,6 +3963,7 @@ static void moe_cache_free_device(moe_cache_device & device) {
         (void) cudaHostUnregister((void *) r.first);
     }
     device.pinned.clear();
+    moe_cache_arena_free(device);
     if (device.compute_stream) {
         cudaStreamSynchronize(device.compute_stream);
     }
@@ -3417,6 +4247,29 @@ static void moe_cache_defer_add(moe_cache_device & device, int pool_index, const
     }
 }
 
+// ARENA: whether an expert's host copy is the arena: its shape has one (a) and none of its tensors is registered in place
+// (a registered tensor is copied and read where it is)
+static bool moe_arena_wanted(const moe_cache_device & d, const moe_expert_arena * a, const moe_cache_job & j,
+                             const moe_cache_pool & p) {
+    if (!a) {
+        return false;
+    }
+    const auto pinned = [&](const void * source, size_t bytes) {
+        const uintptr_t src = (uintptr_t) source;
+        auto range = std::upper_bound(d.pinned.begin(), d.pinned.end(), std::make_pair(src, UINTPTR_MAX));
+        return range != d.pinned.begin() && src + bytes <= (--range)->second;
+    };
+    if (j.whole) {
+        return !pinned(j.source[0], j.bytes);
+    }
+    for (int r = 0; r < MOE_ROLES; r++) {
+        if (pinned(j.source[r], j.role_bytes[r] + (j.pad_follows[r] ? p.role_pad[r] : 0))) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool moe_cache_enqueue_locked(
         moe_cache_session & session, moe_cache_device & device,
         moe_cache_pool & pool, int pool_index, const void * host_base,
@@ -3436,6 +4289,29 @@ static bool moe_cache_enqueue_locked(
         device.insert_skips++;
         return false;
     }
+    // ARENA: only an expert the arena holds is admitted, its slot held until the copy is done (the CPU rows or a
+    // prefill read it there first; the fill thread reads no file). The pre-gating's prefetches (off by default) copy
+    // from the mapping
+    int hold = -1;
+    moe_expert_arena * ar = pregate ? nullptr : moe_arena_of(device, layer);
+    if (ar) {
+        moe_cache_job probe;
+        moe_cache_job_sources(*layer, pool, expert, probe);
+        if (moe_arena_wanted(device, ar, probe, pool)) {
+            hold = ar->acquire(key);
+            if (hold < 0) {
+                ar->refused++;
+                return false;
+            }
+        } else {
+            ar = nullptr;
+        }
+    }
+    const auto unhold = [&] {
+        if (hold >= 0) {
+            ar->release(hold);
+        }
+    };
 
     int slot_index = -1;
     if (!pool.free_slots.empty()) {
@@ -3448,11 +4324,13 @@ static bool moe_cache_enqueue_locked(
         }
         if (candidate < 0) {
             device.insert_skips++;
+            unhold();
             return false;
         }
         const uint16_t victim_freq = pool.slots[candidate].freq;
         if (contest && victim_freq >= freq) {
             device.admission_skips++;
+            unhold();
             return false;
         }
         const moe_cache_key victim = pool.slots[candidate].key;
@@ -3466,6 +4344,7 @@ static bool moe_cache_enqueue_locked(
             }
         }
     } else {
+        unhold();
         return false;
     }
 
@@ -3480,6 +4359,7 @@ static bool moe_cache_enqueue_locked(
         if (!inserted.second) {
             moe_cache_slot_reset(pool, slot_index, true);
             device.insert_skips++;
+            unhold();
             return false;
         }
         moe_cache_direct_set(pool, key, slot_index);
@@ -3489,22 +4369,16 @@ static bool moe_cache_enqueue_locked(
         job.slot = slot_index;
         job.generation = slot.generation;
         job.key = key;
-        job.whole = true;
-        for (int r = 0; r < MOE_ROLES; r++) {
-            job.source[r] = (const char *)layer->tensor[r] + (size_t)expert * layer->stride[r];
-            // the pad copied from the next expert's first bytes when they follow (stride = bytes)
-            job.pad_follows[r] = expert + 1 < layer->n_expert && layer->stride[r] == layer->bytes[r];
-            job.role_bytes[r] = layer->bytes[r];
-            job.whole = job.whole && layer->stride[r] == pool.expert_size &&
-                (const char *) job.source[r] == (const char *) job.source[0] + pool.role_offset[r];
-        }
-        job.bytes = pool.expert_size;
+        moe_cache_job_sources(*layer, pool, expert, job);
         job.rewarm = rewarm;
+        job.arena_hold = hold;
+        job.arena = hold >= 0 ? ar : nullptr;
         (pregate ? device.pregate_queue : device.queue).push_back(job);
         device.queued_bytes += pool.expert_size;
     } catch (...) {
         moe_cache_slot_reset(pool, slot_index, true);
         device.insert_skips++;
+        unhold();
         return false;
     }
     device.inserts++;
@@ -4441,6 +5315,83 @@ static void moe_cache_profile_save_heat(moe_cache_session & session) {
 // another text those counts held the ranking's experts in the cache too long (simulator, fresh servers on the hybrid's
 // depth trace: 80.56 % of hits with 1 against 80.44 % with the heat; 0 and 2 within 0.03 point of 1). Without a
 // ranking the cache starts empty and fills during generation: the first prompt read everything over PCIe.
+// ARENA: filled once at start (buun's seed reads), before the preload, which copies from it: the preload's ranking first
+// (GGML_CUDA_MOE_CACHE_PRELOAD), then every other expert layer by layer, until each shape's arena is full (no eviction).
+// Read with O_DIRECT by the reader threads, in batches; the session lock is held (the pools are being built)
+static void moe_cache_arena_seed(moe_cache_device & device) {
+    if (device.arenas.empty() || !device.arena_readers) {
+        return;
+    }
+    const int64_t t0 = ggml_time_us();
+    std::vector<std::pair<int, int>> order;   // (layer number, expert)
+    if (const char * path = getenv("GGML_CUDA_MOE_CACHE_PRELOAD"); path && *path) {
+        std::vector<moe_cache_ranked_expert> ranking;
+        uint32_t n_layers = 0, n_experts = 0;
+        if (moe_cache_ranking_read(path, ranking, n_layers, n_experts)) {
+            for (const auto & r : ranking) {
+                order.push_back({r.layer, r.expert});
+            }
+        }
+    }
+    for (const auto & [number, layer] : device.layers) {
+        for (int64_t e = 0; e < layer.n_expert; e++) {
+            order.push_back({number, (int) e});
+        }
+    }
+    struct load { moe_expert_arena * ar; int slot; moe_cache_job job; const moe_cache_pool * pool; };
+    std::vector<load> loads;
+    size_t n_read = 0, n_failed = 0, bytes = 0;
+    const auto flush = [&] {
+        std::vector<char> ok(loads.size(), 0);
+        std::vector<std::function<void()>> tasks;
+        for (size_t i = 0; i < loads.size(); i++) {
+            tasks.push_back([&, i] { ok[i] = moe_arena_load(device, *loads[i].ar, loads[i].slot, loads[i].job, *loads[i].pool); });
+        }
+        device.arena_readers->run(tasks);
+        for (size_t i = 0; i < loads.size(); i++) {
+            if (ok[i]) {
+                loads[i].ar->commit(loads[i].slot);
+                n_read++;
+                bytes += loads[i].job.bytes;
+            } else {
+                loads[i].ar->abort(loads[i].slot);
+                loads[i].ar->load_failures++;
+                n_failed++;
+            }
+        }
+        loads.clear();
+    };
+    for (const auto & [number, expert] : order) {
+        const auto l = device.layers.find(number);
+        if (l == device.layers.end() || l->second.shape < 0 || expert >= l->second.n_expert) {
+            continue;
+        }
+        const moe_cache_layer & cl = l->second;
+        moe_expert_arena * ar = moe_arena_of(device, &cl);
+        const int pi = device.shapes[cl.shape].pool;
+        if (!ar || ar->free_list.empty() || pi < 0 || pi >= (int) device.pools.size()) {
+            continue;
+        }
+        const moe_cache_pool & pool = *device.pools[pi];
+        moe_cache_job jb;
+        moe_cache_job_sources(cl, pool, expert, jb);
+        if (!moe_arena_wanted(device, ar, jb, pool)) {
+            continue;
+        }
+        const int t = ar->take(moe_cache_key{cl.tensor[MOE_ROLE_GATE], expert}, pi);
+        if (t >= 0) {
+            loads.push_back({ar, t, jb, &pool});
+            if (loads.size() >= 256) {
+                flush();
+            }
+        }
+    }
+    flush();
+    const double sec = (ggml_time_us() - t0) / 1e6;
+    MOE_CACHE_LOG("[moe-cache] CUDA%d arena: %zu experts (%.2f GiB) read at start in %.2f s (%.2f GB/s), %zu failed\n",
+            device.physical, n_read, bytes / 1073741824.0, sec, sec > 0 ? bytes / sec / 1e9 : 0.0, n_failed);
+}
+
 static void moe_cache_preload(const moe_cache_session & session, moe_cache_device & device) {
     const char * path = getenv("GGML_CUDA_MOE_CACHE_PRELOAD");
     if (!path || !*path) {
@@ -4466,6 +5417,7 @@ static void moe_cache_preload(const moe_cache_session & session, moe_cache_devic
     size_t loaded = 0, bytes = 0, skipped = 0;
     std::vector<int> installed;   // (pool, slot) in ranking order, pushed to the LRU's cold end at the end
     std::vector<moe_cache_pool *> installed_pool;
+    std::vector<std::pair<moe_expert_arena *, int>> arena_held;
     cudaError_t err = cudaSuccess;
     for (uint32_t i = 0; i < n_ranked && err == cudaSuccess; i++) {
         const int layer_number = ranking[i].layer, expert = ranking[i].expert;
@@ -4505,8 +5457,14 @@ static void moe_cache_preload(const moe_cache_session & session, moe_cache_devic
             continue;
         }
         char * dst = moe_cache_slot_ptr(pool, s);
+        // ARENA: from the expert's slot (read at start), held until the copies are done
+        moe_expert_arena * ar = moe_arena_of(device, &layer);
+        const int a = ar ? ar->acquire(key) : -1;
+        if (a >= 0) {
+            arena_held.push_back({ar, a});
+        }
         for (int r = 0; r < MOE_ROLES && err == cudaSuccess; r++) {
-            const char * src = (const char *) layer.tensor[r] + (size_t) expert * layer.stride[r];
+            const char * src = a >= 0 ? ar->slots[a].part[r] : (const char *) layer.tensor[r] + (size_t) expert * layer.stride[r];
             const bool follows = expert + 1 < layer.n_expert && layer.stride[r] == layer.bytes[r];
             err = cudaMemcpyAsync(dst + pool.role_offset[r], src, pool.role_bytes[r] + (follows ? pool.role_pad[r] : 0),
                                   cudaMemcpyHostToDevice, moe_cache_zone_stream);
@@ -4530,6 +5488,12 @@ static void moe_cache_preload(const moe_cache_session & session, moe_cache_devic
     }
     if (err == cudaSuccess) {
         err = cudaStreamSynchronize(moe_cache_zone_stream);
+    }
+    if (err != cudaSuccess) {
+        (void) cudaStreamSynchronize(moe_cache_zone_stream);   // no copy may still read a slot given back
+    }
+    for (const auto & h : arena_held) {
+        h.first->release(h.second);
     }
     // hottest first in the list: each pushed to the front ends up hotter than the ones pushed after it
     for (size_t k = 0; k < installed.size(); k++) {
@@ -4831,12 +5795,115 @@ static int moe_cache_prefill_residents(void * opaque, void * backend, const ggml
 }
 
 static void moe_cache_prefill_unpin_locked(moe_cache_session & session) {
+    for (auto & kv : session.prefill_arena_pins) {
+        for (const auto & pin : kv.second) {
+            pin.first->release(pin.second);
+        }
+    }
+    session.prefill_arena_pins.clear();
     for (const auto & pin : session.prefill_pins) {
         if (pin.second >= 0 && pin.second < pin.first->n_slots && pin.first->slots[pin.second].readers > 0) {
             pin.first->slots[pin.second].readers--;
         }
     }
     session.prefill_pins.clear();
+}
+
+// ARENA: the host sources of the experts a prefetch copies (ggml_moe_cache.prefill_sources)
+static int moe_cache_prefill_sources(void * opaque, void * backend, const ggml_tensor * w, const uint64_t * resident,
+                                     const void ** srcs, size_t * pad, int pslot) {
+    moe_cache_session * session = (moe_cache_session *) opaque;
+    const int64_t n_expert = w ? w->ne[2] : 0;
+    for (int64_t e = 0; e < n_expert; e++) {
+        srcs[e] = nullptr;
+    }
+    *pad = 0;
+    moe_cache_device * device = session ? moe_cache_device_for_backend(*session, backend) : nullptr;
+    if (!device || device->arenas.empty()) {
+        return 0;
+    }
+    struct load { int slot; int32_t e; moe_cache_job job; };
+    std::vector<load> loads;
+    const moe_cache_pool * pp = nullptr;
+    moe_expert_arena * ar = nullptr;
+    const void * key = nullptr;
+    int role = -1;
+    int n = 0;
+    {
+        std::lock_guard<std::mutex> lock(session->mu);
+        // the previous copies from this prefetch slot are done: their arena slots go back
+        auto & pins = session->prefill_arena_pins[pslot];
+        for (const auto & pin : pins) {
+            pin.first->release(pin.second);
+        }
+        pins.clear();
+        if (session->stopping || session->dormant || device->dead.load() || !device->budget_ready) {
+            return 0;
+        }
+        const moe_cache_layer * cl = moe_cache_layer_of(*device, w->data);
+        role = moe_cache_role_of_name(w->name);
+        const int pi = cl && cl->shape >= 0 ? device->shapes[cl->shape].pool : -1;
+        ar = moe_arena_of(*device, cl);
+        if (!cl || !ar || role < 0 || cl->tensor[role] != w->data || cl->n_expert != n_expert || pi < 0 ||
+                pi >= (int) device->pools.size()) {
+            return 0;
+        }
+        pp = device->pools[pi].get();
+        key = cl->tensor[MOE_ROLE_GATE];
+        *pad = pp->role_pad[role];
+        for (int64_t e = 0; e < n_expert; e++) {
+            if (resident && resident[e]) {
+                continue;
+            }
+            const int a = ar->acquire(moe_cache_key{key, (int32_t) e}, false);
+            if (a >= 0) {
+                pins.push_back({ar, a});
+                srcs[e] = ar->slots[a].part[role];
+                n++;
+                continue;
+            }
+            moe_cache_job jb;
+            moe_cache_job_sources(*cl, *pp, (int32_t) e, jb);
+            if (!moe_arena_wanted(*device, ar, jb, *pp)) {
+                continue;
+            }
+            // read into the zone the prefill borrows (lent at its first read, given back when generation starts):
+            // copied from there, never admitted; the zone full, the expert is copied from the mapping
+            if (!ar->zone_active) {
+                ar->lend();
+                device->arena_gen++;   // a restoration still under way gives up
+            }
+            const int t = ar->transit_take(moe_cache_key{key, (int32_t) e}, pi);
+            if (t >= 0) {
+                loads.push_back({t, (int32_t) e, jb});
+            }
+        }
+    }
+    if (loads.empty()) {
+        return n;
+    }
+    std::vector<char> ok(loads.size(), 0);
+    std::vector<std::function<void()>> tasks;
+    for (size_t i = 0; i < loads.size(); i++) {
+        tasks.push_back([&, i] { ok[i] = moe_arena_load(*device, *ar, loads[i].slot, loads[i].job, *pp); });
+    }
+    device->arena_readers->run(tasks);
+    std::lock_guard<std::mutex> lock(session->mu);
+    auto & pins = session->prefill_arena_pins[pslot];
+    for (size_t i = 0; i < loads.size(); i++) {
+        if (ok[i]) {
+            ar->commit(loads[i].slot);
+            const int a = ar->acquire(moe_cache_key{key, loads[i].e}, false);
+            pins.push_back({ar, a});
+            srcs[loads[i].e] = ar->slots[a].part[role];
+            ar->prefill_loads++;
+            n++;
+        } else {
+            ar->abort(loads[i].slot);
+            ar->load_failures++;
+        }
+    }
+    return n;
 }
 
 static void moe_cache_prefill_unpin(void * opaque) {
@@ -5472,6 +6539,8 @@ struct moe_hosted_state {
     uint32_t last_seq = 0;
     std::vector<int32_t> cpu_rows, experts;
     std::vector<float> out, act;
+    std::vector<const void *> arena_src;   // ARENA: per CPU row, its expert's gate, up and down in the arena (or null)
+    std::vector<int> arena_held;           // the slots read, released after the CPU rows
     std::vector<uint8_t> act8;   // the CPU rows' activations as q8_0 blocks (from h_act8)
     int64_t st_n = 0, st_gap = 0, st_gaps = 0, st_plan = 0, st_cpu = 0, st_rows = 0, t_done = 0;
     // DIAGNOSTIC (GGML_CUDA_MOE_TIMELINE): host times per layer (seq % MOE_TL_RING): publication seen, plan flag
@@ -6309,6 +7378,125 @@ static void moe_hosted_admit_deferred(moe_hosted_state & st, moe_hosted_layer & 
     }
 }
 
+// ARENA: generation starts: each arena's zone given back to it, and the experts its lending evicted read back, hottest
+// first, into its free slots by the reader threads behind any read the CPU rows wait for. A prefill lending again
+// (arena_gen bumped) makes the reads still queued give up
+// ARENA: one expert read back into a free slot of its arena by the reader threads, behind any read the CPU rows wait for;
+// a prefill lending again (arena_gen bumped) makes it give up (session lock held)
+static void moe_arena_restore_one_locked(moe_cache_session & sess, moe_cache_device & device, moe_expert_arena * ar,
+                                         const moe_cache_key & key, int pi, uint64_t gen) {
+    if (ar->free_list.empty() || pi < 0 || pi >= (int) device.pools.size()) {
+        return;   // restored into free slots only: no eviction for it
+    }
+    // an expert the VRAM cache holds is restored too, as the arena keeps the VRAM's experts everywhere. MEASURED (32 GB):
+    // skipped, 730 of the 3 456 a lending evicted were not restored and short-prompt steps took +2.1 % (2 ABBA pairs);
+    // the preload's copies given back and an expert moved to the cold end at its fill: the CPU's reads from the file
+    // x1.9, refused admissions x1.8, steps +30 %. The VRAM cache turns over (~50 000 evictions a run) and an expert it
+    // evicts comes back through the arena
+    const moe_cache_layer * cl = moe_cache_layer_of(device, key.tensor);
+    if (!cl) {
+        return;
+    }
+    const moe_cache_pool * pp = device.pools[pi].get();
+    moe_cache_job jb;
+    moe_cache_job_sources(*cl, *pp, key.expert, jb);
+    const int t = ar->take(key, pi);
+    if (t < 0) {
+        return;   // there already (read by the CPU rows meanwhile)
+    }
+    moe_cache_device * d = &device;
+    moe_cache_session * session = &sess;
+    device.arena_readers->post([d, session, ar, t, jb, pp, gen] {
+        bool ok = false;
+        {
+            std::lock_guard<std::mutex> lock(session->mu);
+            ok = d->arena_gen == gen;
+        }
+        ok = ok && moe_arena_load(*d, *ar, t, jb, *pp);
+        std::lock_guard<std::mutex> lock(session->mu);
+        if (ok) {
+            ar->commit(t);
+            ar->restored++;
+        } else {
+            ar->abort(t);
+        }
+    });
+}
+
+// ARENA: generation starts: each arena's zone given back to it, then the restoration (moe_arena_restore_prompt). The
+// prompt's counts are copied from the device on a reader thread, not here: this thread answers the hosted layer the GPU
+// waits for, and a copy queued behind that wait would never run
+static void moe_arena_restore_start_locked(moe_cache_session & sess, moe_cache_device & device) {
+    if (device.arenas.empty() || !device.arena_readers) {
+        return;
+    }
+    const uint64_t gen = device.arena_gen;
+    std::vector<std::pair<moe_expert_arena *, std::vector<std::pair<moe_cache_key, int>>>> evicted;
+    for (auto & a : device.arenas) {
+        if (a && a->zone_active) {
+            evicted.push_back({a.get(), a->give_back()});
+        }
+    }
+    if (evicted.empty()) {
+        return;
+    }
+    if (!moe_arena_restore_prompt() || !g_prefill_counts.load()) {
+        for (auto & [ar, keys] : evicted) {
+            for (const auto & [key, pi] : keys) {
+                moe_arena_restore_one_locked(sess, device, ar, key, pi, gen);
+            }
+        }
+        return;
+    }
+    moe_cache_device * d = &device;
+    moe_cache_session * session = &sess;
+    device.arena_readers->post([d, session, gen] {
+        const int rows = g_prefill_counts_rows, n = g_prefill_counts_n;
+        int * dev = g_prefill_counts.load();
+        if (!dev) {
+            return;
+        }
+        static thread_local cudaStream_t stream = nullptr;
+        ggml_cuda_set_device(d->logical);
+        if (!stream && cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return;
+        }
+        std::vector<int> counts((size_t) rows * n);
+        if (cudaMemcpyAsync(counts.data(), dev, counts.size() * sizeof(int), cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
+                cudaMemsetAsync(dev, 0, counts.size() * sizeof(int), stream) != cudaSuccess ||
+                cudaStreamSynchronize(stream) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return;
+        }
+        std::lock_guard<std::mutex> lock(session->mu);
+        if (d->arena_gen != gen) {
+            return;
+        }
+        // the experts the prompt routed rows to that the arena does not hold, most rows first
+        struct cand { int rows; moe_expert_arena * ar; moe_cache_key key; int pi; };
+        std::vector<cand> c;
+        for (const auto & [number, layer] : d->layers) {
+            moe_expert_arena * ar = moe_arena_of(*d, &layer);
+            if (!ar || number >= rows || layer.shape < 0) {
+                continue;
+            }
+            const int pi = d->shapes[layer.shape].pool;
+            for (int e = 0; e < n && e < layer.n_expert; e++) {
+                const int r = counts[(size_t) number * n + e];
+                const moe_cache_key key{layer.tensor[MOE_ROLE_GATE], e};
+                if (r > 0 && !ar->map.count(key)) {
+                    c.push_back({r, ar, key, pi});
+                }
+            }
+        }
+        std::stable_sort(c.begin(), c.end(), [](const cand & a, const cand & b) { return a.rows > b.rows; });
+        for (const cand & x : c) {
+            moe_arena_restore_one_locked(*session, *d, x.ar, x.key, x.pi, gen);
+        }
+    });
+}
+
 static int moe_hosted_plan(moe_hosted_state & st, moe_hosted_layer & layer, const int32_t * ids, int rows,
                            uint64_t * out, int32_t * cpu_rows, uint32_t * flag, uint32_t seq) {
     moe_cache_session & session = *st.session;
@@ -6326,6 +7514,7 @@ static int moe_hosted_plan(moe_hosted_state & st, moe_hosted_layer & layer, cons
         if (layer.layer_number == device.main_first && device.rewarm_armed) {
             device.rewarm_armed = false;
             moe_cache_rewarm_start_locked(session, device);
+            moe_arena_restore_start_locked(session, device);
         }
         if (defer && layer.layer_number == device.main_first) {
             device.deferred.clear();   // a new pass, a new list
@@ -6529,11 +7718,16 @@ static int moe_hosted_split(moe_hosted_state * st, moe_hosted_layer * layer, int
             }
             // a candidate: an expert of the CPU rows, its entry (absent: -1, or copying), the time of its three copies one
             // after another
+            // ARENA: an absent expert the arena does not hold is not a candidate (its copy would wait for a read of
+            // the file); it stays on the CPU rows, which read it into the arena
             struct cand { int32_t e; int rows; int slot; double copies; int tensors; };
             std::vector<cand> c;
+            std::vector<int32_t> unheld;
+            const moe_cache_layer * acl = device.arenas.empty() ? nullptr : moe_cache_layer_of(device, key);
+            moe_expert_arena * aar = moe_arena_of(device, acl);
             for (int j = 0; j < n_cpu; j++) {
                 const int32_t e = layer->h_ids[cpu_rows[j]];
-                bool seen = false;
+                bool seen = std::find(unheld.begin(), unheld.end(), e) != unheld.end();
                 for (auto & x : c) {
                     if (x.e == e) { x.rows++; seen = true; }
                 }
@@ -6542,6 +7736,15 @@ static int moe_hosted_split(moe_hosted_state * st, moe_hosted_layer * layer, int
                     const auto f = pool->map.find(moe_cache_key{key, e});
                     if (f != pool->map.end()) {
                         x.slot = f->second;
+                    } else if (aar) {
+                        moe_cache_job probe;
+                        moe_cache_job_sources(*acl, *pool, e, probe);
+                        const auto a = aar->map.find(moe_cache_key{key, e});
+                        if (moe_arena_wanted(device, aar, probe, *pool) &&
+                                (a == aar->map.end() || !aar->slots[a->second].valid)) {
+                            unheld.push_back(e);
+                            continue;
+                        }
                     }
                     if (packed) {
                         // kernel copy: the entry at the link's rate, no copy overhead nor queue
@@ -6988,6 +8191,7 @@ static void moe_hosted_serve_one(moe_hosted_state * st, uint32_t seq) {
     int n_cpu = moe_hosted_plan(*st, *layer, layer->h_ids, rows, layer->h_plan, cpu_rows.data(), &layer->h_flags[0], seq);
     n_cpu = moe_hosted_tail_skip(*st, *layer, rows, cpu_rows.data(), n_cpu);
     const int64_t t_cal = st->cal_left > 0 && n_tokens >= 2 && moe_split_enabled() ? ggml_time_us() : 0;
+    int64_t t_reads = 0;   // ARENA: the CPU rows' reads of the file, out of the calibration (the model times the compute)
     n_cpu = moe_hosted_split(st, layer, rows, n_tokens, seq, cpu_rows.data(), n_cpu);
     const int64_t t_plan = stats_every > 0 ? ggml_time_us() : 0;
 
@@ -7013,6 +8217,95 @@ static void moe_hosted_serve_one(moe_hosted_state * st, uint32_t seq) {
         }
         out.resize((size_t) n_cpu * layer->n_embd);
         g_session_suppressed++;
+        // ARENA: the absent experts the arena holds are read there; the others are read into slots with O_DIRECT first (in
+        // parallel), then computed from them (from the weights when no slot is free). Slots held meanwhile
+        std::vector<const void *> & src = st->arena_src;
+        std::vector<int> & held = st->arena_held;
+        moe_expert_arena * har = nullptr;   // the arena of held
+        src.clear();
+        held.clear();
+        if (!st->device->arenas.empty()) {
+            moe_cache_device & dev = *st->device;
+            const void * key = layer->gate_w->data;
+            struct load { int slot; int32_t e; moe_cache_job job; };
+            std::vector<load> loads;
+            std::vector<std::pair<int32_t, int>> slot_of;   // distinct expert -> its slot
+            const moe_cache_pool * pp = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(st->session->mu);
+                const moe_cache_layer * cl = moe_cache_layer_of(dev, key);
+                const int pi = cl && cl->shape >= 0 ? dev.shapes[cl->shape].pool : -1;
+                har = moe_arena_of(dev, cl);
+                if (har && pi >= 0 && pi < (int) dev.pools.size()) {
+                    pp = dev.pools[pi].get();
+                    for (int j = 0; j < n_cpu; j++) {
+                        const int32_t e = ids[j];
+                        bool seen = false;
+                        for (const auto & x : slot_of) {
+                            seen = seen || x.first == e;
+                        }
+                        if (seen) {
+                            continue;
+                        }
+                        const int a = har->acquire(moe_cache_key{key, e});
+                        if (a >= 0) {
+                            held.push_back(a);
+                            slot_of.push_back({e, a});
+                            har->cpu_hits++;
+                            continue;
+                        }
+                        moe_cache_job jb;
+                        moe_cache_job_sources(*cl, *pp, e, jb);
+                        if (!moe_arena_wanted(dev, har, jb, *pp)) {
+                            continue;
+                        }
+                        const int t = har->take(moe_cache_key{key, e}, pi);
+                        if (t >= 0) {
+                            loads.push_back({t, e, jb});
+                        }
+                    }
+                }
+            }
+            if (!loads.empty()) {
+                std::vector<char> ok(loads.size(), 0);
+                std::vector<std::function<void()>> tasks;
+                for (size_t i = 0; i < loads.size(); i++) {
+                    tasks.push_back([&, i] { ok[i] = moe_arena_load(dev, *har, loads[i].slot, loads[i].job, *pp); });
+                }
+                const int64_t t_read = t_cal > 0 ? ggml_time_us() : 0;
+                dev.arena_readers->run(tasks);
+                if (t_cal > 0) {
+                    t_reads += ggml_time_us() - t_read;
+                }
+                std::lock_guard<std::mutex> lock(st->session->mu);
+                for (size_t i = 0; i < loads.size(); i++) {
+                    if (ok[i]) {
+                        har->commit(loads[i].slot);
+                        const int a = har->acquire(moe_cache_key{key, loads[i].e});
+                        held.push_back(a);
+                        slot_of.push_back({loads[i].e, a});
+                        har->cpu_loads++;
+                    } else {
+                        har->abort(loads[i].slot);
+                        har->load_failures++;
+                    }
+                }
+            }
+            if (!slot_of.empty()) {
+                src.assign((size_t) 3 * n_cpu, nullptr);
+                for (int j = 0; j < n_cpu; j++) {
+                    for (const auto & x : slot_of) {
+                        if (x.first == ids[j]) {
+                            const auto & sl = har->slots[x.second];
+                            src[3 * j + 0] = sl.part[MOE_ROLE_GATE];
+                            src[3 * j + 1] = sl.part[MOE_ROLE_UP];
+                            src[3 * j + 2] = sl.part[MOE_ROLE_DOWN];
+                            break;
+                        }
+                    }
+                }
+            }
+        }
         // without the F32 rows, the generic path of cpu_experts takes them from the q8_0 blocks; a prompt's block (more
         // than 256 rows, the multi-row kernels' limit) in calls of 256 rows, its rows sorted by expert first
         const int call_rows = 256;
@@ -7020,8 +8313,12 @@ static void moe_hosted_serve_one(moe_hosted_state * st, uint32_t seq) {
             const int n = std::min(call_rows, n_cpu - j0);
             ggml_moe_cache.cpu_experts(layer->gate_w, layer->up_w, layer->down_w,
                                        moe_hosted_act_f32() ? act.data() + (size_t) j0 * layer->n_embd : nullptr,
-                                       st->act8.data() + (size_t) j0 * q8_row, ids.data() + j0, 1, n,
+                                       st->act8.data() + (size_t) j0 * q8_row, ids.data() + j0,
+                                       src.empty() ? nullptr : src.data() + (size_t) 3 * j0, 1, n,
                                        out.data() + (size_t) j0 * layer->n_embd, st->n_threads);
+        }
+        for (const int a : held) {
+            har->release(a);
         }
         g_session_suppressed--;
         for (int j = 0; j < n_cpu; j++) {
@@ -7031,7 +8328,7 @@ static void moe_hosted_serve_one(moe_hosted_state * st, uint32_t seq) {
     }
     __atomic_store_n(&layer->h_flags[16], seq, __ATOMIC_RELEASE);
     if (t_cal > 0 && n_cpu > 0) {
-        moe_split_calibrate(st, ids.data(), n_cpu, ggml_time_us() - t_cal);
+        moe_split_calibrate(st, ids.data(), n_cpu, ggml_time_us() - t_cal - t_reads);
     }
     moe_hosted_admit_deferred(*st, *layer);
     if (!st->tl_host.empty()) {
@@ -7923,6 +9220,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.prefill_residents = moe_cache_prefill_residents;
     ggml_moe_cache.prefill_table = moe_cache_prefill_table;
     ggml_moe_cache.prefill_unpin = moe_cache_prefill_unpin;
+    ggml_moe_cache.prefill_sources = moe_cache_prefill_sources;
     ggml_moe_cache.lend = moe_cache_lend;
     ggml_moe_cache.restore = moe_cache_restore;
     ggml_moe_cache.borrow = moe_cache_borrow;

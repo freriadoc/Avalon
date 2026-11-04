@@ -1529,8 +1529,30 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
 
             const size_t prefetch_size = prefetch && use_mmap ? -1 : 0;
 
+            // with the expert arena or the direct load of the registered experts (ggml-cuda: GGML_CUDA_MOE_ARENA_MB, auto
+            // by default on Linux, GGML_CUDA_MOE_PIN_DIRECT), the experts are read from the file with O_DIRECT: not read
+            // ahead into the page cache here (the mapping's ranges left out of its prefetch, as the lazy tensors')
+            static const bool experts_direct = [] {
+                const char * a = getenv("GGML_CUDA_MOE_ARENA_MB");
+                const char * d = getenv("GGML_CUDA_MOE_PIN_DIRECT");
+#if defined(__linux__)
+                const bool arena = !a || strcmp(a, "0") != 0;
+#else
+                const bool arena = a && strcmp(a, "0") != 0;
+#endif
+                return arena || (d && atoi(d) != 0);
+            }();
+            llama_mmap::ranges no_prefetch = lazy.for_file(idx);
+            if (experts_direct) {
+                for (const auto & [name, w] : weights_map) {
+                    if (w.idx == idx && name.find("_exps") != std::string::npos) {
+                        no_prefetch.emplace_back(w.offs, w.offs + ggml_nbytes(w.tensor));
+                    }
+                }
+            }
+
             std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
-                    lazy.for_file(idx));
+                    no_prefetch);
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());

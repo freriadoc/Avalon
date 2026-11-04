@@ -4578,7 +4578,8 @@ static inline int ggml_cpu_moe_l3_next(int * const * cnt, int g, int n_pairs, in
 
 static bool ggml_cpu_moe_experts_multi(const struct ggml_tensor * gate_w, const struct ggml_tensor * up_w,
                                        const struct ggml_tensor * down_w, const float * act, const void * act_q8,
-                                       const int32_t * experts, int n, float * out, int n_threads) {
+                                       const int32_t * experts, const void * const * src, int n, float * out,
+                                       int n_threads) {
 #if defined(__AVX2__) && defined(GGML_USE_OPENMP)
     const enum ggml_type tk = gate_w->type;
     const int64_t n_embd = gate_w->ne[0];
@@ -4673,7 +4674,8 @@ static bool ggml_cpu_moe_experts_multi(const struct ggml_tensor * gate_w, const 
             const int32_t e = uniq[ue]; \
             const int r0 = first[ue]; \
             for (int64_t row = (int64_t) ch * rb1; row < (int64_t) (ch + 1) * rb1 && row < n_ff; row++) { \
-                const char * wr = (const char *) W->data + (size_t) e * W->nb[2] + (size_t) row * W->nb[1]; \
+                const char * wb = src && src[3 * r0 + t] ? (const char *) src[3 * r0 + t] : (const char *) W->data + (size_t) e * W->nb[2]; \
+                const char * wr = wb + (size_t) row * W->nb[1]; \
                 for (int r = r0; r >= 0; ) { \
                     int nc = 0; \
                     for (; r >= 0 && nc < 8; r = next[r], nc++) { \
@@ -4716,7 +4718,8 @@ static bool ggml_cpu_moe_experts_multi(const struct ggml_tensor * gate_w, const 
             const int32_t e = uniq[ue]; \
             const int r0 = first[ue]; \
             for (int64_t row = (int64_t) ch * rb3; row < (int64_t) (ch + 1) * rb3 && row < n_embd; row++) { \
-                const char * wr = (const char *) down_w->data + (size_t) e * down_w->nb[2] + (size_t) row * down_w->nb[1]; \
+                const char * wb = src && src[3 * r0 + 2] ? (const char *) src[3 * r0 + 2] : (const char *) down_w->data + (size_t) e * down_w->nb[2]; \
+                const char * wr = wb + (size_t) row * down_w->nb[1]; \
                 if (next[r0] < 0 && td == GGML_TYPE_IQ4_NL) { \
                     dot_nl((int) n_ff, out + (size_t) r0 * n_embd + row, 0, wr, 0, h8 + (size_t) r0 * h_row, 0, 1); \
                 } else { \
@@ -4749,7 +4752,7 @@ static bool ggml_cpu_moe_experts_multi(const struct ggml_tensor * gate_w, const 
     return true;
 #else
     GGML_UNUSED(gate_w); GGML_UNUSED(up_w); GGML_UNUSED(down_w); GGML_UNUSED(act); GGML_UNUSED(act_q8);
-    GGML_UNUSED(experts); GGML_UNUSED(n); GGML_UNUSED(out); GGML_UNUSED(n_threads);
+    GGML_UNUSED(experts); GGML_UNUSED(src); GGML_UNUSED(n); GGML_UNUSED(out); GGML_UNUSED(n_threads);
     return false;
 #endif
 }
@@ -4757,10 +4760,12 @@ static bool ggml_cpu_moe_experts_multi(const struct ggml_tensor * gate_w, const 
 // Whole experts of one token on the CPU for the MoE block the GPU hosts (ggml_moe_cache.cpu_experts):
 // a small graph gate / up / swiglu / down over the given experts only, on the model's weight
 // tensors, computed by this thread and n_threads - 1 others. The thread that calls it has no MoE
-// cache session, so these MUL_MAT_ID go the plain CPU way.
+// cache session, so these MUL_MAT_ID go the plain CPU way. src (optional, k = 1): per row, the expert's gate, up and
+// down in another copy of the weights (the arena), NULL for the tensor's; the graph path reads the tensors.
 static void ggml_cpu_moe_experts(const struct ggml_tensor * gate_w, const struct ggml_tensor * up_w,
                                  const struct ggml_tensor * down_w, const float * act, const void * act_q8,
-                                 const int32_t * experts, int k, int n_tokens, float * out, int n_threads) {
+                                 const int32_t * experts, const void * const * src, int k, int n_tokens, float * out,
+                                 int n_threads) {
     const int n = k * n_tokens;
     const int64_t t_call = ggml_time_us();
     // the experts without a graph, each weight block decoded once for all the rows of its expert (GGML_CPU_MOE_MULTI=0:
@@ -4784,7 +4789,7 @@ static void ggml_cpu_moe_experts(const struct ggml_tensor * gate_w, const struct
             }
             dst = chk;
         }
-        if (dst && ggml_cpu_moe_experts_multi(gate_w, up_w, down_w, act, act_q8, experts, n, dst, n_threads)) {
+        if (dst && ggml_cpu_moe_experts_multi(gate_w, up_w, down_w, act, act_q8, experts, src, n, dst, n_threads)) {
             if (!multi_check) {
                 return;
             }

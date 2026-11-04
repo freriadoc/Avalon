@@ -21,9 +21,10 @@ desktop most people would call old.
 The model is ~89 GiB; the GPU holds ~4.6 GiB of dense weights plus a cache of 9 – 14 GiB of experts, the rest stays in
 RAM. **16 GB of RAM is enough**: the model is memory-mapped, and what does not fit is read again from the disk. With
 the server's RAM capped at 14 GB (a 16 GB machine), the MTP best case was 90.3 t/s and 93.4 t/s after a 19k prompt
-(98.99 / 98.5 uncapped, same series); with 28 GB (a 32 GB machine), 89.0 t/s. The disk there is an NVMe SSD, a Kingston
-FURY Renegade (PCIe 4.0) running at PCIe 3.0, ~3 GB/s; a SATA SSD was not measured, and with less RAM the prefill of new
-prompts depends on it.
+(98.99 / 98.5 uncapped, same series). With 28 GB and the GPU driver's limit on registered memory of a 32 GB machine
+(both simulated), the expert arena gives 87 – 92 t/s (12 servers) and ~1,075 t/s for the prefill of a new 19k prompt.
+The disk there is an NVMe SSD, a Kingston FURY Renegade (PCIe 4.0) running at PCIe 3.0, ~3 GB/s; a SATA SSD was not
+measured, and with less RAM the prefill of new prompts depends on it.
 
 ## Two ideas behind Avalon
 
@@ -135,6 +136,9 @@ GSM8K (the first 200 problems of the test set, greedy, 4,096 tokens at most): **
 - **Hosted MoE**: the GPU keeps each MoE block, computes the cached experts while the CPU computes the missing ones,
   and moves one or two missing experts to the GPU when that finishes sooner (all inside the HIP graph).
 - **Expert prefetch** during prefill on 4 slots borrowed from the cache, cached experts read in place.
+- **Expert arena in RAM** (buun's idea of a RAM tier under the GPU cache) when the experts do not all fit in RAM: slots
+  of registered memory read from the disk with O_DIRECT instead of the page cache, part of them lent to the prefill and
+  restored before generation. When they all fit, they are registered in place, loaded with O_DIRECT.
 - **Sparse attention (QSA) for long contexts**: masks built on the GPU, gathered cells for generation, split kept
   across speculative steps.
 - **MTP speculative decoding** with a small draft head (cut LM head over 65k frequent tokens) that shares the main
@@ -243,7 +247,7 @@ prefill only uses the first GPU's PCIe link, so with two cards in x8 / x8 slots 
 - [llama.cpp](https://github.com/ggml-org/llama.cpp) and the ggml authors: the base.
 - [buun-llama-cpp](https://github.com/spiritbuun/buun-llama-cpp) (spiritbuun): Avalon started as a branch of buun and
   is built on its GPU expert cache and LFU admission; buun's expert heat profile recorded the shipped
-  `moe-cache-ranking.bin`. Thank you.
+  `moe-cache-ranking.bin`, and the expert arena in RAM follows buun's RAM tier of hot experts. Thank you.
 - [thecodacus](https://github.com/thecodacus): the expert prefetch.
 - [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) (Iwan Kawrakow): the IQ3_K and IQ3_KS types, the shared
   MTP head support.
