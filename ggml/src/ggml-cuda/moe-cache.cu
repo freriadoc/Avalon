@@ -4270,6 +4270,25 @@ static bool moe_arena_wanted(const moe_cache_device & d, const moe_expert_arena 
     return true;
 }
 
+// ARENA: whether the arena should hold the expert and does not (an expert the tail skip left out, a rewarm's): not proposed
+// for admission, since only the arena's experts are. MEASURED against reading such an expert in the background for its
+// next demand (16 and 32 GB, 2 ABBA pairs each): the same steps, ~5 000 fewer reads from the file a run and 4 – 10 %
+// fewer arena evictions (session lock held)
+static bool moe_arena_absent_locked(moe_cache_device & device, const moe_cache_pool & pool, const moe_cache_key & key) {
+    const moe_cache_layer * layer = moe_cache_layer_of(device, key.tensor);
+    moe_expert_arena * ar = layer ? moe_arena_of(device, layer) : nullptr;
+    if (!ar) {
+        return false;
+    }
+    moe_cache_job probe;
+    moe_cache_job_sources(*layer, pool, key.expert, probe);
+    if (!moe_arena_wanted(device, ar, probe, pool)) {
+        return false;
+    }
+    const auto it = ar->map.find(key);
+    return it == ar->map.end() || !ar->slots[it->second].valid;
+}
+
 static bool moe_cache_enqueue_locked(
         moe_cache_session & session, moe_cache_device & device,
         moe_cache_pool & pool, int pool_index, const void * host_base,
@@ -4290,8 +4309,8 @@ static bool moe_cache_enqueue_locked(
         return false;
     }
     // ARENA: only an expert the arena holds is admitted, its slot held until the copy is done (the CPU rows or a
-    // prefill read it there first; the fill thread reads no file). The pre-gating's prefetches (off by default) copy
-    // from the mapping
+    // prefill read it there first; the others are not proposed, moe_arena_absent_locked; the fill thread reads no file).
+    // The pre-gating's prefetches (off by default) copy from the mapping
     int hold = -1;
     moe_expert_arena * ar = pregate ? nullptr : moe_arena_of(device, layer);
     if (ar) {
@@ -4475,6 +4494,9 @@ static void moe_cache_rewarm_feed_locked(moe_cache_session & session, moe_cache_
         }
         moe_cache_pool & pool = *device.pools[pool_index];
         if (pool.free_slots.empty() || pool.map.count(key)) {
+            continue;
+        }
+        if (moe_arena_absent_locked(device, pool, key)) {
             continue;
         }
         int inserts_left = 1;
@@ -7360,6 +7382,12 @@ static void moe_hosted_admit_deferred(moe_hosted_state & st, moe_hosted_layer & 
         }
         return true;
     };
+    if (!device.arenas.empty()) {   // ARENA: the candidates the arena does not hold leave the list
+        c.erase(std::remove_if(c.begin(), c.end(), [&](const auto & k) {
+            return k.pool >= 0 && k.pool < (int) device.pools.size() &&
+                   moe_arena_absent_locked(device, *device.pools[k.pool], k.key);
+        }), c.end());
+    }
     if (layer.layer_number == device.main_last) {   // the pass's end: all of them, in order
         for (const auto & k : c) {
             admit(k);
