@@ -6665,7 +6665,8 @@ static void * g_rows_h = nullptr;                // mapped host buffer, HOST_ROW
 static void * g_rows_m = nullptr;                // its device address
 static volatile uint32_t * g_rows_flag_h = nullptr;   // batches written by the host (mapped)
 static uint32_t * g_rows_flag_m = nullptr;
-static uint32_t * g_rows_ticket = nullptr;       // batches read by the GPU (device memory)
+static uint32_t * g_rows_ticket = nullptr;       // batches read by the GPU: in the memory of the GPU that runs the node
+static int g_rows_ticket_device = -1;            // that GPU (allocated at the node's first launch)
 static uint32_t g_rows_count = 0;
 static std::atomic<void (*)(void *)> g_rows_fn{nullptr};
 static void * g_rows_user = nullptr;
@@ -6685,9 +6686,7 @@ void * ggml_cuda_host_rows_buffer(size_t bytes) {
     }
     if (!g_rows_h) {
         void * flag = nullptr;
-        if (!moe_hosted_host_alloc(&g_rows_h, HOST_ROWS_CAP) || !moe_hosted_host_alloc(&flag, 64) ||
-                cudaMalloc((void **) &g_rows_ticket, sizeof(uint32_t)) != cudaSuccess ||
-                cudaMemset(g_rows_ticket, 0, sizeof(uint32_t)) != cudaSuccess) {
+        if (!moe_hosted_host_alloc(&g_rows_h, HOST_ROWS_CAP) || !moe_hosted_host_alloc(&flag, 64)) {
             (void) cudaGetLastError();
             g_rows_h = nullptr;
             return nullptr;
@@ -6759,6 +6758,18 @@ bool ggml_cuda_host_rows_node(ggml_backend_cuda_context & ctx, ggml_tensor * nod
     cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
     const bool now = cudaStreamIsCapturing(ctx.stream(), &capture) == cudaSuccess && capture == cudaStreamCaptureStatusNone;
 #endif
+    // the ticket is read and written by this kernel only: in this GPU's memory, allocated by the first launch (the buffers
+    // above are mapped host memory, the host writes them). Not in ggml_cuda_host_rows_buffer: the graph's builder calls it
+    // without a device, and a cudaMalloc there took the thread's current device (with two GPUs the second one, which the
+    // first then faulted on without P2P, Avalon#26)
+    if (!g_rows_ticket) {
+        ggml_cuda_set_device(ctx.device);
+        CUDA_CHECK(cudaMalloc((void **) &g_rows_ticket, sizeof(uint32_t)));
+        CUDA_CHECK(cudaMemset(g_rows_ticket, 0, sizeof(uint32_t)));
+        g_rows_ticket_device = ctx.device;
+        MOE_CACHE_LOG("[moe-cache] CUDA%d host rows: ticket allocated%s\n", ctx.device, now ? "" : " during a capture");
+    }
+    GGML_ASSERT(g_rows_ticket_device == ctx.device && "the host rows node moved to another GPU");
     if (now) {
         moe_host_rows_run();
     }
