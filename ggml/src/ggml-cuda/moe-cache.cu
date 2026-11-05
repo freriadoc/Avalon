@@ -6649,8 +6649,8 @@ static __device__ __forceinline__ unsigned long long moe_tl_clock() {
 static __device__ __forceinline__ void moe_hosted_pause() {
 #if defined(GGML_USE_HIP)
     __builtin_amdgcn_s_sleep(127);
-#else
-    __nanosleep(2000);
+#elif __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+    __nanosleep(2000);   // sm_70+ only; Pascal (P40, sm_61) spins without a pause
 #endif
 }
 
