@@ -13265,6 +13265,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // Quantized sparse prefill must use the same GQA specialization as its allocation query.
+    for (int64_t ratio : {4, 12}) {
+        for (int64_t nb : {12, 16}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {ratio, 1}, 65536, nb,
+                    true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0,
+                    {0, 1, 2, 3}, true, false, 128));
+        }
+    }
     test_cases.emplace_back(new test_flash_attn_ext(72, 64, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 72, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 113, 75, true, true, 8.0f, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
