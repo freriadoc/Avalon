@@ -40,6 +40,7 @@
 #include "ggml-cuda/qwen4-hc.cuh"
 #include "ggml-cuda/mk.cuh"
 #include "ggml-cuda/gdn-wmma.cuh"
+#include "ggml-cuda/gdn-sm80-chunked.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
@@ -6937,8 +6938,11 @@ static void ggml_cuda_add_mmq_scratch(ggml_backend_cuda_context * cuda_ctx, ggml
             }
             key[0] = -(int64_t) (intptr_t) node;
         } else if (node->op == GGML_OP_GATED_DELTA_NET && node->src[GGML_SCHED_SCRATCH_SRC] == nullptr &&
-                   ggml_cuda_gdn_wmma_usable(node)) {
-            need = ggml_cuda_gdn_wmma_scratch_size(node->src[2]->ne[2]);
+                   (ggml_cuda_gdn_sm80_chunked_scratch_size_for(node, cuda_ctx->device) > 0 || ggml_cuda_gdn_wmma_usable(node))) {
+            need = ggml_cuda_gdn_sm80_chunked_scratch_size_for(node, cuda_ctx->device);
+            if (ggml_cuda_gdn_wmma_usable(node)) {
+                need = std::max(need, ggml_cuda_gdn_wmma_scratch_size(node->src[2]->ne[2]));
+            }
             for (int k = 0; k < GGML_CUDA_MMQ_SCRATCH_KEY; k++) {
                 key[k] = 0;
             }
