@@ -10434,10 +10434,13 @@ static moe_hosted_layer * moe_hosted_register(moe_hosted_state & st, moe_cache_d
     layer->h_plan2 = st.h_plan2;
     layer->d_plan = st.d_plan;
     layer->d_plan2 = st.d_plan2;
+    // EXPERT SPLIT only: the other cards' plans and each row's card (1.5 MiB a layer), read nowhere else (every use
+    // checks the split or its cards first)
+    const bool split = moe_cache_expert_split();
     bool ok = moe_hosted_host_alloc((void **) &layer->h_flags, 512) &&
-              moe_hosted_host_alloc((void **) &layer->h_plan2k, (size_t) MOE_SPLIT_MAX_CARDS * 3 * rows * sizeof(uint64_t)) &&
-              moe_hosted_host_alloc((void **) &layer->h_plank, (size_t) MOE_SPLIT_MAX_CARDS * 3 * rows * sizeof(uint64_t)) &&
-              moe_hosted_host_alloc((void **) &layer->h_src, (size_t) rows) &&
+              (!split || moe_hosted_host_alloc((void **) &layer->h_plan2k, (size_t) MOE_SPLIT_MAX_CARDS * 3 * rows * sizeof(uint64_t))) &&
+              (!split || moe_hosted_host_alloc((void **) &layer->h_plank, (size_t) MOE_SPLIT_MAX_CARDS * 3 * rows * sizeof(uint64_t))) &&
+              (!split || moe_hosted_host_alloc((void **) &layer->h_src, (size_t) rows)) &&
               moe_hosted_host_alloc((void **) &layer->h_pred, (2 + rows) * sizeof(int32_t)) &&
               moe_hosted_host_alloc((void **) &layer->h_fetch, (1 + 3 * MOE_SPLIT_FETCH_MAX) * sizeof(uint64_t)) &&
               moe_hosted_host_alloc((void **) &layer->h_chk, (size_t) (getenv("GGML_CUDA_MOE_SPLIT_VERIFY") ? rows : 1) *
@@ -10449,8 +10452,8 @@ static moe_hosted_layer * moe_hosted_register(moe_hosted_state & st, moe_cache_d
          (layer->m_flags = moe_hosted_device_ptr(layer->h_flags)) && (layer->m_pred = moe_hosted_device_ptr(layer->h_pred)) &&
          (layer->m_plan2 = moe_hosted_device_ptr(layer->h_plan2)) && (layer->m_chk = moe_hosted_device_ptr(layer->h_chk)) &&
          (layer->m_fetch = moe_hosted_device_ptr(layer->h_fetch)) &&
-         (layer->m_plank = moe_hosted_device_ptr(layer->h_plank)) && (layer->m_src = moe_hosted_device_ptr(layer->h_src)) &&
-         (layer->m_plan2k = moe_hosted_device_ptr(layer->h_plan2k));
+         (!split || ((layer->m_plank = moe_hosted_device_ptr(layer->h_plank)) && (layer->m_src = moe_hosted_device_ptr(layer->h_src)) &&
+                     (layer->m_plan2k = moe_hosted_device_ptr(layer->h_plan2k))));
     ok = ok && cudaMalloc((void **) &layer->d_fetch, (1 + 3 * MOE_SPLIT_FETCH_MAX) * sizeof(uint64_t)) == cudaSuccess &&
          cudaMemset(layer->d_fetch, 0, sizeof(uint64_t)) == cudaSuccess &&
          cudaMalloc((void **) &layer->d_act_ids, rows * sizeof(int32_t)) == cudaSuccess &&
