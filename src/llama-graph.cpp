@@ -2530,6 +2530,25 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     return moe_out;
 }
 
+bool llama_embd_raw_rows(const ggml_tensor * table) {
+    // a table in host memory whose type a GPU backend dequantizes by a copy (ggml_cast): its rows are sent quantized
+    // (Q8_0: 2720 bytes per row of 2560 instead of 10240). LLAMA_EMBD_RAW_ROWS=0: the rows dequantized on the host
+    static const bool enabled = !getenv("LLAMA_EMBD_RAW_ROWS") || atoi(getenv("LLAMA_EMBD_RAW_ROWS")) != 0;
+    if (!enabled || !table || !table->buffer || !ggml_backend_buffer_is_host(table->buffer)) {
+        return false;
+    }
+    switch (table->type) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+            return true;
+        default:
+            return false;
+    }
+}
+
 // input embeddings with optional lora
 ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float tok_scale) const {
     const int64_t n_embd_inp = hparams.n_embd_inp();
@@ -2575,8 +2594,16 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
     // we use ggml_build_forward_order to make the GET_ROWS ops stick at the beginning of the compute graph
     // this way the embeddings remain in the host buffer, and the GET_ROWS run before any other computations
     {
-        embd0 = ggml_get_rows(ctx0, tok_embd, inp->tokens);
-        ggml_build_forward_order(gf, embd0);
+        if (llama_embd_raw_rows(tok_embd)) {
+            // the rows gathered in their type on the host, dequantized by the GPU that reads them: a quarter of the bytes
+            // copied and kept for Q8_0 (llama_embd_raw_rows)
+            ggml_tensor * rows = ggml_get_rows_raw(ctx0, tok_embd, inp->tokens);
+            ggml_build_forward_order(gf, rows);
+            embd0 = ggml_cast(ctx0, rows, GGML_TYPE_F32);
+        } else {
+            embd0 = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+            ggml_build_forward_order(gf, embd0);
+        }
 
         embd1 = inp->embd;
 

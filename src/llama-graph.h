@@ -1012,6 +1012,10 @@ struct llm_graph_qkv {
     ggml_tensor * v; // [n_embd_head, n_head_kv, n_tokens]
 };
 
+// rows of a quantized embedding table in host memory gathered without dequantizing (ggml_get_rows_raw), then
+// dequantized where they are read
+bool llama_embd_raw_rows(const ggml_tensor * table);
+
 struct llm_graph_context {
     const llm_arch arch;
 

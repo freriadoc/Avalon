@@ -5336,6 +5336,10 @@ static void ggml_compute_forward_get_rows_q(
     const int ir0 = dr*ith;
     const int ir1 = MIN(ir0 + dr, nr);
 
+    // ggml_get_rows_raw: the rows kept in their type
+    const bool raw = dst->type == type;
+    const size_t row_size = ggml_row_size(type, nc);
+
     for (int64_t i = ir0; i < ir1; ++i) {
         const int64_t i12 = i/(ne11*ne10);
         const int64_t i11 = (i - i12*ne11*ne10)/ne10;
@@ -5343,6 +5347,12 @@ static void ggml_compute_forward_get_rows_q(
         const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
 
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
+
+        if (raw) {
+            memcpy((char *) dst->data + i10*nb1 + i11*nb2 + i12*nb3,
+                   (const char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03, row_size);
+            continue;
+        }
 
         dequantize_row_q(
                 (const void *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03),
