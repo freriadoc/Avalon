@@ -597,6 +597,7 @@ struct moe_cache_device {
     size_t budget_reserve_bytes = 0;
     size_t budget_limit = 0;
     size_t preload_bytes = 0;   // what moe_cache_preload installed (EXPERT SPLIT, DEAL=2: where the next card's band starts)
+    int64_t preload_us = 0;     // the time its copies took, from the first to the end of the last (the link's measured rate)
     size_t coordinator_allocated_bytes = 0;
     size_t allocated_bytes = 0;
     moe_cache_scratch scratch_reserve;
@@ -6139,6 +6140,7 @@ static void moe_cache_preload(const moe_cache_session & session, moe_cache_devic
         return;
     }
     device.preload_bytes = bytes;
+    device.preload_us = ggml_time_us() - t0;
     MOE_CACHE_LOG("[moe-cache] CUDA%d preload: %zu experts (%.2f GiB) from %s in %.2f s, %zu of %u pairs outside the model\n",
             device.physical, loaded, bytes / 1073741824.0, path, (ggml_time_us() - t0) / 1e6, skipped, n_ranked);
 }
@@ -10145,6 +10147,28 @@ static double moe_cache_pcie_bytes_per_us(int physical, std::string & desc) {
 #endif
 }
 
+// the copy rate of a card's link, bytes per microsecond: the preload's (GiB of experts copied from host memory at start,
+// measured once, already done: the link as it is, a slot or a host that halves it included), else the link's
+// capabilities (moe_cache_pcie_bytes_per_us) when they are known and the measure is not well below them. GGML_CUDA_MOE_PCIE_MEASURED=0: the
+// capabilities only. 0 when neither is known
+static double moe_cache_link_rate(const moe_cache_device & device, std::string & desc) {
+    const double caps = moe_cache_pcie_bytes_per_us(device.physical, desc);
+    static const bool use_measured = !getenv("GGML_CUDA_MOE_PCIE_MEASURED") || atoi(getenv("GGML_CUDA_MOE_PCIE_MEASURED")) != 0;
+    if (!use_measured || device.preload_bytes < ((size_t) 1 << 30) || device.preload_us <= 0) {
+        return caps;
+    }
+    // the measured rate replaces the capabilities' only when well below them (a link that does not give what it reads,
+    // 11 - 12 GB/s on a 16 GT/s x16 path read as 27.2 on a rented host): the dispatcher's terms were fitted on the
+    // capabilities' rate of a link that gives it (13.6 GB/s, PCIe 3.0 x16 at 86 %), which a preload measures within ~10 %
+    const double measured = (double) device.preload_bytes / (double) device.preload_us;
+    const bool take = caps <= 0.0 || measured < 0.75 * caps;
+    char text[192];
+    snprintf(text, sizeof(text), "%s%s%.2f GB/s measured by the preload (%.2f GiB), %s", desc.c_str(), desc.empty() ? "" : "; ",
+             measured / 1000.0, device.preload_bytes / 1073741824.0, take ? "taken" : "the capabilities' kept");
+    desc = text;
+    return take ? measured : caps;
+}
+
 // the CPU rows' team: one thread per physical core the process may run on (its affinity mask, SMT siblings counted
 // once); elsewhere, or when the topology is not readable, half the hardware threads
 static int moe_hosted_default_threads() {
@@ -10260,7 +10284,7 @@ static moe_hosted_state * moe_hosted_state_for(moe_cache_session & session, moe_
     MOE_CACHE_LOG("[moe-cache] CUDA%d CPU rows: %d threads\n", device.physical, st->n_threads);
     {
         std::string desc;
-        const double rate = moe_cache_pcie_bytes_per_us(device.physical, desc);
+        const double rate = moe_cache_link_rate(device, desc);
         if (rate > 0.0) {
             st->pcie_bytes_per_us = rate;
             MOE_CACHE_LOG("[moe-cache] CUDA%d PCIe: %s\n", device.physical, desc.c_str());
@@ -10714,7 +10738,7 @@ static void moe_split_cards_create(moe_cache_session & session, moe_hosted_state
         }
         {
             std::string desc;
-            const double rate = moe_cache_pcie_bytes_per_us(card.device->physical, desc);
+            const double rate = moe_cache_link_rate(*card.device, desc);
             if (rate > 0.0) {
                 card.rate = rate;
             }
