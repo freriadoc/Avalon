@@ -1666,3 +1666,7 @@ void ggml_cuda_mul_mat_q(
 size_t ggml_cuda_mmq_scratch_size(const ggml_tensor * dst, int cc, int64_t key[GGML_CUDA_MMQ_SCRATCH_KEY]);
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
+
+// GGML_CUDA_MOE_GROUPED=G: nodes i .. i + 3 (gate, up, swiglu, down of a prompt's MoE block) by groups of G experts;
+// the nodes it covered past i (3), or 0 when it does not take them
+int ggml_cuda_moe_block_grouped(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);

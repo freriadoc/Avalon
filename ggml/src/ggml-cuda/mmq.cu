@@ -20,6 +20,7 @@ void ggml_cuda_mmq_tile_prefix(const int32_t * expert_bounds, int n_experts, int
 }
 #include "quantize.cuh"
 #include "mmid.cuh"
+#include "unary.cuh"
 #include "moe-cache.cuh"
 #include "ggml-backend-impl.h"
 
@@ -641,4 +642,202 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     }
 
     return (!GGML_CUDA_CC_IS_CDNA(cc)) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// GGML_CUDA_MOE_GROUPED=G (experiment, off by default): a prompt's MoE block, gate MUL_MAT_ID, up MUL_MAT_ID, SWIGLU and
+// down MUL_MAT_ID, computed by groups of G experts: per group gate, up, their swiglu, the down's activation quantized and
+// down, over that group's rows only (the condition of an expert ring smaller than a layer: a group's experts are done
+// with once its down is). The rows of every expert are read back to the host once per block (a 2 KB copy and a stream
+// synchronization), so that each launch has the grid of its own rows. The same kernels, the same tiles, the same sums,
+// the swiglu row by row as unary_gated_op_kernel: the result is the ungrouped one bit for bit.
+
+// out[row] = silu(gate[row]) * up[row] for the compact rows r0 .. r1 - 1 (ids_dst: compact row -> row of the outputs)
+static __global__ void k_moe_grouped_swiglu(const float * __restrict__ gate, const float * __restrict__ up, float * __restrict__ out,
+        const int32_t * __restrict__ ids_dst, const int r0, const int64_t n, const int64_t sg, const int64_t su, const int64_t so) {
+    const int64_t row = ids_dst[r0 + blockIdx.y];
+    for (int64_t j = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; j < n; j += (int64_t) gridDim.x*blockDim.x) {
+        const float g = gate[row*sg + j];
+        out[row*so + j] = (g / (1.0f + expf(-g))) * up[row*su + j];
+    }
+}
+
+static int mmq_pick_J(ggml_type type, int64_t ncols_opt, bool fallback, int cc, size_t smpbo, ggml_prec prec_src1) {
+    int J_best = 0, ntiles_J_best = INT_MAX;
+    for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
+        const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc, prec_src1);
+        if (config.type == GGML_TYPE_COUNT || mmq_get_nbytes_shared(config, cc) > smpbo) {
+            continue;
+        }
+        const int ntiles_x = (ncols_opt + config.J - 1) / config.J;
+        if (ntiles_x < ntiles_J_best) {
+            J_best = J;
+            ntiles_J_best = ntiles_x;
+        }
+    }
+    return J_best;
+}
+
+int ggml_cuda_moe_block_grouped(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    static const int G = getenv("GGML_CUDA_MOE_GROUPED") ? atoi(getenv("GGML_CUDA_MOE_GROUPED")) : 0;
+    if (G <= 0 || i + 3 >= cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * gate = cgraph->nodes[i], * up = cgraph->nodes[i + 1], * glu = cgraph->nodes[i + 2], * down = cgraph->nodes[i + 3];
+    if (gate->op != GGML_OP_MUL_MAT_ID || up->op != GGML_OP_MUL_MAT_ID || glu->op != GGML_OP_GLU ||
+            down->op != GGML_OP_MUL_MAT_ID || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1) != 0 ||
+            glu->src[0] != gate || glu->src[1] != up || down->src[1] != glu) {
+        return 0;
+    }
+    const ggml_tensor * x = gate->src[1], * ids = gate->src[2];
+    const ggml_tensor * wg = gate->src[0], * wu = up->src[0], * wd = down->src[0];
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const int64_t n_expert = wg->ne[2], n_used = ids->ne[0], n_tok = ids->ne[1];
+    // one sequence of a prompt, the activation broadcast to the experts (ne11 == 1), every tensor on the device, MMQ
+    // types, contiguous outputs, the experts dividing into groups, no prefill table (weights read in place)
+    if (up->src[1] != x || up->src[2] != ids || down->src[2] != ids || x->ne[1] != 1 || x->type != GGML_TYPE_F32 ||
+            n_expert % G != 0 || G >= n_expert || n_tok < 128 || wg->ne[3] != 1 ||
+            !ggml_is_contiguous(gate) || !ggml_is_contiguous(up) || !ggml_is_contiguous(glu) || !ggml_is_contiguous(down) ||
+            !ggml_is_contiguous(x) || wg->type != wu->type || wg->ne[1] != wu->ne[1] ||
+            ggml_cuda_moe_prefill_table(wg->data) || ggml_cuda_moe_prefill_table(wu->data) || ggml_cuda_moe_prefill_table(wd->data)) {
+        return 0;
+    }
+    for (const ggml_tensor * w : { wg, wu, wd }) {
+        if (!w->buffer || ggml_backend_buffer_is_host(w->buffer) ||
+                !ggml_cuda_should_use_mmq(w->type, cc, n_tok, n_expert) || w->type == GGML_TYPE_NVFP4 || w->type == GGML_TYPE_MXFP4 ||
+                ggml_cuda_mmq_get_prec_src1(w, w == wd ? down : gate, cc) != GGML_PREC_Q8) {
+            return 0;
+        }
+    }
+    // by groups, gate, up and the swiglu stay live until the last group's down: the allocator, which sees them dead
+    // once the swiglu (down) has read them, may have placed a later output over them. The swiglu over its inputs is
+    // fine (row by row); anything else over them: the ungrouped way
+    auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * a0 = (const char *) a->data, * b0 = (const char *) b->data;
+        return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+    };
+    if (overlap(down, gate) || overlap(down, up) || overlap(down, glu) || overlap(down, x) || overlap(gate, up) ||
+            overlap(glu, x) || overlap(gate, x) || overlap(up, x)) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            GGML_LOG_INFO("%s: %s: outputs over the block's live tensors, computed ungrouped\n", __func__, down->name);
+        }
+        return 0;
+    }
+    cudaStream_t stream = ctx.stream();
+    {
+        // the bounds are read back to the host: not inside a graph capture (the block is then computed ungrouped)
+        cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(stream, &cs) != cudaSuccess || cs != cudaStreamCaptureStatusNone) {
+            (void) cudaGetLastError();
+            return 0;
+        }
+    }
+    const size_t smpbo = ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo;
+    const int64_t rows = n_tok * n_used;
+    const int64_t n_embd = x->ne[0], n_ff = gate->ne[0];
+    const int64_t ne10p_gu = GGML_PAD(n_embd, MATRIX_ROW_PADDING), ne10p_d = GGML_PAD(n_ff, MATRIX_ROW_PADDING);
+    const bool fb_gu = ggml_cuda_mmq_needs_fallback(wg->ne[1]), fb_d = ggml_cuda_mmq_needs_fallback(wd->ne[1]);
+    int64_t ncols_opt = n_tok;
+    if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
+        ncols_opt = (rows + n_expert - 1) / n_expert;
+    }
+    const int J_gu = mmq_pick_J(wg->type, ncols_opt, fb_gu, cc, smpbo, GGML_PREC_Q8);
+    const int J_d  = mmq_pick_J(wd->type, ncols_opt, fb_d,  cc, smpbo, GGML_PREC_Q8);
+    GGML_ASSERT(J_gu > 0 && J_d > 0);
+
+    ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), rows), ids_dst(ctx.pool(), rows + std::max(J_gu, J_d) - 1),
+        bounds(ctx.pool(), n_expert + 1), prefix(ctx.pool(), G + 1);
+    const size_t q8_gu_bytes = rows*ne10p_gu*sizeof(block_q8_1_mmq)/QK8_1_MMQ + mmq_src1_tail;
+    const size_t q8_d_bytes  = rows*ne10p_d *sizeof(block_q8_1_mmq)/QK8_1_MMQ + mmq_src1_tail;
+    ggml_cuda_pool_alloc<char> q8_gu(ctx.pool(), q8_gu_bytes), q8_d(ctx.pool(), q8_d_bytes);
+
+    // the rows by expert (the inverse map for the broadcast activation), the activation quantized once for gate and up
+    ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(), n_expert, n_tok,
+        n_used, 1, ids->nb[1] / ggml_element_size(ids), x->nb[2] / x->nb[1], /*write_inverse =*/ true, stream);
+    quantize_scatter_mmq_q8_1_cuda((const float *) x->data, ids_src1.get(), q8_gu.get(), wg->type, n_embd,
+        x->nb[2] / sizeof(float), ne10p_gu, n_tok, rows, (int) n_used, stream);
+    std::vector<int32_t> hb(n_expert + 1);
+    CUDA_CHECK(cudaMemcpyAsync(hb.data(), bounds.get(), (n_expert + 1)*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    auto launch = [&](const ggml_tensor * w, ggml_tensor * dst, const char * q8, int64_t ne10p, int64_t ne11, int J, bool fallback,
+                      int64_t g0, int r0, int r1) {
+        const size_t ts = ggml_type_size(w->type);
+        mmq_args a = {
+            (const char *) w->data + g0*w->nb[2], w->type, (const int *) q8, ids_dst.get(), bounds.get() + g0, (float *) dst->data,
+            nullptr,
+            w->ne[0], w->ne[1], rows, (int64_t) (w->nb[1]/ts), rows, (int64_t) (dst->nb[1]/sizeof(float)),
+            G, G, (int64_t) (w->nb[2]/ts), (int64_t) (ne11*ne10p*sizeof(block_q8_1)/(QK8_1*sizeof(int))), (int64_t) (dst->nb[2]/sizeof(float)),
+            1, 1, (int64_t) (w->nb[3]/ts), 0, (int64_t) (dst->nb[3]/sizeof(float)),
+            n_tok, J};
+        // the grid of the group's own rows (the compact grid bound for them)
+        a.ncols_dst = r1 - r0;
+        ggml_cuda_mmq_tile_prefix(bounds.get() + g0, G, J, prefix.get(), stream);
+        a.tile_prefix = prefix.get();
+        GGML_UNUSED(fallback);
+        ggml_cuda_mul_mat_q_switch_type(ctx, a, stream, GGML_PREC_Q8);
+    };
+    for (int64_t g0 = 0; g0 < n_expert; g0 += G) {
+        const int r0 = hb[g0], r1 = hb[g0 + G];
+        if (r1 <= r0) {
+            continue;
+        }
+        launch(wg, gate, q8_gu.get(), ne10p_gu, 1, J_gu, fb_gu, g0, r0, r1);
+        launch(wu, up,   q8_gu.get(), ne10p_gu, 1, J_gu, fb_gu, g0, r0, r1);
+        {
+            const dim3 grid((unsigned) std::min<int64_t>((n_ff + 255)/256, 8), (unsigned) (r1 - r0));
+            k_moe_grouped_swiglu<<<grid, 256, 0, stream>>>((const float *) gate->data, (const float *) up->data, (float *) glu->data,
+                ids_dst.get(), r0, n_ff, gate->nb[1]/sizeof(float), up->nb[1]/sizeof(float), glu->nb[1]/sizeof(float));
+        }
+        quantize_mmq_q8_1_rows_cuda((const float *) glu->data, ids_dst.get(), q8_d.get(), wd->type, n_ff,
+            glu->nb[1]/sizeof(float), ne10p_d, r0, r1 - r0, (int) rows, stream);
+        launch(wd, down, q8_d.get(), ne10p_d, n_used, J_d, fb_d, g0, r0, r1);
+    }
+    CUDA_CHECK(cudaGetLastError());
+
+    // GGML_CUDA_MOE_GROUPED_CHECK=1: the block again the ungrouped way into copies of its outputs, compared bit for bit
+    static const bool check = getenv("GGML_CUDA_MOE_GROUPED_CHECK") && atoi(getenv("GGML_CUDA_MOE_GROUPED_CHECK")) != 0;
+    if (check) {
+        ggml_tensor tg = *gate, tu = *up, th = *glu, td = *down;
+        ggml_cuda_pool_alloc<char> bg(ctx.pool(), ggml_nbytes(gate)), bu(ctx.pool(), ggml_nbytes(up)),
+            bh(ctx.pool(), ggml_nbytes(glu)), bd(ctx.pool(), ggml_nbytes(down));
+        tg.data = bg.get(); tu.data = bu.get(); th.data = bh.get(); td.data = bd.get();
+        tg.src[GGML_SCHED_SCRATCH_SRC] = tu.src[GGML_SCHED_SCRATCH_SRC] = td.src[GGML_SCHED_SCRATCH_SRC] = nullptr;
+        th.src[0] = &tg; th.src[1] = &tu; td.src[1] = &th;
+        ggml_cuda_mul_mat_q(ctx, wg, x, ids, &tg);
+        ggml_cuda_mul_mat_q(ctx, wu, x, ids, &tu);
+        ggml_cuda_op_swiglu(ctx, &th);
+        ggml_cuda_mul_mat_q(ctx, wd, &th, ids, &td);
+        std::vector<char> ga(ggml_nbytes(gate)), gb(ggml_nbytes(gate)), ua(ggml_nbytes(up)), ub(ggml_nbytes(up));
+        CUDA_CHECK(cudaMemcpyAsync(ga.data(), gate->data, ga.size(), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(gb.data(), tg.data,    gb.size(), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(ua.data(), up->data,   ua.size(), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(ub.data(), tu.data,    ub.size(), cudaMemcpyDeviceToHost, stream));
+        std::vector<char> a(ggml_nbytes(down)), b(ggml_nbytes(down)), c(ggml_nbytes(glu)), d(ggml_nbytes(glu));
+        CUDA_CHECK(cudaMemcpyAsync(a.data(), down->data, a.size(), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(b.data(), td.data,    b.size(), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(c.data(), glu->data,  c.size(), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(d.data(), th.data,    d.size(), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        static int n_checked = 0, n_diff = 0;
+        n_checked++;
+        const bool same_d = memcmp(a.data(), b.data(), a.size()) == 0, same_h = memcmp(c.data(), d.data(), c.size()) == 0;
+        if (!same_d || !same_h) {
+            n_diff++;
+        }
+        if (!same_d || !same_h || n_checked <= 2 || n_checked % 48 == 0) {
+            const bool same_g = memcmp(ga.data(), gb.data(), ga.size()) == 0, same_u = memcmp(ua.data(), ub.data(), ua.size()) == 0;
+            size_t ndiff = 0; double maxd = 0.0;
+            for (size_t k = 0; k < ga.size()/4; k++) {
+                const float p0 = ((const float *) ga.data())[k], p1 = ((const float *) gb.data())[k];
+                if (p0 != p1) { ndiff++; maxd = std::max(maxd, (double) fabsf(p0 - p1)); }
+            }
+            GGML_LOG_INFO("%s: %s: %d blocks checked, %d differ (gate %s: %zu values, max %.3g; up %s, swiglu %s, down %s)\n", __func__,
+                    down->name, n_checked, n_diff, same_g ? "identical" : "DIFFERS", ndiff, maxd, same_u ? "identical" : "DIFFERS",
+                    same_h ? "identical" : "DIFFERS", same_d ? "identical" : "DIFFERS");
+        }
+    }
+    return 3;
 }

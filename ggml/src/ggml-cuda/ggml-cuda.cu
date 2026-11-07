@@ -6758,6 +6758,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                static const bool moe_grouped = getenv("GGML_CUDA_MOE_GROUPED") && atoi(getenv("GGML_CUDA_MOE_GROUPED")) > 0;
+                if (moe_grouped && node->op == GGML_OP_MUL_MAT_ID) {
+                    if (i == cuda_ctx->router_next && cuda_ctx->router_pending) {
+                        ggml_cuda_router_flush(*cuda_ctx);   // the block reads the routing
+                    }
+                    const int covered = ggml_cuda_moe_block_grouped(*cuda_ctx, cgraph, i);
+                    if (covered > 0) {
+                        written(i, i + covered);
+                        i += covered;
+                        continue;
+                    }
+                }
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
                 if (i == cuda_ctx->router_next && cuda_ctx->router_pending) {
                     // only the deferred top-k leaves the router pending past the node that reads its logits

@@ -92,3 +92,9 @@ void * ggml_cuda_q8_1_produce_out(ggml_backend_cuda_context & ctx, const ggml_cg
 // q8_1_out's buffer if it holds the activation that ggml_cuda_q8_1_reuse would quantize with these arguments
 const void * ggml_cuda_q8_1_out_match(ggml_backend_cuda_context & ctx, const float * x,
         int64_t ne00, int64_t s01, int64_t s02, int64_t s03, int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3);
+
+// rows row0 .. row0 + nrows - 1 of a MUL_MAT_ID's compact activation, at their place among nrows_total
+void quantize_mmq_q8_1_rows_cuda(
+        const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
+        const int64_t ne00, const int64_t s01, const int64_t ne0, const int row0, const int nrows, const int nrows_total,
+        cudaStream_t stream);
