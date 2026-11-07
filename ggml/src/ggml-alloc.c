@@ -1,4 +1,5 @@
 #include "ggml-alloc.h"
+#include "ggml-alloc-plan.h"
 #include "ggml-backend-impl.h"
 #include "ggml-backend-moe-cache.h"
 #include "ggml.h"
@@ -124,6 +125,10 @@ struct ggml_dyn_tallocr {
     size_t max_chunk_size;
     struct tallocr_chunk * chunks[GGML_VBUFFER_MAX_CHUNKS];
     int n_chunks;
+
+    // DIAGNOSTIC (GGML_ALLOC_TRACE_BUFS): bytes live now and at most, the bound any placement must reach
+    size_t live;
+    size_t live_max;
 
 #ifdef GGML_ALLOCATOR_DEBUG
     struct {
@@ -304,6 +309,8 @@ static struct buffer_address ggml_dyn_tallocr_alloc(struct ggml_dyn_tallocr * al
 
     chunk->max_size = MAX(chunk->max_size, addr.offset + size);
 
+    alloc->live += size;
+    alloc->live_max = MAX(alloc->live_max, alloc->live);
     return addr;
 
     GGML_UNUSED(tensor);
@@ -311,6 +318,7 @@ static struct buffer_address ggml_dyn_tallocr_alloc(struct ggml_dyn_tallocr * al
 
 // this is a very naive implementation, but for our case the number of free blocks should be very small
 static void ggml_dyn_tallocr_free_bytes(struct ggml_dyn_tallocr * alloc, struct buffer_address addr, size_t size) {
+    alloc->live -= MIN(alloc->live, aligned_offset(NULL, size, alloc->alignment));
     size = aligned_offset(NULL, size, alloc->alignment);
 
     struct tallocr_chunk * chunk = alloc->chunks[addr.chunk];
@@ -356,6 +364,8 @@ static void ggml_dyn_tallocr_reset(struct ggml_dyn_tallocr * alloc) {
         alloc->chunks[i] = NULL;
     }
     alloc->n_chunks = 0;
+    alloc->live = 0;
+    alloc->live_max = 0;
 
 #ifdef GGML_ALLOCATOR_DEBUG
     for (int i = 0; i < 1024; i++) {
@@ -391,6 +401,14 @@ static void ggml_dyn_tallocr_free(struct ggml_dyn_tallocr * alloc) {
 
 static size_t ggml_dyn_tallocr_max_size(struct ggml_dyn_tallocr * alloc, int chunk) {
     return chunk < alloc->n_chunks ? alloc->chunks[chunk]->max_size : 0;
+}
+
+static size_t ggml_dyn_tallocr_total_size(struct ggml_dyn_tallocr * alloc) {
+    size_t total = 0;
+    for (int c = 0; c < alloc->n_chunks; c++) {
+        total += alloc->chunks[c]->max_size;
+    }
+    return total;
 }
 
 
@@ -472,6 +490,7 @@ struct hash_node {
     int buffer_id;
     struct buffer_address addr;
     bool allocated;
+    int block; // 1 + the index of its block in the recorded plan (ggml_gallocr_plan), 0 if none
 };
 
 struct tensor_alloc {
@@ -505,6 +524,25 @@ struct ggml_gallocr {
     int n_leafs;
 
     bool shrink; // see ggml_gallocr_set_shrink
+
+    // the blocks of a reservation's walk, recorded for the offline placement (ggml_gallocr_plan)
+    bool plan_rec;
+    int64_t plan_tick;
+    struct ggml_alloc_plan_block * plan_blocks;
+    int * plan_buffer;
+    const struct ggml_tensor ** plan_tensor; // the tensor that opened each block (GGML_ALLOC_PLAN_DUMP)
+    int plan_n, plan_cap;
+    // the last plans, reused when a reservation records the same blocks (the graph shapes alternate: the plan of a
+    // prefill graph took 15 ms, redone at every change of phase)
+    struct ggml_alloc_plan_memo {
+        const void * alloc;
+        size_t cap;
+        int n;
+        struct ggml_alloc_plan_block * blocks; // sizes, lifetimes and the result
+        int n_chunks;
+        size_t chunk_sizes[GGML_VBUFFER_MAX_CHUNKS];
+    } plan_memo[8];
+    int plan_memo_next;
 
     // changes whenever a buffer is allocated again or freed: the tensors placed before are no longer valid
     uint64_t generation;
@@ -553,6 +591,12 @@ ggml_gallocr_t ggml_gallocr_new(ggml_backend_buffer_type_t buft) {
 void ggml_gallocr_free(ggml_gallocr_t galloc) {
     if (galloc == NULL) {
         return;
+    }
+    free(galloc->plan_blocks);
+    free(galloc->plan_buffer);
+    free(galloc->plan_tensor);
+    for (int m = 0; m < 8; m++) {
+        free(galloc->plan_memo[m].blocks);
     }
 
     for (int i = 0; i < galloc->n_buffers; i++) {
@@ -678,6 +722,7 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
                             assert(view_src_hn->addr.chunk == p_hn->addr.chunk && view_src_hn->addr.offset == p_hn->addr.offset);
                             hn->buffer_id = p_hn->buffer_id;
                             hn->addr = p_hn->addr;
+                            hn->block = view_src_hn->block;
                             p_hn->allocated = false; // avoid freeing the parent
                             view_src_hn->allocated = false;
                             ggml_gallocr_free_extra_space(galloc, node, view_src);
@@ -687,6 +732,7 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
                         AT_PRINTF("reusing parent %s for %s\n", parent->name, node->name);
                         hn->buffer_id = p_hn->buffer_id;
                         hn->addr = p_hn->addr;
+                        hn->block = p_hn->block;
                         p_hn->allocated = false; // avoid freeing the parent
                         ggml_gallocr_free_extra_space(galloc, node, parent);
                         return;
@@ -700,6 +746,22 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
         size_t size = ggml_backend_buft_get_alloc_size(buft, node);
         hn->buffer_id = buffer_id;
         hn->addr = ggml_dyn_tallocr_alloc(alloc, size, node);
+        if (galloc->plan_rec) {
+            if (galloc->plan_n == galloc->plan_cap) {
+                galloc->plan_cap = galloc->plan_cap ? 2*galloc->plan_cap : 4096;
+                galloc->plan_blocks = (struct ggml_alloc_plan_block *) realloc(galloc->plan_blocks, galloc->plan_cap*sizeof(struct ggml_alloc_plan_block));
+                galloc->plan_buffer = (int *) realloc(galloc->plan_buffer, galloc->plan_cap*sizeof(int));
+                galloc->plan_tensor = (const struct ggml_tensor **) realloc(galloc->plan_tensor, galloc->plan_cap*sizeof(struct ggml_tensor *));
+                GGML_ASSERT(galloc->plan_blocks && galloc->plan_buffer && galloc->plan_tensor);
+            }
+            // the extra space a reusing child frees early (ggml_gallocr_free_extra_space) stays in the block: a few
+            // bytes of padding at most, the in-place reuse requires the same layout
+            struct ggml_alloc_plan_block b = { aligned_offset(NULL, size, alloc->alignment), galloc->plan_tick++, INT64_MAX, 0, 0 };
+            galloc->plan_blocks[galloc->plan_n] = b;
+            galloc->plan_buffer[galloc->plan_n] = buffer_id;
+            galloc->plan_tensor[galloc->plan_n] = node;
+            hn->block = ++galloc->plan_n;
+        }
         // DIAGNOSTIC (GGML_ALLOC_TRACE_BIG=MiB): every tensor at least that large, as it is placed
         {
             static long trace_mib = -1;
@@ -707,7 +769,7 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
                 trace_mib = getenv("GGML_ALLOC_TRACE_BIG") ? atol(getenv("GGML_ALLOC_TRACE_BIG")) : 0;
             }
             if (trace_mib > 0 && size >= ((size_t) trace_mib << 20)) {
-                GGML_LOG_INFO("alloc big: %-40s %-12s %s [%lld,%lld,%lld,%lld] %.0f MiB at chunk %d + %.0f MiB\n", node->name, ggml_op_desc(node),
+                GGML_LOG_INFO("alloc big: buf%d %-40s %-12s %s [%lld,%lld,%lld,%lld] %.0f MiB at chunk %d + %.0f MiB\n", buffer_id, node->name, ggml_op_desc(node),
                         ggml_type_name(node->type), (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2],
                         (long long) node->ne[3], size / 1048576.0, hn->addr.chunk, hn->addr.offset / 1048576.0);
             }
@@ -734,6 +796,9 @@ static void ggml_gallocr_free_node(ggml_gallocr_t galloc, struct ggml_tensor * n
     remove_allocated_tensor(alloc, hn->addr, node);
 #endif
 
+    if (galloc->plan_rec && hn->block > 0) {
+        galloc->plan_blocks[hn->block - 1].t1 = galloc->plan_tick++;
+    }
     ggml_dyn_tallocr_free_bytes(alloc, hn->addr, size);
     hn->allocated = false;
 }
@@ -742,16 +807,42 @@ static int get_node_buffer_id(const int * node_buffer_ids, int i) {
     return node_buffer_ids ? node_buffer_ids[i] : 0;
 }
 
-static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids) {
+// returns whether the graph has leafs kept for the whole graph (see below); seal_mask: the buffers whose chunks they
+// seal
+static bool ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids,
+        uint32_t seal_mask) {
     // clear hash tables
     ggml_hash_set_reset(&galloc->hash_set);
     memset(galloc->hash_values, 0, sizeof(struct hash_node) * galloc->hash_set.size);
+    galloc->plan_n    = 0;
+    galloc->plan_tick = 0;
 
     // allocate leafs
     // these may be tensors that the application is not using in the graph, but may still want to allocate for other purposes
+    bool kept_leafs = false;
     for (int i = 0; i < graph->n_leafs; i++) {
         struct ggml_tensor * leaf = graph->leafs[i];
         ggml_gallocr_allocate_node(galloc, leaf, get_node_buffer_id(leaf_buffer_ids, i));
+        kept_leafs = kept_leafs || ((leaf->flags & GGML_TENSOR_FLAG_INPUT) && (leaf->flags & GGML_TENSOR_FLAG_OUTPUT));
+    }
+    // the scheduler's pipeline copies (inputs that are also outputs: never freed) take the bottom of their chunks for
+    // the whole graph: the chunks they use can be sealed at their end, so that the rest of the graph is laid out in
+    // fresh chunks as without a pipeline. Below them, each later tensor was shifted by their size, and with chunks capped
+    // at GGML_SCHED_BORROW_CHUNK_MB the shift opened a chunk more (qwen4exp, 2 GPUs: 3 125 -> 3 986 MiB for 144 MiB kept);
+    // which layout is smaller depends on the graph (the reservation tries both, ggml_gallocr_reserve_n_impl)
+    if (kept_leafs) {
+        for (int b = 0; b < galloc->n_buffers && b < 32; b++) {
+            if (!(seal_mask & (1u << b))) {
+                continue;
+            }
+            struct ggml_dyn_tallocr * alloc = galloc->buf_tallocs[b];
+            for (int c = 0; c < alloc->n_chunks; c++) {
+                struct tallocr_chunk * chunk = alloc->chunks[c];
+                if (chunk->n_free_blocks > 0 && chunk->free_blocks[chunk->n_free_blocks - 1].offset > 0) {
+                    chunk->free_blocks[chunk->n_free_blocks - 1].size = 0;
+                }
+            }
+        }
     }
 
     // count number of children and views
@@ -847,6 +938,149 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
             AT_PRINTF("\n");
         }
     }
+    return kept_leafs;
+}
+
+// the recorded blocks of the last walk placed offline (ggml_alloc_plan), per allocator (buffers of the same type share
+// one): kept when the layout is smaller than the walk's own, the tensors' addresses and the chunks rewritten.
+// GGML_ALLOC_PLAN_DUMP=path appends each allocator's blocks for tests/allocplan
+static void ggml_gallocr_plan(ggml_gallocr_t galloc) {
+    if (galloc->plan_n == 0) {
+        return;
+    }
+    const char * dump = getenv("GGML_ALLOC_PLAN_DUMP");
+    for (int i = 0; i < galloc->n_buffers; i++) {
+        struct ggml_dyn_tallocr * alloc = galloc->buf_tallocs[i];
+        bool seen = false;
+        for (int j = 0; j < i; j++) {
+            seen = seen || galloc->buf_tallocs[j] == alloc;
+        }
+        if (seen) {
+            continue;
+        }
+        // the blocks of the buffers sharing this allocator
+        int n = 0;
+        for (int k = 0; k < galloc->plan_n; k++) {
+            n += galloc->buf_tallocs[galloc->plan_buffer[k]] == alloc;
+        }
+        if (n == 0) {
+            continue;
+        }
+        struct ggml_alloc_plan_block * blocks = (struct ggml_alloc_plan_block *) malloc(n*sizeof(struct ggml_alloc_plan_block));
+        int * index = (int *) malloc(n*sizeof(int));
+        if (!blocks || !index) {
+            free(blocks); free(index);
+            continue;
+        }
+        n = 0;
+        for (int k = 0; k < galloc->plan_n; k++) {
+            if (galloc->buf_tallocs[galloc->plan_buffer[k]] == alloc) {
+                blocks[n] = galloc->plan_blocks[k];
+                index[n] = k;
+                n++;
+            }
+        }
+        const size_t walk_total = ggml_dyn_tallocr_total_size(alloc);
+        if (dump) {
+            FILE * f = fopen(dump, "a");
+            if (f) {
+                fprintf(f, "allocator %s cap %zu walk %zu live_max %zu blocks %d\n", ggml_backend_buft_name(galloc->bufts[i]),
+                        alloc->max_chunk_size, walk_total, alloc->live_max, n);
+                for (int k = 0; k < n; k++) {
+                    const struct ggml_tensor * t = galloc->plan_tensor[index[k]];
+                    fprintf(f, "%zu %lld %lld %s %s %s\n", blocks[k].size, (long long) blocks[k].t0, (long long) blocks[k].t1,
+                            ggml_op_desc(t), ggml_type_name(t->type), t->name[0] ? t->name : "-");
+                }
+                fclose(f);
+            }
+        }
+        size_t chunk_sizes[GGML_VBUFFER_MAX_CHUNKS];
+        const int64_t t_plan = ggml_time_us();
+        int n_chunks = -2;
+        for (int m = 0; m < 8 && n_chunks == -2; m++) {
+            struct ggml_alloc_plan_memo * pm = &galloc->plan_memo[m];
+            if (pm->blocks == NULL || pm->alloc != (const void *) alloc || pm->cap != alloc->max_chunk_size || pm->n != n) {
+                continue;
+            }
+            // the same topology (every block born and freed at the same events) with blocks no larger: each fits at its
+            // planned address (a graph of the same shape with fewer KV cells or tokens, the worst case planned at the
+            // reservation); the chunks sized on this graph's blocks
+            bool fits = true;
+            for (int k = 0; k < n && fits; k++) {
+                fits = blocks[k].size <= pm->blocks[k].size && pm->blocks[k].t0 == blocks[k].t0 && pm->blocks[k].t1 == blocks[k].t1;
+            }
+            if (fits) {
+                for (int c = 0; c < GGML_VBUFFER_MAX_CHUNKS; c++) {
+                    chunk_sizes[c] = 0;
+                }
+                for (int k = 0; k < n; k++) {
+                    blocks[k].chunk  = pm->blocks[k].chunk;
+                    blocks[k].offset = pm->blocks[k].offset;
+                    chunk_sizes[blocks[k].chunk] = MAX(chunk_sizes[blocks[k].chunk], blocks[k].offset + blocks[k].size);
+                }
+                n_chunks = pm->n_chunks;
+            }
+        }
+        const bool memo_hit = n_chunks != -2;
+        if (!memo_hit) {
+            n_chunks = ggml_alloc_plan(blocks, n, alloc->max_chunk_size, chunk_sizes, GGML_VBUFFER_MAX_CHUNKS);
+            struct ggml_alloc_plan_memo * pm = &galloc->plan_memo[galloc->plan_memo_next];
+            galloc->plan_memo_next = (galloc->plan_memo_next + 1) % 8;
+            struct ggml_alloc_plan_block * copy = (struct ggml_alloc_plan_block *) realloc(pm->blocks, n*sizeof(struct ggml_alloc_plan_block));
+            if (copy) {
+                memcpy(copy, blocks, n*sizeof(struct ggml_alloc_plan_block));
+                pm->blocks = copy;
+                pm->alloc = alloc;
+                pm->cap = alloc->max_chunk_size;
+                pm->n = n;
+                pm->n_chunks = n_chunks;
+                memcpy(pm->chunk_sizes, chunk_sizes, sizeof(chunk_sizes));
+            }
+        }
+        const double plan_ms = (ggml_time_us() - t_plan) / 1000.0;
+        size_t plan_total = 0;
+        for (int c = 0; c < n_chunks; c++) {
+            plan_total += chunk_sizes[c];
+        }
+        if (n_chunks > 0 && plan_total < walk_total) {
+            // the addresses: every tensor of a block (the block's owner and the children reusing it in place)
+            for (size_t h = 0; h < galloc->hash_set.size; h++) {
+                if (!ggml_bitset_get(galloc->hash_set.used, h)) {
+                    continue;
+                }
+                struct hash_node * hn = &galloc->hash_values[h];
+                if (hn->block <= 0 || galloc->buf_tallocs[hn->buffer_id] != alloc) {
+                    continue;
+                }
+                // the plan's index of this block: blocks of this allocator in recording order
+                int lo = 0, hi = n - 1, b = -1;
+                while (lo <= hi) {
+                    const int mid = (lo + hi) / 2;
+                    if (index[mid] == hn->block - 1) { b = mid; break; }
+                    if (index[mid] < hn->block - 1) lo = mid + 1; else hi = mid - 1;
+                }
+                GGML_ASSERT(b >= 0);
+                hn->addr.chunk  = blocks[b].chunk;
+                hn->addr.offset = blocks[b].offset;
+            }
+            // the chunks
+            const size_t live_max = alloc->live_max;
+            ggml_dyn_tallocr_reset(alloc);
+            for (int c = 0; c < n_chunks; c++) {
+                const int id = ggml_dyn_tallocr_new_chunk(alloc, 0);
+                GGML_ASSERT(id == c);
+                alloc->chunks[c]->max_size = MAX(chunk_sizes[c], alloc->alignment);
+            }
+            alloc->live_max = live_max;
+            if (getenv("GGML_ALLOC_TRACE_BUFS")) {
+                GGML_LOG_INFO("alloc plan: %s %d blocks: %.0f MiB placed in %d chunks, walk order %.0f MiB, live max %.0f MiB, %.2f ms%s\n",
+                        ggml_backend_buft_name(galloc->bufts[i]), n, plan_total/1048576.0, n_chunks, walk_total/1048576.0, live_max/1048576.0, plan_ms,
+                        memo_hit ? " (reused)" : "");
+            }
+        }
+        free(blocks);
+        free(index);
+    }
 }
 
 static bool ggml_gallocr_reserve_n_impl(
@@ -871,8 +1105,49 @@ static bool ggml_gallocr_reserve_n_impl(
         ggml_dyn_tallocr_reset(galloc->buf_tallocs[i]);
     }
 
-    // allocate in hash table
-    ggml_gallocr_alloc_graph_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids);
+    // allocate in hash table; the walk's blocks recorded for the offline placement (ggml_gallocr_plan),
+    // GGML_ALLOC_PLAN=0: the walk's placement as before
+    const int64_t t_reserve = ggml_time_us();
+    static int plan_env = -1;
+    if (plan_env < 0) {
+        plan_env = !getenv("GGML_ALLOC_PLAN") || atoi(getenv("GGML_ALLOC_PLAN")) != 0;
+    }
+    const bool plan_on = plan_env != 0;
+    galloc->plan_rec = plan_on;
+    const bool kept_leafs = ggml_gallocr_alloc_graph_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, UINT32_MAX);
+    if (kept_leafs) {
+        // the pipeline copies' chunks sealed or not, per buffer: the smaller layout (see ggml_gallocr_alloc_graph_impl)
+        const int n_buf = MIN(galloc->n_buffers, 32);
+        size_t sealed[32];
+        for (int b = 0; b < n_buf; b++) {
+            sealed[b] = ggml_dyn_tallocr_total_size(galloc->buf_tallocs[b]);
+        }
+        for (int i = 0; i < galloc->n_buffers; i++) {
+            ggml_dyn_tallocr_reset(galloc->buf_tallocs[i]);
+        }
+        ggml_gallocr_alloc_graph_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, 0);
+        uint32_t mask = 0;
+        for (int b = 0; b < n_buf; b++) {
+            if (sealed[b] < ggml_dyn_tallocr_total_size(galloc->buf_tallocs[b])) {
+                mask |= 1u << b;
+            }
+        }
+        if (mask != 0) {
+            for (int i = 0; i < galloc->n_buffers; i++) {
+                ggml_dyn_tallocr_reset(galloc->buf_tallocs[i]);
+            }
+            ggml_gallocr_alloc_graph_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, mask);
+        }
+    }
+    galloc->plan_rec = false;
+    const int64_t t_walk = ggml_time_us();
+    if (plan_on) {
+        ggml_gallocr_plan(galloc);
+    }
+    if (getenv("GGML_ALLOC_TRACE_BUFS")) {
+        const int64_t t_end = ggml_time_us();
+        GGML_LOG_INFO("alloc reserve: %d nodes, walk %.2f ms, plan %.2f ms\n", graph->n_nodes, (t_walk - t_reserve)/1000.0, (t_end - t_walk)/1000.0);
+    }
 
     // set the node_allocs from the hash table
     if (galloc->n_nodes < graph->n_nodes) {
