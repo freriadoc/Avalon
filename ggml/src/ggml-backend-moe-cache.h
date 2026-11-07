@@ -170,6 +170,9 @@ struct ggml_moe_cache_api {
     void (*prefill_unpin)(void * session);
     int  (*lend)(void * session, void * backend, size_t bytes, void ** zones, int n_zones);
     void (*restore)(void * session, void * backend);
+    // GGML_CUDA_MOE_RING_PREFILL: the prompt's expert ring in the zones the scheduler borrowed (base, bytes), or none
+    // (base NULL: the ring's copies and reads end before the zones go back)
+    void (*ring_zone)(void * session, void * backend, void * base, size_t bytes);
 
     // Plain memory lending, for the compute buffer of a prefill graph: borrow returns a
     // contiguous block of at least 'bytes' taken from the cache of this backend's device

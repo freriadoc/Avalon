@@ -20,6 +20,11 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
     return -1;
 }
 
+int ggml_cuda_moe_ring_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
+    (void) ctx; (void) cgraph; (void) i;
+    return 0;
+}
+
 void ggml_cuda_moe_hosted_flush(ggml_backend_cuda_context & ctx, const ggml_tensor * node) {
     (void) ctx; (void) node;
 }
@@ -60,6 +65,9 @@ bool ggml_cuda_host_rows_node(ggml_backend_cuda_context & ctx, ggml_tensor * nod
 #include "../ggml-backend-moe-cache.h"
 #include "moe-arena.h"
 #include "moe-ram-budget.h"
+#include "moe-ring.h"
+#include "mmq.cuh"
+#include <functional>
 
 // EXL3 weights are not part of this tree: every path below that tests for them is dead.
 static inline bool ggml_type_is_exl3(ggml_type) { return false; }
@@ -568,6 +576,8 @@ struct moe_cache_device {
     // the expert arena (moe-arena.h, GGML_CUDA_MOE_ARENA_MB): one per expert shape (index of shapes, null for a shape
     // without one), its slots under the session lock; one mapping, registered in pieces of whole slots of each
     std::vector<std::shared_ptr<moe_expert_arena>> arenas;
+    // GGML_CUDA_MOE_RING_PREFILL: the prompt's expert ring in the zones the scheduler borrowed (moe_cache_ring_zone)
+    struct moe_ring_state * ring = nullptr;
     // EXPERT SPLIT: the experts' host memory (the pin, the arena) is the session's, taken once by the first card
     // (host_ready once done) and shared by the others (host_shared: they register, read and unmap nothing themselves)
     bool host_ready = false;
@@ -6565,10 +6575,16 @@ static int moe_cache_prefill_sources(void * opaque, void * backend, const ggml_t
     return n;
 }
 
+static void moe_ring_drain(moe_cache_device & device);
+
 static void moe_cache_prefill_unpin(void * opaque) {
     moe_cache_session * session = (moe_cache_session *)opaque;
     if (!session) {
         return;
+    }
+    // the prefill ring's reads of the entries it pinned are done first (GGML_CUDA_MOE_RING_PREFILL)
+    for (auto & d : session->devices) {
+        moe_ring_drain(*d);
     }
     std::lock_guard<std::mutex> lock(session->mu);
     moe_cache_prefill_unpin_locked(*session);
@@ -10762,6 +10778,273 @@ static void moe_split_cards_create(moe_cache_session & session, moe_hosted_state
     ggml_cuda_set_device(host.logical);
 }
 
+
+// ---------------------------------------------------------------------------------------------------------------------
+// GGML_CUDA_MOE_RING_PREFILL: a prompt's MoE blocks hosted, their experts streamed through a ring of entries in the
+// zones the scheduler borrowed for the prefill (ggml_moe_cache.ring_zone), computed by groups (mmq.cu,
+// ggml_cuda_moe_block_grouped_xe). The experts the cache holds are read in place; the others are copied in a fixed
+// order (layer, expert), a packed layer's row in one copy, each into the next entry once the group that read it last is
+// done (an event on the compute stream, waited for on the copy stream): the copies of a layer start before its block,
+// behind the previous layer's groups.
+struct moe_ring_state {
+    char * base = nullptr;
+    size_t bytes = 0;
+    size_t entry = 0;
+    moe_vram_ring<moe_cache_key, moe_cache_key_hash> ring;
+    cudaStream_t copy = nullptr;
+    static constexpr int P = 4096;   // events: groups in flight stay far below
+    std::vector<cudaEvent_t> done, copied;
+    int64_t seq = 0;                 // the next group's number
+    std::vector<std::pair<moe_cache_pool *, int>> pins, pins_prev;
+    uint64_t copies = 0, in_place = 0;
+};
+
+static void moe_ring_drain(moe_cache_device & device) {
+    if (!device.ring || !device.ring->copy) {
+        return;
+    }
+    moe_ring_state & r = *device.ring;
+    ggml_cuda_set_device(device.logical);
+    CUDA_CHECK(cudaStreamSynchronize(r.copy));
+    if (r.seq > 0) {
+        CUDA_CHECK(cudaEventSynchronize(r.done[(r.seq - 1) % moe_ring_state::P]));
+    }
+}
+
+static void moe_ring_unpin(moe_cache_session & session, std::vector<std::pair<moe_cache_pool *, int>> & pins) {
+    std::lock_guard<std::mutex> lock(session.mu);
+    for (const auto & pin : pins) {
+        if (pin.second >= 0 && pin.second < pin.first->n_slots && pin.first->slots[pin.second].readers > 0) {
+            pin.first->slots[pin.second].readers--;
+        }
+    }
+    pins.clear();
+}
+
+static void moe_cache_ring_zone(void * opaque, void * backend, void * base, size_t bytes) {
+    moe_cache_session * session = (moe_cache_session *) opaque;
+    moe_cache_device * device = session ? moe_cache_device_for_backend(*session, backend) : nullptr;
+    if (!device) {
+        return;
+    }
+    ggml_cuda_set_device(device->logical);
+    if (!device->ring) {
+        device->ring = new moe_ring_state();
+        moe_ring_state & r = *device->ring;
+        CUDA_CHECK(cudaStreamCreateWithFlags(&r.copy, cudaStreamNonBlocking));
+        r.done.resize(moe_ring_state::P);
+        r.copied.resize(moe_ring_state::P);
+        for (int k = 0; k < moe_ring_state::P; k++) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&r.done[k], cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&r.copied[k], cudaEventDisableTiming));
+        }
+    }
+    moe_ring_state & r = *device->ring;
+    if (!base) {
+        if (r.base) {
+            // nothing may still copy into the zones or read them: they go back to the cache
+            CUDA_CHECK(cudaStreamSynchronize(r.copy));
+            if (r.seq > 0) {
+                CUDA_CHECK(cudaEventSynchronize(r.done[(r.seq - 1) % moe_ring_state::P]));
+            }
+            moe_ring_unpin(*session, r.pins_prev);
+            moe_ring_unpin(*session, r.pins);
+            MOE_CACHE_LOG("[moe-cache] CUDA%d prefill ring: %llu experts copied, %llu read in place (%.1f %% in place)\n",
+                    device->physical, (unsigned long long) r.copies, (unsigned long long) r.in_place,
+                    100.0 * r.in_place / std::max<uint64_t>(1, r.copies + r.in_place));
+        }
+        r.base = nullptr;
+        r.bytes = 0;
+        r.ring.give_back();
+        return;
+    }
+    if (r.base == base && r.bytes == bytes) {
+        return;
+    }
+    // an entry: the largest expert of the device's pools, with what MMQ reads past its last row
+    size_t largest = 0;
+    for (const auto & pool : device->pools) {
+        largest = std::max(largest, pool->expert_size);
+    }
+    r.entry = GGML_PAD(largest + 1024, 256);
+    r.base = (char *) base;
+    r.bytes = bytes;
+    const size_t n = r.entry ? bytes / r.entry : 0;
+    r.ring.lend(n, {});
+    // finite bytes past each expert's rows (the zones held cache entries; zeroed once)
+    CUDA_CHECK(cudaMemsetAsync(base, 0, bytes, r.copy));
+    MOE_CACHE_LOG("[moe-cache] CUDA%d prefill ring: %zu entries of %zu KiB in %zu MiB\n", device->physical, n, r.entry >> 10, bytes >> 20);
+}
+
+int ggml_cuda_moe_ring_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
+    if (i + 3 >= cgraph->n_nodes || g_session_stack.empty() || !g_session_stack.back().active) {
+        return 0;
+    }
+    ggml_tensor * gate = cgraph->nodes[i], * up = cgraph->nodes[i + 1], * down = cgraph->nodes[i + 3];
+    if (gate->op != GGML_OP_MUL_MAT_ID || up->op != GGML_OP_MUL_MAT_ID || down->op != GGML_OP_MUL_MAT_ID) {
+        return 0;
+    }
+    moe_cache_session & session = *g_session_stack.back().active;
+    moe_cache_device * device = nullptr;
+    for (auto & d : session.devices) {
+        if (d->logical == ctx.device) {
+            device = d.get();
+        }
+    }
+    if (!device || !device->ring || !device->ring->base) {
+        return 0;
+    }
+    moe_ring_state & r = *device->ring;
+    const ggml_tensor * w[3] = { gate->src[0], up->src[0], down->src[0] };
+    const int64_t n_expert = w[0]->ne[2];
+    const size_t stride = w[0]->nb[2];
+    const char * lo = nullptr;
+    for (const ggml_tensor * t : w) {
+        if (t->nb[2] != stride || t->ne[2] != n_expert || !t->buffer || !ggml_backend_buffer_is_host(t->buffer)) {
+            return 0;
+        }
+        lo = lo ? std::min(lo, (const char *) t->data) : (const char *) t->data;
+    }
+    size_t role_off[3];
+    for (int k = 0; k < 3; k++) {
+        role_off[k] = (const char *) w[k]->data - lo;
+        // a packed layer: the three parts within one row of `stride` bytes
+        if (role_off[k] + w[k]->nb[1]*w[k]->ne[1] > stride || stride + 512 > r.entry) {
+            return 0;
+        }
+    }
+    const int G = 32;
+    if (n_expert % G != 0 || !r.ring.fits(G)) {
+        return 0;
+    }
+    // the experts the cache holds (a whole expert: every role), pinned until the next block's synchronization
+    std::vector<uint64_t> xe[3];
+    for (int k = 0; k < 3; k++) {
+        xe[k].assign(n_expert, 0);
+    }
+    {
+        std::lock_guard<std::mutex> lock(session.mu);
+        const moe_cache_layer * layer = moe_cache_layer_of(*device, w[0]->data);
+        const int pool_index = moe_cache_pool_of(*device, w[0]->data);
+        if (!session.stopping && !session.dormant && !device->dead.load() && device->budget_ready && layer &&
+                pool_index >= 0 && pool_index < (int) device->pools.size() && layer->n_expert == n_expert) {
+            moe_cache_pool & pool = *device->pools[pool_index];
+            int role_of[3];
+            bool ok = pool.slab != nullptr;
+            for (int k = 0; k < 3 && ok; k++) {
+                role_of[k] = moe_cache_role_of_name(w[k]->name);
+                ok = role_of[k] >= 0 && layer->tensor[role_of[k]] == w[k]->data;
+            }
+            const auto d = ok ? pool.direct.find(layer->tensor[MOE_ROLE_GATE]) : pool.direct.end();
+            if (d != pool.direct.end()) {
+                for (int64_t e = 0; e < n_expert && e < (int64_t) d->second.size(); e++) {
+                    const int sl = d->second[e];
+                    if (sl >= 0 && pool.slots[sl].state == moe_cache_slot_state::valid) {
+                        pool.slots[sl].readers++;
+                        session.prefill_pins.push_back({&pool, sl});   // released by prefill_unpin (after moe_ring_drain)
+                        for (int k = 0; k < 3; k++) {
+                            xe[k][e] = moe_cache_entry_addr(pool, sl) + pool.role_offset[role_of[k]];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // the others: an entry each, in order; a copy waits for the group that read its entry last
+    cudaStream_t cs = ctx.stream();
+    const int64_t seq0 = r.seq;
+    const int64_t n_groups = n_expert / G;
+    struct pend { int64_t e; int64_t wait; int entry; bool issued; };
+    std::vector<std::vector<pend>> by_group(n_groups);
+    for (int64_t e = 0; e < n_expert; e++) {
+        if (xe[0][e]) {
+            r.in_place++;
+            continue;
+        }
+        int64_t wait = -1;
+        const int entry = r.ring.take(moe_cache_key{w[0]->data, (int32_t) e}, seq0 + e / G, &wait);
+        GGML_ASSERT(entry >= 0);
+        for (int k = 0; k < 3; k++) {
+            xe[k][e] = (uint64_t) (uintptr_t) (r.base + (size_t) entry * r.entry + role_off[k]);
+        }
+        by_group[e / G].push_back({e, wait, entry, false});
+    }
+    static const bool validate = getenv("GGML_CUDA_MOE_RING_VALIDATE") && atoi(getenv("GGML_CUDA_MOE_RING_VALIDATE")) != 0;
+    if (validate) {
+        const uint64_t s0 = (uint64_t) (uintptr_t) device->band_slab, s1 = s0 + moe_cache_band_total(*device);
+        const uint64_t q0 = (uint64_t) (uintptr_t) r.base, q1 = q0 + r.bytes;
+        int bad = 0, in_slab = 0, in_ring = 0;
+        for (int k = 0; k < 3; k++) {
+            for (int64_t e = 0; e < n_expert; e++) {
+                const uint64_t a = xe[k][e];
+                const bool ring_a = a >= q0 && a < q1, slab_a = a >= s0 && a < s1;
+                in_ring += ring_a; in_slab += slab_a && !ring_a;
+                if (!ring_a && !slab_a && bad++ < 4) {
+                    GGML_LOG_INFO("ring validate %s: role %d expert %lld at %#llx outside slab [%#llx, %#llx) and ring [%#llx, %#llx)\n",
+                        w[0]->name, k, (long long) e, (unsigned long long) a, (unsigned long long) s0, (unsigned long long) s1,
+                        (unsigned long long) q0, (unsigned long long) q1);
+                }
+            }
+        }
+        GGML_LOG_INFO("ring validate %s: %d in the slab, %d in the ring, %d elsewhere; stride %zu entry %zu offsets %zu %zu %zu\n", w[0]->name,
+                in_slab, in_ring, bad, stride, r.entry, role_off[0], role_off[1], role_off[2]);
+    }
+    int64_t recorded = seq0;            // groups below have their done event recorded
+    int64_t next_group_to_close = 0;    // groups below have every copy issued (and their copied event)
+    // the copies in order, group by group, as far as their waits are recorded: those that wait for nothing of this
+    // block go now (they run during the routing and the previous layers)
+    auto advance = [&]() {
+        while (next_group_to_close < n_groups) {
+            bool all = true;
+            for (auto & p : by_group[next_group_to_close]) {
+                if (p.issued) {
+                    continue;
+                }
+                if (p.wait >= recorded) {
+                    all = false;
+                    break;
+                }
+                if (p.wait >= 0) {
+                    CUDA_CHECK(cudaStreamWaitEvent(r.copy, r.done[p.wait % moe_ring_state::P], 0));
+                }
+                CUDA_CHECK(cudaMemcpyAsync(r.base + (size_t) p.entry * r.entry, lo + (size_t) p.e*stride, stride,
+                                           cudaMemcpyHostToDevice, r.copy));
+                r.copies++;
+                p.issued = true;
+            }
+            if (!all) {
+                break;
+            }
+            if (!by_group[next_group_to_close].empty()) {
+                CUDA_CHECK(cudaEventRecord(r.copied[(seq0 + next_group_to_close) % moe_ring_state::P], r.copy));
+            }
+            next_group_to_close++;
+        }
+    };
+    advance();
+    std::function<void(int64_t)> before = [&](int64_t g) {
+        advance();
+        GGML_ASSERT(next_group_to_close > g && "a group's copies wait for itself");
+        if (!by_group[g].empty()) {
+            CUDA_CHECK(cudaStreamWaitEvent(cs, r.copied[(seq0 + g) % moe_ring_state::P], 0));
+        }
+    };
+    std::function<void(int64_t)> after = [&](int64_t g) {
+        CUDA_CHECK(cudaEventRecord(r.done[(seq0 + g) % moe_ring_state::P], cs));
+        recorded = seq0 + g + 1;
+        advance();
+    };
+    std::function<void()> synced = [&]() {   // the previous block's reads are done: its pins go
+        moe_ring_unpin(session, r.pins_prev);
+    };
+    const int covered = ggml_cuda_moe_block_grouped_xe(ctx, cgraph, i, G, xe, &before, &after, &synced);
+    GGML_ASSERT(covered > 0 && "a ring prompt MoE block the grouped path does not take");
+    r.seq = seq0 + n_groups;
+    r.pins_prev.insert(r.pins_prev.end(), r.pins.begin(), r.pins.end());
+    r.pins.clear();
+    return covered;
+}
+
 int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
     if (i + 3 >= cgraph->n_nodes) {
         return -1;
@@ -11171,6 +11454,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.prefill_sources = moe_cache_prefill_sources;
     ggml_moe_cache.lend = moe_cache_lend;
     ggml_moe_cache.restore = moe_cache_restore;
+    ggml_moe_cache.ring_zone = moe_cache_ring_zone;
     ggml_moe_cache.borrow = moe_cache_borrow;
     ggml_moe_cache.give_back = moe_cache_give_back;
     ggml_moe_cache.compute_buffer_type = moe_cache_compute_buffer_type;

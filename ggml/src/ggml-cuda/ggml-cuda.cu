@@ -6750,7 +6750,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     if (i == cuda_ctx->router_next && cuda_ctx->router_pending) {
                         ggml_cuda_router_flush(*cuda_ctx);   // the block reads the routing
                     }
-                    const int covered = ggml_cuda_moe_block_grouped_host(*cuda_ctx, cgraph, i);
+                    int covered = ggml_cuda_moe_ring_block(*cuda_ctx, cgraph, i);
+                    if (covered <= 0) {
+                        covered = ggml_cuda_moe_block_grouped_host(*cuda_ctx, cgraph, i);
+                    }
                     if (covered > 0) {
                         written(i, i + covered);
                         i += covered;

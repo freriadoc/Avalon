@@ -1672,3 +1672,10 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 int ggml_cuda_moe_block_grouped(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 // GGML_CUDA_MOE_RING_PREFILL: the same with the block's experts in host memory (a prompt's block the scheduler hosts)
 int ggml_cuda_moe_block_grouped_host(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+// the same with each expert at an address (xe: per role gate, up, down, n_expert each) and hooks around each group and
+// after the stream's synchronization (the prefill's expert ring, moe-cache.cu)
+#include <functional>
+#include <vector>
+int ggml_cuda_moe_block_grouped_xe(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i, int G,
+        const std::vector<uint64_t> * xe, std::function<void(int64_t)> * before, std::function<void(int64_t)> * after,
+        std::function<void()> * synced);

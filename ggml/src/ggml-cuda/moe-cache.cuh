@@ -26,6 +26,8 @@ struct ggml_cgraph;
 // the CPU through a host thread) and returns the nodes it covers after i (3), or -1 if node i does
 // not start such a block.
 int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, struct ggml_cgraph * cgraph, int i);
+// GGML_CUDA_MOE_RING_PREFILL: a prompt's MoE block by groups, its absent experts through the prefill's ring; 0: not taken
+int ggml_cuda_moe_ring_block(ggml_backend_cuda_context & ctx, struct ggml_cgraph * cgraph, int i);
 
 // rows a graph waits for, written by the host after the launch (see moe-cache.cu): the mapped buffer (nullptr if too large),
 // the task that writes it (run by the first wait for the GPU), the node that waits for it (true: the node was launched)

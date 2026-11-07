@@ -1183,6 +1183,7 @@ struct ggml_backend_sched {
     bool prefetch_experts;
     int prefetch_slots_wanted;   // slots per GPU (GGML_SCHED_PREFETCH_EXPERTS)
     size_t prefetch_ring_half;   // GGML_SCHED_PREFETCH_RING_MB: the ring's two zones, each this size (0: slots)
+    size_t prefetch_slot_bytes;  // the slot size the MoE cache lays its zones out for (prime)
     // one prefetch per backend: each GPU copies the experts of the layers it computes over its own link, into its own
     // slots (a layer split over several GPUs)
     struct ggml_sched_prefetch pf[GGML_SCHED_MAX_BACKENDS];
@@ -1497,6 +1498,17 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
 static bool ggml_backend_sched_is_hosted_moe(ggml_backend_sched_t sched, const struct ggml_tensor * node) {
     return sched->moe_hosted && !sched->moe_hosted->empty() && sched->moe_hosted->count(node) > 0;
+}
+
+static int ggml_backend_sched_ring_backend(ggml_backend_sched_t sched, int split_id) {
+    const ggml_backend_sched_split * split = &sched->splits[split_id];
+    for (int j = 0; j < split->graph.n_nodes; j++) {
+        const ggml_tensor * n = split->graph.nodes[j];
+        if (n->op == GGML_OP_MUL_MAT_ID && n->src[2] && n->src[2]->ne[1] >= 128 && ggml_backend_sched_is_hosted_moe(sched, n)) {
+            return split->backend_id;
+        }
+    }
+    return -1;
 }
 
 // With a MoE cache session (GGML_MOE_GPU=0 turns it off), a MoE block gate / up / swiglu / down whose weights are
@@ -2349,6 +2361,9 @@ static void ggml_backend_sched_prefetch_restore(ggml_backend_sched_t sched) {
         if (pf.backend) {
             ggml_backend_synchronize(pf.backend);
         }
+        if (ggml_moe_cache.ring_zone) {
+            ggml_moe_cache.ring_zone(sched->moe_cache_session, pf.lend_backend, nullptr, 0);
+        }
         if (ggml_moe_cache.restore) {
             ggml_moe_cache.restore(sched->moe_cache_session, pf.lend_backend);
         }
@@ -2363,9 +2378,24 @@ static void ggml_backend_sched_prefetch_restore(ggml_backend_sched_t sched) {
 
 // the current graph (after split_graph) prefetches expert tensors: a split starting with an expert product of host
 // weights at a batch where virtually every expert is used (the criterion of the prefetch in compute_splits)
+static bool ggml_backend_sched_ring_prefill() {
+    static const bool v = getenv("GGML_CUDA_MOE_RING_PREFILL") && atoi(getenv("GGML_CUDA_MOE_RING_PREFILL")) > 0;
+    return v;
+}
+
+// GGML_CUDA_MOE_RING_PREFILL: the backend of a hosted MoE block of a prompt in this graph (its ring needs the zones), or -1
+static int ggml_backend_sched_ring_backend(ggml_backend_sched_t sched, int split_id);
+
 static bool ggml_backend_sched_graph_prefetches(ggml_backend_sched_t sched) {
     if (!sched->prefetch_experts || sched->callback_eval) {
         return false;
+    }
+    if (ggml_backend_sched_ring_prefill()) {
+        for (int i = 0; i < sched->n_splits; i++) {
+            if (ggml_backend_sched_ring_backend(sched, i) >= 0) {
+                return true;
+            }
+        }
     }
     for (int i = 0; i < sched->n_splits; i++) {
         const ggml_backend_sched_split * split = &sched->splits[i];
@@ -2631,6 +2661,42 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     // reuse already waits on the GPU for its previous user (pf.free)
     if (!ggml_backend_sched_graph_prefetches(sched)) {
         ggml_backend_sched_prefetch_restore(sched);
+    }
+    // GGML_CUDA_MOE_RING_PREFILL: the zones of each GPU whose hosted prompt blocks stream their experts, as one ring
+    if (ggml_backend_sched_ring_prefill() && sched->moe_cache_session && ggml_moe_cache.lend && ggml_moe_cache.ring_zone &&
+            sched->prefetch_slot_bytes && !sched->callback_eval) {
+        for (int s = 0; s < sched->n_splits; s++) {
+            const int b = ggml_backend_sched_ring_backend(sched, s);
+            if (b < 0) {
+                continue;
+            }
+            ggml_sched_prefetch & pf = sched->pf[b];
+            ggml_backend_t backend = sched->backends[b];
+            if (!pf.lent && ggml_backend_sched_prefetch_backend_init(sched, pf, backend->device)) {
+                void * zones[GGML_SCHED_MAX_PREFETCH_SLOTS] = {};
+                const int n = ggml_moe_cache.lend(sched->moe_cache_session, backend, sched->prefetch_slot_bytes, zones, pf.n_slots);
+                if (n >= 2) {
+                    bool contiguous = true;
+                    const ptrdiff_t step = (char *) zones[1] - (char *) zones[0];
+                    for (int k = 1; k < n; k++) {
+                        contiguous = contiguous && (char *) zones[k] - (char *) zones[k - 1] == step;
+                    }
+                    pf.n_slots = n;
+                    for (int k = 0; k < n; k++) {
+                        pf.slot_data[k] = zones[k];
+                        pf.used[k] = false;
+                    }
+                    pf.lent = true;
+                    pf.lend_backend = backend;
+                    if (contiguous && step > 0) {
+                        ggml_moe_cache.ring_zone(sched->moe_cache_session, backend, zones[0], (size_t) step * n);
+                        sched->prefill_pinned = true;   // the ring pins the experts it reads in place
+                    }
+                } else if (n == 1) {
+                    ggml_moe_cache.restore(sched->moe_cache_session, backend);
+                }
+            }
+        }
     }
 
     ggml_tensor * prev_ids_tensor = nullptr;
@@ -4113,6 +4179,7 @@ static void ggml_backend_sched_prime_moe_cache(ggml_backend_sched_t sched, struc
         } else {
             ggml_moe_cache.set_lend_size(sched->moe_cache_session, slot_bytes, sched->prefetch_slots_wanted);
         }
+        sched->prefetch_slot_bytes = slot_bytes;
     }
 
     int accepted[2] = {0, 0};

@@ -25,6 +25,7 @@ void ggml_cuda_mmq_tile_prefix(const int32_t * expert_bounds, int n_experts, int
 #include "ggml-backend-impl.h"
 
 #include <cstdint>
+#include <functional>
 #include <cstring>
 
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream, const ggml_prec prec_src1) {
@@ -687,11 +688,27 @@ static int moe_grouped_size() {
 
 // xe_host: per role (gate, up, down), each expert's address (a packed layer: its stride is no whole number of
 // blocks, MMQ then reads the experts by address, as the prefill's in-place reads)
+struct moe_grouped_hooks {
+    int G = 0;                                     // the group size (0: moe_grouped_size())
+    std::function<void(int64_t)> * before = nullptr, * after = nullptr;   // around each group (empty ones too)
+    std::function<void()> * synced = nullptr;      // once the stream is synchronized (the rows read back)
+};
+
 static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i,
-        const ggml_tensor * wg_dev, const ggml_tensor * wu_dev, const ggml_tensor * wd_dev, const std::vector<uint64_t> * xe_host);
+        const ggml_tensor * wg_dev, const ggml_tensor * wu_dev, const ggml_tensor * wd_dev, const std::vector<uint64_t> * xe_host,
+        const moe_grouped_hooks * hooks = nullptr);
 
 int ggml_cuda_moe_block_grouped(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
     return moe_block_grouped_impl(ctx, cgraph, i, nullptr, nullptr, nullptr, nullptr);
+}
+
+int ggml_cuda_moe_block_grouped_xe(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i, int G,
+        const std::vector<uint64_t> * xe, std::function<void(int64_t)> * before, std::function<void(int64_t)> * after,
+        std::function<void()> * synced) {
+    const ggml_tensor * gate = cgraph->nodes[i], * up = cgraph->nodes[i + 1], * down = cgraph->nodes[i + 3];
+    moe_grouped_hooks h;
+    h.G = G; h.before = before; h.after = after; h.synced = synced;
+    return moe_block_grouped_impl(ctx, cgraph, i, gate->src[0], up->src[0], down->src[0], xe, &h);
 }
 
 // GGML_CUDA_MOE_RING_PREFILL (step 1, the expert ring to come): a prompt's MoE block with its experts in host memory
@@ -754,8 +771,9 @@ int ggml_cuda_moe_block_grouped_host(ggml_backend_cuda_context & ctx, const ggml
 }
 
 static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i,
-        const ggml_tensor * wg_dev, const ggml_tensor * wu_dev, const ggml_tensor * wd_dev, const std::vector<uint64_t> * xe_host) {
-    const int G = moe_grouped_size();
+        const ggml_tensor * wg_dev, const ggml_tensor * wu_dev, const ggml_tensor * wd_dev, const std::vector<uint64_t> * xe_host,
+        const moe_grouped_hooks * hooks) {
+    const int G = hooks && hooks->G > 0 ? hooks->G : moe_grouped_size();
     if (G <= 0 || i + 3 >= cgraph->n_nodes) {
         return 0;
     }
@@ -824,11 +842,45 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
     const int J_d  = mmq_pick_J(wd->type, ncols_opt, fb_d,  cc, smpbo, GGML_PREC_Q8);
     GGML_ASSERT(J_gu > 0 && J_d > 0);
 
-    ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), rows), ids_dst(ctx.pool(), rows + std::max(J_gu, J_d) - 1),
-        bounds(ctx.pool(), n_expert + 1), prefix(ctx.pool(), G + 1);
+    // the scratch the scheduler placed in the compute buffer for gate (its ids and its quantized activation, shared with
+    // up) and for down (its quantized activation), as the ungrouped products use it; else pool memory
+    const mmq_scratch_layout lg = mmq_scratch_get_layout(gate, cc), ld = mmq_scratch_get_layout(down, cc);
+    const ggml_tensor * sg_t = gate->src[GGML_SCHED_SCRATCH_SRC], * sd_t = down->src[GGML_SCHED_SCRATCH_SRC];
+    char * sg = sg_t && sg_t->data && ggml_nbytes(sg_t) >= lg.size ? (char *) sg_t->data : nullptr;
+    char * sd = sd_t && sd_t->data && ggml_nbytes(sd_t) >= ld.size ? (char *) sd_t->data : nullptr;
+    if (sg && sd && sg == sd) {
+        sd = nullptr;   // one scratch for both: down's activation apart
+    }
+    // by groups the scratch must outlive every output of the block, which the allocator may have placed over it (it
+    // sees gate's scratch dead after up, down's before down): then pool memory
+    auto over = [&](const char * p, size_t n) {
+        for (const ggml_tensor * t : { (const ggml_tensor *) gate, (const ggml_tensor *) up, (const ggml_tensor *) glu,
+                                       (const ggml_tensor *) down, x, ids }) {
+            const char * t0 = (const char *) t->data;
+            if (t0 < p + n && p < t0 + ggml_nbytes(t)) {
+                return true;
+            }
+        }
+        return false;
+    };
+    if (sg && over(sg, lg.size)) {
+        sg = nullptr;
+    }
+    if (sd && over(sd, ld.size)) {
+        sd = nullptr;
+    }
+    ctx.mmq_scratch_last = nullptr;   // what the scratch holds is no longer what a next product would expect
     const size_t q8_gu_bytes = rows*ne10p_gu*sizeof(block_q8_1_mmq)/QK8_1_MMQ + mmq_src1_tail;
     const size_t q8_d_bytes  = rows*ne10p_d *sizeof(block_q8_1_mmq)/QK8_1_MMQ + mmq_src1_tail;
-    ggml_cuda_pool_alloc<char> q8_gu(ctx.pool(), q8_gu_bytes), q8_d(ctx.pool(), q8_d_bytes);
+    ggml_cuda_pool_alloc<int32_t> ids_src1_p(ctx.pool()), ids_dst_p(ctx.pool()), bounds_p(ctx.pool()), prefix(ctx.pool(), G + 1);
+    ggml_cuda_pool_alloc<char> q8_gu_p(ctx.pool()), q8_d_p(ctx.pool());
+    struct ptr_i32 { int32_t * p; int32_t * get() const { return p; } };
+    struct ptr_c { char * p; char * get() const { return p; } };
+    const ptr_i32 ids_src1 { sg ? (int32_t *) (sg + lg.ids_src1)      : ids_src1_p.alloc(rows) };
+    const ptr_i32 ids_dst  { sg ? (int32_t *) (sg + lg.ids_dst)       : ids_dst_p.alloc(rows + std::max(J_gu, J_d) - 1) };
+    const ptr_i32 bounds   { sg ? (int32_t *) (sg + lg.expert_bounds) : bounds_p.alloc(n_expert + 1) };
+    const ptr_c   q8_gu    { sg ? sg + lg.src1_q8_1 : q8_gu_p.alloc(q8_gu_bytes) };
+    const ptr_c   q8_d     { sd ? sd + ld.src1_q8_1 : q8_d_p.alloc(q8_d_bytes) };
 
     // the rows by expert (the inverse map for the broadcast activation), the activation quantized once for gate and up
     ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(), n_expert, n_tok,
@@ -844,6 +896,9 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
     std::vector<int32_t> hb(n_expert + 1);
     CUDA_CHECK(cudaMemcpyAsync(hb.data(), bounds.get(), (n_expert + 1)*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (hooks && hooks->synced) {
+        (*hooks->synced)();
+    }
 
     auto launch = [&](const ggml_tensor * w, ggml_tensor * dst, const char * q8, int64_t ne10p, int64_t ne11, int J, bool fallback,
                       int64_t g0, int r0, int r1, int role) {
@@ -867,7 +922,13 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
     };
     for (int64_t g0 = 0; g0 < n_expert; g0 += G) {
         const int r0 = hb[g0], r1 = hb[g0 + G];
+        if (hooks && hooks->before) {
+            (*hooks->before)(g0 / G);
+        }
         if (r1 <= r0) {
+            if (hooks && hooks->after) {
+                (*hooks->after)(g0 / G);
+            }
             continue;
         }
         launch(wg, gate, q8_gu.get(), ne10p_gu, 1, J_gu, fb_gu, g0, r0, r1, 0);
@@ -880,6 +941,9 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
         quantize_mmq_q8_1_rows_cuda((const float *) glu->data, ids_dst.get(), q8_d.get(), wd->type, n_ff,
             glu->nb[1]/sizeof(float), ne10p_d, r0, r1 - r0, (int) rows, stream);
         launch(wd, down, q8_d.get(), ne10p_d, n_used, J_d, fb_d, g0, r0, r1, 2);
+        if (hooks && hooks->after) {
+            (*hooks->after)(g0 / G);
+        }
     }
     CUDA_CHECK(cudaGetLastError());
 
