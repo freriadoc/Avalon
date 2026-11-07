@@ -3406,7 +3406,8 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
         if (node->op == GGML_OP_MUL_MAT_ID) {
             // GGML_CUDA_MOE_GROUPED: a prompt's MoE block by groups reads its experts' rows back to the host
-            static const bool moe_grouped = getenv("GGML_CUDA_MOE_GROUPED") && atoi(getenv("GGML_CUDA_MOE_GROUPED")) > 0;
+            static const bool moe_grouped = (getenv("GGML_CUDA_MOE_GROUPED") && atoi(getenv("GGML_CUDA_MOE_GROUPED")) > 0) ||
+                                            (getenv("GGML_CUDA_MOE_RING_PREFILL") && atoi(getenv("GGML_CUDA_MOE_RING_PREFILL")) > 0);
             if (moe_grouped && node->src[2] && node->src[2]->ne[1] >= 128) {
                 use_cuda_graph = false;
             }
@@ -6739,6 +6740,22 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 if (ggml_cuda_host_rows_node(*cuda_ctx, node)) {
                     written(i, i);
                     continue;
+                }
+
+                // GGML_CUDA_MOE_RING_PREFILL: a prompt's MoE block of host weights by groups of experts (the scheduler
+                // hosts every MoE block of a prompt in that mode)
+                static const bool ring_prefill = getenv("GGML_CUDA_MOE_RING_PREFILL") && atoi(getenv("GGML_CUDA_MOE_RING_PREFILL")) > 0;
+                if (ring_prefill && node->op == GGML_OP_MUL_MAT_ID && node->src[0]->buffer &&
+                        !ggml_backend_buft_is_cuda(node->src[0]->buffer->buft) && node->src[2] && node->src[2]->ne[1] >= 128) {
+                    if (i == cuda_ctx->router_next && cuda_ctx->router_pending) {
+                        ggml_cuda_router_flush(*cuda_ctx);   // the block reads the routing
+                    }
+                    const int covered = ggml_cuda_moe_block_grouped_host(*cuda_ctx, cgraph, i);
+                    if (covered > 0) {
+                        written(i, i + covered);
+                        i += covered;
+                        continue;
+                    }
                 }
 
                 // weights in host memory: the scheduler left a MoE block of the cache on the GPU

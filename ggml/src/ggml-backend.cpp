@@ -1506,6 +1506,7 @@ static bool ggml_backend_sched_is_hosted_moe(ggml_backend_sched_t sched, const s
 // others (ggml_cuda_moe_hosted_block); no weight is copied. GGML_MOE_HOSTED_MAX_ROWS=N: a fixed limit instead.
 static void ggml_backend_sched_find_hosted_moe(ggml_backend_sched_t sched, const struct ggml_cgraph * graph) {
     static const bool enabled = !getenv("GGML_MOE_GPU") || atoi(getenv("GGML_MOE_GPU")) != 0;
+    static const bool ring_prefill = getenv("GGML_CUDA_MOE_RING_PREFILL") && atoi(getenv("GGML_CUDA_MOE_RING_PREFILL")) > 0;
     // the routed rows of a hosted block: the backend's (ggml-cuda's moe_hosted_max_rows, GGML_MOE_HOSTED_MAX_ROWS)
     static const bool fixed_rows = getenv("GGML_MOE_HOSTED_MAX_ROWS") != nullptr;
     const int64_t max_rows = ggml_moe_cache.hosted_max_rows ? ggml_moe_cache.hosted_max_rows() : 64;
@@ -1544,7 +1545,16 @@ static void ggml_backend_sched_find_hosted_moe(ggml_backend_sched_t sched, const
         if (!((gate == graph->nodes[i] && up == graph->nodes[i + 1]) || (gate == graph->nodes[i + 1] && up == graph->nodes[i])) ||
             !host_weights(gate) || !host_weights(up) || !host_weights(down) ||
             gate->src[2] != ids || up->src[2] != ids || gate->src[1] != up->src[1] ||
-            ids->ne[0] * ids->ne[1] > max_rows || ids->ne[1] > 1024) {
+            (!ring_prefill && (ids->ne[0] * ids->ne[1] > max_rows || ids->ne[1] > 1024))) {
+            continue;
+        }
+        if (ring_prefill && ids->ne[1] >= 128) {
+            // GGML_CUDA_MOE_RING_PREFILL: a prompt's block hosted whatever its rows (ggml-cuda computes it by groups,
+            // its experts through the ring), no split, no prefetch
+            sched->moe_hosted->insert(gate);
+            sched->moe_hosted->insert(up);
+            sched->moe_hosted->insert(down);
+            i += 3;
             continue;
         }
         candidates.push_back({ gate, up, down, ids->ne[0] * ids->ne[1] });

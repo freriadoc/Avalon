@@ -678,8 +678,77 @@ static int mmq_pick_J(ggml_type type, int64_t ncols_opt, bool fallback, int cc, 
     return J_best;
 }
 
+// the block's group size: GGML_CUDA_MOE_GROUPED=G, else 32 when the prompt's experts come through the ring path
+static int moe_grouped_size() {
+    static const int G = getenv("GGML_CUDA_MOE_GROUPED") ? atoi(getenv("GGML_CUDA_MOE_GROUPED")) :
+                         getenv("GGML_CUDA_MOE_RING_PREFILL") && atoi(getenv("GGML_CUDA_MOE_RING_PREFILL")) > 0 ? 32 : 0;
+    return G;
+}
+
+static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i,
+        const ggml_tensor * wg_dev, const ggml_tensor * wu_dev, const ggml_tensor * wd_dev, bool * declined);
+
 int ggml_cuda_moe_block_grouped(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
-    static const int G = getenv("GGML_CUDA_MOE_GROUPED") ? atoi(getenv("GGML_CUDA_MOE_GROUPED")) : 0;
+    return moe_block_grouped_impl(ctx, cgraph, i, nullptr, nullptr, nullptr, nullptr);
+}
+
+// GGML_CUDA_MOE_RING_PREFILL (step 1, the expert ring to come): a prompt's MoE block with its experts in host memory
+// (the scheduler hosts it: no split, no prefetch), its layer copied whole to the device (one copy when its three
+// tensors are one packed range, else three), then computed by groups. The copy is pool memory: run with a larger
+// GGML_CUDA_MOE_CACHE_RESERVE_MB (a layer is ~1.1 GiB) until the ring takes its place
+int ggml_cuda_moe_block_grouped_host(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    if (moe_grouped_size() <= 0 || i + 3 >= cgraph->n_nodes) {
+        return 0;
+    }
+    const ggml_tensor * gate = cgraph->nodes[i], * up = cgraph->nodes[i + 1], * down = cgraph->nodes[i + 3];
+    if (gate->op != GGML_OP_MUL_MAT_ID || up->op != GGML_OP_MUL_MAT_ID || down->op != GGML_OP_MUL_MAT_ID) {
+        return 0;
+    }
+    const ggml_tensor * w[3] = { gate->src[0], up->src[0], down->src[0] };
+    const char * lo = nullptr, * hi = nullptr;
+    size_t sum = 0;
+    for (const ggml_tensor * t : w) {
+        if (!t->buffer || !ggml_backend_buffer_is_host(t->buffer) || t->view_src) {
+            return 0;
+        }
+        const char * a = (const char *) t->data, * b = a + ggml_nbytes(t);
+        lo = lo ? std::min(lo, a) : a;
+        hi = hi ? std::max(hi, b) : b;
+        sum += ggml_nbytes(t);
+    }
+    cudaStream_t stream = ctx.stream();
+    const bool one_range = (size_t) (hi - lo) <= sum + sum / 16;   // a packed layer: its tensors interleaved per expert
+    // MMQ reads a little past an expert's last row (up to 512 values): a zeroed tail after the copy
+    constexpr size_t tail = 64*1024;
+    const size_t span = one_range ? (size_t) (hi - lo) : sum + 2*tail;
+    ggml_cuda_pool_alloc<char> buf(ctx.pool(), span + tail);
+    CUDA_CHECK(cudaMemsetAsync(buf.get() + span, 0, tail, stream));
+    ggml_tensor dw[3];
+    size_t off = 0;
+    for (int k = 0; k < 3; k++) {
+        dw[k] = *w[k];   // its host buffer kept (weights: MMQ clears no padding past it); its data the device copy's
+        if (one_range) {
+            dw[k].data = buf.get() + ((const char *) w[k]->data - lo);
+        } else {
+            dw[k].data = buf.get() + off;
+            CUDA_CHECK(cudaMemcpyAsync(dw[k].data, w[k]->data, ggml_nbytes(w[k]), cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemsetAsync((char *) dw[k].data + ggml_nbytes(w[k]), 0, tail, stream));
+            off += ggml_nbytes(w[k]) + tail;
+        }
+    }
+    if (one_range) {
+        CUDA_CHECK(cudaMemcpyAsync(buf.get(), lo, (size_t) (hi - lo), cudaMemcpyHostToDevice, stream));
+    }
+    bool declined = false;
+    const int covered = moe_block_grouped_impl(ctx, cgraph, i, &dw[0], &dw[1], &dw[2], &declined);
+    GGML_ASSERT(covered > 0 && "a hosted prompt MoE block the grouped path does not take");
+    return covered;
+}
+
+static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i,
+        const ggml_tensor * wg_dev, const ggml_tensor * wu_dev, const ggml_tensor * wd_dev, bool * declined) {
+    GGML_UNUSED(declined);
+    const int G = moe_grouped_size();
     if (G <= 0 || i + 3 >= cgraph->n_nodes) {
         return 0;
     }
@@ -690,7 +759,8 @@ int ggml_cuda_moe_block_grouped(ggml_backend_cuda_context & ctx, const ggml_cgra
         return 0;
     }
     const ggml_tensor * x = gate->src[1], * ids = gate->src[2];
-    const ggml_tensor * wg = gate->src[0], * wu = up->src[0], * wd = down->src[0];
+    const bool host_w = wg_dev != nullptr;   // the weights copied to the device (ggml_cuda_moe_block_grouped_host)
+    const ggml_tensor * wg = host_w ? wg_dev : gate->src[0], * wu = host_w ? wu_dev : up->src[0], * wd = host_w ? wd_dev : down->src[0];
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int64_t n_expert = wg->ne[2], n_used = ids->ne[0], n_tok = ids->ne[1];
     // one sequence of a prompt, the activation broadcast to the experts (ne11 == 1), every tensor on the device, MMQ
@@ -703,7 +773,7 @@ int ggml_cuda_moe_block_grouped(ggml_backend_cuda_context & ctx, const ggml_cgra
         return 0;
     }
     for (const ggml_tensor * w : { wg, wu, wd }) {
-        if (!w->buffer || ggml_backend_buffer_is_host(w->buffer) ||
+        if ((!host_w && (!w->buffer || ggml_backend_buffer_is_host(w->buffer))) ||
                 !ggml_cuda_should_use_mmq(w->type, cc, n_tok, n_expert) || w->type == GGML_TYPE_NVFP4 || w->type == GGML_TYPE_MXFP4 ||
                 ggml_cuda_mmq_get_prec_src1(w, w == wd ? down : gate, cc) != GGML_PREC_Q8) {
             return 0;

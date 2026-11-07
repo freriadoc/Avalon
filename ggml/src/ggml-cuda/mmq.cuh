@@ -1670,3 +1670,5 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 // GGML_CUDA_MOE_GROUPED=G: nodes i .. i + 3 (gate, up, swiglu, down of a prompt's MoE block) by groups of G experts;
 // the nodes it covered past i (3), or 0 when it does not take them
 int ggml_cuda_moe_block_grouped(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+// GGML_CUDA_MOE_RING_PREFILL: the same with the block's experts in host memory (a prompt's block the scheduler hosts)
+int ggml_cuda_moe_block_grouped_host(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
