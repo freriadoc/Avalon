@@ -1244,6 +1244,20 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
+// four int8 values from an 8-entry table (t0: entries 0..3, t1: 4..7) at the indices 0..7 in the four bytes of idx: one
+// byte permutation, against the eight of get_int_from_table_16 for eight values. For IQ3_KS, whose grid (the fourth
+// index bit) is constant over its block of 32: MMQ -4 % on an A4000, -1.3 % on the 7900 XT. IQ3_K picks its grid per 16
+// values: no gain on the A4000, +1.2 % on the 7900 XT, it keeps the table of 16
+static __device__ __forceinline__ int ggml_cuda_lookup8(const int idx, const uint32_t t0, const uint32_t t1) {
+#if defined(GGML_USE_HIP)
+    return __builtin_amdgcn_perm(t1, t0, idx);
+#else
+    int sel = (idx | (idx >> 4)) & 0x00FF00FF;   // the bytes' indices as the nibbles of a __byte_perm selector
+    sel = (sel | (sel >> 8)) & 0x0000FFFF;
+    return __byte_perm(t0, t1, sel);
+#endif // defined(GGML_USE_HIP)
+}
+
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_iq3_k(
         const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
     constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
@@ -1348,19 +1362,19 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
         const int shift_l = 2*(kqsx % 4);
         const int shift_h = kqsx % 8;
-        const int ext_lo  = ((bxi->extra >> (8 + kqsx)) & 1) * 0x08080808;   // the block's grid, both halves
-        const int ext_hi  = ext_lo;
+        const bool g = (bxi->extra >> (8 + kqsx)) & 1;   // the block's grid, both halves
+        const uint32_t * tab = (const uint32_t *) iq3nl_values;
+        const uint32_t t0 = g ? tab[2] : tab[0];
+        const uint32_t t1 = g ? tab[3] : tab[1];
 
 #pragma unroll
         for (int m = 0; m < 8; m += 2) {
-            // the 3-bit indices of weights 4m..4m+7 of the block, the grid bit added: two ints of
-            // bytes 0..15, packed as the low and high nibbles of one int for the table of 16
-            const int ext = m < 4 ? ext_lo : ext_hi;
+            // the 3-bit indices of weights 4m..4m+7 of the block, one byte each, looked up in the 8 values of its grid
             const int i0q = ((get_int_b2(bxi->qs, 8*(kqsx/4) + m + 0) >> shift_l) & 0x03030303) |
-                            (((get_int_b2(bxi->qh, m + 0) >> shift_h) & 0x01010101) << 2) | ext;
+                            (((get_int_b2(bxi->qh, m + 0) >> shift_h) & 0x01010101) << 2);
             const int i1q = ((get_int_b2(bxi->qs, 8*(kqsx/4) + m + 1) >> shift_l) & 0x03030303) |
-                            (((get_int_b2(bxi->qh, m + 1) >> shift_h) & 0x01010101) << 2) | ext;
-            const int2 v = get_int_from_table_16(i0q | (i1q << 4), iq3nl_values);
+                            (((get_int_b2(bxi->qh, m + 1) >> shift_h) & 0x01010101) << 2);
+            const int2 v = make_int2(ggml_cuda_lookup8(i0q, t0, t1), ggml_cuda_lookup8(i1q, t0, t1));
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
             x_qs[i*sram_stride + 8*kqsx + m + 0] = v.x;
