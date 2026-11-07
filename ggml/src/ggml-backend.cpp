@@ -13,6 +13,7 @@
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
 #include "ggml-backend-moe-cache.h"
+#include "ggml-sched-ring.h"
 
 // Optional MoE expert cache function table, populated by a supporting backend.
 struct ggml_moe_cache_api ggml_moe_cache = {};
@@ -1101,6 +1102,12 @@ struct ggml_sched_prefetch {
     ggml_backend_event_t tab_ev[GGML_SCHED_PREFETCH_TABLES];
     bool tab_used[GGML_SCHED_PREFETCH_TABLES];
     int tab_cur;
+    // GGML_SCHED_PREFETCH_RING_MB: the lent zones as one byte ring (ggml_sched_ring); each prefetched tensor takes a
+    // chunk holding its table of expert addresses and the experts the cache does not hold, packed back to back. The
+    // slots above become the ring's records (their events guard the chunks)
+    bool ring_on;
+    char * ring_base;
+    ggml_sched_ring ring;
 };
 
 struct ggml_backend_sched {
@@ -1175,6 +1182,7 @@ struct ggml_backend_sched {
     // they overlap compute, alternating between two staging slots
     bool prefetch_experts;
     int prefetch_slots_wanted;   // slots per GPU (GGML_SCHED_PREFETCH_EXPERTS)
+    size_t prefetch_ring_half;   // GGML_SCHED_PREFETCH_RING_MB: the ring's two zones, each this size (0: slots)
     // one prefetch per backend: each GPU copies the experts of the layers it computes over its own link, into its own
     // slots (a layer split over several GPUs)
     struct ggml_sched_prefetch pf[GGML_SCHED_MAX_BACKENDS];
@@ -2279,6 +2287,23 @@ static size_t ggml_backend_sched_prefetch_table_offset(size_t tensor_alloc_size)
     return GGML_PAD(tensor_alloc_size, 256);
 }
 
+// GGML_SCHED_PREFETCH_RING_MB=N: the prefill's expert prefetch through a byte ring of N MiB borrowed from the MoE
+// cache (two contiguous zones at the top of its banded slab) instead of one slot per expert tensor, each a whole tensor
+// in size; only the experts the cache does not hold take room. Raised to two of the largest chunks. 0 / unset: slots
+static size_t ggml_sched_prefetch_ring_bytes() {
+    static const size_t v = getenv("GGML_SCHED_PREFETCH_RING_MB") ? (size_t) atoll(getenv("GGML_SCHED_PREFETCH_RING_MB")) << 20 : 0;
+    return v;
+}
+// the largest chunk a tensor of alloc size slot_bytes (its table included) can take: every expert copied, each
+// rounded up to 256 bytes with its pad (up to 512)
+static size_t ggml_sched_prefetch_ring_chunk_max(size_t slot_bytes) {
+    return slot_bytes + (size_t) GGML_SCHED_PREFETCH_TABLE_EXPERTS*(512 + 256);
+}
+static size_t ggml_sched_prefetch_ring_half(size_t slot_bytes) {
+    const size_t want = std::max(ggml_sched_prefetch_ring_bytes()/2, ggml_sched_prefetch_ring_chunk_max(slot_bytes));
+    return GGML_PAD(want, 4096);
+}
+
 // the entries the last prefill graph read in place go back to the cache once that graph is done with them (each
 // prefetched split records prefetch_free behind its kernels); before anything that may lend, borrow or move entries
 static void ggml_backend_sched_prefill_unpin(ggml_backend_sched_t sched) {
@@ -2318,6 +2343,11 @@ static void ggml_backend_sched_prefetch_restore(ggml_backend_sched_t sched) {
             ggml_moe_cache.restore(sched->moe_cache_session, pf.lend_backend);
         }
         pf.lent = false;
+        if (pf.ring_on) {
+            pf.ring_on = false;
+            pf.ring_base = NULL;
+            pf.ring.reset(0);
+        }
     }
 }
 
@@ -2461,6 +2491,51 @@ static bool ggml_backend_sched_prefetch_init(ggml_backend_sched_t sched, ggml_sc
     if (sched->moe_cache_session && ggml_moe_cache.lend && ggml_moe_cache.set_lend_size) {
         if (pf.lent) {
             return true;
+        }
+        if (ggml_sched_prefetch_ring_bytes() && sched->prefetch_ring_half && ggml_moe_cache.prefill_residents) {
+            // the ring: two zones that are one byte range (the banded slab's top), the slots become its records
+            const size_t half = sched->prefetch_ring_half;
+            ggml_moe_cache.set_lend_size(sched->moe_cache_session, half, 2);
+            void * zones[2] = {};
+            const int n_lent = ggml_moe_cache.lend(sched->moe_cache_session, split_backend, half, zones, 2);
+            if (n_lent == 2 && (char *) zones[1] == (char *) zones[0] + half) {
+                pf.ring_on   = true;
+                pf.ring_base = (char *) zones[0];
+                pf.ring.reset(2*half);
+                pf.n_slots = GGML_SCHED_MAX_PREFETCH_SLOTS;
+                pf.cur = 0;
+                for (int i = 0; i < pf.n_slots; i++) {
+                    if (pf.ready[i] == NULL) {
+                        pf.ready[i] = ggml_backend_event_new(split_backend->device);
+                        pf.free[i]  = ggml_backend_event_new(split_backend->device);
+                        GGML_ASSERT(pf.ready[i] && pf.free[i]);
+                    }
+                    pf.used[i] = false;
+                    pf.slot_data[i] = NULL;
+                }
+                pf.lent = true;
+                pf.lend_backend = split_backend;
+                return true;
+            }
+            if (n_lent > 0) {
+                // not one range (no banded slab): two slots of half each, which holds the largest tensor
+                pf.ring_on = false;
+                pf.n_slots = n_lent;
+                pf.cur = 0;
+                for (int i = 0; i < n_lent; i++) {
+                    pf.slot_data[i] = zones[i];
+                }
+                pf.lent = true;
+                pf.lend_backend = split_backend;
+                static bool warned = false;
+                if (!warned) {
+                    warned = true;
+                    GGML_LOG_WARN("%s: prefetch ring: the lent zones are not one range, 2 slots of %zu MiB instead\n",
+                            __func__, half >> 20);
+                }
+                return true;
+            }
+            return false;
         }
         ggml_moe_cache.set_lend_size(sched->moe_cache_session, size, pf.n_slots);
         void * zones[GGML_SCHED_MAX_PREFETCH_SLOTS] = {};
@@ -2778,6 +2853,89 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 pf_n++;
                                 pf_bytes += n_copied*(packed_step ? (int64_t) packed_step : (int64_t) input->nb[2]);
                             }
+                            bool ring_done = false;
+                            GGML_ASSERT((!pf.ring_on || n_resident >= 0) && "prefetch ring: the tensor has no table of experts");
+                            if (pf.ring_on && n_resident >= 0) {
+                                // the ring: a chunk holds the table, then each expert to copy at a fixed stride (its
+                                // part and the bytes MMQ reads past its last row: those that follow it in its source,
+                                // else, as the cache's entries, a copy of its own first bytes)
+                                uint64_t * tab = pf.table[slot];
+                                const size_t src_stride = input->nb[2];
+                                const size_t part = packed_step ? input->nb[1]*input->ne[1] : src_stride;
+                                const size_t pad  = packed_step ? packed_step - part : std::min<size_t>(src_stride, 512);
+                                const size_t stride = GGML_PAD(part + pad, 256);
+                                const size_t tab_bytes = GGML_PAD((size_t) n_expert*sizeof(uint64_t), 256);
+                                int64_t n_copy = 0;
+                                for (int64_t e = 0; e < n_expert; e++) {
+                                    n_copy += tab[e] == 0;
+                                }
+                                const size_t chunk = tab_bytes + (size_t) n_copy*stride;
+                                const size_t off = pf.ring.alloc(chunk, slot, [&](int rec) {
+                                    ggml_backend_event_wait(pf.backend, pf.free[rec]);
+                                });
+                                GGML_ASSERT(off != SIZE_MAX && "prefetch ring smaller than one tensor's chunk");
+                                char * base = pf.ring_base + off;
+                                input_cpy->data = base;
+                                GGML_ASSERT(pf.backend->iface.set_tensor_async != NULL);
+                                auto put = [&](const void * src, size_t dst_off, size_t size) {
+                                    pf.backend->iface.set_tensor_async(pf.backend, input_cpy, src, dst_off, size);
+                                };
+                                auto put_2d = [&](const void * src, size_t dst_off, size_t size, size_t n) {
+                                    if (n > 1 && pf.backend->iface.set_tensor_2d_async) {
+                                        pf.backend->iface.set_tensor_2d_async(pf.backend, input_cpy, src, dst_off, size, n,
+                                            stride, src_stride);
+                                    } else {
+                                        for (size_t i = 0; i < n; i++) {
+                                            put((const char *) src + i*src_stride, dst_off + i*stride, size);
+                                        }
+                                    }
+                                };
+                                int64_t j = 0;
+                                for (int64_t e0 = 0; e0 < n_expert; ) {
+                                    if (tab[e0]) {
+                                        e0++;
+                                        continue;
+                                    }
+                                    const size_t d0 = tab_bytes + (size_t) j*stride;
+                                    if (n_arena > 0 && arena_src[e0]) {
+                                        const char * src = (const char *) arena_src[e0];
+                                        const size_t have = std::min(pad, arena_pad);
+                                        put(src, d0, part + have);
+                                        if (have < pad) {
+                                            put(src, d0 + part + have, pad - have);
+                                        }
+                                        tab[e0] = (uint64_t) (uintptr_t) (base + d0);
+                                        e0++; j++;
+                                        continue;
+                                    }
+                                    int64_t e1 = e0;
+                                    while (e1 < n_expert && !tab[e1] && !(n_arena > 0 && arena_src[e1])) {
+                                        e1++;
+                                    }
+                                    // the last expert of the tensor has no bytes after it in the source
+                                    const int64_t full = e1 == n_expert ? e1 - 1 : e1;
+                                    const char * src0 = (const char *) input->data + (size_t) e0*src_stride;
+                                    if (full > e0) {
+                                        put_2d(src0, d0, part + pad, (size_t) (full - e0));
+                                    }
+                                    if (full < e1) {
+                                        const char * srcl = (const char *) input->data + (size_t) full*src_stride;
+                                        const size_t dl = d0 + (size_t) (full - e0)*stride;
+                                        put(srcl, dl, part);
+                                        put(srcl, dl + part, pad);
+                                    }
+                                    for (int64_t e = e0; e < e1; e++, j++) {
+                                        tab[e] = (uint64_t) (uintptr_t) (base + tab_bytes + (size_t) j*stride);
+                                    }
+                                    e0 = e1;
+                                }
+                                GGML_ASSERT(j == n_copy);
+                                put(tab, 0, (size_t) n_expert*sizeof(uint64_t));
+                                ggml_backend_event_record(pf.tab_ev[pf.tab_cur == 0 ? GGML_SCHED_PREFETCH_TABLES - 1 : pf.tab_cur - 1], pf.backend);
+                                split_prefill_table = (const uint64_t *) base;
+                                ring_done = true;
+                            }
+                            if (!ring_done) {
                             if (n_resident <= 0 && n_arena == 0 && packed_step) {
                                 ggml_sched_copy_packed_experts(pf.backend, input_cpy, input, 0, n_expert, packed_step);
                             } else if (n_resident <= 0 && n_arena == 0) {
@@ -2852,6 +3010,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                         zeros.data(), nbytes, padded - nbytes);
                                 }
                             }
+                            }   // !ring_done
                             ggml_backend_event_record(pf.ready[slot], pf.backend);
                             ggml_backend_event_wait(split_backend, pf.ready[slot]);
                             if (pf_stats) pf_issue += ggml_time_us() - pf_t_issue;
@@ -3935,7 +4094,15 @@ static void ggml_backend_sched_prime_moe_cache(ggml_backend_sched_t sched, struc
     }
 
     if (sched->prefetch_experts && slot_bytes && ggml_moe_cache.set_lend_size) {
-        ggml_moe_cache.set_lend_size(sched->moe_cache_session, slot_bytes, sched->prefetch_slots_wanted);
+        if (ggml_sched_prefetch_ring_bytes() && ggml_moe_cache.prefill_residents) {
+            sched->prefetch_ring_half = ggml_sched_prefetch_ring_half(slot_bytes);
+            GGML_LOG_INFO("%s: prefetch ring of %zu MiB (two zones of %zu MiB) instead of %d slots of %zu MiB\n", __func__,
+                    (2*sched->prefetch_ring_half) >> 20, sched->prefetch_ring_half >> 20, sched->prefetch_slots_wanted,
+                    slot_bytes >> 20);
+            ggml_moe_cache.set_lend_size(sched->moe_cache_session, sched->prefetch_ring_half, 2);
+        } else {
+            ggml_moe_cache.set_lend_size(sched->moe_cache_session, slot_bytes, sched->prefetch_slots_wanted);
+        }
     }
 
     int accepted[2] = {0, 0};
