@@ -1269,6 +1269,26 @@ llama_model_qwen4exp::graph::qsa_sel llama_model_qwen4exp::graph::build_qsa_sel(
         const slice_sel ss  = select(t0, n_t);
         const auto      vis = vis_of(t0, n_t);
         ggml_tensor * sel = ggml_qsa_select(ctx0, ss.sel_idx, ss.top_score, vis.first, vis.second, (int32_t) kpool, GGML_QSA_SELECT_DENSE);
+        // ggml-cuda computes the mask from the top-k, the scores, the pools' cells and the tail in one kernel
+        // (qsa-select.cu, GET_ROWS + CONCAT + GET_ROWS + QSA_SELECT), which reads them while it writes the mask: as extra
+        // sources they stay alive until the mask is computed, so that the allocator never gives the mask their memory and
+        // the fusion is never refused (with a tighter placement it was, at every QSA layer: 2 x 9 ms of GET_ROWS each)
+        {
+            const auto base = [](ggml_tensor * t) {
+                while (t && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW) && t->src[0]) {
+                    t = t->src[0];
+                }
+                return t;
+            };
+            ggml_tensor * scores = base(ss.top_score);            // the scores' GET_ROWS
+            ggml_tensor * cells  = base(ss.sel_idx->src[0]);       // the pools' cells' GET_ROWS
+            if (scores && scores->op == GGML_OP_GET_ROWS && cells && cells->op == GGML_OP_GET_ROWS) {
+                sel->src[4] = scores->src[1];                      // top-k
+                sel->src[5] = base(scores->src[0]);                // scores
+                sel->src[6] = base(cells->src[0]);                 // the pools' cells
+                sel->src[7] = ss.sel_idx->src[1];                  // tail
+            }
+        }
         cb(sel, "indexer_sel", il);
         return sel;
     };
