@@ -332,6 +332,15 @@ __attribute__((constructor)) static void ggml_hip_set_hw_queues() {
 __attribute__((constructor)) static void ggml_cuda_set_module_loading() {
     setenv("CUDA_MODULE_LOADING", "EAGER", /*overwrite =*/ 0);
 }
+#elif !defined(GGML_USE_MUSA) && defined(_WIN32)
+// Windows (MSVC has no constructor attribute): the same EAGER default, set when this DLL loads, before cuInit.
+// Without it the warm-up hung after 16 hosted layers on an RTX 5070 Ti (driver 617.42, CUDA 13.4).
+static const int ggml_cuda_module_loading_default = [] {
+    if (!getenv("CUDA_MODULE_LOADING")) {
+        _putenv_s("CUDA_MODULE_LOADING", "EAGER");
+    }
+    return 0;
+}();
 #endif
 
 static ggml_cuda_device_info ggml_cuda_init() {
