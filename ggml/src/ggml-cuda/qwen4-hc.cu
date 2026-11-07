@@ -245,7 +245,9 @@ static __device__ __forceinline__ void qwen4_hc_combine_norm_body(const qwen4_hc
     }
 }
 
-static __global__ void qwen4_hc_combine_norm_f32(const qwen4_hc_k1_args a) {
+// launched with QWEN4_HC_K1_THREADS threads: the bound keeps NVIDIA's compiler at 64 registers (96 without it, a
+// launch that fails "too many resources requested")
+static __global__ void __launch_bounds__(QWEN4_HC_K1_THREADS, 1) qwen4_hc_combine_norm_f32(const qwen4_hc_k1_args a) {
     qwen4_hc_combine_norm_body(a, blockIdx.x, blockIdx.y);
 }
 
@@ -706,9 +708,10 @@ static __device__ __forceinline__ void qwen4_hc_up_pre_body(const qwen4_hc_k3_ar
 }
 
 // mixed_q8_1 (null: none): the q8_1 of mixed as quantize_q8_1 writes it, for the product that reads it; then a
-// workgroup has QK8_1 warps (n_embd % QK8_1 == 0): its outputs are one q8_1 block per token
+// workgroup has QK8_1 warps (n_embd % QK8_1 == 0): its outputs are one q8_1 block per token. Up to 1024 threads: the
+// bound keeps NVIDIA's compiler at 64 registers (66 - 67 at 7 - 8 tokens without it: the launch failed on an A4000)
 template <int T, int NB = 0, ggml_type WT = GGML_TYPE_Q8_0>
-static __global__ void qwen4_hc_up_pre_q8_0(
+static __global__ void __launch_bounds__(1024, 1) qwen4_hc_up_pre_q8_0(
         const void * w, const float * lo, const float * xn, float * mixed,
         int n_lo, int n_embd, int hc, float scale, block_q8_1 * mixed_q8_1) {
     extern __shared__ float qwen4_hc_k3_smem[];
