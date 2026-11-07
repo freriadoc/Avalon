@@ -2228,13 +2228,17 @@ int llama_context::stage_begin(const llama_batch_ext & batch_inp, const std::vec
 
 // pipeline stages, LLAMA_STAGES_FULL_UBATCH_FROM=N: the ubatch of a batch of n_tokens, half the requested one below N
 // tokens (as without it: the same graphs, reserved at that size), the requested one from N on; a change of size
-// reserves the graphs again before the batch (once per change: a long prompt after short ones, and back)
+// reserves the graphs again before the batch (a long prompt after short ones, and back at the next batch below N that
+// fills the pipeline at half; the small batches keep the reservation they find)
 void llama_context::stage_ubatch_for(uint32_t n_tokens) {
     const uint32_t from = llama_stage_full_ubatch_from();
     if (!from || !stage_ub_full || stage_ub_full == stage_ub_half) {
         return;
     }
-    const uint32_t want = n_tokens >= from ? stage_ub_full : stage_ub_half;
+    // back at half only for a batch that fills the pipeline at half (two ubatches or more): not for the prompt's tail
+    // of a few tokens, the generation or a verification, which do not pipeline and fit either reservation (each
+    // change reserves the graphs again, ~370 ms on 2 x RTX 5060 Ti)
+    const uint32_t want = n_tokens >= from ? stage_ub_full : n_tokens >= 2*stage_ub_half ? stage_ub_half : cparams.n_ubatch;
     if (cparams.n_ubatch != want) {
         LLAMA_LOG_INFO("%s: pipeline stage ubatch %u -> %u (a batch of %u tokens)\n", __func__, cparams.n_ubatch, want, n_tokens);
         cparams.n_ubatch = want;
