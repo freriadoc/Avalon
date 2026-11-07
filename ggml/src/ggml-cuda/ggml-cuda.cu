@@ -1734,7 +1734,16 @@ struct cublas_scratch_layout {
 
 static bool ggml_cuda_cublas_prefer_f32_output(ggml_type compute_type, int cc) {
     if (compute_type == GGML_TYPE_F16) {
-        return cc == GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc);
+        // F16 inputs accumulated in F32 by the tensor cores, F32 written directly (as Strata's prefill GEMMs): on NVIDIA by
+        // default (GGML_CUDA_CUBLAS_F16_ACC32=0: F16 accumulation and an F16 output converted); not under HIP, where
+        // rocBLAS halves the prefill with it on the 7900 XT (=1 to force it)
+        static const bool acc32 = getenv("GGML_CUDA_CUBLAS_F16_ACC32") ? atoi(getenv("GGML_CUDA_CUBLAS_F16_ACC32")) != 0 :
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+            false;
+#else
+            true;
+#endif
+        return acc32 || cc == GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc);
     }
     if (compute_type == GGML_TYPE_BF16) {
         return !GGML_CUDA_CC_IS_RDNA3(cc) && !GGML_CUDA_CC_IS_CDNA(cc);
@@ -1746,16 +1755,39 @@ static cublas_scratch_layout ggml_cuda_cublas_scratch_get_layout(const ggml_tens
         const ggml_tensor * dst, ggml_type compute_type, int cc) {
     const size_t ts = ggml_type_size(compute_type);
     cublas_scratch_layout l;
-    if (src0->type != compute_type) {
-        l.src0 = l.size; l.size += GGML_PAD(ggml_nelements(src0)*ts, 256);
-    }
+    // src1 first: the products of a group sharing the scratch (the same activation) find its conversion at offset 0
     if (src1->type != compute_type) {
         l.src1 = l.size; l.size += GGML_PAD(ggml_nelements(src1)*ts, 256);
+    }
+    if (src0->type != compute_type) {
+        l.src0 = l.size; l.size += GGML_PAD(ggml_nelements(src0)*ts, 256);
     }
     if (compute_type != GGML_TYPE_F32 && !ggml_cuda_cublas_prefer_f32_output(compute_type, cc)) {
         l.dst = l.size; l.size += GGML_PAD(ggml_nelements(dst)*ts, 256);
     }
     return l;
+}
+
+// the key of the conversion of src1 a cuBLAS product makes (ggml_cuda_add_mmq_scratch groups the products with the
+// same one, the first converts); a key no other node has when there is nothing to convert
+static void ggml_cuda_cublas_src1_key(const ggml_tensor * src1, const ggml_tensor * dst, ggml_type compute_type,
+        int64_t key[GGML_CUDA_MMQ_SCRATCH_KEY]) {
+    for (int i = 0; i < GGML_CUDA_MMQ_SCRATCH_KEY; i++) {
+        key[i] = 0;
+    }
+    // GGML_CUDA_CUBLAS_SHARE=0: every product converts src1 itself (to compare)
+    static const bool share = !getenv("GGML_CUDA_CUBLAS_SHARE") || atoi(getenv("GGML_CUDA_CUBLAS_SHARE")) != 0;
+    if (src1->type == compute_type || !share) {
+        key[0] = -(int64_t) (intptr_t) dst;
+        return;
+    }
+    key[0] = (int64_t) (intptr_t) src1->data;
+    key[1] = -1 - (int64_t) compute_type;   // never an mmq key's ids pointer
+    for (int i = 0; i < 4; i++) {
+        key[2 + i] = src1->ne[i];
+        key[6 + i] = (int64_t) src1->nb[i];
+    }
+    key[10] = (int64_t) src1->type;
 }
 
 template<ggml_type compute_type>
@@ -1806,6 +1838,15 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     bool is_src0_cont_2 = ggml_is_contiguous_2(src0);
     bool is_src1_cont_2 = ggml_is_contiguous_2(src1);
 
+    // the F16 (or BF16) image of src1 left in this scratch by the previous product of its group (q / k / v, gate and
+    // up of the same activation): converted once
+    int64_t src1_key[GGML_CUDA_MMQ_SCRATCH_KEY];
+    ggml_cuda_cublas_src1_key(src1, dst, compute_type, src1_key);
+    const bool src1_reuse = scratch && src1->type != compute_type && ctx.mmq_scratch_last == scratch_t &&
+        memcmp(ctx.mmq_scratch_key, src1_key, sizeof(src1_key)) == 0;
+    ctx.mmq_scratch_last = scratch ? scratch_t : nullptr;
+    memcpy(ctx.mmq_scratch_key, src1_key, sizeof(src1_key));
+
     if (src0->type == compute_type) {
         src0_ptr = (const cuda_t *) src0->data;
     } else {
@@ -1839,7 +1880,9 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         if (ggml_is_contiguously_allocated(src1)) {
             const auto convert_func = traits::convert(src1->type);
             GGML_ASSERT(convert_func != nullptr);
-            convert_func(src1->data, src1_conv, ggml_nelements(src1), main_stream);
+            if (!src1_reuse) {
+                convert_func(src1->data, src1_conv, ggml_nelements(src1), main_stream);
+            }
             const size_t src1_bs = ggml_blck_size(src1->type);
             s11 *= src1_bs;
             s12 *= src1_bs;
@@ -1847,7 +1890,9 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         } else {
             const auto convert_func = traits::convert_nc(src1->type);
             GGML_ASSERT(convert_func != nullptr);
-            convert_func(src1->data, src1_conv, ne10, ne11, ne12, ne13, s11, s12, s13, main_stream);
+            if (!src1_reuse) {
+                convert_func(src1->data, src1_conv, ne10, ne11, ne12, ne13, s11, s12, s13, main_stream);
+            }
             s11 = ne10;
             s12 = ne11*s11;
             s13 = ne12*s12;
@@ -2341,6 +2386,18 @@ static ggml_cuda_mul_mat_path ggml_cuda_mul_mat_get_path(const ggml_tensor * src
     }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
         return GGML_CUDA_MM_MMVQ;
+    }
+    // the dense Q8_0 products of at least 512 columns (the prefill's) by cuBLAS on NVIDIA, the weights converted to F16
+    // (A4000, 19k prefill: 794 -> 908 t/s with F16 accumulation, perplexity within its error); MMQ under HIP, as fast as
+    // the best of rocBLAS on the 7900 XT. GGML_CUDA_DENSE_CUBLAS=N: from N columns, 0: never
+    static const int64_t dense_cublas = getenv("GGML_CUDA_DENSE_CUBLAS") ? atoll(getenv("GGML_CUDA_DENSE_CUBLAS")) :
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+        0;
+#else
+        512;
+#endif
+    if (dense_cublas > 0 && src0->type == GGML_TYPE_Q8_0 && ne11 >= dense_cublas) {
+        return GGML_CUDA_MM_CUBLAS;
     }
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
         return GGML_CUDA_MM_MMQ;
@@ -6877,12 +6934,10 @@ static size_t ggml_cuda_mul_mat_scratch_size(const ggml_tensor * dst, int device
             return need;
         }
         case GGML_CUDA_MM_CUBLAS: {
-            // nothing to share: a key no other node has
-            for (int i = 0; i < GGML_CUDA_MMQ_SCRATCH_KEY; i++) {
-                key[i] = 0;
-            }
-            key[0] = -(int64_t) (intptr_t) dst;
-            return ggml_cuda_cublas_scratch_get_layout(src0, src1, dst, ggml_cuda_cublas_compute_type(src0, src1, dst, cc), cc).size;
+            // the products converting the same activation the same way share one scratch (its image at offset 0)
+            const ggml_type compute_type = ggml_cuda_cublas_compute_type(src0, src1, dst, cc);
+            ggml_cuda_cublas_src1_key(src1, dst, compute_type, key);
+            return ggml_cuda_cublas_scratch_get_layout(src0, src1, dst, compute_type, cc).size;
         }
         default:
             return 0;
