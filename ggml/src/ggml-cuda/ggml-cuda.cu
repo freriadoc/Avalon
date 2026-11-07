@@ -3405,6 +3405,11 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
         if (node->op == GGML_OP_MUL_MAT_ID) {
+            // GGML_CUDA_MOE_GROUPED: a prompt's MoE block by groups reads its experts' rows back to the host
+            static const bool moe_grouped = getenv("GGML_CUDA_MOE_GROUPED") && atoi(getenv("GGML_CUDA_MOE_GROUPED")) > 0;
+            if (moe_grouped && node->src[2] && node->src[2]->ne[1] >= 128) {
+                use_cuda_graph = false;
+            }
             if (ggml_cuda_mul_mat_id_needs_sync(node, cc)) {
                 // the mul_mat_id fallback path synchronizes the stream, so we cannot use CUDA graphs
                 // ref: https://github.com/ggml-org/llama.cpp/pull/18958
