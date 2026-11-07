@@ -169,7 +169,7 @@ static void mk_launch_chain128(const ggml_cuda_mk_tasks & T, int n_stages, cudaS
 
 // the chain kernel of blocks of 256 threads: stages of the indexer key's tasks (mk_class_chain256), each looping over
 // its virtual blocks, a grid barrier between two stages (its own pair: it never runs at the same time as k_mk_chain128)
-static __device__ __attribute__((aligned(256))) unsigned g_mk_bar256[128];   // count [0], generation [64]
+static __device__ __align__(256) unsigned g_mk_bar256[128];   // count [0], generation [64]
 
 // the chain kernel's grid (at most: a few blocks, all resident at once whatever runs on other queues, grid-barrier.cuh;
 // at the full occupancy, 7 x 42 blocks, it waited for ever in a prefill), and the largest task it takes (a few loops

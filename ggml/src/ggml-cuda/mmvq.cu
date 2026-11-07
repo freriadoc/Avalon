@@ -857,7 +857,7 @@ static __global__ void mul_mat_vec_q(
                         gate_value += gate_biases[j];
                         if constexpr (swiglu) {
                             result *= ggml_cuda_op_silu_single(gate_value);
-                        } else
+                        } else {
                         switch (active_glu) {
                             case GGML_GLU_OP_SWIGLU:
                                 result *= ggml_cuda_op_silu_single(gate_value);
@@ -874,6 +874,7 @@ static __global__ void mul_mat_vec_q(
                             default:
                                 result = result * gate_value;
                                 break;
+                        }
                         }
                     }
                 }

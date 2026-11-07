@@ -92,6 +92,42 @@ static inline bool ggml_type_is_exl3(ggml_type) { return false; }
 #include <utility>
 #include <vector>
 
+// Windows / MSVC host compiler (nvcc -ccbin cl): no GCC __atomic builtins. These spots read and write
+// flags in pinned host memory that the GPU polls; on x86-64 a volatile access between compiler barriers
+// is what GCC emits for these orders (plain mov), so the shim keeps the Linux behaviour.
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <type_traits>
+template <typename T>
+static inline typename std::remove_cv<T>::type moe_msvc_atomic_load(T * p) {
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    const typename std::remove_cv<T>::type v = *(const volatile T *) p;
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    return v;
+}
+template <typename T, typename V>
+static inline void moe_msvc_atomic_store(T * p, V v) {
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    *(volatile T *) p = (typename std::remove_cv<T>::type) v;
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+}
+#define __atomic_load_n(p, order)     moe_msvc_atomic_load(p)
+#define __atomic_store_n(p, v, order) moe_msvc_atomic_store((p), (v))
+#if !defined(__CUDA_ARCH__)
+#include <intrin.h>
+#define __builtin_ia32_pause()  _mm_pause()
+#define __builtin_ia32_sfence() _mm_sfence()
+template <typename T, typename V>
+static inline T moe_msvc_atomic_add_fetch(T * p, V v) {   // a locked add (full barrier on x86-64): 32-bit only
+    static_assert(sizeof(T) == sizeof(long), "moe_msvc_atomic_add_fetch: 32-bit values only");
+    return (T) (_InterlockedExchangeAdd((volatile long *) p, (long) v) + (long) v);
+}
+#define __atomic_add_fetch(p, v, order) moe_msvc_atomic_add_fetch((p), (v))
+#else
+// nvcc's device pass parses the host code that uses it (and never runs it): a plain add keeps it parsing
+#define __atomic_add_fetch(p, v, order) (*(p) += (v))
+#endif
+#endif
+
 #if defined(_WIN32)
 #  define WIN32_LEAN_AND_MEAN
 #  ifndef NOMINMAX
@@ -2064,7 +2100,7 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
             }
             if (error == cudaSuccess) {
                 while ((error = cudaStreamQuery(stream)) == cudaErrorNotReady) {
-#if defined(__x86_64__)
+#if defined(__x86_64__) || (defined(_M_X64) && !defined(__CUDA_ARCH__))
                     __builtin_ia32_pause();
 #endif
                 }
@@ -2209,7 +2245,7 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                     // stream (itself waiting on a kernel) for a fill of ~60 us. Polled, it keeps its
                     // engine; a fill lasts tens of microseconds, this thread has nothing else to do.
                     while ((error = cudaStreamQuery(stream)) == cudaErrorNotReady) {
-#if defined(__x86_64__)
+#if defined(__x86_64__) || (defined(_M_X64) && !defined(__CUDA_ARCH__))
                         __builtin_ia32_pause();
 #endif
                     }
@@ -3644,7 +3680,9 @@ static void moe_cache_arena_free(moe_cache_device & device) {
     }
     for (const auto & f : device.arena_fds) {
         if (f.second >= 0) {
-            close(f.second);
+#if !defined(_WIN32)
+            close(f.second);   // the arena opens files only on Linux
+#endif
         }
     }
     device.arena_fds.clear();
@@ -7446,7 +7484,7 @@ static void moe_host_rows_run() {
     }
     fn(g_rows_user);
     std::atomic_thread_fence(std::memory_order_seq_cst);
-#if defined(__x86_64__)
+#if defined(__x86_64__) || (defined(_M_X64) && !defined(__CUDA_ARCH__))
     __builtin_ia32_sfence();
 #endif
     *g_rows_flag_h = ++g_rows_count;
@@ -9755,7 +9793,7 @@ static void moe_hosted_serve_one(moe_hosted_state * st, uint32_t seq) {
             for (int r = 0; r < rows; r++) any |= layer->h_plan2[2 * rows + r] != 0;
             if (any) {
                 while ((int32_t) (__atomic_load_n(&layer->h_flags[28], __ATOMIC_ACQUIRE) - seq) < 0) {
-#if defined(__x86_64__)
+#if defined(__x86_64__) || (defined(_M_X64) && !defined(__CUDA_ARCH__))
                     __builtin_ia32_pause();
 #endif
                 }
@@ -9977,7 +10015,7 @@ bool ggml_cuda_moe_hosted_wait(void * stream_ptr, void * event_ptr, int device) 
         if (served) {
             continue;
         }
-#if defined(__x86_64__)
+#if defined(__x86_64__) || (defined(_M_X64) && !defined(__CUDA_ARCH__))
         __builtin_ia32_pause();
 #endif
         for (int k = 0; k < n_st; k++) {
@@ -10138,7 +10176,7 @@ static void moe_hosted_server(moe_hosted_state * st) {
                     break;
                 }
             }
-#if defined(__x86_64__)
+#if defined(__x86_64__) || (defined(_M_X64) && !defined(__CUDA_ARCH__))
             __builtin_ia32_pause();
 #endif
         }

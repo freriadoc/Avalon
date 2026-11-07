@@ -1236,7 +1236,7 @@ llama_model_qwen4exp::graph::qsa_sel llama_model_qwen4exp::graph::build_qsa_sel(
         ggml_tensor * sel_idx;   // I32 [n_sel, n_t]
         ggml_tensor * top_score; // F32 [n_top_pool, n_t]
     };
-    const auto select = [=, this](int64_t t0, int64_t n_t) -> slice_sel {
+    const auto select = [=](int64_t t0, int64_t n_t) -> slice_sel {
         ggml_tensor * q_t = n_t == n_tokens ? q : ggml_view_3d(ctx0, q, idx_dim, n_idx_h, n_t, q->nb[1], q->nb[2], t0*q->nb[2]);
 
         // the reference sums the rectified head scores unweighted, scaled by 1/sqrt(head_dim),
@@ -1280,7 +1280,7 @@ llama_model_qwen4exp::graph::qsa_sel llama_model_qwen4exp::graph::build_qsa_sel(
     };
 
     // the visibility of a cell: from the positions, or the dense KQ mask
-    const auto vis_of = [=, this](int64_t t0, int64_t n_t) -> std::pair<ggml_tensor *, ggml_tensor *> {
+    const auto vis_of = [=](int64_t t0, int64_t n_t) -> std::pair<ggml_tensor *, ggml_tensor *> {
         if (pos_mode) {
             return { inp_kpool->cell_pos,
                      n_t == n_tokens ? inp_kpool->tok_pos : ggml_view_1d(ctx0, inp_kpool->tok_pos, n_t, t0*sizeof(int32_t)) };
@@ -1314,7 +1314,7 @@ llama_model_qwen4exp::graph::qsa_sel llama_model_qwen4exp::graph::build_qsa_sel(
     // with the context times the ubatch (4 GiB at 256k with 8192 tokens): the queries go by slices
     // keeping that mask under 512 MiB (one sequence)
     GGML_ASSERT(kq_mask->ne[0] == n_kv && kq_mask->ne[1]*kq_mask->ne[2]*kq_mask->ne[3] == n_tokens);
-    const auto dense = [=, this](int64_t t0, int64_t n_t) {
+    const auto dense = [=](int64_t t0, int64_t n_t) {
         const slice_sel ss  = select(t0, n_t);
         const auto      vis = vis_of(t0, n_t);
         ggml_tensor * sel = ggml_qsa_select(ctx0, ss.sel_idx, ss.top_score, vis.first, vis.second, (int32_t) kpool, GGML_QSA_SELECT_DENSE);

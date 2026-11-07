@@ -304,7 +304,7 @@ static __global__ void top_k_radix_gather(
 // from the blocks' histograms and keeps the state in registers. The histograms alternate between two buffers (a
 // block may still read pass p's while another writes pass p + 1's); the gather's counts go in the first, free from
 // pass 3 on.
-static __device__ __attribute__((aligned(256))) unsigned g_top_k_bar[128];   // count [0], generation [64]: two lines
+static __device__ __align__(256) unsigned g_top_k_bar[128];   // count [0], generation [64]: two lines
 
 #define TOP_K_QSA_TAIL_PER_THREAD 8   // selection slots a thread of the fused kernel holds
 

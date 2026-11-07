@@ -107,6 +107,7 @@ struct ggml_riscv_arch_features_type {
     #define NOMINMAX
 #endif
 #include <windows.h>
+#include <intrin.h>
 
 #if defined(_MSC_VER) && !defined(__clang__)
 #define GGML_CACHE_ALIGN __declspec(align(GGML_CACHE_LINE))
@@ -4568,7 +4569,11 @@ static inline int ggml_cpu_moe_l3_next(int * const * cnt, int g, int n_pairs, in
     for (int k = 0; k < 2; k++) {
         const int h = k == 0 ? g : 1 - g;
         const int len = h == 0 ? c0 : n_ch - c0;
+#if defined(_MSC_VER) && !defined(__clang__)
+        const int i = (int) _InterlockedExchangeAdd((volatile long *) cnt[h], 1);
+#else
         const int i = __atomic_fetch_add(cnt[h], 1, __ATOMIC_RELAXED);
+#endif
         if (i < n_pairs * len) {
             return (i / len) * n_ch + (h == 0 ? 0 : c0) + i % len;
         }
@@ -4651,6 +4656,7 @@ static bool ggml_cpu_moe_experts_multi(const struct ggml_tensor * gate_w, const 
     int * cnt_gu[2] = { cnt_lines[0], cnt_lines[1] }, * cnt_d[2] = { cnt_lines[2], cnt_lines[3] };
     #pragma omp parallel num_threads(n_threads)
     {
+        int     it;   // the omp-for loops' index (private: declared in the parallel region)
         float   hrow[QK8_0];
         const void * ys[8];
         int          rs[8];
@@ -4660,7 +4666,7 @@ static bool ggml_cpu_moe_experts_multi(const struct ggml_tensor * gate_w, const 
         // work and no barrier
         if (!act_q8) {
             #pragma omp for
-            for (int it = 0; it < n * nb_a; it++) {
+            for (it = 0; it < n * nb_a; it++) {
                 const int j = it / nb_a, b = it % nb_a;
                 quantize_row_q8_0_gpu(act + (size_t) j * n_embd + (size_t) b * QK8_0, a8 + (size_t) j * a_row + (size_t) b * sizeof(block_q8_0), QK8_0);
             }
@@ -4698,12 +4704,12 @@ static bool ggml_cpu_moe_experts_multi(const struct ggml_tensor * gate_w, const 
             #pragma omp barrier
         } else {
             #pragma omp for schedule(dynamic, 1)
-            for (int it = 0; it < n_uniq * 2 * n_ch1; it++) MOE_GU_BODY(it)
+            for (it = 0; it < n_uniq * 2 * n_ch1; it++) MOE_GU_BODY(it)
         }
         #undef MOE_GU_BODY
         // swiglu, then the activations of down, a q8_0 block per item (every thread works, not one per row)
         #pragma omp for
-        for (int it = 0; it < n * nb_0; it++) {
+        for (it = 0; it < n * nb_0; it++) {
             const int j = it / nb_0, b = it % nb_0;
             const float * gj = g + (size_t) j * n_ff + (size_t) b * QK8_0;
             const float * uj = u + (size_t) j * n_ff + (size_t) b * QK8_0;
@@ -4745,7 +4751,7 @@ static bool ggml_cpu_moe_experts_multi(const struct ggml_tensor * gate_w, const 
             }
         } else {
             #pragma omp for schedule(dynamic, 1)
-            for (int it = 0; it < n_uniq * n_ch3; it++) MOE_D_BODY(it)
+            for (it = 0; it < n_uniq * n_ch3; it++) MOE_D_BODY(it)
         }
         #undef MOE_D_BODY
     }
