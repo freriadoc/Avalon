@@ -733,8 +733,6 @@ struct moe_cache_session {
     std::vector<std::unique_ptr<moe_cache_device>> devices;
     std::unordered_map<int, int> layer_devices;
     std::unordered_map<const void *, int> tensor_devices;
-    // the experts' host RAM, decided once for all the cards (moe-ram-budget.h; total and cards set by moe_cache_host_experts)
-    moe_ram_plan ram_plan;
     // KV: tensors of the KV cache whose end may be lent (moe_cache_kv_register), attached when the pools are built
     struct kv_tensor { const char * data; size_t bytes; size_t row_bytes; int logical; };
     std::vector<kv_tensor> kv_tensors;
@@ -3834,6 +3832,13 @@ static size_t moe_cache_env_mb(const char * name, size_t dflt) {
 // arena (moe-ram-budget.h): one card, every range when they fit both the arena's room (moe_cache_arena_auto_bytes) and
 // KFD's limit for registered memory (RAM - RAM/64 - 1.5 GiB for all processes) less 1 GiB for the pinned buffers
 // allocated later; several cards, the budget decided once at the first card's decision. Sets device.pin_quota
+
+// the experts' host RAM, decided once for all the cards of the process (moe-ram-budget.h): one plan for every session,
+// as each stage of a pipeline over several GPUs has a session of its own (a plan per session decided again at the second
+// card's session, with the room the first card had already taken: 9 of 22 GiB registered, the rest faulted in at 175 t/s)
+static moe_ram_plan g_ram_plan;
+static std::mutex g_ram_plan_mu;   // taken after a session's mu, never before
+
 static moe_ram_mode moe_cache_experts_fit(moe_cache_session & session, moe_cache_device & device) {
     std::vector<std::pair<uintptr_t, uintptr_t>> ranges;
     for (const auto & t : device.seen_tensors) {
@@ -3854,7 +3859,8 @@ static moe_ram_mode moe_cache_experts_fit(moe_cache_session & session, moe_cache
     }
     const size_t ram = total << 10;
     const size_t kfd = ram - ram / 64 - ((size_t) 3 << 29);
-    moe_ram_plan & plan = session.ram_plan;
+    std::lock_guard<std::mutex> ram_lock(g_ram_plan_mu);
+    moe_ram_plan & plan = g_ram_plan;
     const bool first = !plan.decided;
     // GGML_CUDA_MOE_PIN_RESERVE_MB: the whole reserve of several cards; else GGML_CUDA_MOE_PIN_RESERVE_BASE_MB (10240)
     // plus GGML_CUDA_MOE_PIN_RESERVE_CARD_MB (3072) per card after the first
@@ -6137,16 +6143,16 @@ static void moe_cache_preload(const moe_cache_session & session, moe_cache_devic
             device.physical, loaded, bytes / 1073741824.0, path, (ggml_time_us() - t0) / 1e6, skipped, n_ranked);
 }
 
-// the model's host expert bytes and cards (moe-ram-budget.h): kept until the first card decides, ignored after
+// the model's host expert bytes and cards (moe-ram-budget.h): kept until the first card of the process decides, ignored after
 static void moe_cache_host_experts(void * opaque, size_t bytes, int n_devices) {
     moe_cache_session * session = (moe_cache_session *) opaque;
     if (!session) {
         return;
     }
-    std::lock_guard<std::mutex> lock(session->mu);
-    if (!session->ram_plan.decided) {
-        session->ram_plan.total = bytes;
-        session->ram_plan.n_devices = n_devices;
+    std::lock_guard<std::mutex> ram_lock(g_ram_plan_mu);
+    if (!g_ram_plan.decided) {
+        g_ram_plan.total = bytes;
+        g_ram_plan.n_devices = n_devices;
     }
 }
 
