@@ -10126,18 +10126,18 @@ static void moe_hosted_server(moe_hosted_state * st) {
             // loads a cuBLASLt module (cuLibraryLoadData) that waits for the device while holding a driver lock;
             // a cudaStreamQuery each poll then waited for that lock while the device waited for this mailbox
             // (RTX 4090, 30 Oct.: a fresh server's first request hung with blocks of more than 128 rows)
-            const uint32_t seq = __atomic_load_n(&st->h_mail->seq, __ATOMIC_ACQUIRE);
             uint32_t advanced = 0;
             {
-                std::unique_lock<std::mutex> serving(st->serve_mu, std::try_to_lock);
-                if (serving.owns_lock()) {
-                    if (seq != st->last_seq) {
-                        st->last_seq = seq;
-                        moe_hosted_serve_one(st, seq);
-                    }
-                    advanced = st->last_seq - seen;
-                    seen = st->last_seq;
+                // blocking: a thread waiting for the stream holds serve_mu and serves the mailbox meanwhile (the last
+                // block of a prefill, launched with its graph, published seconds later: polled for nothing before)
+                std::unique_lock<std::mutex> serving(st->serve_mu);
+                const uint32_t seq = __atomic_load_n(&st->h_mail->seq, __ATOMIC_ACQUIRE);
+                if (seq != st->last_seq) {
+                    st->last_seq = seq;
+                    moe_hosted_serve_one(st, seq);
                 }
+                advanced = st->last_seq - seen;
+                seen = st->last_seq;
             }
             if (advanced) {
                 std::lock_guard<std::mutex> lock(st->server_mu);
