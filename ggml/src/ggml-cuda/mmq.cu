@@ -477,6 +477,27 @@ void ggml_cuda_mul_mat_q(
     static const bool compact = !getenv("GGML_CUDA_MMQ_COMPACT") || atoi(getenv("GGML_CUDA_MMQ_COMPACT")) != 0;
     ggml_cuda_pool_alloc<int32_t> tile_prefix(ctx.pool());
     mmq_args args_c = args;
+    // GGML_CUDA_MMQ_EXPERT_GROUP=G (experiment, the prefill's MoE by groups of experts): the experts in groups of G, one
+    // launch each over its experts' rows (the bounds, the addresses and the weights from expert g0 on); the same tiles,
+    // the same sums: the result is the ungrouped one bit for bit. The grid of a group is sized for every row (its rows
+    // are known on the device only): the tiles past its own exit at once
+    static const int expert_group = getenv("GGML_CUDA_MMQ_EXPERT_GROUP") ? atoi(getenv("GGML_CUDA_MMQ_EXPERT_GROUP")) : 0;
+    if (compact && expert_group > 0 && expert_group < ne02 && ne02 % expert_group == 0) {
+        const int G = expert_group;
+        tile_prefix.alloc(G + 1);
+        for (int64_t g0 = 0; g0 < ne02; g0 += G) {
+            mmq_args a = args;
+            a.x             = args.x_experts ? args.x : args.x + g0*src0->nb[2];
+            a.x_experts     = args.x_experts ? args.x_experts + g0 : nullptr;
+            a.expert_bounds = expert_bounds + g0;
+            a.nchannels_x   = G;
+            a.nchannels_y   = G;
+            ggml_cuda_mmq_tile_prefix(expert_bounds + g0, G, J_best, tile_prefix.get(), stream);
+            a.tile_prefix = tile_prefix.get();
+            ggml_cuda_mul_mat_q_switch_type(ctx, a, stream, prec_src1);
+        }
+        return;
+    }
     if (compact) {
         tile_prefix.alloc(ne02 + 1);
         ggml_cuda_mmq_tile_prefix(expert_bounds, (int) ne02, J_best, tile_prefix.get(), stream);
