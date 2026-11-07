@@ -224,6 +224,10 @@ struct ggml_moe_cache_api {
     // the hosted MoE's cost, to choose it over the prefetch: a block of 'rows' routed rows takes fixed_us + rows * row_us
     // hosted, its expert tensors' bytes / copy_bytes_per_us prefetched; false when not known (no device yet)
     bool (*hosted_cost)(void * session, double * copy_bytes_per_us, double * fixed_us, double * row_us);
+    // the model's expert tensors in host memory, all cards together (page-rounded ranges, merged), and the GPUs they are
+    // spread over: the host RAM they take is decided once for the whole session, at its first card (set before the
+    // first graph; a pipeline stage's session does not see the other stage's tensors yet)
+    void (*host_experts)(void * session, size_t bytes, int n_devices);
 };
 
 GGML_API struct ggml_moe_cache_api ggml_moe_cache;
@@ -240,6 +244,9 @@ GGML_API void * ggml_backend_sched_detach_moe_cache(ggml_backend_sched_t sched);
 GGML_API void    ggml_backend_sched_moe_cache_kv_register(ggml_backend_sched_t sched, const struct ggml_tensor * tensor, size_t row_bytes);
 GGML_API void    ggml_backend_sched_moe_cache_kv_set_rows(ggml_backend_sched_t sched, int64_t rows);
 GGML_API int64_t ggml_backend_sched_moe_cache_kv_first_lent_row(ggml_backend_sched_t sched);
+// the model's host expert bytes (all cards) and the GPUs they are spread over (ggml_moe_cache.host_experts); a no-op
+// without a session
+GGML_API void    ggml_backend_sched_moe_cache_host_experts(ggml_backend_sched_t sched, size_t bytes, int n_devices);
 GGML_API void   ggml_backend_sched_attach_moe_cache(ggml_backend_sched_t sched, void * session);
 // the session of a scheduler (NULL without one), to share it with another
 GGML_API void * ggml_backend_sched_get_moe_cache(ggml_backend_sched_t sched);

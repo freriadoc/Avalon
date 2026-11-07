@@ -59,6 +59,7 @@ bool ggml_cuda_host_rows_node(ggml_backend_cuda_context & ctx, ggml_tensor * nod
 #include "ggml-cuda.h"
 #include "../ggml-backend-moe-cache.h"
 #include "moe-arena.h"
+#include "moe-ram-budget.h"
 
 // EXL3 weights are not part of this tree: every path below that tests for them is dead.
 static inline bool ggml_type_is_exl3(ggml_type) { return false; }
@@ -560,6 +561,7 @@ struct moe_cache_device {
     // PIN, direct load (moe_cache_pin_load_direct): the expert ranges made anonymous memory filled from the files with
     // O_DIRECT before they are registered; each one's file and offset, to map it back if KFD refuses it
     bool pin_direct = false;
+    size_t pin_quota = SIZE_MAX;   // the bytes this card may register (moe-ram-budget.h, several cards that do not all fit)
     bool arena_off = false, pin_off = false;   // GGML_CUDA_MOE_ARENA_MB=auto's choice (moe_cache_build_pending)
     struct pin_file { uintptr_t start, end; std::string path; uint64_t offset; };
     std::vector<pin_file> pin_files;
@@ -731,6 +733,8 @@ struct moe_cache_session {
     std::vector<std::unique_ptr<moe_cache_device>> devices;
     std::unordered_map<int, int> layer_devices;
     std::unordered_map<const void *, int> tensor_devices;
+    // the experts' host RAM, decided once for all the cards (moe-ram-budget.h; total and cards set by moe_cache_host_experts)
+    moe_ram_plan ram_plan;
     // KV: tensors of the KV cache whose end may be lent (moe_cache_kv_register), attached when the pools are built
     struct kv_tensor { const char * data; size_t bytes; size_t row_bytes; int logical; };
     std::vector<kv_tensor> kv_tensors;
@@ -3236,6 +3240,23 @@ static void moe_cache_pin_experts(const moe_cache_session & session, moe_cache_d
             merged.push_back(r);
         }
     }
+    // several cards that do not all fit (moe-ram-budget.h): the ranges under this card's quota only; the others stay
+    // as mapped, in the page cache, not registered (fills copied through the staging buffer)
+    size_t budget_left_out = 0, budget_left_bytes = 0;
+    if (device.pin_quota != SIZE_MAX) {
+        std::vector<char> keep(merged.size(), 0);
+        (void) moe_ram_select(merged, device.pin_quota, keep);
+        std::vector<std::pair<uintptr_t, uintptr_t>> kept;
+        for (size_t i = 0; i < merged.size(); i++) {
+            if (keep[i]) {
+                kept.push_back(merged[i]);
+            } else {
+                budget_left_out++;
+                budget_left_bytes += merged[i].second - merged[i].first;
+            }
+        }
+        merged.swap(kept);
+    }
     // direct load (device.pin_direct): reader threads fill the ranges, each registered as soon as it is filled
     std::vector<std::atomic<int>> left(merged.size());
     std::vector<char> loaded(merged.size(), 1);
@@ -3294,8 +3315,11 @@ static void moe_cache_pin_experts(const moe_cache_session & session, moe_cache_d
         fail = merged.size() - device.pinned.size();
     }
     std::sort(device.pinned.begin(), device.pinned.end());
-    MOE_CACHE_LOG("[moe-cache] CUDA%d pin: %zu expert tensors registered (%zu MiB) in %.1f s, %zu left out%s%s\n",
+    fail += budget_left_out;
+    MOE_CACHE_LOG("[moe-cache] CUDA%d pin: %zu expert tensors registered (%zu MiB) in %.1f s, %zu left out%s%s%s\n",
             device.physical, device.pinned.size(), bytes >> 20, (ggml_time_us() - t0) / 1e6, fail,
+            budget_left_out ? (" (" + std::to_string(budget_left_out) + " over the RAM budget, " +
+                std::to_string(budget_left_bytes >> 20) + " MiB in the page cache)").c_str() : "",
             device.pin_full ? " (KFD's system memory limit reached)" : "",
             device.pin_direct ? (" (read with O_DIRECT: " + std::to_string(direct_bytes >> 20) + " MiB)").c_str() : "");
 }
@@ -3337,7 +3361,7 @@ static size_t moe_arena_read_number(const std::string & path, const char * key) 
 // GGML_CUDA_MOE_ARENA_MB=auto (buun's rule for his RAM tier): the memory free to take now, less a margin
 // (GGML_CUDA_MOE_ARENA_MARGIN_MB, 4096): the smaller of MemAvailable and, under every cgroup v2 limit above this
 // process, the limit less what cannot be reclaimed without swap (anonymous, shared, kernel; the page cache can be)
-static size_t moe_cache_arena_auto_bytes() {
+static size_t moe_cache_room_bytes() {
     size_t room = moe_arena_read_number("/proc/meminfo", "MemAvailable:");
     room = room == SIZE_MAX ? SIZE_MAX : room << 10;
     std::ifstream cg("/proc/self/cgroup");
@@ -3360,8 +3384,17 @@ static size_t moe_cache_arena_auto_bytes() {
             dir.resize(dir.rfind('/'));
         }
     }
+    return room;
+}
+
+static size_t moe_cache_arena_margin_mb() {
     const char * m = getenv("GGML_CUDA_MOE_ARENA_MARGIN_MB");
-    const size_t margin = (m ? (size_t) atoll(m) : 4096) << 20;
+    return m ? (size_t) atoll(m) : 4096;
+}
+
+static size_t moe_cache_arena_auto_bytes() {
+    const size_t room = moe_cache_room_bytes();
+    const size_t margin = moe_cache_arena_margin_mb() << 20;
     return room != SIZE_MAX && room > margin ? room - margin : 0;
 }
 
@@ -3792,9 +3825,16 @@ static bool moe_arena_load(const moe_cache_device & d, moe_expert_arena & ar, in
 #endif
 }
 
-// whether every expert range fits both the arena's room (moe_cache_arena_auto_bytes) and KFD's limit for registered
-// memory (RAM - RAM/64 - 1.5 GiB for all processes), less 1 GiB for the pinned buffers allocated later
-static bool moe_cache_experts_fit(const moe_cache_device & device) {
+static size_t moe_cache_env_mb(const char * name, size_t dflt) {
+    const char * v = getenv(name);
+    return v ? (size_t) atoll(v) : dflt;
+}
+
+// whether this card's expert ranges are registered in place (all, or its quota of the session's budget) or go to the
+// arena (moe-ram-budget.h): one card, every range when they fit both the arena's room (moe_cache_arena_auto_bytes) and
+// KFD's limit for registered memory (RAM - RAM/64 - 1.5 GiB for all processes) less 1 GiB for the pinned buffers
+// allocated later; several cards, the budget decided once at the first card's decision. Sets device.pin_quota
+static moe_ram_mode moe_cache_experts_fit(moe_cache_session & session, moe_cache_device & device) {
     std::vector<std::pair<uintptr_t, uintptr_t>> ranges;
     for (const auto & t : device.seen_tensors) {
         const uintptr_t b = (uintptr_t) t.first;
@@ -3810,15 +3850,39 @@ static bool moe_cache_experts_fit(const moe_cache_device & device) {
     }
     const size_t total = moe_arena_read_number("/proc/meminfo", "MemTotal:");
     if (total == SIZE_MAX) {
-        return false;
+        return MOE_RAM_ARENA;
     }
     const size_t ram = total << 10;
     const size_t kfd = ram - ram / 64 - ((size_t) 3 << 29);
-    const size_t room = moe_cache_arena_auto_bytes();
-    const bool fit = bytes + ((size_t) 1 << 30) <= kfd && bytes <= room;
-    MOE_CACHE_LOG("[moe-cache] CUDA%d experts: %zu MiB, room %zu MiB, KFD limit ~%zu MiB: %s\n", device.physical,
-            bytes >> 20, room >> 20, kfd >> 20, fit ? "registered in place, read with O_DIRECT" : "the arena");
-    return fit;
+    moe_ram_plan & plan = session.ram_plan;
+    const bool first = !plan.decided;
+    // GGML_CUDA_MOE_PIN_RESERVE_MB: the whole reserve of several cards; else GGML_CUDA_MOE_PIN_RESERVE_BASE_MB (10240)
+    // plus GGML_CUDA_MOE_PIN_RESERVE_CARD_MB (3072) per card after the first
+    const size_t reserve_one = moe_ram_reserve_bytes(1, moe_cache_arena_margin_mb(), 0, 0);
+    const size_t reserve_multi = getenv("GGML_CUDA_MOE_PIN_RESERVE_MB")
+        ? moe_cache_env_mb("GGML_CUDA_MOE_PIN_RESERVE_MB", 0) * moe_ram_mib
+        : moe_ram_reserve_bytes(plan.n_devices, moe_cache_arena_margin_mb(),
+              moe_cache_env_mb("GGML_CUDA_MOE_PIN_RESERVE_BASE_MB", 10240), moe_cache_env_mb("GGML_CUDA_MOE_PIN_RESERVE_CARD_MB", 3072));
+    const size_t room_raw = moe_cache_room_bytes();
+    const moe_ram_choice c = moe_ram_choose(plan, bytes, room_raw, kfd, reserve_one, reserve_multi);
+    device.pin_quota = c.mode == MOE_RAM_PIN_PART ? c.quota : SIZE_MAX;
+    if (plan.n_devices <= 1 || plan.total == 0) {
+        const size_t room = room_raw == SIZE_MAX ? 0 : (room_raw > reserve_one ? room_raw - reserve_one : 0);
+        MOE_CACHE_LOG("[moe-cache] CUDA%d experts: %zu MiB, room %zu MiB, KFD limit ~%zu MiB: %s\n", device.physical,
+                bytes >> 20, room >> 20, kfd >> 20, c.mode == MOE_RAM_PIN_ALL ? "registered in place, read with O_DIRECT" : "the arena");
+    } else {
+        if (first) {
+            MOE_CACHE_LOG("[moe-cache] host RAM for the experts of %d cards: %zu MiB in all, room %zu MiB, reserve %zu MiB, "
+                    "KFD limit ~%zu MiB: budget %zu MiB, %s\n", plan.n_devices, plan.total >> 20,
+                    plan.room >> 20, reserve_multi >> 20, kfd >> 20, plan.budget >> 20,
+                    plan.all_fit ? "every card registers all its experts" : "each card registers its share");
+        }
+        MOE_CACHE_LOG("[moe-cache] CUDA%d experts: %zu MiB, room %zu MiB (session budget %zu MiB, %zu taken): %s %zu MiB, "
+                "read with O_DIRECT%s\n", device.physical, bytes >> 20, plan.room >> 20, plan.budget >> 20, plan.used >> 20,
+                c.mode == MOE_RAM_PIN_ALL ? "registered in place" : "its share registered in place,", c.quota >> 20,
+                c.mode == MOE_RAM_PIN_ALL ? "" : ", the rest left in the page cache");
+    }
+    return c.mode;
 }
 
 static void moe_cache_build_pending(
@@ -3861,7 +3925,7 @@ static void moe_cache_build_pending(
         const char * d = getenv("GGML_CUDA_MOE_PIN_DIRECT");
         device.pin_direct = d && atoi(d) != 0;
         if (moe_cache_arena_mb() == SIZE_MAX && moe_cache_pin_enabled()) {
-            device.pin_direct = moe_cache_experts_fit(device);
+            device.pin_direct = moe_cache_experts_fit(session, device) != MOE_RAM_ARENA;
             device.arena_off = device.pin_direct;
             device.pin_off = !device.pin_direct;
         }
@@ -4015,7 +4079,13 @@ static int moe_cache_discover_pool(
             moe_arena_open_files(device);   // a layer shown after the arena was built: its file too
         }
         device.visits_since_new_tensor = 0;
-        if (device.pools_built && !device.pinned.empty() && !device.pin_full) {
+        size_t pinned_bytes = 0;   // under a RAM budget (moe-ram-budget.h), a late tensor registered only within the quota
+        for (const auto & r : device.pinned) {
+            pinned_bytes += r.second - r.first;
+        }
+        const bool in_quota = device.pin_quota == SIZE_MAX ||
+            pinned_bytes + GGML_PAD(tensor_size + 4095, 4096) <= device.pin_quota;
+        if (device.pools_built && !device.pinned.empty() && !device.pin_full && in_quota) {
             // a tensor of a scheduler sharing the session (MTP draft), shown after the pools were built: registered
             // like the others, still before its first graph (registering synchronizes every stream)
             size_t bytes = 0;
@@ -6065,6 +6135,19 @@ static void moe_cache_preload(const moe_cache_session & session, moe_cache_devic
     device.preload_bytes = bytes;
     MOE_CACHE_LOG("[moe-cache] CUDA%d preload: %zu experts (%.2f GiB) from %s in %.2f s, %zu of %u pairs outside the model\n",
             device.physical, loaded, bytes / 1073741824.0, path, (ggml_time_us() - t0) / 1e6, skipped, n_ranked);
+}
+
+// the model's host expert bytes and cards (moe-ram-budget.h): kept until the first card decides, ignored after
+static void moe_cache_host_experts(void * opaque, size_t bytes, int n_devices) {
+    moe_cache_session * session = (moe_cache_session *) opaque;
+    if (!session) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(session->mu);
+    if (!session->ram_plan.decided) {
+        session->ram_plan.total = bytes;
+        session->ram_plan.n_devices = n_devices;
+    }
 }
 
 static void moe_cache_attach_kv(moe_cache_session & session, moe_cache_device & device) {
@@ -11029,6 +11112,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.kv_needs_set_rows = moe_cache_kv_needs_set_rows;
     ggml_moe_cache.kv_set_rows = moe_cache_kv_set_rows;
     ggml_moe_cache.kv_first_lent_row = moe_cache_kv_first_lent_row;
+    ggml_moe_cache.host_experts = moe_cache_host_experts;
     ggml_moe_cache.session_leave = moe_cache_session_leave;
     ggml_moe_cache.begin = moe_cache_begin;
     ggml_moe_cache.assign = moe_cache_assign;

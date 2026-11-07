@@ -3355,6 +3355,12 @@ void ggml_backend_sched_moe_cache_kv_set_rows(ggml_backend_sched_t sched, int64_
     ggml_moe_cache.kv_set_rows(sched->moe_cache_session, rows);
 }
 
+void ggml_backend_sched_moe_cache_host_experts(ggml_backend_sched_t sched, size_t bytes, int n_devices) {
+    if (sched && sched->moe_cache_session && !sched->moe_cache_guest && ggml_moe_cache.host_experts) {
+        ggml_moe_cache.host_experts(sched->moe_cache_session, bytes, n_devices);
+    }
+}
+
 int64_t ggml_backend_sched_moe_cache_kv_first_lent_row(ggml_backend_sched_t sched) {
     if (!sched || !sched->moe_cache_session || sched->moe_cache_guest || !ggml_moe_cache.kv_first_lent_row) {
         return 0;

@@ -906,6 +906,36 @@ static bool llama_model_has_cacheable_moe_weights(
     return false;
 }
 
+// the model's expert tensors in host memory (all layers, whichever GPU computes them): their page-rounded ranges merged
+// (a packed layer's three tensors share one), for the MoE cache's host RAM decision (ggml_moe_cache.host_experts)
+static size_t llama_model_host_expert_bytes(const llama_model & model) {
+    std::vector<std::pair<uintptr_t, uintptr_t>> ranges;
+    for (const auto & entry : model.tensors_by_name) {
+        const std::string & name = entry.first;
+        const ggml_tensor * tensor = entry.second;
+        if (!tensor || !tensor->data || (name.find("_exps") == std::string::npos && name.find("_chexps") == std::string::npos) ||
+            ggml_n_dims(tensor) != 3) {
+            continue;
+        }
+        ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+        if (!buffer || !ggml_backend_buffer_is_host(buffer) ||
+            ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            continue;
+        }
+        const uintptr_t b = (uintptr_t) tensor->data;
+        ranges.push_back({b & ~(uintptr_t) 4095, (b + ggml_nbytes(tensor) + 4095) & ~(uintptr_t) 4095});
+    }
+    std::sort(ranges.begin(), ranges.end());
+    size_t bytes = 0;
+    uintptr_t end = 0;
+    for (const auto & r : ranges) {
+        const uintptr_t b = std::max(r.first, end);
+        bytes += r.second > b ? r.second - b : 0;
+        end = std::max(end, r.second);
+    }
+    return bytes;
+}
+
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
@@ -968,6 +998,13 @@ void llama_context::sched_reserve() {
                 cparams.moe_cache_expert_parallel,
                 cparams.moe_cache_cpu_overlap,
                 cparams.moe_cache_profile_path.empty() ? nullptr : cparams.moe_cache_profile_path.c_str());
+        // the experts' host RAM is decided once for every card of the session: their total and the GPUs, known here only
+        // (a pipeline stage's scheduler sees its own layers)
+        int n_gpus = 0;
+        for (const auto & d : model.devices) {
+            n_gpus += !d.is_meta && ggml_backend_dev_type(d.dev) == GGML_BACKEND_DEVICE_TYPE_GPU;
+        }
+        ggml_backend_sched_moe_cache_host_experts(sched.get(), llama_model_host_expert_bytes(model), n_gpus);
         // the end of the KV cache lent to the new session (GGML_CUDA_MOE_CACHE_KV_LEND=1): its tensors registered
         // before the pools are built; a tensor shared by two caches once
         if (memory) {
