@@ -17,9 +17,13 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <mutex>
+#include <condition_variable>
+#include <thread>
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -449,11 +453,31 @@ llama_context::llama_context(
 
         // TODO: move these checks to ggml_backend_sched
         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
+        // the GPUs this context computes on (a pipeline stage: one of the model's devices only, llama_context_params::
+        // stage_device); with the model's count, a stage took the pipeline path, which keeps one graph per output kind:
+        // each verification of a different size (1 to 4 tokens) rebuilt and recaptured its graphs
+        int n_gpu_backends = 0;
+        for (auto & backend : backends) {
+            if (ggml_backend_dev_type(ggml_backend_get_device(backend.get())) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                n_gpu_backends++;
+            }
+        }
+        // and the GPUs holding the model's weights: the MTP draft (one layer, on the target's last GPU) took the pipeline
+        // path over the target's two devices, which costs its passes the small-graph cache (draft +12 % per step)
+        std::set<ggml_backend_dev_t> weight_gpus;
+        for (const auto & [buft, size] : model.memory_breakdown()) {
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+            if (size > 0 && dev && !ggml_backend_buft_is_host(buft) && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                weight_gpus.insert(dev);
+            }
+        }
         bool pipeline_parallel =
-            model.n_devices() > 1 &&
+            model.n_devices() > 1 && n_gpu_backends > 1 && weight_gpus.size() > 1 &&
             model.n_gpu_layers() > model.hparams.n_layer_all &&
             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
             cparams.offload_kqv &&
+            // with the experts in host memory (--cpu-moe) a layer split overlaps nothing: prefill at 19k to 120k equal
+            // with and without it (2 x A4000), generation -6.5 % with it; the pipeline stages do that overlap
             !model.has_tensor_overrides();
 
         // pipeline parallelism requires support for async compute and events in all devices
