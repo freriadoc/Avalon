@@ -1371,14 +1371,16 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         }
 
-        // one signed 5-bit scale per block of 32, stored for both halves of 16 (the q8_0_16 layout)
+        // one signed 5-bit scale per block of 32: the q8_0 layout for the MMA product (one scale per 32 values, as the
+        // IQ3_S; the q8_0_16 product converted each 16 values' integer sum to float, its half rate on Ampere), both
+        // halves of 16 for the dp4a one (q8_0_16)
         const float d = bxi->d;
         const int ls = (int)(((bxi->scales[kqsx%4] >> 4*(kqsx/4)) & 0xf) | (((bxi->extra >> kqsx) & 1) << 4)) - 16;
         const float d0 = d * ls;
         const float d1 = d0;
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
-        x_df[i*sram_stride                             + 2*kqsx+0] = d0;
-        x_df[i*sram_stride                             + 2*kqsx+1] = d1;
+        GGML_UNUSED(d1);
+        x_df[i*sram_stride                             + kqsx] = d0;
 #else
         x_df[i*(2*MMQ_TILE_NE_K*2/QI8_0) + i/(QI8_0/4) + 2*kqsx+0] = d0;
         x_df[i*(2*MMQ_TILE_NE_K*2/QI8_0) + i/(QI8_0/4) + 2*kqsx+1] = d1;
