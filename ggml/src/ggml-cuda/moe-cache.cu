@@ -6544,7 +6544,7 @@ struct moe_hosted_state {
     int64_t split_moved = 0;                                 // SPLIT: experts moved to the GPU
     int split_tensors = 0;                                   // SPLIT: tensors copied for the last layer's moved experts
     // SPLIT: the CPU term of the dispatcher's model scaled to this machine (moe_split_calibrate), measured once
-    double cpu_scale = 1.0;
+    std::atomic<double> cpu_scale{1.0};
     int cal_left = moe_split_cal_skip + moe_split_cal_layers;   // GGML_CUDA_MOE_SPLIT_CPU_SCALE=x: fixed, not measured
     double cal_measured = 0.0, cal_model = 0.0;
     // served by the thread that waits for the stream (ggml_cuda_moe_hosted_wait)
@@ -7986,7 +7986,7 @@ static void moe_split_calibrate(moe_hosted_state * st, const int32_t * ids, int 
     if (st->cal_left == 0 && st->cal_model > 0.0) {
         st->cpu_scale = st->cal_measured / st->cal_model;
         MOE_CACHE_LOG("[moe-cache] CUDA%d split: CPU rows take %.2f x the model's time (%d layers, %.1f us per layer)\n",
-                      st->device->physical, st->cpu_scale, moe_split_cal_layers, st->cal_measured / moe_split_cal_layers);
+                      st->device->physical, st->cpu_scale.load(), moe_split_cal_layers, st->cal_measured / moe_split_cal_layers);
     }
 }
 
@@ -8733,6 +8733,37 @@ static moe_hosted_state * moe_hosted_state_for(moe_cache_session & session, moe_
     return entry.get();
 }
 
+// The scheduler hosts a MoE block when that beats its prefetch, which copies the block's expert tensors whatever the
+// batch: hosted if fixed_us + rows * row_us < the tensors' bytes / copy_bytes_per_us. Fitted on the 7900 XT in PCIe 3.0
+// (IQ3_KS hybrid, 48 MoE layers, 8 CPU threads, CPU scale 0.95): a prompt of 164 / 278 / 413 / 692 / 853 tokens takes
+// 0.61 / 0.82 / 1.14 / 1.95 / 2.24 s hosted, ~0.235 s + 2.35 ms per token, i.e. per layer 4.9 ms + 4.9 us per routed
+// row, against 3.05 s for the prefetch (its bytes / the link's copy rate, 13.6 GB/s). The row term is the CPU's (the
+// GPU computes the resident rows meanwhile): it follows the CPU team (its threads, the measured scale of
+// moe_split_calibrate, 1.0 until it is fixed), the fixed term does not. 7900 XT: ~12 000 rows (above the buffers' 8191);
+// RTX 4090 in PCIe 4.0 (27.2 GB/s, 13 threads at 1.71): ~5 000 rows, ~500 tokens
+static constexpr double moe_hosted_fit_fixed_us = 4900.0, moe_hosted_fit_row_us = 4.9, moe_hosted_fit_scale = 0.95;
+
+static bool moe_hosted_cost(void * session_ptr, double * copy_bytes_per_us, double * fixed_us, double * row_us) {
+    moe_cache_session * session = static_cast<moe_cache_session *>(session_ptr);
+    if (!session || session->devices.empty() || !session->devices[0]) {
+        return false;
+    }
+    moe_hosted_state * st = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_hosted_mu);
+        auto it = g_hosted.find({session, session->devices[0]->logical});
+        st = it == g_hosted.end() ? nullptr : it->second.get();
+    }
+    if (!st) {
+        return false;   // no hosted block yet: the scheduler keeps its default
+    }
+    *copy_bytes_per_us = st->pcie_bytes_per_us;
+    *fixed_us = moe_hosted_fit_fixed_us;
+    *row_us = moe_hosted_fit_row_us * (st->cpu_scale.load() / moe_hosted_fit_scale) *
+              (moe_split_cpu_fit_threads / std::max(1, st->n_threads));
+    return true;
+}
+
 static void moe_hosted_shutdown(moe_cache_session * session) {
     std::vector<std::unique_ptr<moe_hosted_state>> states;
     {
@@ -9249,6 +9280,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.prepare_queues = moe_cache_prepare_queues;
     ggml_moe_cache.hosted_max_rows = moe_hosted_max_rows;
     ggml_moe_cache.largest_lend = moe_cache_largest_lend;
+    ggml_moe_cache.hosted_cost = moe_hosted_cost;
     ggml_moe_cache.plan = nullptr;   // nodes are served by the hosted MoE only (moe_cache_begin)
     ggml_moe_cache.dispatch = nullptr;   // nodes are served by the hosted MoE only (moe_cache_begin)
     ggml_moe_cache.collect = nullptr;   // nodes are served by the hosted MoE only (moe_cache_begin)

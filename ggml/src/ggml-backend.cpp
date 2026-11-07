@@ -1446,13 +1446,25 @@ static bool ggml_backend_sched_is_hosted_moe(ggml_backend_sched_t sched, const s
 }
 
 // With a MoE cache session (GGML_MOE_GPU=0 turns it off), a MoE block gate / up / swiglu / down whose weights are
-// in host memory stays on the GPU for batches of up to the backend's hosted rows (8191 by default) and 1024 tokens: the
-// GPU computes the rows
-// the cache holds, a host thread the others (ggml_cuda_moe_hosted_block); no weight is copied.
+// in host memory stays on the GPU for batches of up to the backend's hosted rows (8191 by default) and 1024 tokens when that beats
+// the prefetch, which copies the block's expert tensors whatever the batch (ggml_moe_cache.hosted_cost: the link's
+// copy rate and the CPU's speed, both measured once): the GPU computes the rows the cache holds, a host thread the
+// others (ggml_cuda_moe_hosted_block); no weight is copied. GGML_MOE_HOSTED_MAX_ROWS=N: a fixed limit instead.
 static void ggml_backend_sched_find_hosted_moe(ggml_backend_sched_t sched, const struct ggml_cgraph * graph) {
     static const bool enabled = !getenv("GGML_MOE_GPU") || atoi(getenv("GGML_MOE_GPU")) != 0;
     // the routed rows of a hosted block: the backend's (ggml-cuda's moe_hosted_max_rows, GGML_MOE_HOSTED_MAX_ROWS)
+    static const bool fixed_rows = getenv("GGML_MOE_HOSTED_MAX_ROWS") != nullptr;
     const int64_t max_rows = ggml_moe_cache.hosted_max_rows ? ggml_moe_cache.hosted_max_rows() : 64;
+    static double logged_row_us = 0.0;
+    // what the prefetch copies of an expert tensor (a packed layer's: its experts at their step)
+    const auto copy_bytes = [](const struct ggml_tensor * w) {
+        const size_t step = ggml_sched_packed_expert_step(w);
+        return step ? step * (size_t) w->ne[2] : ggml_nbytes(w);
+    };
+    struct candidate { const struct ggml_tensor * gate, * up, * down; int64_t rows; };
+    std::vector<candidate> candidates;
+    double row_us_seen = 0.0, fixed_us_seen = 0.0;
+    int64_t cross_min = INT64_MAX, cross_max = 0;
     if (sched->moe_hosted) {
         sched->moe_hosted->clear();
     }
@@ -1481,10 +1493,36 @@ static void ggml_backend_sched_find_hosted_moe(ggml_backend_sched_t sched, const
             ids->ne[0] * ids->ne[1] > max_rows || ids->ne[1] > 1024) {
             continue;
         }
-        sched->moe_hosted->insert(gate);
-        sched->moe_hosted->insert(up);
-        sched->moe_hosted->insert(down);
+        candidates.push_back({ gate, up, down, ids->ne[0] * ids->ne[1] });
+        double rate = 0.0, fixed_us = 0.0, row_us = 0.0;
+        if (!fixed_rows && ggml_moe_cache.hosted_cost &&
+            ggml_moe_cache.hosted_cost(sched->moe_cache_session, &rate, &fixed_us, &row_us) && rate > 0.0 && row_us > 0.0) {
+            // the prefetch copies the whole tensors (less the experts the cache holds, read in place: not counted)
+            const double copy_us = (double) (copy_bytes(gate->src[0]) + copy_bytes(up->src[0]) + copy_bytes(down->src[0])) / rate;
+            const int64_t cross = std::max<int64_t>(0, (int64_t) ((copy_us - fixed_us) / row_us));
+            row_us_seen = row_us;
+            fixed_us_seen = fixed_us;
+            cross_min = std::min(cross_min, cross);
+            cross_max = std::max(cross_max, cross);
+        }
         i += 3;
+    }
+    // one limit for the graph, its lowest: large hosted blocks between prefetched layers hang the prefill (the GPU
+    // spins; seen with 2 CPU threads, layers of 2520 - 4630 rows and a block of 2780; cause not found), while a graph
+    // of hosted blocks, or of prefetched layers and a last layer of a few rows (its outputs), works
+    const int64_t limit = row_us_seen > 0.0 ? cross_min : max_rows;
+    for (const auto & c : candidates) {
+        if (c.rows <= limit) {
+            sched->moe_hosted->insert(c.gate);
+            sched->moe_hosted->insert(c.up);
+            sched->moe_hosted->insert(c.down);
+        }
+    }
+    if (row_us_seen > 0.0 && row_us_seen != logged_row_us) {   // at the first hosted graph, again once the CPU scale is measured
+        logged_row_us = row_us_seen;
+        GGML_LOG_INFO("%s: hosting a MoE block beats its prefetch up to %lld - %lld routed rows (%.0f + %.2f us per row "
+                      "against the copy), hosted up to %lld\n", __func__, (long long) cross_min, (long long) cross_max,
+                      fixed_us_seen, row_us_seen, (long long) std::min(cross_min, max_rows));
     }
 }
 
