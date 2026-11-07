@@ -9220,7 +9220,7 @@ static int moe_hosted_split(moe_hosted_state * st, moe_hosted_layer * layer, int
 // the same bench's on the 7900 XT (moe_split_gpu_bench_ref_us) scales every GPU term
 static constexpr double moe_split_gpu_bench_ref_us = 147.2;   // the 7900 XT (ROCm 7.2.4): 147.7 and 146.7 us on two starts
 static void moe_split_gpu_bench(moe_hosted_state * st, moe_cache_device & device, const moe_hosted_layer * layer,
-                                ggml_type wtype, ggml_type dtype) {
+                                ggml_type wtype, ggml_type dtype, cudaStream_t stream) {
     st->gpu_benched = true;
     if (const char * fixed = getenv("GGML_CUDA_MOE_SPLIT_GPU_SCALE")) {
         st->gpu_scale = atof(fixed);
@@ -9250,10 +9250,11 @@ static void moe_split_gpu_bench(moe_hosted_state * st, moe_cache_device & device
     const int64_t padded_embd = GGML_PAD(n_embd, MATRIX_ROW_PADDING), padded_ff = GGML_PAD(n_ff, MATRIX_ROW_PADDING);
     uint64_t * d_plan = nullptr; int32_t * d_ids = nullptr; char * d_act = nullptr, * d_mid = nullptr;
     float * d_glu = nullptr, * d_out = nullptr; unsigned * d_count = nullptr;
-    cudaStream_t stream = nullptr; cudaEvent_t e0 = nullptr, e1 = nullptr;
+    // on the block's own stream (not capturing here): a stream of its own kept a 7th hardware queue for good (ROCm keeps
+    // a destroyed stream's queue), 38 MiB of context save area and one more queue for the scheduler
+    cudaEvent_t e0 = nullptr, e1 = nullptr;
     const size_t mid_blocks = (size_t) R * (padded_ff / QK8_1);
-    bool ok = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) == cudaSuccess &&
-              cudaEventCreateWithFlags(&e0, 0) == cudaSuccess && cudaEventCreateWithFlags(&e1, 0) == cudaSuccess &&
+    bool ok = cudaEventCreateWithFlags(&e0, 0) == cudaSuccess && cudaEventCreateWithFlags(&e1, 0) == cudaSuccess &&
               cudaMalloc((void **) &d_plan, h_plan.size() * sizeof(uint64_t)) == cudaSuccess &&
               cudaMalloc((void **) &d_ids, R * sizeof(int32_t)) == cudaSuccess &&
               cudaMalloc((void **) &d_act, (size_t) tokens * (padded_embd / QK8_1) * sizeof(block_q8_1)) == cudaSuccess &&
@@ -9293,11 +9294,10 @@ static void moe_split_gpu_bench(moe_hosted_state * st, moe_cache_device & device
         us = 1e3 * ms / iters;
     }
     (void) cudaGetLastError();
-    if (stream) cudaStreamSynchronize(stream);
+    cudaStreamSynchronize(stream);
     cudaFree(d_plan); cudaFree(d_ids); cudaFree(d_act); cudaFree(d_mid); cudaFree(d_count); cudaFree(d_glu); cudaFree(d_out);
     if (e0) cudaEventDestroy(e0);
     if (e1) cudaEventDestroy(e1);
-    if (stream) cudaStreamDestroy(stream);
     if (!ok || us <= 0.0) {
         MOE_CACHE_LOG("[moe-cache] CUDA%d split: GPU bench failed, the model's GPU terms kept\n", device.physical);
         return;
@@ -10694,7 +10694,7 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
     if (!st->gpu_benched) {
         cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
         if (cudaStreamIsCapturing(ctx.stream(), &capture) == cudaSuccess && capture == cudaStreamCaptureStatusNone) {
-            moe_split_gpu_bench(st, *device, layer, gate->src[0]->type, down->src[0]->type);
+            moe_split_gpu_bench(st, *device, layer, gate->src[0]->type, down->src[0]->type, ctx.stream());
         }
         (void) cudaGetLastError();
     }
