@@ -72,6 +72,24 @@ docker run -v /path/to/models:/models -p 8080:8080 ghcr.io/ggml-org/llama.cpp:se
 
 In the above examples, `--entrypoint /app/llama-cli` is specified for clarity, but you can safely omit it since it's the default entrypoint in the container.
 
+## Podman
+
+The Dockerfiles in [.devops/](../.devops/) build and run with podman using the same commands. Build the server image from the source tree:
+
+```bash
+podman build -t local/llama.cpp:server --target server -f .devops/cpu.Dockerfile .
+```
+
+Then run it, e.g. as an OpenAI-compatible server:
+
+```bash
+podman run -v /path/to/models:/models -p 8080:8080 local/llama.cpp:server -m /models/7B/ggml-model-q4_0.gguf --port 8080 --host 0.0.0.0
+```
+
+Notes:
+- podman stores local images under the `localhost/` prefix, so `local/llama.cpp:server` shows up as `localhost/local/llama.cpp:server`.
+- In rootless mode, only high ports (1024+) can be published to the host, so use a port above 1024 if 8080 is unavailable.
+
 ## Docker With CUDA
 
 Assuming one has the [nvidia-container-toolkit](https://github.com/NVIDIA/nvidia-container-toolkit) properly installed on Linux, or is using a GPU enabled cloud, `cuBLAS` should be accessible inside the container.
