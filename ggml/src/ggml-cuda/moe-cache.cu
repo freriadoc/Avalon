@@ -6583,6 +6583,10 @@ static void moe_cache_prefill_table(const void * w_data, const uint64_t * table)
     g_prefill_table   = table;
 }
 
+void ggml_cuda_moe_prefill_table_set(const void * w_data, const uint64_t * table) {
+    moe_cache_prefill_table(w_data, table);
+}
+
 const uint64_t * ggml_cuda_moe_prefill_table(const void * w_data) {
     return w_data && w_data == g_prefill_table_w ? g_prefill_table : nullptr;
 }

@@ -54,6 +54,8 @@ bool ggml_cuda_moe_hosted_active();   // cudaStream_t, cudaEvent_t, the stream's
 // or its place in the prefetch slot), registered by the scheduler for the duration of its split; nullptr otherwise.
 // MMQ then reads each expert at its address (ggml_cuda_mul_mat_q).
 const uint64_t * ggml_cuda_moe_prefill_table(const void * w_data);
+// the table MMQ reads for w_data's experts (nullptr: none); the scheduler's thread, around one split
+void ggml_cuda_moe_prefill_table_set(const void * w_data, const uint64_t * table);
 // ARENA, restoration of the prompt's experts (GGML_CUDA_MOE_ARENA_RESTORE=prompt): the device counters of the rows a
 // prefill routes to each expert of the layer of the gate weight named w_name (its copy's name: "...blk.N.ffn_gate_exps"),
 // nullptr when not counted; ggml_cuda_moe_count_rows adds MMQ's expert bounds (n + 1) to them on stream

@@ -685,8 +685,10 @@ static int moe_grouped_size() {
     return G;
 }
 
+// xe_host: per role (gate, up, down), each expert's address (a packed layer: its stride is no whole number of
+// blocks, MMQ then reads the experts by address, as the prefill's in-place reads)
 static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i,
-        const ggml_tensor * wg_dev, const ggml_tensor * wu_dev, const ggml_tensor * wd_dev, bool * declined);
+        const ggml_tensor * wg_dev, const ggml_tensor * wu_dev, const ggml_tensor * wd_dev, const std::vector<uint64_t> * xe_host);
 
 int ggml_cuda_moe_block_grouped(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
     return moe_block_grouped_impl(ctx, cgraph, i, nullptr, nullptr, nullptr, nullptr);
@@ -739,15 +741,20 @@ int ggml_cuda_moe_block_grouped_host(ggml_backend_cuda_context & ctx, const ggml
     if (one_range) {
         CUDA_CHECK(cudaMemcpyAsync(buf.get(), lo, (size_t) (hi - lo), cudaMemcpyHostToDevice, stream));
     }
-    bool declined = false;
-    const int covered = moe_block_grouped_impl(ctx, cgraph, i, &dw[0], &dw[1], &dw[2], &declined);
+    std::vector<uint64_t> xe[3];
+    for (int k = 0; k < 3; k++) {
+        xe[k].resize(w[k]->ne[2]);
+        for (int64_t e = 0; e < w[k]->ne[2]; e++) {
+            xe[k][e] = (uint64_t) (uintptr_t) ((const char *) dw[k].data + e*w[k]->nb[2]);
+        }
+    }
+    const int covered = moe_block_grouped_impl(ctx, cgraph, i, &dw[0], &dw[1], &dw[2], xe);
     GGML_ASSERT(covered > 0 && "a hosted prompt MoE block the grouped path does not take");
     return covered;
 }
 
 static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i,
-        const ggml_tensor * wg_dev, const ggml_tensor * wu_dev, const ggml_tensor * wd_dev, bool * declined) {
-    GGML_UNUSED(declined);
+        const ggml_tensor * wg_dev, const ggml_tensor * wu_dev, const ggml_tensor * wd_dev, const std::vector<uint64_t> * xe_host) {
     const int G = moe_grouped_size();
     if (G <= 0 || i + 3 >= cgraph->n_nodes) {
         return 0;
@@ -828,12 +835,18 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
         n_used, 1, ids->nb[1] / ggml_element_size(ids), x->nb[2] / x->nb[1], /*write_inverse =*/ true, stream);
     quantize_scatter_mmq_q8_1_cuda((const float *) x->data, ids_src1.get(), q8_gu.get(), wg->type, n_embd,
         x->nb[2] / sizeof(float), ne10p_gu, n_tok, rows, (int) n_used, stream);
+    ggml_cuda_pool_alloc<uint64_t> xe_dev(ctx.pool(), xe_host ? 3*n_expert : 1);
+    if (xe_host) {
+        for (int k = 0; k < 3; k++) {
+            CUDA_CHECK(cudaMemcpyAsync(xe_dev.get() + k*n_expert, xe_host[k].data(), n_expert*sizeof(uint64_t), cudaMemcpyHostToDevice, stream));
+        }
+    }
     std::vector<int32_t> hb(n_expert + 1);
     CUDA_CHECK(cudaMemcpyAsync(hb.data(), bounds.get(), (n_expert + 1)*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     auto launch = [&](const ggml_tensor * w, ggml_tensor * dst, const char * q8, int64_t ne10p, int64_t ne11, int J, bool fallback,
-                      int64_t g0, int r0, int r1) {
+                      int64_t g0, int r0, int r1, int role) {
         const size_t ts = ggml_type_size(w->type);
         mmq_args a = {
             (const char *) w->data + g0*w->nb[2], w->type, (const int *) q8, ids_dst.get(), bounds.get() + g0, (float *) dst->data,
@@ -842,6 +855,9 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
             G, G, (int64_t) (w->nb[2]/ts), (int64_t) (ne11*ne10p*sizeof(block_q8_1)/(QK8_1*sizeof(int))), (int64_t) (dst->nb[2]/sizeof(float)),
             1, 1, (int64_t) (w->nb[3]/ts), 0, (int64_t) (dst->nb[3]/sizeof(float)),
             n_tok, J};
+        if (xe_host) {
+            a.x_experts = xe_dev.get() + role*n_expert + g0;
+        }
         // the grid of the group's own rows (the compact grid bound for them)
         a.ncols_dst = r1 - r0;
         ggml_cuda_mmq_tile_prefix(bounds.get() + g0, G, J, prefix.get(), stream);
@@ -854,8 +870,8 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
         if (r1 <= r0) {
             continue;
         }
-        launch(wg, gate, q8_gu.get(), ne10p_gu, 1, J_gu, fb_gu, g0, r0, r1);
-        launch(wu, up,   q8_gu.get(), ne10p_gu, 1, J_gu, fb_gu, g0, r0, r1);
+        launch(wg, gate, q8_gu.get(), ne10p_gu, 1, J_gu, fb_gu, g0, r0, r1, 0);
+        launch(wu, up,   q8_gu.get(), ne10p_gu, 1, J_gu, fb_gu, g0, r0, r1, 1);
         {
             const dim3 grid((unsigned) std::min<int64_t>((n_ff + 255)/256, 8), (unsigned) (r1 - r0));
             k_moe_grouped_swiglu<<<grid, 256, 0, stream>>>((const float *) gate->data, (const float *) up->data, (float *) glu->data,
@@ -863,7 +879,7 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
         }
         quantize_mmq_q8_1_rows_cuda((const float *) glu->data, ids_dst.get(), q8_d.get(), wd->type, n_ff,
             glu->nb[1]/sizeof(float), ne10p_d, r0, r1 - r0, (int) rows, stream);
-        launch(wd, down, q8_d.get(), ne10p_d, n_used, J_d, fb_d, g0, r0, r1);
+        launch(wd, down, q8_d.get(), ne10p_d, n_used, J_d, fb_d, g0, r0, r1, 2);
     }
     CUDA_CHECK(cudaGetLastError());
 
@@ -876,10 +892,14 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
         tg.data = bg.get(); tu.data = bu.get(); th.data = bh.get(); td.data = bd.get();
         tg.src[GGML_SCHED_SCRATCH_SRC] = tu.src[GGML_SCHED_SCRATCH_SRC] = td.src[GGML_SCHED_SCRATCH_SRC] = nullptr;
         th.src[0] = &tg; th.src[1] = &tu; td.src[1] = &th;
-        ggml_cuda_mul_mat_q(ctx, wg, x, ids, &tg);
-        ggml_cuda_mul_mat_q(ctx, wu, x, ids, &tu);
+        auto table = [&](const ggml_tensor * w, int role) {
+            ggml_cuda_moe_prefill_table_set(xe_host ? w->data : nullptr, xe_host ? xe_dev.get() + role*n_expert : nullptr);
+        };
+        table(wg, 0); ggml_cuda_mul_mat_q(ctx, wg, x, ids, &tg);
+        table(wu, 1); ggml_cuda_mul_mat_q(ctx, wu, x, ids, &tu);
         ggml_cuda_op_swiglu(ctx, &th);
-        ggml_cuda_mul_mat_q(ctx, wd, &th, ids, &td);
+        table(wd, 2); ggml_cuda_mul_mat_q(ctx, wd, &th, ids, &td);
+        ggml_cuda_moe_prefill_table_set(nullptr, nullptr);
         std::vector<char> ga(ggml_nbytes(gate)), gb(ggml_nbytes(gate)), ua(ggml_nbytes(up)), ub(ggml_nbytes(up));
         CUDA_CHECK(cudaMemcpyAsync(ga.data(), gate->data, ga.size(), cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaMemcpyAsync(gb.data(), tg.data,    gb.size(), cudaMemcpyDeviceToHost, stream));
