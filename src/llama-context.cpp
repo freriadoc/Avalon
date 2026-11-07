@@ -193,9 +193,13 @@ llama_context::llama_context(
                 // its stage's layers only, so the halving does not double one card's copies
                 const uint32_t n_ub = params.n_ubatch == 0 ? params.n_batch : std::min(params.n_batch, params.n_ubatch);
                 params.n_ubatch = n_ub > 512 ? std::max<uint32_t>(512, n_ub / 2) : n_ub;
-                LLAMA_LOG_INFO("%s: pipeline stages: layers [0, %d) on %s, [%d, %u) on %s, ubatch %u -> %u\n", __func__,
-                        stage_b, ggml_backend_dev_name(model.devices[0].dev), stage_b, model.hparams.n_layer(),
-                        ggml_backend_dev_name(model.devices[1].dev), n_ub, params.n_ubatch);
+                // a batch as large as the context: the stages overlap within one decode only, each call fills and drains
+                // the pipeline. 120k at batches of 38144 (4 calls) 1 451 t/s, 65536 (2) 1 549, 131072 (1) 1 600; 60k
+                // 1 649 -> 1 768 (2 x A4000)
+                params.n_batch = std::max(params.n_batch, params.n_ctx == 0 ? model.hparams.n_ctx_train : params.n_ctx);
+                LLAMA_LOG_INFO("%s: pipeline stages: layers [0, %d) on %s, [%d, %u) on %s, ubatch %u -> %u, batch %u\n",
+                        __func__, stage_b, ggml_backend_dev_name(model.devices[0].dev), stage_b, model.hparams.n_layer(),
+                        ggml_backend_dev_name(model.devices[1].dev), n_ub, params.n_ubatch, params.n_batch);
             }
         }
     }
@@ -527,6 +531,7 @@ llama_context::llama_context(
 
         if (stage_b > 0) {
             llama_context_params pf = params_orig;
+            pf.n_batch      = params.n_batch;
             pf.n_ubatch     = params.n_ubatch; // both stages split a batch the same way
             pf.stage_il0    = 0;
             pf.stage_il1    = stage_b;
