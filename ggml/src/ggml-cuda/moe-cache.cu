@@ -4526,8 +4526,16 @@ static void moe_cache_session_enter_impl(void * opaque, bool guest) {
     }
     if (session->active_scopes == 0 && !guest) {
         // a graph starts: after prefill graphs (they lend), the first one that did not lend
-        // means generation has started
-        if (session->lent_in_last_graph) {
+        // means generation has started. Zones still lent here were the previous graph's too: a prefill graph after
+        // another keeps them without lending again (ggml_backend_sched_compute_splits); counted as lending, else the
+        // last ubatch armed the restoration and the generation's compute buffer borrow disarmed it before its start
+        bool zones_out = false;
+        for (const auto & device_ptr : session->devices) {
+            for (const auto & pool_ptr : device_ptr->pools) {
+                zones_out = zones_out || pool_ptr->zone_lent;
+            }
+        }
+        if (session->lent_in_last_graph || zones_out) {
             session->lent_since_evictions = true;
         } else if (session->lent_since_evictions) {
             // the restoration starts at this graph's first hosted layer (moe_hosted_plan): a prompt chunk too short to
