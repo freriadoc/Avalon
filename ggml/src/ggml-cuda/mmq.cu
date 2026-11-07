@@ -1,5 +1,23 @@
 #include "common.cuh"
 #include "mmq.cuh"
+
+// each expert's first column tile of width J in the compact MUL_MAT_ID grid (prefix[e]: tiles of the experts before e,
+// prefix[n]: all of them), from mm_ids_helper's row bounds; one thread: 512 experts in a few microseconds
+static __global__ void k_mmq_tile_prefix(const int32_t * __restrict__ bounds, const int n, const int J, int32_t * __restrict__ prefix) {
+    if (threadIdx.x != 0) {
+        return;
+    }
+    int t = 0;
+    for (int e = 0; e < n; ++e) {
+        prefix[e] = t;
+        t += (bounds[e + 1] - bounds[e] + J - 1) / J;
+    }
+    prefix[n] = t;
+}
+
+void ggml_cuda_mmq_tile_prefix(const int32_t * expert_bounds, int n_experts, int J, int32_t * prefix, cudaStream_t stream) {
+    k_mmq_tile_prefix<<<1, 32, 0, stream>>>(expert_bounds, n_experts, J, prefix);
+}
 #include "quantize.cuh"
 #include "mmid.cuh"
 #include "moe-cache.cuh"
@@ -451,7 +469,18 @@ void ggml_cuda_mul_mat_q(
         ne03, ne13, s03, s13, s3,
         ne12, J_best, ggml_cuda_moe_prefill_table(src0->data)};
 
-    ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
+    // the grid over the tiles that hold rows (mmq_tile_remap): each expert's first column tile for J_best, from the
+    // bounds mm_ids_helper wrote. GGML_CUDA_MMQ_COMPACT=0: every expert times the batch's tiles, as before
+    static const bool compact = !getenv("GGML_CUDA_MMQ_COMPACT") || atoi(getenv("GGML_CUDA_MMQ_COMPACT")) != 0;
+    ggml_cuda_pool_alloc<int32_t> tile_prefix(ctx.pool());
+    mmq_args args_c = args;
+    if (compact) {
+        tile_prefix.alloc(ne02 + 1);
+        ggml_cuda_mmq_tile_prefix(expert_bounds, (int) ne02, J_best, tile_prefix.get(), stream);
+        args_c.tile_prefix = tile_prefix.get();
+    }
+
+    ggml_cuda_mul_mat_q_switch_type(ctx, args_c, stream, prec_src1);
 }
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
