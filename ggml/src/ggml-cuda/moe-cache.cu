@@ -654,6 +654,7 @@ struct moe_cache_device {
     // EXPERT SPLIT (GGML_MOE_CACHE_EXPERT_SPLIT=1): the hosted rows this card planned, by where their expert was (here,
     // in another card's cache, nowhere), and its admissions sent to another card; the rows another card's plans found here
     long long split_local = 0, split_remote = 0, split_absent = 0, split_admit_away = 0, split_served = 0;
+    long long split_moved_away = 0;   // experts its dispatcher moved to another card
     long long zone_lends = 0;
     long long prefill_resident = 0;   // experts of prefetched tensors read in place
     long long prefill_streamed = 0;   // experts of prefetched tensors copied
@@ -3728,8 +3729,9 @@ static void moe_cache_log_stats(moe_cache_device & device) {
     const long long total = device.hits + device.misses;
     if (moe_cache_expert_split()) {
         MOE_CACHE_LOG("[moe-cache] CUDA%d expert split: planned rows here %lld, in another card's cache %lld, nowhere %lld; "
-                "admissions sent to another card %lld; rows other cards found here %lld\n", device.physical,
-                device.split_local, device.split_remote, device.split_absent, device.split_admit_away, device.split_served);
+                "admissions sent to another card %lld; experts moved to another card %lld; rows other cards found here %lld\n",
+                device.physical, device.split_local, device.split_remote, device.split_absent, device.split_admit_away,
+                device.split_moved_away, device.split_served);
     }
     MOE_CACHE_LOG("[moe-cache] CUDA%d hits=%lld/%lld (%.1f%%) used=%zu/%zu enqueued=%lld filled=%lld fill-fail=%lld evictions=%lld skips=%lld admission=%lld queue=%zu jobs/%zu MiB dispatch-fail=%lld collect-fail=%lld act-dedup=%lld cpu-overlap=%lld fusion=%lld/%lld pairs=%lld/%lld/%lld/%lld fusion-attempts=%lld fusion-nodes=%lld full-fusion=%lld/%lld down-mmv-dedicated=%lld bypass=%lld\n",
             device.physical, device.hits, total,
@@ -6569,6 +6571,11 @@ struct moe_hosted_layer {
     uint64_t * m_plank = nullptr;
     int8_t * h_src = nullptr;
     int8_t * m_src = nullptr;
+    // EXPERT SPLIT, the dispatcher: per other card, the rows of the experts moved to it (3 x rows each); its moved experts'
+    // flag is h_flags[34 + 8 k], raised by its fill thread when they arrived (split_pending_k copies left)
+    uint64_t * h_plan2k = nullptr;
+    uint64_t * m_plan2k = nullptr;
+    int split_pending_k[MOE_SPLIT_MAX_CARDS + 1] = {};
     uint32_t * d_expect = nullptr;  // sequence number of the layer's last publication
 };
 
@@ -6586,6 +6593,8 @@ struct moe_split_card {
     uint32_t * d_last = nullptr;      // per layer slot: the last publication it served
     uint32_t * d_seq = nullptr;       // the publication being served (the wait kernel -> the done kernel)
     uint64_t * d_plan = nullptr;      // 3 x rows entry addresses
+    uint64_t * d_plan2 = nullptr;     // the rows of the experts the dispatcher moved to this card
+    double rate = 13600.0;            // its link's copy rate, bytes per microsecond (moe_cache_pcie_bytes_per_us)
     int32_t * d_act_ids = nullptr;    // row -> token
     char * d_q8_act = nullptr;        // the activations as q8_1, quantized here as the hosting card does
     float * d_act = nullptr;          // the activations (F32, copied from the hosting card's mapped buffer)
@@ -7417,6 +7426,33 @@ static __global__ void k_split_card_wait(const volatile uint32_t * flag0, uint32
     }
 }
 
+// EXPERT SPLIT: the experts the dispatcher moved to this card arrived (its flag reached the publication): their rows' part of
+// the plan
+static __global__ void k_split_card_wait2(const volatile uint32_t * flag, const uint32_t * d_seq, const uint64_t * m_plan2,
+                                          uint64_t * d_plan2, int n_plan, volatile uint32_t * diag, int card) {
+    __shared__ uint32_t seq;
+    if (threadIdx.x == 0) {
+        seq = *d_seq;
+        const unsigned long long t0 = moe_tl_clock();
+        while ((int32_t) (*flag - seq) < 0) {
+            if (moe_tl_clock() - t0 > MOE_SPLIT_WAIT_BUDGET) {
+                if (diag && diag[0] == 0) {
+                    diag[1] = card; diag[2] = 0; diag[3] = seq; diag[4] = *flag;
+                    __threadfence_system();
+                    diag[0] = 3;
+                }
+                break;
+            }
+            ggml_cuda_poll_pause();
+        }
+        __threadfence_system();
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < n_plan; i += blockDim.x) {
+        d_plan2[i] = ((const volatile uint64_t *) m_plan2)[i];
+    }
+}
+
 // EXPERT SPLIT: this card's rows are in the hosting card's result buffer: its flag
 static __global__ void k_split_card_done(const uint32_t * d_seq, volatile uint32_t * flag) {
     __threadfence_system();
@@ -7441,24 +7477,29 @@ static __global__ void k_moe_hosted_merge(const uint32_t * d_expect, const volat
     if (threadIdx.x == 0) {
         expect = *d_expect;
         const unsigned long long t0 = tl ? moe_tl_clock() : 0;
-        // EXPERT SPLIT: a row of another card waits for that card's flag, the others for the CPU's
-        const int src = m_src ? m_src[row] : 0;
-        if (src > 0) {
-            flag = flags + 32 + 8 * src;
-        }
-        const unsigned long long tw = src > 0 && diag ? moe_tl_clock() : 0;
         while ((int32_t) (*flag - expect) < 0) {
-            if (src > 0 && diag && moe_tl_clock() - tw > MOE_SPLIT_WAIT_BUDGET) {
-                if (diag[0] == 0) {
-                    diag[1] = src; diag[2] = row; diag[3] = expect; diag[4] = *flag;
-                    __threadfence_system();
-                    diag[0] = 2;
-                }
-                break;
-            }
             moe_hosted_pause();
         }
         __threadfence_system();
+        // EXPERT SPLIT: a row of another card waits for that card's flag too; its producer is read after the CPU's flag,
+        // which the host raises after the dispatcher wrote the rows it moved to a card
+        const int src = m_src ? m_src[row] : 0;
+        if (src > 0) {
+            const volatile uint32_t * kflag = flags + 32 + 8 * src;
+            const unsigned long long tw = moe_tl_clock();
+            while ((int32_t) (*kflag - expect) < 0) {
+                if (diag && moe_tl_clock() - tw > MOE_SPLIT_WAIT_BUDGET) {
+                    if (diag[0] == 0) {
+                        diag[1] = src; diag[2] = row; diag[3] = expect; diag[4] = *kflag;
+                        __threadfence_system();
+                        diag[0] = 2;
+                    }
+                    break;
+                }
+                moe_hosted_pause();
+            }
+            __threadfence_system();
+        }
         if (tl) {
             tl[(expect % MOE_TL_RING) * 8 + 4] = t0;   // the merge reached (one of its waiting blocks)
             tl[(expect % MOE_TL_RING) * 8 + 2] = moe_tl_clock();
@@ -8043,9 +8084,22 @@ static bool moe_split_enabled() {
     return enabled;
 }
 
+// EXPERT SPLIT: the moved experts' flag of every card the dispatcher sent none to (its chain waits for it in every layer)
+static void moe_split_cards_release(moe_hosted_state * st, moe_hosted_layer * layer, uint32_t seq) {
+    for (const moe_split_card & card : st->split_cards) {
+        if (__atomic_load_n(&layer->split_pending_k[card.index], __ATOMIC_ACQUIRE) == 0) {
+            __atomic_store_n(&layer->h_flags[34 + 8 * card.index], seq, __ATOMIC_RELEASE);
+        }
+    }
+}
+
 static int moe_hosted_split(moe_hosted_state * st, moe_hosted_layer * layer, int rows, int n_tokens, uint32_t seq,
                             int32_t * cpu_rows, int n_cpu) {
+    if (!st->split_cards.empty() && layer->h_plan2k) {
+        memset(layer->h_plan2k, 0, (size_t) MOE_SPLIT_MAX_CARDS * 3 * rows * sizeof(uint64_t));
+    }
     if (!moe_split_enabled() || n_tokens < 2) {
+        moe_split_cards_release(st, layer, seq);
         return n_cpu;
     }
     st->split_tensors = 0;
@@ -8282,11 +8336,145 @@ static int moe_hosted_split(moe_hosted_state * st, moe_hosted_layer * layer, int
                 st->split_tensors = (packed ? 1 : MOE_ROLES) * (int) moved_experts.size();
                 session.cv.notify_all();
             }
+            // EXPERT SPLIT: the other cards as destinations, one expert at a time while one still ends the window sooner.
+            // A card's term: its resident rows, then the moved experts' copies over its own link one after another, their
+            // rows and the crossing of its rows through host memory (the same model's terms as card 0's)
+            if (!st->split_cards.empty() && layer->h_plan2k && layer->h_src && n_cpu > 0) {
+                const int ncard = (int) st->split_cards.size();
+                std::vector<bool> taken(c.size(), false);
+                for (int b : best) {
+                    taken[b] = true;
+                }
+                std::vector<int> krows(ncard + 1, 0), kmoved(ncard + 1, 0);
+                std::vector<double> karr(ncard + 1, 0.0), kend(ncard + 1, 0.0);
+                for (int row = 0; row < rows; row++) {
+                    const int src = layer->h_src[row];
+                    if (src > 0 && src <= ncard) {
+                        krows[src]++;
+                    }
+                }
+                const double cross_us = 10.0;   // a card's rows through host memory and its flag (tests/mgproto: ~18 us a layer)
+                const auto card_end = [&](int k, int moved_rows, double arrival) {
+                    const double before = krows[k] ? moe_split_gpu_before_us + moe_split_gpu_row_us * krows[k] : 0.0;
+                    if (moved_rows == 0) {
+                        return krows[k] ? before + cross_us : 0.0;
+                    }
+                    return std::max(before, arrival) + moe_split_gpu_moved_row_us * moved_rows + 2 * cross_us;
+                };
+                for (int k = 1; k <= ncard; k++) {
+                    kend[k] = card_end(k, 0, 0.0);
+                }
+                int moved0_rows = 0, moved0_tensors = 0;
+                double moved0_copies = 0.0;
+                for (int b : best) {
+                    if (std::find(moved_experts.begin(), moved_experts.end(), c[b].e) != moved_experts.end()) {
+                        moved0_rows += c[b].rows;
+                        moved0_tensors += c[b].tensors;
+                        moved0_copies += c[b].copies;
+                    }
+                }
+                const double arrival0 = moved0_tensors == 0 ? 0.0 : by_kernel && packed ? gpu_before + moved0_copies :
+                                        moe_split_copy_start_us + moved0_copies;
+                const double gpu0 = std::max(gpu_before, arrival0) + moe_split_gpu_after_us + moe_split_gpu_moved_row_us * moved0_rows;
+                int d_left = 0;
+                for (size_t i = 0; i < c.size(); i++) {
+                    d_left += !taken[i];
+                }
+                int tensors_all = moved0_tensors;
+                const auto window_now = [&](int d, int r, int t, int kk, double kk_end) {
+                    double w = std::max(cpu_time(d, r, t), gpu0);
+                    for (int k = 1; k <= ncard; k++) {
+                        w = std::max(w, k == kk ? kk_end : kend[k]);
+                    }
+                    return w;
+                };
+                double W = window_now(d_left, n_cpu, tensors_all, 0, 0.0);
+                for (;;) {
+                    int bi = -1, bk = -1;
+                    double bW = W - 1.0, b_end = 0.0, b_arr = 0.0;
+                    for (size_t i = 0; i < c.size(); i++) {
+                        if (taken[i] || c[i].slot >= 0) {
+                            continue;
+                        }
+                        for (int k = 1; k <= ncard; k++) {
+                            moe_cache_device & dk = *st->split_cards[k - 1].device;
+                            const int pik = moe_cache_pool_of(dk, key);
+                            if (pik < 0 || pik >= (int) dk.pools.size() || !dk.pools[pik]->slab ||
+                                    dk.pools[pik]->map.count(moe_cache_key{key, c[i].e})) {
+                                continue;
+                            }
+                            const double arr = karr[k] + moe_split_copy_start_us + dk.pools[pik]->expert_size / st->split_cards[k - 1].rate;
+                            const double end = card_end(k, kmoved[k] + c[i].rows, arr);
+                            const double w = window_now(d_left - 1, n_cpu - c[i].rows, tensors_all + c[i].tensors, k, end);
+                            if (w < bW) {
+                                bW = w; bi = (int) i; bk = k; b_end = end; b_arr = arr;
+                            }
+                        }
+                    }
+                    if (bi < 0) {
+                        break;
+                    }
+                    taken[bi] = true;
+                    // the admission to card bk, its copy first in that card's fill queue, its rows to that card
+                    moe_split_card & card = st->split_cards[bk - 1];
+                    moe_cache_device & dk = *card.device;
+                    const int pik = moe_cache_pool_of(dk, key);
+                    moe_cache_pool & pk = *dk.pools[pik];
+                    int inserts_left = 1;
+                    bool wake = false;
+                    uint16_t freq = 0;
+                    if (session.config.lfu) {
+                        const auto d = device.demand_count.find(moe_cache_key{key, c[bi].e});
+                        freq = d != device.demand_count.end() ? d->second.count : 0;
+                    }
+                    const bool deferring = dk.deferring;
+                    dk.deferring = false;
+                    const bool ok = moe_cache_enqueue_locked(session, dk, pk, pik, key, c[bi].e, pk.expert_size, inserts_left,
+                                                             wake, true, false, false, freq);
+                    dk.deferring = deferring;
+                    if (!ok) {
+                        continue;   // no entry for it there: it stays on the CPU rows
+                    }
+                    moe_cache_job job = dk.queue.back();
+                    dk.queue.pop_back();
+                    job.split_flag = layer->h_flags + 34 + 8 * card.index;
+                    job.split_pending = &layer->split_pending_k[card.index];
+                    job.split_seq = seq;
+                    __atomic_add_fetch(&layer->split_pending_k[card.index], 1, __ATOMIC_ACQ_REL);
+                    dk.queue.push_front(job);
+                    pk.slots[job.slot].readers++;
+                    st->pins.push_back({&pk, job.slot});
+                    const uint64_t entry = moe_cache_entry_addr(pk, job.slot);
+                    uint64_t * plan2k = layer->h_plan2k + (size_t) (card.index - 1) * 3 * rows;
+                    int left = 0;
+                    for (int j = 0; j < n_cpu; j++) {
+                        const int row = cpu_rows[j];
+                        if (layer->h_ids[row] == c[bi].e) {
+                            for (int r = 0; r < MOE_ROLES; r++) {
+                                plan2k[r * rows + row] = entry + pk.role_offset[r];
+                            }
+                            layer->h_src[row] = (int8_t) card.index;
+                        } else {
+                            cpu_rows[left++] = row;
+                        }
+                    }
+                    n_cpu = left;
+                    d_left--;
+                    tensors_all += c[bi].tensors;
+                    karr[bk] = b_arr;
+                    kmoved[bk] += c[bi].rows;
+                    kend[bk] = b_end;
+                    W = bW;
+                    device.split_moved_away++;
+                    session.cv.notify_all();
+                }
+            }
         }
     }
     if (jobs == 0) {
         __atomic_store_n(&layer->h_flags[24], seq, __ATOMIC_RELEASE);
     }
+    moe_split_cards_release(st, layer, seq);
     return n_cpu;
 }
 
@@ -9207,7 +9395,8 @@ static moe_hosted_layer * moe_hosted_register(moe_hosted_state & st, moe_cache_d
     layer->h_plan2 = st.h_plan2;
     layer->d_plan = st.d_plan;
     layer->d_plan2 = st.d_plan2;
-    bool ok = moe_hosted_host_alloc((void **) &layer->h_flags, 256) &&
+    bool ok = moe_hosted_host_alloc((void **) &layer->h_flags, 512) &&
+              moe_hosted_host_alloc((void **) &layer->h_plan2k, (size_t) MOE_SPLIT_MAX_CARDS * 3 * rows * sizeof(uint64_t)) &&
               moe_hosted_host_alloc((void **) &layer->h_plank, (size_t) MOE_SPLIT_MAX_CARDS * 3 * rows * sizeof(uint64_t)) &&
               moe_hosted_host_alloc((void **) &layer->h_src, (size_t) rows) &&
               moe_hosted_host_alloc((void **) &layer->h_pred, (2 + rows) * sizeof(int32_t)) &&
@@ -9220,7 +9409,8 @@ static moe_hosted_layer * moe_hosted_register(moe_hosted_state & st, moe_cache_d
          (layer->m_flags = moe_hosted_device_ptr(layer->h_flags)) && (layer->m_pred = moe_hosted_device_ptr(layer->h_pred)) &&
          (layer->m_plan2 = moe_hosted_device_ptr(layer->h_plan2)) && (layer->m_chk = moe_hosted_device_ptr(layer->h_chk)) &&
          (layer->m_fetch = moe_hosted_device_ptr(layer->h_fetch)) &&
-         (layer->m_plank = moe_hosted_device_ptr(layer->h_plank)) && (layer->m_src = moe_hosted_device_ptr(layer->h_src));
+         (layer->m_plank = moe_hosted_device_ptr(layer->h_plank)) && (layer->m_src = moe_hosted_device_ptr(layer->h_src)) &&
+         (layer->m_plan2k = moe_hosted_device_ptr(layer->h_plan2k));
     ok = ok && cudaMalloc((void **) &layer->d_fetch, (1 + 3 * MOE_SPLIT_FETCH_MAX) * sizeof(uint64_t)) == cudaSuccess &&
          cudaMemset(layer->d_fetch, 0, sizeof(uint64_t)) == cudaSuccess &&
          cudaMalloc((void **) &layer->d_act_ids, rows * sizeof(int32_t)) == cudaSuccess &&
@@ -9451,6 +9641,7 @@ static void moe_split_cards_create(moe_cache_session & session, moe_hosted_state
             cudaMemset(card.d_last, 0, MOE_SPLIT_MAX_SLOTS * sizeof(uint32_t)) == cudaSuccess &&
             cudaMalloc((void **) &card.d_seq, sizeof(uint32_t)) == cudaSuccess &&
             cudaMalloc((void **) &card.d_plan, (size_t) 3 * rows * sizeof(uint64_t)) == cudaSuccess &&
+            cudaMalloc((void **) &card.d_plan2, (size_t) 3 * rows * sizeof(uint64_t)) == cudaSuccess &&
             cudaMalloc((void **) &card.d_act_ids, rows * sizeof(int32_t)) == cudaSuccess &&
             cudaMemcpy(card.d_act_ids, act_ids.data(), rows * sizeof(int32_t), cudaMemcpyHostToDevice) == cudaSuccess &&
             cudaMalloc((void **) &card.d_q8_act, (size_t) tokens * (padded_embd / QK8_1) * sizeof(block_q8_1)) == cudaSuccess &&
@@ -9469,8 +9660,16 @@ static void moe_split_cards_create(moe_cache_session & session, moe_hosted_state
                 GGML_ABORT("EXPERT SPLIT: diagnostic word allocation failed");
             }
         }
+        {
+            std::string desc;
+            const double rate = moe_cache_pcie_bytes_per_us(card.device->physical, desc);
+            if (rate > 0.0) {
+                card.rate = rate;
+            }
+        }
         MOE_CACHE_LOG("[moe-cache] CUDA%d expert split: device %d computes the rows of its cache for device %d's blocks "
-                "(card %d)\n", card.device->physical, card.device->logical, host.logical, card.index);
+                "(card %d, %.1f GB/s for a copy)\n", card.device->physical, card.device->logical, host.logical, card.index,
+                card.rate / 1000.0);
         st.split_cards.push_back(card);
         if (g_split_capture_owner && g_split_capture_device == host.logical) {
             moe_split_capture_card(card);   // made during a capture of the hosting card's graph
@@ -9732,6 +9931,17 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
                                        (int64_t) rows * n_ff, padded_ff, rows, 1, 1, card.stream);
             }
             ggml_cuda_moe_cache_mmv(down->src[0]->type, card.d_q8_mid, card.d_plan + 2 * rows, nullptr, layer->m_res, n_ff,
+                                    n_embd, rows, rows, card.stream, nullptr, (int) n_tokens);
+            // the experts the dispatcher moved to this card, once copied (the flag comes without any)
+            k_split_card_wait2<<<1, 256, 0, card.stream>>>(layer->m_flags + 34 + 8 * card.index, card.d_seq,
+                                                           layer->m_plan2k + (size_t) (card.index - 1) * 3 * rows, card.d_plan2,
+                                                           3 * rows, st->m_split_diag, card.index);
+            ggml_cuda_moe_cache_mmv_fused(wtype, card.d_q8_act, card.d_plan2, card.d_plan2 + rows, card.d_act_ids, card.d_glu,
+                                          n_embd, n_ff, rows, n_tokens, -INFINITY, INFINITY, -INFINITY, INFINITY,
+                                          card.stream, nullptr, 0, nullptr, nullptr, (int) n_tokens);
+            quantize_row_q8_1_cuda(card.d_glu, nullptr, card.d_q8_mid, wtype, n_ff, n_ff, (int64_t) rows * n_ff,
+                                   (int64_t) rows * n_ff, padded_ff, rows, 1, 1, card.stream);
+            ggml_cuda_moe_cache_mmv(down->src[0]->type, card.d_q8_mid, card.d_plan2 + 2 * rows, nullptr, layer->m_res, n_ff,
                                     n_embd, rows, rows, card.stream, nullptr, (int) n_tokens);
             k_split_card_done<<<1, 1, 0, card.stream>>>(card.d_seq, layer->m_flags + 32 + 8 * card.index);
             CUDA_CHECK(cudaGetLastError());
