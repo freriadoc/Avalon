@@ -279,6 +279,13 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
         ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 4>(ctx, dst);
         return;
     }
+    // the same for a q8_0 / q4_0 K/V gathered as it is (ggml_cuda_flash_attn_ext_mma_f16_kv_quant_sparse): the node's
+    // allocation left out the f16 copy of the K/V on that promise (ggml_cuda_flash_attn_ext_get_alloc_size). With the 8
+    // below the launch converted the K/V past the node's bytes (NVIDIA, a ratio of 12: all-NaN attention from 64k cells)
+    if (ggml_cuda_flash_attn_ext_mma_f16_kv_quant_sparse(cc, dst)) {
+        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 4>(ctx, dst);
+        return;
+    }
 
     // On Volta the GQA optimizations aren't as impactful vs. minimizing wasted compute:
     if (cc == GGML_CUDA_CC_VOLTA) {
