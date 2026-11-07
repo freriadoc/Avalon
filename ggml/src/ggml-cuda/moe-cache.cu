@@ -256,14 +256,14 @@ struct moe_cache_pool {
 
     std::vector<moe_cache_kv_range> kv;   // KV tails lent to this pool
 
-    // BANDS (moe_cache_allocate_banded): the pools of a device share one slab cut into bands of band_bytes, each band
-    // holding band_per entries of every pool at band_off; slot s of range 0 sits in band s / band_per. A run of bands
-    // is a run of slots in every pool, at its tail: zones and loans take whole bands, from every expert shape alike.
+    // BANDS (moe_cache_allocate_banded): the pools of a device share one slab cut into bands of band_bytes, every band
+    // holding entries of every pool (as many as keep each pool at its share of the slab, so the counts differ from band
+    // to band; a band's last entry may run into the next). A run of bands is a run of slots in every pool, at its tail:
+    // zones and loans take whole bands, from every expert shape alike.
     char * band_base = nullptr;
     size_t band_bytes = 0;
-    size_t band_off = 0;
-    int band_per = 0;
-    int band_slots = 0;   // band_per x the device's bands
+    std::vector<char *> band_ptr;   // per slot of the bands: its address, increasing
+    int band_slots = 0;             // the slots of the bands
     std::vector<uint8_t> band_refs;   // per slot of the bands: the loans covering it (an entry astride two loans: 2)
 };
 
@@ -278,8 +278,7 @@ static inline int32_t moe_cache_gpu_index(const moe_cache_pool & pool, int index
 
 static inline char * moe_cache_slot_ptr(const moe_cache_pool & pool, int index) {
     if (index < pool.band_slots) {
-        return pool.band_base + (size_t)(index / pool.band_per) * pool.band_bytes + pool.band_off +
-               (size_t)(index % pool.band_per) * pool.expert_size;
+        return pool.band_ptr[(size_t)index];
     }
     return pool.gpu_base + (size_t)moe_cache_gpu_index(pool, index) * pool.expert_size;
 }
@@ -2761,28 +2760,15 @@ static void moe_cache_band_room(const moe_cache_device & device, size_t & free_b
 // starts before a or ends after b included)
 static void moe_cache_band_slots(const moe_cache_pool & pool, size_t a, size_t b, int & s0, int & s1) {
     s0 = s1 = 0;
-    if (!pool.band_per || b <= a) {
+    if (pool.band_ptr.empty() || b <= a) {
         return;
     }
-    const size_t es = pool.expert_size, seg = (size_t)pool.band_per * es;
-    const size_t ca = a / pool.band_bytes, oa = a % pool.band_bytes;
-    // the first slot: in a's band, the entry holding oa (or the first of the segment if oa is before it); past the
-    // segment, the first of the next band
-    if (oa < pool.band_off) {
-        s0 = (int)ca * pool.band_per;
-    } else if (oa - pool.band_off < seg) {
-        s0 = (int)ca * pool.band_per + (int)((oa - pool.band_off) / es);
-    } else {
-        s0 = (int)(ca + 1) * pool.band_per;
-    }
-    // one past the last: in the band of b - 1, the entries starting before b's offset there
-    const size_t cb = (b - 1) / pool.band_bytes, ob = b - cb * pool.band_bytes;   // ob in (0, band_bytes]
-    int j1 = 0;
-    if (ob > pool.band_off) {
-        j1 = (int)std::min<size_t>((size_t)pool.band_per, (ob - pool.band_off + es - 1) / es);
-    }
-    s1 = (int)cb * pool.band_per + j1;
-    s1 = std::min(s1, pool.band_slots);
+    const char * pa = pool.band_base + a, * pb = pool.band_base + b;
+    const size_t es = pool.expert_size;
+    // the first entry ending after a, and the first starting at b or later
+    s0 = (int)(std::upper_bound(pool.band_ptr.begin(), pool.band_ptr.end(), pa,
+                                [es](const char * at, const char * e) { return at < e + es; }) - pool.band_ptr.begin());
+    s1 = (int)(std::lower_bound(pool.band_ptr.begin(), pool.band_ptr.end(), pb) - pool.band_ptr.begin());
     if (s1 < s0) {
         s1 = s0;
     }
@@ -2833,45 +2819,91 @@ static void moe_cache_band_release(moe_cache_device & device, size_t a, size_t b
     }
 }
 
-// BANDS: the shapes' pools in one slab of bands. Each band holds a whole number of entries of every shape, in proportion
-// to its weight (entry size x experts, as the pools' budgets), the band's tail filled with the smallest entries that fit:
-// what stays is lost for good (~0.7 % at 128 MiB). A run of bands is then a run of slots at the same place in every
-// pool, so a loan of any size up to the slab takes from every shape alike and finds one contiguous piece.
+// BANDS: where the entries of each shape sit in the slab (offsets, increasing): each shape's share of the slab in
+// proportion to its weight (entry size x experts, as the pools' budgets), band after band the whole number that keeps its
+// running count closest to that share (a band holds 1.35 entries of a small shape: 1 or 2 by turns), the band's tail
+// given to the shapes furthest behind it (the smallest entries, given every tail, would grow past their share). A band
+// may end up to one entry into the next (the last one within the slab): nothing is lost between bands. A shape that
+// gets no entry: false.
+static bool moe_cache_band_layout(const std::vector<moe_cache_shape *> & shapes, size_t band, int n_bands,
+        std::vector<std::vector<size_t>> & offs) {
+    const size_t n = shapes.size();
+    long double total = 0.0;
+    size_t largest = 0;
+    for (const moe_cache_shape * sh : shapes) {
+        total += (long double)sh->expert_size * (long double)sh->n_entries;
+        largest = std::max(largest, sh->expert_size);
+    }
+    std::vector<long double> share(n);   // entries per band
+    for (size_t i = 0; i < n; i++) {
+        share[i] = (long double)band * (long double)shapes[i]->n_entries / total;
+    }
+    offs.assign(n, {});
+    std::vector<long long> have(n, 0);
+    size_t at = 0;   // where the next band's entries start (past the band's beginning when the previous one ran over)
+    for (int c = 0; c < n_bands; c++) {
+        // the band's entries end at most one entry past its end (the last band's within the slab)
+        const size_t room = (size_t)(c + 1) * band + (c + 1 < n_bands ? largest : 0) - at;
+        std::vector<long long> k(n);
+        size_t used = 0;
+        for (size_t i = 0; i < n; i++) {
+            k[i] = std::max<long long>(0, (long long)(share[i] * (long double)(c + 1)) - have[i]);
+            used += (size_t)k[i] * shapes[i]->expert_size;
+        }
+        // behind (> 0) or ahead (< 0) of its share after this band, in its own entries per band
+        auto lag = [&](size_t i) { return (share[i] * (long double)(c + 1) - (long double)(have[i] + k[i])) / share[i]; };
+        while (used > room) {
+            size_t best = n;
+            for (size_t i = 0; i < n; i++) {
+                if (k[i] > 0 && (best == n || lag(i) < lag(best))) {
+                    best = i;
+                }
+            }
+            k[best]--;
+            used -= shapes[best]->expert_size;
+        }
+        for (;;) {
+            size_t best = n;
+            for (size_t i = 0; i < n; i++) {
+                if (used + shapes[i]->expert_size <= room && lag(i) > 0 && (best == n || lag(i) > lag(best))) {
+                    best = i;
+                }
+            }
+            if (best == n) {
+                break;
+            }
+            k[best]++;
+            used += shapes[best]->expert_size;
+        }
+        for (size_t i = 0; i < n; i++) {
+            for (long long j = 0; j < k[i]; j++) {
+                offs[i].push_back(at);
+                at += shapes[i]->expert_size;
+            }
+            have[i] += k[i];
+        }
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (have[i] <= 0 || have[i] > INT_MAX / 2) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// BANDS: the shapes' pools in one slab of bands, each band holding whole entries of every shape (moe_cache_band_layout):
+// what stays at a band's tail is lost for good (~0.7 % at 128 MiB). A run of bands is then a run of slots at the same
+// place in every pool, so a loan of any size up to the slab takes from every shape alike and finds one contiguous piece.
 static bool moe_cache_allocate_banded(moe_cache_session & session, moe_cache_device & device,
         const std::vector<moe_cache_shape *> & shapes, size_t budget) {
     const size_t band = moe_cache_band_bytes();
     if (!band || shapes.empty()) {
         return false;
     }
-    long double total = 0.0;
     for (const moe_cache_shape * sh : shapes) {
         if (sh->expert_size == 0 || sh->n_layers <= 0 || sh->n_entries == 0 || ggml_type_is_exl3((ggml_type)sh->role_type[MOE_ROLE_GATE]) ||
                 sh->expert_size > band) {
             return false;
-        }
-        total += (long double)sh->expert_size * (long double)sh->n_entries;
-    }
-    std::vector<int> per(shapes.size());
-    size_t used = 0;
-    for (size_t i = 0; i < shapes.size(); i++) {
-        const long double weight = (long double)shapes[i]->expert_size * (long double)shapes[i]->n_entries;
-        per[i] = (int)((long double)band * weight / total / (long double)shapes[i]->expert_size);
-        used += (size_t)per[i] * shapes[i]->expert_size;
-    }
-    std::vector<size_t> by_size(shapes.size());
-    for (size_t i = 0; i < shapes.size(); i++) {
-        by_size[i] = i;
-    }
-    std::sort(by_size.begin(), by_size.end(), [&](size_t a, size_t b) { return shapes[a]->expert_size < shapes[b]->expert_size; });
-    for (size_t i : by_size) {
-        while (used + shapes[i]->expert_size <= band) {
-            per[i]++;
-            used += shapes[i]->expert_size;
-        }
-    }
-    for (int p : per) {
-        if (p <= 0) {
-            return false;   // a band too small for a share of every shape
         }
     }
     int n_bands = (int)std::min<size_t>(budget / band, INT_MAX / 2);
@@ -2889,18 +2921,23 @@ static bool moe_cache_allocate_banded(moe_cache_session & session, moe_cache_dev
         MOE_CACHE_LOG("[moe-cache] CUDA%d banded slab refused: a slab per pool\n", device.physical);
         return false;
     }
+    std::vector<std::vector<size_t>> offs;
+    if (!moe_cache_band_layout(shapes, band, n_bands, offs)) {
+        (void)cudaFree(slab);
+        return false;   // a band too small for a share of every shape
+    }
     const size_t allocated = (size_t)n_bands * band;
     moe_cache_budget_allocation(device, allocated, true);
     device.band_slab = slab;
     device.band_bytes = band;
     device.n_bands = n_bands;
     device.band_zone_begin = (size_t)n_bands * band;
-    size_t off = 0;
+    size_t placed = 0;
     for (size_t i = 0; i < shapes.size(); i++) {
         moe_cache_shape & shape = *shapes[i];
         shape.finished = true;
         std::unique_ptr<moe_cache_pool> pool(new moe_cache_pool());
-        const int slot_count = per[i] * n_bands;
+        const int slot_count = (int)offs[i].size();
         pool->expert_size = moe_cache_entry_layout(shape.role_bytes, shape.role_pad, pool->role_offset);
         for (int r = 0; r < MOE_ROLES; r++) {
             pool->role_bytes[r] = shape.role_bytes[r];
@@ -2916,8 +2953,11 @@ static bool moe_cache_allocate_banded(moe_cache_session & session, moe_cache_dev
         pool->covers_all_entries = (uint64_t)slot_count >= shape.n_entries;
         pool->band_base = slab;
         pool->band_bytes = band;
-        pool->band_off = off;
-        pool->band_per = per[i];
+        pool->band_ptr.resize((size_t)slot_count);
+        for (int j = 0; j < slot_count; j++) {
+            pool->band_ptr[(size_t)j] = slab + offs[i][(size_t)j];
+        }
+        placed += (size_t)slot_count * pool->expert_size;
         pool->band_slots = slot_count;
         pool->band_refs.assign((size_t)slot_count, 0);
         pool->slots.resize(slot_count);
@@ -2926,18 +2966,17 @@ static bool moe_cache_allocate_banded(moe_cache_session & session, moe_cache_dev
         for (int index = slot_count - 1; index >= 0; index--) {
             pool->free_slots.push_back(index);   // the low bands fill first, the tail (lent first) last
         }
-        off += (size_t)per[i] * pool->expert_size;
         device.pools.push_back(std::move(pool));
         shape.pool = (int)device.pools.size() - 1;
-        MOE_CACHE_LOG("[moe-cache] CUDA%d pool[%d]: experts %s/%s/%s (up/gate/down) entry=%zu KiB slots=%d (%d a band) experts=%llu coverage=%s total=%zu MiB\n",
+        MOE_CACHE_LOG("[moe-cache] CUDA%d pool[%d]: experts %s/%s/%s (up/gate/down) entry=%zu KiB slots=%d (%.2f a band) experts=%llu coverage=%s total=%zu MiB\n",
                 device.physical, shape.pool, ggml_type_name((ggml_type)shape.role_type[MOE_ROLE_UP]),
                 ggml_type_name((ggml_type)shape.role_type[MOE_ROLE_GATE]), ggml_type_name((ggml_type)shape.role_type[MOE_ROLE_DOWN]),
-                shape.expert_size >> 10, slot_count, per[i], (unsigned long long)shape.n_entries,
+                shape.expert_size >> 10, slot_count, (double)slot_count / n_bands, (unsigned long long)shape.n_entries,
                 device.pools.back()->covers_all_entries ? "complete" : "partial", ((size_t)slot_count * shape.expert_size) >> 20);
     }
     device.allocated_bytes += allocated;
-    MOE_CACHE_LOG("[moe-cache] CUDA%d banded slab: %d bands of %zu MiB (%zu MiB), %zu KiB of each band unused (%.2f %%)\n",
-            device.physical, n_bands, band >> 20, allocated >> 20, (band - off) >> 10, 100.0 * (double)(band - off) / (double)band);
+    MOE_CACHE_LOG("[moe-cache] CUDA%d banded slab: %d bands of %zu MiB (%zu MiB), %zu KiB unused (%.2f %%)\n",
+            device.physical, n_bands, band >> 20, allocated >> 20, (allocated - placed) >> 10, 100.0 * (double)(allocated - placed) / (double)allocated);
     if (!moe_cache_start_worker(session, device)) {
         GGML_ABORT("moe-cache: the fill worker did not start");
     }
@@ -4322,7 +4361,7 @@ static void moe_cache_free_device(moe_cache_device & device) {
         cudaStreamSynchronize(device.compute_stream);
     }
     for (auto & pool_ptr : device.pools) {
-        if (pool_ptr->slab && pool_ptr->band_per) {
+        if (pool_ptr->slab && pool_ptr->band_slots) {
             pool_ptr->slab = nullptr;   // BANDS: the device's slab, freed below
         } else if (pool_ptr->slab) {
             cudaFree(pool_ptr->slab);
@@ -5194,7 +5233,7 @@ static void moe_cache_setup_zone(moe_cache_device & device, size_t zone_bytes, i
         device.band_zone_begin = total - (size_t)zones * slot;
         for (auto & pool_ptr : device.pools) {
             moe_cache_pool & pool = *pool_ptr;
-            if (!pool.band_per || zones == 0) {
+            if (!pool.band_slots || zones == 0) {
                 continue;
             }
             int s0, s1;
@@ -6482,7 +6521,7 @@ static int moe_cache_lend(void * opaque, void * backend, size_t bytes, void ** z
     if (banded && device->band_zone_bytes >= bytes) {
         band_ready = true;
         for (auto & pool_ptr : device->pools) {
-            if (pool_ptr->band_per && pool_ptr->zone_lent) {
+            if (pool_ptr->band_slots && pool_ptr->zone_lent) {
                 band_ready = false;
             }
         }
@@ -6512,7 +6551,7 @@ static int moe_cache_lend(void * opaque, void * backend, size_t bytes, void ** z
         return 0;
     }
     for (auto & pool_ptr : device->pools) {
-        if (std::find(chosen.begin(), chosen.end(), pool_ptr.get()) == chosen.end() && !(banded && pool_ptr->band_per)) {
+        if (std::find(chosen.begin(), chosen.end(), pool_ptr.get()) == chosen.end() && !(banded && pool_ptr->band_slots)) {
             continue;
         }
         for (const moe_cache_slot & slot : pool_ptr->slots) {
@@ -6809,7 +6848,7 @@ static void * moe_cache_borrow(void * opaque, void * backend, size_t bytes) {
         }
         for (auto & pool_ptr : device->pools) {
             for (const moe_cache_slot & slot : pool_ptr->slots) {
-                if (pool_ptr->band_per && slot.readers > 0) {
+                if (pool_ptr->band_slots && slot.readers > 0) {
                     MOE_CACHE_LOG("[moe-cache] CUDA%d borrow refused: expert still being read\n", device->physical);
                     return nullptr;
                 }
@@ -7024,7 +7063,7 @@ static void moe_cache_restore(void * opaque, void * backend) {
     // BANDS: the zones' byte range back, a slot astride a loan staying out until that loan returns
     bool band_lent = false;
     for (auto & pool_ptr : device->pools) {
-        if (pool_ptr->band_per && pool_ptr->zone_lent) {
+        if (pool_ptr->band_slots && pool_ptr->zone_lent) {
             band_lent = true;
             pool_ptr->zone_lent = false;
         }
