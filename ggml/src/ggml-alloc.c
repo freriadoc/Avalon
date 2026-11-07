@@ -532,6 +532,10 @@ struct ggml_gallocr {
     int * plan_buffer;
     const struct ggml_tensor ** plan_tensor; // the tensor that opened each block (GGML_ALLOC_PLAN_DUMP)
     int plan_n, plan_cap;
+    // the blocks a node frees, ended only after the next node's allocations: a fusion of two nodes writes the second's
+    // output while it reads the first's inputs (the QSA gather and its cast to f16 over the selected indices)
+    int * plan_defer;
+    int plan_defer_n, plan_defer_cap;
     // the last plans, reused when a reservation records the same blocks (the graph shapes alternate: the plan of a
     // prefill graph took 15 ms, redone at every change of phase)
     struct ggml_alloc_plan_memo {
@@ -595,6 +599,7 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
     free(galloc->plan_blocks);
     free(galloc->plan_buffer);
     free(galloc->plan_tensor);
+    free(galloc->plan_defer);
     for (int m = 0; m < 8; m++) {
         free(galloc->plan_memo[m].blocks);
     }
@@ -797,10 +802,23 @@ static void ggml_gallocr_free_node(ggml_gallocr_t galloc, struct ggml_tensor * n
 #endif
 
     if (galloc->plan_rec && hn->block > 0) {
-        galloc->plan_blocks[hn->block - 1].t1 = galloc->plan_tick++;
+        if (galloc->plan_defer_n == galloc->plan_defer_cap) {
+            galloc->plan_defer_cap = galloc->plan_defer_cap ? 2*galloc->plan_defer_cap : 256;
+            galloc->plan_defer = (int *) realloc(galloc->plan_defer, galloc->plan_defer_cap*sizeof(int));
+            GGML_ASSERT(galloc->plan_defer);
+        }
+        galloc->plan_defer[galloc->plan_defer_n++] = hn->block - 1;
     }
     ggml_dyn_tallocr_free_bytes(alloc, hn->addr, size);
     hn->allocated = false;
+}
+
+// the blocks deferred by ggml_gallocr_free_node end now
+static void ggml_gallocr_plan_end_deferred(ggml_gallocr_t galloc) {
+    for (int k = 0; k < galloc->plan_defer_n; k++) {
+        galloc->plan_blocks[galloc->plan_defer[k]].t1 = galloc->plan_tick++;
+    }
+    galloc->plan_defer_n = 0;
 }
 
 static int get_node_buffer_id(const int * node_buffer_ids, int i) {
@@ -816,6 +834,7 @@ static bool ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
     memset(galloc->hash_values, 0, sizeof(struct hash_node) * galloc->hash_set.size);
     galloc->plan_n    = 0;
     galloc->plan_tick = 0;
+    galloc->plan_defer_n = 0;
 
     // allocate leafs
     // these may be tensors that the application is not using in the graph, but may still want to allocate for other purposes
@@ -894,6 +913,8 @@ static bool ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
 
         // allocate node
         ggml_gallocr_allocate_node(galloc, node, buffer_id);
+        // what the previous node freed ends after this node's output: they never share an address
+        ggml_gallocr_plan_end_deferred(galloc);
 
         AT_PRINTF("exec: %s (%s) <= ", ggml_op_desc(node), node->name);
         for (int j = 0; j < GGML_MAX_SRC; j++) {
@@ -938,6 +959,7 @@ static bool ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
             AT_PRINTF("\n");
         }
     }
+    ggml_gallocr_plan_end_deferred(galloc);
     return kept_leafs;
 }
 
