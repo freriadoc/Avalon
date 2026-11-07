@@ -162,6 +162,7 @@ struct llama_context {
     // the buffers between the stages, for ubatches of up to n_rows tokens: a prefill's taken from the MoE caches of the
     // two devices (as the compute buffers are), a few rows otherwise; false when they cannot be allocated
     bool stage_buffers(uint32_t n_rows);
+    void stage_ubatch_for(uint32_t n_tokens);   // LLAMA_STAGES_FULL_UBATCH_FROM: this batch's ubatch, reserved again on a change
     bool stage_step(ggml_tensor * out, uint32_t & n_tokens);
     void stage_end();
 
@@ -324,6 +325,8 @@ private:
     ggml_backend_buffer_ptr stage_buf_out[2];
     ggml_backend_buffer_ptr stage_buf_in[2];
     uint32_t stage_rows = 0;   // the ubatch size the buffers hold
+    uint32_t stage_ub_half = 0;   // pipeline stages: the ubatch they split a batch into (the requested one halved)
+    uint32_t stage_ub_full = 0;   // and the requested one (LLAMA_STAGES_FULL_UBATCH_FROM)
     // the stage buffers each kept graph was built with (process_ubatch reuses a graph for the same ones only)
     std::map<const void *, std::pair<const ggml_tensor *, const ggml_tensor *>> stage_graph_bufs;
     ggml_tensor * stage_out[2] = { nullptr, nullptr };

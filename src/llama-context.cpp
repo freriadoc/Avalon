@@ -154,6 +154,13 @@ struct llama_memory_stage_pair : public llama_memory_i {
     }
 };
 
+// pipeline stages: LLAMA_STAGES_FULL_UBATCH_FROM=N (tokens; 0 / unset: the ubatch always halved, as before)
+static uint32_t llama_stage_full_ubatch_from() {
+    static const uint32_t v = getenv("LLAMA_STAGES_FULL_UBATCH_FROM") ? (uint32_t) atoll(getenv("LLAMA_STAGES_FULL_UBATCH_FROM")) : 0;
+    return v;
+}
+
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -192,7 +199,12 @@ llama_context::llama_context(
                 // 1 487 - 1 504 -> 1 601 - 1 613 t/s, 60k and 120k equal (2 x A4000). Each ubatch copies the experts of
                 // its stage's layers only, so the halving does not double one card's copies
                 const uint32_t n_ub = params.n_ubatch == 0 ? params.n_batch : std::min(params.n_batch, params.n_ubatch);
+                // LLAMA_STAGES_FULL_UBATCH_FROM=N: the requested ubatch kept (graphs reserved at it) and halved per batch
+                // only for a batch of fewer than N tokens (llama_stage_ubatch): a long prompt fills the pipeline once,
+                // its bubble is small, and a whole ubatch copies each GPU's experts half as often per token
                 params.n_ubatch = n_ub > 512 ? std::max<uint32_t>(512, n_ub / 2) : n_ub;
+                stage_ub_half = params.n_ubatch;
+                stage_ub_full = n_ub;
                 // a batch as large as the context: the stages overlap within one decode only, each call fills and drains
                 // the pipeline. 120k at batches of 38144 (4 calls) 1 451 t/s, 65536 (2) 1 549, 131072 (1) 1 600; 60k
                 // 1 649 -> 1 768 (2 x A4000)
@@ -541,6 +553,8 @@ llama_context::llama_context(
             pf.embeddings   = false;
             pf.ctx_other    = nullptr;
             stage_first.reset(new llama_context(model, pf));
+            stage_first->stage_ub_half = stage_ub_half;
+            stage_first->stage_ub_full = stage_ub_full;
             memory.reset(new llama_memory_stage_pair(std::move(memory), stage_first->memory.get()));
 
             // the buffers between the stages are made by each decode for its ubatches (stage_buffers): none during the
@@ -2197,6 +2211,7 @@ int llama_context::stage_begin(const llama_batch_ext & batch_inp, const std::vec
     balloc->set_breaks(std::vector<int32_t>(breaks));
     stage_n_left = balloc->get_n_tokens();
 
+    stage_ubatch_for(balloc->get_n_tokens());
     sched_reserve();
     memory_update(false);
 
@@ -2209,6 +2224,22 @@ int llama_context::stage_begin(const llama_batch_ext & batch_inp, const std::vec
     }
     stage_more = true;
     return 0;
+}
+
+// pipeline stages, LLAMA_STAGES_FULL_UBATCH_FROM=N: the ubatch of a batch of n_tokens, half the requested one below N
+// tokens (as without it: the same graphs, reserved at that size), the requested one from N on; a change of size
+// reserves the graphs again before the batch (once per change: a long prompt after short ones, and back)
+void llama_context::stage_ubatch_for(uint32_t n_tokens) {
+    const uint32_t from = llama_stage_full_ubatch_from();
+    if (!from || !stage_ub_full || stage_ub_full == stage_ub_half) {
+        return;
+    }
+    const uint32_t want = n_tokens >= from ? stage_ub_full : stage_ub_half;
+    if (cparams.n_ubatch != want) {
+        LLAMA_LOG_INFO("%s: pipeline stage ubatch %u -> %u (a batch of %u tokens)\n", __func__, cparams.n_ubatch, want, n_tokens);
+        cparams.n_ubatch = want;
+        sched_need_reserve = true;
+    }
 }
 
 bool llama_context::stage_buffers(uint32_t n_rows) {
@@ -2429,6 +2460,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     output_swaps.clear();
     embd_batch_idxs.clear();
 
+    if (stage_first) {
+        stage_ubatch_for(n_tokens_all);
+    }
     sched_reserve();
 
     bool did_optimize = false;
