@@ -42,6 +42,11 @@ void ggml_cuda_moe_hosted_flush(ggml_backend_cuda_context & ctx, const struct gg
 // while computing the missed experts of the hosted blocks the stream publishes meanwhile. Returns
 // false if no block is hosted: the caller synchronizes as usual.
 bool ggml_cuda_moe_hosted_wait(void * stream, void * event, int device);
+// EXPERT SPLIT: the other cards' chains recorded with the hosting card's graph (owner: its ggml_cuda_graph), and launched
+// with it
+void ggml_cuda_moe_split_capture_begin(int device, const void * owner);
+void ggml_cuda_moe_split_capture_end(int device, const void * owner);
+void ggml_cuda_moe_split_graph_launch(int device, const void * owner);
 // a hosted MoE block exists (its kernels may wait for the host)
 bool ggml_cuda_moe_hosted_active();   // cudaStream_t, cudaEvent_t, the stream's device
 

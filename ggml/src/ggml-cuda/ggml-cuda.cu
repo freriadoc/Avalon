@@ -6690,6 +6690,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
             graph->split_wait = cuda_ctx->split_wait_captured;
+            ggml_cuda_moe_split_capture_end(cuda_ctx->device, graph);
             graph_evaluated_or_captured = true; // CUDA graph has been captured
 
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
@@ -6709,7 +6710,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         if (cuda_graph_update_required) { // Update graph executable
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
         }
-        // Launch graph
+        // Launch graph (EXPERT SPLIT: the other cards' graphs recorded with it first)
+        ggml_cuda_moe_split_graph_launch(cuda_ctx->device, graph);
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
         cuda_ctx->split_wait_queued |= graph->split_wait;
 #else
@@ -6806,6 +6808,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
+        ggml_cuda_moe_split_capture_begin(cuda_ctx->device, cuda_ctx->cuda_graph(graph_key));
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
