@@ -116,6 +116,32 @@ LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t 
 // ubatches, nextn rows of the outputs only). Serves that one decode.
 LLAMA_API bool llama_set_mtp_h_from(struct llama_context * ctx, struct llama_context * tgt, const float * row_first);
 
+// Pipeline stages: an MTP draft fed ubatch by ubatch during the target's decode, instead of from a host copy of the
+// nextn rows of the whole batch (n_embd_out floats per token: 10 GiB of pinned RAM at a batch of 262 144 tokens).
+// The target's decode of several ubatches calls cb first with rows == NULL (may this batch be consumed? tokens and pos
+// of the whole batch, seq_id -1 when it holds several sequences or embeddings), then, if it said yes, once per ubatch
+// after its graph ran with rows = that ubatch's nextn rows on the device (batch rows [row0, row0 + n_rows), valid
+// until cb returns). A false from a ubatch fails the decode. With the cb set, the target's host buffer holds the nextn
+// rows of the batches cb did not take only (grown to them), not of a whole -b. NULL unsets it
+struct llama_nextn_rows {
+    const llama_token * tokens;
+    const llama_pos   * pos;
+    llama_seq_id        seq_id;
+    int64_t             row0;
+    int64_t             n_rows;
+    int64_t             n_total;
+    const struct ggml_tensor * rows;
+    ggml_backend_t      backend;
+};
+typedef bool (*llama_nextn_rows_cb)(void * user, const struct llama_nextn_rows * r);
+LLAMA_API void llama_set_nextn_rows_cb(struct llama_context * ctx, llama_nextn_rows_cb cb, void * user);
+
+// The next decode of ctx (an MTP draft) copies its hidden-state input from rows (n_rows of them, on backend's device),
+// as llama_set_mtp_h_from does from a target's single-ubatch decode: batch row i takes row i - 1, row 0 the host row
+// row_first. False, nothing set, when ctx has no backend on that device
+LLAMA_API bool llama_set_mtp_h_rows(struct llama_context * ctx, const struct ggml_tensor * rows, int64_t n_rows,
+                                    ggml_backend_t backend, const float * row_first);
+
 // Marks the entries that a joint decision head (clef) reads, the default is 0
 // See https://github.com/ggml-org/llama.cpp/pull/29831 for details
 // A run of entries with the same value is one span, spans must be separated by entries with value 0

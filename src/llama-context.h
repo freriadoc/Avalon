@@ -118,6 +118,8 @@ struct llama_context {
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
     uint32_t reserve_outputs(int32_t n_outputs) { return output_reserve(n_outputs); }   // llama_output_reserve
+    void set_nextn_rows_cb(llama_nextn_rows_cb cb, void * user);
+    bool set_mtp_h_rows(const ggml_tensor * rows, int64_t n_rows, ggml_backend_t backend, const float * row_first);
     bool share_moe_cache(llama_context & owner);                                            // llama_share_moe_cache
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
@@ -377,6 +379,13 @@ private:
 
     // this context's hidden-state input read from another's device rows (cparams.mtp_h_src points here)
     llama_mtp_h_src mtp_h_src;
+
+    // pipeline stages: the MTP draft fed per ubatch (llama_set_nextn_rows_cb); nextn_rows_want: the unmasked nextn rows
+    // the host output buffer holds (-1: n_batch, without the cb or the stages)
+    llama_nextn_rows_cb nextn_cb      = nullptr;
+    void *              nextn_cb_user = nullptr;
+    bool                nextn_cb_on   = false;   // the current decode's batch is consumed by the cb
+    int64_t             nextn_rows_want = -1;
 
     // tokens of the decode call still to come after the current ubatch: the KV rows they will need are taken from the MoE
     // expert cache with the current ubatch's (process_ubatch)

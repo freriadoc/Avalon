@@ -1434,6 +1434,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    // pipeline stages: the target's batch of several ubatches taken during its decode, ubatch by ubatch, from its rows
+    // on the device (llama_set_nextn_rows_cb); process() then has nothing to replay
+    bool         rows_cb_ok   = false;   // the current target batch is taken by on_rows
+    llama_seq_id rows_cb_seq  = -1;
+    int64_t      rows_cb_n    = 0;       // its rows taken so far
+    int64_t      rows_cb_done = -1;      // the size of the batch taken whole, until process() sees it
+
+    static bool rows_cb(void * user, const llama_nextn_rows * r) {
+        return static_cast<common_speculative_impl_draft_mtp *>(user)->on_rows(*r);
+    }
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -1486,12 +1497,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
-        // the target's output buffer at its final size now (nextn rows of a whole batch, the outputs of
-        // a verification: n_max drafted tokens + 1 per sequence), not grown at the first requests
-        llama_output_reserve(ctx_tgt, (int32_t) n_seq * (this->params.n_max + 1));
 
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
+
+        // pipeline stages (the only targets that call it): a prompt batch taken ubatch by ubatch during the target's
+        // decode; its host buffer then holds no nextn rows of a whole -b (raised to the context with the stages)
+        static const bool h_dev_off = getenv("LLAMA_MTP_H_DEVICE") && atoi(getenv("LLAMA_MTP_H_DEVICE")) == 0;
+        static const bool rows_off  = getenv("LLAMA_MTP_ROWS_CB") && atoi(getenv("LLAMA_MTP_ROWS_CB")) == 0;
+        if (!h_dev_off && !rows_off && !chain_heads && !is_mem_shared && n_mtp_layers == 1) {
+            llama_set_nextn_rows_cb(ctx_tgt, rows_cb, this);
+        }
+        // the target's output buffer at its final size now (nextn rows of a whole batch, the outputs of
+        // a verification: n_max drafted tokens + 1 per sequence), not grown at the first requests
+        llama_output_reserve(ctx_tgt, (int32_t) n_seq * (this->params.n_max + 1));
 
         if (chain_heads) {
             this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
@@ -1555,8 +1574,73 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
+    // the target's decode of a batch of several ubatches (pipeline stages): r.rows == NULL asks whether this impl takes
+    // the batch; then each ubatch's rows, on the device until this returns: decoded by the draft as process() would
+    // through llama_set_mtp_h_from, row 0 of each ubatch paired with the last row of the one before (pending_h)
+    bool on_rows(const llama_nextn_rows & r) {
+        auto * ctx_dft = this->params.ctx_dft;
+        if (!r.rows) {
+            rows_cb_done = -1;
+            rows_cb_n    = 0;
+            rows_cb_seq  = r.seq_id;
+            rows_cb_ok   = r.tokens && r.seq_id >= 0 && r.seq_id < (llama_seq_id) n_seq;
+            return rows_cb_ok;
+        }
+        const llama_seq_id seq_id = rows_cb_seq;
+        if (!rows_cb_ok || r.row0 != rows_cb_n || r.rows->ne[0] != n_embd) {
+            return false;
+        }
+        if (r.row0 == 0) {
+            // as process(): the draft's own cells from the batch on are dropped, the deferred rows before it decoded first
+            // on their own
+            const llama_pos pos_beg = r.pos[0];
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, pos_beg, -1);
+            defer_keep_before(seq_id, pos_beg);
+            if (n_deferred() > 0) {
+                batch.clear();
+                for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+                    defer_add(s);
+                }
+                const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+                if (rc != 0) {
+                    SPC_ERR("llama_process(ctx_dft) of the deferred rows failed rc=%d\n", (int) rc);
+                    return false;
+                }
+                for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+                    defer_clear(s);
+                }
+            }
+        }
+        if (!llama_set_mtp_h_rows(ctx_dft, r.rows, r.n_rows, r.backend, pending_h[seq_id].data())) {
+            SPC_ERR("%s", "the draft has no backend on the device of the target's rows\n");
+            return false;
+        }
+        batch.clear();
+        for (int64_t i = 0; i < r.n_rows; ++i) {
+            batch.add(r.tokens[i], r.pos[i], seq_id, false);
+        }
+        const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+        if (rc != 0) {
+            SPC_ERR("llama_process(ctx_dft) of the target rows [%lld, %lld) failed rc=%d\n", (long long) r.row0,
+                    (long long) (r.row0 + r.n_rows), (int) rc);
+            return false;
+        }
+        // its copies from the target's rows done before the target's next ubatch overwrites them
+        llama_synchronize(ctx_dft);
+        ggml_backend_tensor_get(r.rows, pending_h[seq_id].data(), (size_t) (r.n_rows - 1) * r.rows->nb[1],
+                (size_t) n_embd * sizeof(float));
+        rows_cb_n += r.n_rows;
+        if (rows_cb_n == r.n_total) {
+            rows_cb_done = r.n_total;
+        }
+        return true;
+    }
+
     ~common_speculative_impl_draft_mtp() override {
         auto * ctx_dft = this->params.ctx_dft;
+        if (this->params.ctx_tgt) {
+            llama_set_nextn_rows_cb(this->params.ctx_tgt, nullptr, nullptr);
+        }
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
             if (backend_chains[seq_id] == nullptr) {
                 continue;
@@ -1621,6 +1705,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         auto * ctx_dft = this->params.ctx_dft;
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+
+        // the batch was taken during the target's decode (on_rows): its last row is pending_h, as below for a prompt batch
+        {
+            const int64_t done = rows_cb_done;
+            rows_cb_done = -1;
+            if (done == n_tokens && rows_cb_seq >= 0 && i_batch_beg[rows_cb_seq] == 0 && i_batch_end[rows_cb_seq] == n_tokens - 1) {
+                verify_h_rows[rows_cb_seq] = 1;
+                verify_h[rows_cb_seq] = pending_h[rows_cb_seq];
+                return true;
+            }
+        }
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
