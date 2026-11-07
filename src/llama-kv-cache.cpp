@@ -408,6 +408,30 @@ llama_kv_cache::llama_kv_cache(
                     ggml_backend_tensor_set(t, attn_rot_hadamard.at(t->ne[0]).data(), 0, ggml_nbytes(t));
                 }
             }
+
+            for (const auto & layer : layers) {
+                ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(layer.k->buffer);
+                if (buft == ggml_backend_buffer_get_type(rot_buf.get()) || rot_copies.count(buft)) {
+                    continue;
+                }
+                rot_copy & rc = rot_copies[buft];
+                rc.ctx.reset(ggml_init(params));
+                if (rot_k) {
+                    rc.k = ggml_dup_tensor(rc.ctx.get(), rot_k);
+                }
+                if (rot_v) {
+                    rc.v = ggml_dup_tensor(rc.ctx.get(), rot_v);
+                }
+                rc.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(rc.ctx.get(), buft));
+                if (!rc.buf) {
+                    throw std::runtime_error("failed to allocate buffer for the attention rotation matrices");
+                }
+                for (ggml_tensor * t : { rc.k, rc.v }) {
+                    if (t) {
+                        ggml_backend_tensor_set(t, attn_rot_hadamard.at(t->ne[0]).data(), 0, ggml_nbytes(t));
+                    }
+                }
+            }
         }
     }
 
@@ -1586,6 +1610,21 @@ ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
     }
 
     return res;
+}
+
+ggml_tensor * llama_kv_cache::layer_rot(ggml_tensor * rot, int32_t il) const {
+    if (rot == nullptr || (rot != rot_k && rot != rot_v) || rot_copies.empty()) {
+        return rot;
+    }
+    const auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) {
+        return rot;
+    }
+    const auto rc = rot_copies.find(ggml_backend_buffer_get_type(layers[it->second].k->buffer));
+    if (rc == rot_copies.end()) {
+        return rot;
+    }
+    return rot == rot_k ? rc->second.k : rc->second.v;
 }
 
 ggml_tensor * llama_kv_cache::build_input_v_rot(ggml_context * ctx) const {
@@ -3061,6 +3100,10 @@ ggml_tensor * llama_kv_cache_context::build_input_k_rot(ggml_context * ctx) cons
 
 ggml_tensor * llama_kv_cache_context::build_input_v_rot(ggml_context * ctx) const {
     return kv->build_input_v_rot(ctx);
+}
+
+ggml_tensor * llama_kv_cache_context::layer_rot(ggml_tensor * rot, int32_t il) const {
+    return kv->layer_rot(rot, il);
 }
 
 void llama_kv_cache_context::set_input_k_shift(ggml_tensor * dst) const {

@@ -28,7 +28,8 @@ llama_batch_allocr::llama_batch_allocr(uint32_t n_pos_per_embd, bool allow_mixed
 bool llama_batch_allocr::init(
         const llama_batch_ext & batch_inp,
         const llama_vocab & vocab,
-        bool output_all) {
+        bool output_all,
+        const llama_memory_i * mem_check) {
     clear();
 
     this->vocab     = &vocab;
@@ -44,7 +45,7 @@ bool llama_batch_allocr::init(
         return false;
     }
 
-    const llama_memory_i * mem = batch_inp.mem;
+    const llama_memory_i * mem = mem_check ? mem_check : batch_inp.mem;
 
     //
     // determine the content types of the batch
@@ -566,7 +567,37 @@ void llama_batch_allocr::split_reset() {
     used.resize(get_n_tokens(), false);
 }
 
+void llama_batch_allocr::set_breaks(std::vector<int32_t> idxs) {
+    std::sort(idxs.begin(), idxs.end());
+    breaks = std::move(idxs);
+}
+
+uint32_t llama_batch_allocr::break_cap(uint32_t n_ubatch) const {
+    if (breaks.empty() || seq_id_unq.size() != 1 || n_ubatch == 0) {
+        return n_ubatch;
+    }
+    int32_t first = 0;
+    while (first < (int32_t) used.size() && used[first]) {
+        ++first;
+    }
+    int32_t end = (int32_t) used.size();
+    for (const int32_t b : breaks) {
+        if (b > first) {
+            end = std::min(end, b);
+            break;
+        }
+    }
+    const uint32_t run = (uint32_t) (end - first);
+    if (run == 0) {
+        return n_ubatch;
+    }
+    // equal parts: a short last ubatch costs about as much as a full one (all the experts copied)
+    const uint32_t k = (run + n_ubatch - 1) / n_ubatch;
+    return (run + k - 1) / k;
+}
+
 llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
+    n_ubatch = break_cap(n_ubatch);
     // find the first unused token
     uint32_t cur_idx = 0;
     while (cur_idx < used.size() && used[cur_idx]) {
@@ -601,6 +632,12 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
 }
 
 llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail) {
+    {
+        const uint32_t cap = break_cap(n_ubatch);
+        if (cap > n_keep_tail) {
+            n_ubatch = cap;
+        }
+    }
     if (sequential && has_cpl) {
         LLAMA_LOG_ERROR("%s: sequential split is not supported when there are coupled sequences in the input batch (you may need to use the -kvu flag)\n", __func__);
 
@@ -772,6 +809,7 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
 }
 
 llama_ubatch llama_batch_allocr::split_seq(uint32_t n_ubatch) {
+    n_ubatch = break_cap(n_ubatch);
     // find the first unused token
     uint32_t cur_idx = 0;
     while (cur_idx < used.size() && used[cur_idx]) {
@@ -815,6 +853,8 @@ llama_ubatch llama_batch_allocr::split_seq(uint32_t n_ubatch) {
 
 void llama_batch_allocr::clear() {
     n_outputs = 0;
+
+    breaks.clear();
 
     batch = {};
 

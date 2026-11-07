@@ -1665,6 +1665,26 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     const int i_gpu_start = std::max(n_layer_all + 1 - n_gpu_layers, 0);
     const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
+
+    // two GPUs that llama_context will run as pipeline stages (LLAMA_STAGES, qwen4exp): the boundary where the stages
+    // balance, b = round((L + h - k) / 2) for L layers, rather than the free memory's split of the layer count. k: the
+    // first stage's own work in layers (input, its thread's share), h: the last stage's head. Measured on 2 x A4000
+    // (19k prefill, ubatches of 4768): the first stage spent 0.16 s per ubatch beyond its kernels' share (k ~ 1.8), the
+    // head 95 ms of a 19k prefill (h ~ 0.27); 23 / 25 1650 - 1657 t/s against 24 / 24 1602 - 1610, 25 / 23 1584 - 1604,
+    // 22 / 26 1585 - 1598. Kept out when -ts is given
+    {
+        static const bool stages_on = !getenv("LLAMA_STAGES") || atoi(getenv("LLAMA_STAGES")) != 0;
+        if (stages_on && all_zero && n_devices() == 2 && arch == LLM_ARCH_QWEN4EXP && split_mode == LLAMA_SPLIT_MODE_LAYER &&
+                i_gpu_start == 0 && act_gpu_layers > (int) hparams.n_layer()) {
+            const float k = 1.8f;
+            const float h = 0.27f;
+            const int   L = (int) hparams.n_layer();
+            const int   b = std::clamp((int) std::lround((L + h - k) / 2.0f), 1, L - 1);
+            splits[0] = float(b) / act_gpu_layers;
+            LLAMA_LOG_INFO("%s: pipeline stages: layers [0, %d) on the first GPU, [%d, %d) on the second\n", __func__, b, b, L);
+        }
+    }
+
     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
         const bool is_swa = il < n_layer_all && hparams.is_swa(il);
         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
@@ -2816,6 +2836,22 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             filter_recr = [&](uint32_t)    { return false; };
                             if (filter_idx) {
                                 filter_idx = [&](uint32_t il) { return il >= hparams.n_layer(); };
+                            }
+                        }
+
+                        // a stage of a prefill pipeline holds the memory of its layers only (llama_cparams::stage_il0)
+                        if (arch == LLM_ARCH_QWEN4EXP && (cparams.stage_il0 > 0 || cparams.stage_il1 >= 0)) {
+                            const uint32_t il0 = (uint32_t) cparams.stage_il0;
+                            const uint32_t il1 = cparams.stage_il1 < 0 ? hparams.n_layer() : (uint32_t) cparams.stage_il1;
+                            const auto in_stage = [il0, il1](const llama_memory_hybrid::layer_filter_cb & f) {
+                                return llama_memory_hybrid::layer_filter_cb([f, il0, il1](uint32_t il) {
+                                    return il >= il0 && il < il1 && f(il);
+                                });
+                            };
+                            filter_attn = in_stage(filter_attn);
+                            filter_recr = in_stage(filter_recr);
+                            if (filter_idx) {
+                                filter_idx = in_stage(filter_idx);
                             }
                         }
                     }

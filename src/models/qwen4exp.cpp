@@ -447,7 +447,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
 
     // grouped RMSNorm: reduce over one stream, then scale all streams with the [n_embd, hc] gamma
     // the converter folded each gamma to (1 + w)
-    ggml_tensor * xn = ggml_mul(ctx0, ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps), w_norm);
+    // named "norm": the layer's device runs it (llama_context's callback), not the device of the previous layer's
+    // output, so a layer split over GPUs copies the streams once at the boundary instead of the streams and their norm
+    ggml_tensor * xn = ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps);
+    cb(xn, "norm", il);
+    xn = ggml_mul(ctx0, xn, w_norm);
     xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
     cb(xn, "hc_norm", il);
 
@@ -569,8 +573,20 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
                            qwen4exp_host_rows().buffer && n_tokens * hparams.n_expert_used() <= 64 &&
                            qwen4exp_host_rows().buffer((size_t) hparams.ple_head_dim * hparams.ple_n_heads * n_tokens * sizeof(float));
 
+    // a stage of a prefill pipeline (llama_cparams::stage_il0 / stage_il1): only the layers [il0, il1)
+    const int il0 = cparams.stage_il0;
+    const int il1 = cparams.stage_il1 < 0 ? (int) n_layer : cparams.stage_il1;
+    const bool stage_first = il0 == 0;
+    const bool stage_last  = il1 == (int) n_layer;
+    bool stage_ple = false;
+    bool stage_qsa = false;
+    for (int il = il0; il < il1; ++il) {
+        stage_ple = stage_ple || hparams.is_ple(il);
+        stage_qsa = stage_qsa || !hparams.is_recr(il);
+    }
+
     ggml_tensor * ple_emb = nullptr;
-    if (hparams.ple_n_heads > 0) {
+    if (hparams.ple_n_heads > 0 && stage_ple) {
         ple_emb = build_inp_ple(mctx_hyb, host_embd);
         if (!host_embd) {
             // make sure ple_emb and build_inp_embd are in the same graph split
@@ -581,7 +597,9 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     }
 
     ggml_tensor * inpL = nullptr;
-    if (host_embd) {
+    if (!stage_first) {
+        // the residual the previous stage wrote, in this device's buffer: read in place
+    } else if (host_embd) {
         auto inp = std::make_unique<llm_graph_input_qwen4exp_tok_host>(model);
         inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
         ggml_set_input(inp->embd);
@@ -591,28 +609,43 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     } else {
         inpL = build_inp_embd(model.tok_embd);
     }
-    cb(inpL, "model.input_embed", -1);
-    ggml_build_forward_expand(gf, inpL);
+    if (inpL) {
+        cb(inpL, "model.input_embed", -1);
+        ggml_build_forward_expand(gf, inpL);
+    }
 
     // the QSA layers share one set of k-pool inputs
     // the CUDA lightning indexer takes 32 or 64 heads, QSA has a few, so it scores with plain ops
     llm_graph_input_kpool * inp_kpool = nullptr;
-    if (mctx_idx && hparams.indexer_kpool > 0) {
+    if (mctx_idx && hparams.indexer_kpool > 0 && stage_qsa) {
         inp_kpool = build_inp_kpool(mctx_hyb);
     }
 
     ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_out_ids = stage_last ? build_inp_out_ids() : nullptr;
 
-    // the wide residual starts as hc identical copies of the embedding
-    ggml_tensor * res_hc = ggml_repeat_4d(ctx0,
-            ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens),
-            n_embd, hc, n_tokens, 1);
-    cb(res_hc, "hc_init", -1);
+    ggml_tensor * res_hc = nullptr;
+    if (stage_first) {
+        // the wide residual starts as hc identical copies of the embedding
+        res_hc = ggml_repeat_4d(ctx0,
+                ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens),
+                n_embd, hc, n_tokens, 1);
+        cb(res_hc, "hc_init", -1);
+    } else if (cparams.stage_in) {
+        GGML_ASSERT(ggml_nelements(cparams.stage_in) >= n_embd*hc*n_tokens);
+        res_hc = ggml_view_3d(ctx0, cparams.stage_in, n_embd, hc, n_tokens,
+                n_embd*ggml_element_size(cparams.stage_in), n_embd*hc*ggml_element_size(cparams.stage_in), 0);
+        cb(res_hc, "stage_in", -1);
+    } else {
+        // the reservation of the graphs (no buffer from the previous stage yet): an input of the same shape
+        res_hc = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_input(res_hc);
+        cb(res_hc, "stage_in_reserve", -1);
+    }
     // make sure hc_init is in the same graph split as the first layer (-sm tensor)
     ggml_build_forward_expand(gf, res_hc);
 
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = il0; il < il1; ++il) {
         if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
             res->t_layer_inp[il] = hc_stream_mean(ctx0, res_hc);
             cb(res->t_layer_inp[il], "layer_inp", il);
@@ -671,6 +704,22 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         cb(res_hc, "l_last", il);
     }
 
+    if (!stage_last) {
+        // the next stage reads the residual from its own copy of stage_out (none yet when the first stage reserves its
+        // graphs, inside its constructor: the output is then left in the compute buffer)
+        if (!cparams.stage_out) {
+            ggml_build_forward_expand(gf, res_hc);
+            return;
+        }
+        GGML_ASSERT(ggml_nelements(cparams.stage_out) >= ggml_nelements(res_hc));
+        ggml_tensor * out = ggml_view_3d(ctx0, cparams.stage_out, n_embd, hc, n_tokens,
+                n_embd*ggml_element_size(cparams.stage_out), n_embd*hc*ggml_element_size(cparams.stage_out), 0);
+        out = ggml_cpy(ctx0, res_hc, out);
+        cb(out, "stage_out", -1);
+        ggml_build_forward_expand(gf, out);
+        return;
+    }
+
     // the MTP head reads the hc-wide residual, before the final mixer
     res->t_h_nextn = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
     cb(res->t_h_nextn, "h_nextn", -1);
@@ -727,7 +776,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     inp->h_src = cparams.mtp_h_src;
     // copied from the target's rows on the device: on the GPU (graph_get_cb); filled by the host otherwise, in host memory
     // where the scheduler's input copies order its writes after the previous pass
-    inp->h_dev = inp->h_src && inp->h_src->src;
+    inp->h_dev = inp->h_src && (inp->h_src->src || inp->h_src->host);
     if (inp->h_dev) {
         cb(inp->h, "mtp_h_input_dev", -1);
     } else {
@@ -1336,12 +1385,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     // rotate q/k/v before they reach a quantized cache, as the dense path does. the indexer
     // has already scored with its own query in build_qsa_sel, so the selection is unaffected.
     if (inp->self_k_rot) {
-        q_cur = llama_mul_mat_hadamard(ctx0, q_cur, inp->self_k_rot);
-        k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot);
+        q_cur = llama_mul_mat_hadamard(ctx0, q_cur, inp->mctx->layer_rot(inp->self_k_rot, il));
+        k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->mctx->layer_rot(inp->self_k_rot, il));
     }
 
     if (inp->self_v_rot) {
-        v_cur = llama_mul_mat_hadamard(ctx0, v_cur, inp->self_v_rot);
+        v_cur = llama_mul_mat_hadamard(ctx0, v_cur, inp->mctx->layer_rot(inp->self_v_rot, il));
     }
 
     const auto * mctx_cur = inp->mctx;
@@ -1389,7 +1438,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         cb(cur, "kqv_out", il);
 
         if (inp->self_v_rot) {
-            cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+            cur = llama_mul_mat_hadamard(ctx0, cur, inp->mctx->layer_rot(inp->self_v_rot, il));
         }
         return cur;
     }
@@ -1408,7 +1457,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         cb(cur, "kqv_out", il);
 
         if (inp->self_v_rot) {
-            cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+            cur = llama_mul_mat_hadamard(ctx0, cur, inp->mctx->layer_rot(inp->self_v_rot, il));
         }
         return cur;
     }
@@ -1439,7 +1488,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         cb(cur, "kqv_out", il);
 
         if (inp->self_v_rot) {
-            cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+            cur = llama_mul_mat_hadamard(ctx0, cur, inp->mctx->layer_rot(inp->self_v_rot, il));
         }
         return cur;
     }
@@ -1454,7 +1503,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
 
     // the rotation is its own inverse, so undo it on the value side of the output
     if (inp->self_v_rot) {
-        cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+        cur = llama_mul_mat_hadamard(ctx0, cur, inp->mctx->layer_rot(inp->self_v_rot, il));
     }
 
     return cur;
@@ -1499,10 +1548,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
         cb(Kcur, "Kcur", il);
         cb(Vcur, "Vcur", il);
         if (inp->self_k_rot) {
-            Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp->self_k_rot);
+            Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp->mctx->layer_rot(inp->self_k_rot, il));
         }
         if (inp->self_v_rot) {
-            Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp->self_v_rot);
+            Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp->mctx->layer_rot(inp->self_v_rot, il));
         }
         const auto * mctx_cur = inp->mctx;
         ggml_build_forward_expand(gf, Vcur);

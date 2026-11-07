@@ -441,6 +441,12 @@ extern "C" {
         // a source/target/parent context
         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
         struct llama_context * ctx_other;
+
+        // internal: a stage of a pipeline over several GPUs, made by llama_context itself (several GPUs, LLAMA_STAGES=0 turns it off): the layers
+        // [stage_il0, stage_il1) (stage_il1 = -1: to the last layer) on the model's device stage_device (-1: not a stage)
+        int32_t stage_il0;
+        int32_t stage_il1;
+        int32_t stage_device;
     };
 
     struct llama_model_tensor_override {
@@ -972,6 +978,27 @@ extern "C" {
                           size_t   size,
                     llama_seq_id   dest_seq_id,
            llama_state_seq_flags   flags);
+
+    // Snapshots of a sequence's state inside the next llama_decode: the state once every token of the sequence before
+    // pos[i] is processed, as llama_state_seq_get_data_ext(flags) would return it between two calls. The decode ends a
+    // ubatch at each pos (single-sequence batches; equal ubatches in between), so the caller no longer ends its batch
+    // there to save the state (a context checkpoint), and the ubatches of a pipeline over several GPUs keep overlapping.
+    // The copies are queued on the devices' streams, without synchronizing. Replaces the previous request
+    LLAMA_API void llama_set_seq_snapshots(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+               const llama_pos   * pos,
+                         int32_t   n_pos,
+           llama_state_seq_flags   flags);
+
+    // After that decode: the snapshot taken before pos, copied into dst (up to size bytes); returns its size, 0 if none
+    // (pass dst = NULL to get the size)
+    LLAMA_API size_t llama_get_seq_snapshot(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                       llama_pos   pos,
+                         uint8_t * dst,
+                          size_t   size);
 
     //
     // Decoding

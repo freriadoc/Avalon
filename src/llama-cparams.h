@@ -20,6 +20,9 @@ struct llama_mtp_h_src {
     int64_t       row0      = 0;         // batch row of the ubatch whose inputs are being set
     ggml_backend_t backend_src = nullptr; // the device copy is queued on the target's stream, the draft's waits for
     ggml_backend_t backend_dst = nullptr; // it: no synchronous copy, a hosted MoE graph may be waiting for the host
+    // or the target's rows in its host output buffer (a decode of several ubatches): copied from there to the draft's
+    // device on its stream, without passing through the batch; the draft's decode synchronizes before it returns
+    const float * host = nullptr;
 };
 
 struct llama_cparams {
@@ -89,4 +92,12 @@ struct llama_cparams {
     llama_context * ctx_other;
 
     llama_mtp_h_src * mtp_h_src = nullptr; // the context's own, stable across the copies of these parameters
+
+    // a stage of a prefill pipeline over several devices: layers [stage_il0, stage_il1) only. A stage before the last
+    // writes its layers' output (qwen4exp: the hc-wide residual) into stage_out; a stage after the first reads its input
+    // from stage_in instead of the token embeddings. Both are tensors of their own buffers, set before each ubatch
+    int32_t stage_il0 = 0;
+    int32_t stage_il1 = -1;   // -1: to the last layer
+    struct ggml_tensor * stage_in  = nullptr;
+    struct ggml_tensor * stage_out = nullptr;
 };

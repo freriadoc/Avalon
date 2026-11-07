@@ -151,7 +151,20 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
         ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
     }
 
-    if (h_dev && h_src && h_src->src && !ubatch->embd) {
+    if (h_dev && h_src && h_src->host && !ubatch->embd) {
+        // the target's rows from its host output buffer, copied on the draft's stream behind its previous pass
+        const size_t  row  = h->nb[1];
+        const int64_t r0   = h_src->row0;
+        GGML_ASSERT(r0 + n_tokens - 1 <= h_src->n_rows && h->type == GGML_TYPE_F32);
+        int64_t d0 = 0;
+        if (r0 == 0) {
+            ggml_backend_tensor_set_async(h_src->backend_dst, h, h_src->row_first, 0, row);
+            d0 = 1;
+        }
+        if (n_tokens > d0) {
+            ggml_backend_tensor_set_async(h_src->backend_dst, h, h_src->host + (r0 + d0 - 1)*h->ne[0], d0*row, (n_tokens - d0)*row);
+        }
+    } else if (h_dev && h_src && h_src->src && !ubatch->embd) {
         // rows [row0, row0 + n) of the batch: the target's rows one before, batch row 0 from the host
         const size_t  row  = h->nb[1];
         const int64_t r0   = h_src->row0;
@@ -196,7 +209,7 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
     res &= (!params.ubatch.embd)  || (embd   && embd->ne[1]   == params.ubatch.n_tokens);
     res &= (!params.ubatch.embd)  || (h      && h->ne[1]      == params.ubatch.n_tokens);
     // h on the GPU only for a device copy: a graph of one kind is not reused for the other
-    res &= h_dev == (h_src && h_src->src);
+    res &= h_dev == (h_src && (h_src->src || h_src->host));
 
     return res;
 }

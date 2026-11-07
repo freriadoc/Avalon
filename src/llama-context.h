@@ -143,14 +143,27 @@ struct llama_context {
     // if memory_context is provided, it will be applied first to the context's memory
     // ret contains the status of the graph computation
     // returns nullptr only if ret != GGML_STATUS_SUCCESS
+    // launch = false: everything but the launch (memory, graph, allocation, inputs), done by process_ubatch_launch: a
+    // pipeline stage prepares its ubatch while the previous stage computes
     llm_graph_result * process_ubatch(
                 const llama_ubatch & ubatch,
                     llm_graph_type   gtype,
             llama_memory_context_i * mctx,
-                       ggml_status & ret);
+                       ggml_status & ret,
+                              bool   launch = true);
+    ggml_status process_ubatch_launch(llm_graph_result * res, const llama_ubatch & ubatch);
 
     int encode(const llama_batch_ext & batch_inp);
     int decode(const llama_batch_ext & batch_inp);
+
+    // the first stage of a pipeline over several GPUs (the default, LLAMA_STAGES=0 turns it off): a batch processed ubatch by ubatch, split as the
+    // last stage splits it (same breaks, same n_ubatch); each step writes its layers' output into `out`
+    int  stage_begin(const llama_batch_ext & batch_inp, const std::vector<int32_t> & breaks, bool embd_all);
+    // the buffers between the stages, for ubatches of up to n_rows tokens: a prefill's taken from the MoE caches of the
+    // two devices (as the compute buffers are), a few rows otherwise; false when they cannot be allocated
+    bool stage_buffers(uint32_t n_rows);
+    bool stage_step(ggml_tensor * out, uint32_t & n_tokens);
+    void stage_end();
 
     // compat version
     int encode(const llama_batch & batch_inp);
@@ -303,6 +316,26 @@ private:
 
     llama_memory_ptr memory;
 
+    // pipeline stages over several GPUs (the default, LLAMA_STAGES=0 turns it off): this context is the last stage (its device's layers, the head,
+    // the outputs), stage_first the first (the layers before, the embeddings); between them the layers' output of each
+    // ubatch, written on the first stage's device (stage_out) and copied to this one's (stage_in), two of each in turn
+    std::unique_ptr<llama_context> stage_first;
+    ggml_context_ptr        stage_ctx;
+    ggml_backend_buffer_ptr stage_buf_out[2];
+    ggml_backend_buffer_ptr stage_buf_in[2];
+    uint32_t stage_rows = 0;   // the ubatch size the buffers hold
+    // the stage buffers each kept graph was built with (process_ubatch reuses a graph for the same ones only)
+    std::map<const void *, std::pair<const ggml_tensor *, const ggml_tensor *>> stage_graph_bufs;
+    ggml_tensor * stage_out[2] = { nullptr, nullptr };
+    ggml_tensor * stage_in [2] = { nullptr, nullptr };
+    // recorded by this stage behind the graph that read stage_in[i]: the first stage waits for it (on its GPU) before it
+    // copies the ubatch two later there
+    ggml_backend_event_t stage_ev_read[2] = { nullptr, nullptr };
+    // a first stage's batch in progress
+    llama_memory_context_ptr stage_mctx;
+    bool     stage_more   = false;
+    uint32_t stage_n_left = 0;
+
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
 
@@ -322,8 +355,28 @@ private:
                                                       // synchronous ones (a hosted MoE graph may wait for the host)
     int64_t             h_nextn_dev_rows = 0;
 
+    // the nextn rows of a decode of several ubatches gathered on the device in batch order, for the MTP draft as
+    // h_nextn_dev: each ubatch's rows are overwritten by the next one in the compute buffer, and through the host the
+    // draft's input cost ~0.4 s per 19k-token prompt. Borrowed from the expert cache (the compute buffers' type), given
+    // back at the next decode
+    // the rows of the last decode in the host output buffer in batch order (embd_nextn), when not on the device
+    int64_t                 h_nextn_host_rows = 0;
+    int64_t                 h_host_n  = 0;
+    bool                    h_host_ok = false;
+
+    ggml_context_ptr        h_rows_ctx;
+    ggml_backend_buffer_ptr h_rows_buf;
+    ggml_tensor *           h_rows         = nullptr;
+    ggml_backend_t          h_rows_backend = nullptr;
+    int64_t                 h_rows_n       = 0;
+    bool                    h_rows_ok      = false;
+
     // this context's hidden-state input read from another's device rows (cparams.mtp_h_src points here)
     llama_mtp_h_src mtp_h_src;
+
+    // tokens of the decode call still to come after the current ubatch: the KV rows they will need are taken from the MoE
+    // expert cache with the current ubatch's (process_ubatch)
+    int64_t kv_rows_ahead = 0;
 
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
@@ -416,6 +469,25 @@ private:
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
+
+public:
+    // llama_set_seq_snapshots / llama_get_seq_snapshot
+    void set_seq_snapshots(llama_seq_id seq_id, const llama_pos * pos, int32_t n_pos, llama_state_seq_flags flags);
+    size_t get_seq_snapshot(llama_seq_id seq_id, llama_pos pos, uint8_t * dst, size_t size);
+
+private:
+    // capture the requested snapshots that end with this ubatch (decode)
+    void seq_snapshots_capture(const llama_ubatch & ubatch);
+
+    struct seq_snapshot {
+        llama_pos pos = -1;
+        bool      taken = false;
+        size_t    size = 0;
+        ggml_backend_buffer_ptr buf; // pinned host memory: the serialized state, filled by copies on the streams
+    };
+    llama_seq_id snap_seq = -1;
+    llama_state_seq_flags snap_flags = 0;
+    std::vector<seq_snapshot> snaps;
 
     bool has_evaluated_once = false;
 

@@ -147,10 +147,13 @@ public:
     llama_batch_allocr(uint32_t n_pos_per_embd, bool allow_mixed = false);
 
     // convert a llama_batch_ext to internal llama_batch and sanitize it
+    // mem: the memory the positions are checked (and inferred) against, instead of the batch's own (batch_inp.mem, the
+    // memory of the context the batch was made for): a pipeline stage splits the batch of the context that owns it
     bool init(
             const llama_batch_ext & batch_inp,
             const llama_vocab & vocab,
-            bool output_all);
+            bool output_all,
+            const llama_memory_i * mem = nullptr);
 
     const llama_batch & get_batch() const;
 
@@ -167,6 +170,10 @@ public:
 
     // call once before splitting the batch to reset the internal state
     void split_reset();
+
+    // batch indices before which a ubatch must end (a state snapshot, llama_set_seq_snapshots), single-sequence batches
+    // only; between two breaks the ubatches get equal sizes. Cleared by init()
+    void set_breaks(std::vector<int32_t> idxs);
 
     // simple split, unknown number of sequence sets of unequal lengths
     llama_ubatch split_simple(uint32_t n_ubatch);
@@ -186,6 +193,11 @@ public:
 
 private:
     void clear();
+
+    // the largest ubatch the next split may make: n_ubatch, or the equal share of the run up to the next break
+    uint32_t break_cap(uint32_t n_ubatch) const;
+
+    std::vector<int32_t> breaks;
 
     // create the next ubatch based on the provided batch indices (idxs) and the number of sequence sets (n_seqs)
     // return llama_ubatch.n_tokens == 0 if the entire batch was consumed

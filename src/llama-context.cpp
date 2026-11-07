@@ -91,6 +91,69 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
 // the graphs of small ubatches kept, one per shape (LLAMA_GRAPH_SMALL_MAX_TOKENS, llama_context::gf_res_small)
 #define LLAMA_GRAPH_SMALL_MAX_SHAPES 8
 
+// the memory of the last stage of a pipeline over several GPUs (the default, LLAMA_STAGES=0 turns it off), paired with its first stage's: a batch
+// goes to the own memory only (each stage splits and applies it itself, in its decode), every sequence and state operation
+// to both, so that the two hold the same cells
+struct llama_memory_stage_pair : public llama_memory_i {
+    llama_memory_ptr own;
+    llama_memory_i * first;
+
+    llama_memory_stage_pair(llama_memory_ptr own, llama_memory_i * first) : own(std::move(own)), first(first) {}
+
+    llama_memory_context_ptr init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) override {
+        return own->init_batch(balloc, n_ubatch, embd_all);
+    }
+    llama_memory_context_ptr init_full() override { return own->init_full(); }
+    llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override { return own->init_update(lctx, optimize); }
+
+    bool get_can_shift() const override { return own->get_can_shift() && first->get_can_shift(); }
+
+    void clear(bool data) override { own->clear(data); first->clear(data); }
+
+    void get_lendable_kv(std::vector<std::pair<const ggml_tensor *, size_t>> & out) const override { own->get_lendable_kv(out); }
+    void set_kv_lent_from(uint32_t rows) override { own->set_kv_lent_from(rows); }
+    void sync_device(ggml_backend_sched_t sched) override { own->sync_device(sched); }
+
+    bool seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) override {
+        const bool a = own->seq_rm(seq_id, p0, p1);
+        const bool b = first->seq_rm(seq_id, p0, p1);
+        return a && b;
+    }
+    void seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override {
+        own->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+        first->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+    }
+    void seq_keep(llama_seq_id seq_id) override { own->seq_keep(seq_id); first->seq_keep(seq_id); }
+    void seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) override {
+        own->seq_add(seq_id, p0, p1, shift);
+        first->seq_add(seq_id, p0, p1, shift);
+    }
+    void seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) override {
+        own->seq_div(seq_id, p0, p1, d);
+        first->seq_div(seq_id, p0, p1, d);
+    }
+
+    llama_pos seq_pos_min(llama_seq_id seq_id) const override { return own->seq_pos_min(seq_id); }
+    llama_pos seq_pos_max(llama_seq_id seq_id) const override { return own->seq_pos_max(seq_id); }
+
+    std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override {
+        auto res = own->memory_breakdown();
+        for (const auto & [buft, size] : first->memory_breakdown()) {
+            res[buft] += size;
+        }
+        return res;
+    }
+
+    void state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const override {
+        own->state_write(io, seq_id, flags);
+        first->state_write(io, seq_id, flags);
+    }
+    void state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) override {
+        own->state_read(io, seq_id, flags);
+        first->state_read(io, seq_id, flags);
+    }
+};
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -103,6 +166,39 @@ llama_context::llama_context(
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
+
+    // layers split over two GPUs (the default; LLAMA_STAGES=0: one context over both): this context becomes the last
+    // stage of a pipeline (the second GPU's layers, the head, the outputs) and makes the first (the first GPU's layers,
+    // the embeddings) once its own memory exists. Each stage has its device, its memory, its scheduler and its graphs;
+    // prefill +27 to +45 % over the layer split at 19k to 120k, generation equal (2 x A4000)
+    const llama_context_params params_orig = params;
+    int32_t stage_b = 0;
+    {
+        static const bool stages_on = !getenv("LLAMA_STAGES") || atoi(getenv("LLAMA_STAGES")) != 0;
+        if (stages_on && params.stage_device < 0 && params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
+                model.devices.size() == 2 && model.arch == LLM_ARCH_QWEN4EXP) {
+            for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+                if (model.dev_layer(il) == model.devices[1].dev) {
+                    stage_b = (int32_t) il;
+                    break;
+                }
+            }
+            if (stage_b > 0) {
+                params.stage_il0    = stage_b;
+                params.stage_il1    = -1;
+                params.stage_device = 1;
+                // the ubatch split by the stages: with two ubatches (a 19k prompt at 9536) each GPU waits for the other a
+                // third of the time (the first fills the pipeline, the second drains it); at half the ubatch, 19k
+                // 1 487 - 1 504 -> 1 601 - 1 613 t/s, 60k and 120k equal (2 x A4000). Each ubatch copies the experts of
+                // its stage's layers only, so the halving does not double one card's copies
+                const uint32_t n_ub = params.n_ubatch == 0 ? params.n_batch : std::min(params.n_batch, params.n_ubatch);
+                params.n_ubatch = n_ub > 512 ? std::max<uint32_t>(512, n_ub / 2) : n_ub;
+                LLAMA_LOG_INFO("%s: pipeline stages: layers [0, %d) on %s, [%d, %u) on %s, ubatch %u -> %u\n", __func__,
+                        stage_b, ggml_backend_dev_name(model.devices[0].dev), stage_b, model.hparams.n_layer(),
+                        ggml_backend_dev_name(model.devices[1].dev), n_ub, params.n_ubatch);
+            }
+        }
+    }
 
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
@@ -161,6 +257,9 @@ llama_context::llama_context(
     cparams.cb_eval_user_data = params.cb_eval_user_data;
 
     cparams.ctx_other = nullptr;
+
+    cparams.stage_il0 = params.stage_device >= 0 ? params.stage_il0 : 0;
+    cparams.stage_il1 = params.stage_device >= 0 ? params.stage_il1 : -1;
     cparams.mtp_h_src = &mtp_h_src;
 
     // TODO: more generic
@@ -350,8 +449,12 @@ llama_context::llama_context(
     }
 
     if (!hparams.vocab_only) {
-        // GPU backends
-        for (const auto & dev : model.devices) {
+        // GPU backends (a pipeline stage: its device only)
+        for (size_t i = 0; i < model.devices.size(); ++i) {
+            const auto & dev = model.devices[i];
+            if (params.stage_device >= 0 && (int32_t) i != params.stage_device) {
+                continue;
+            }
             ggml_backend_t backend = ggml_backend_dev_init(dev.dev, nullptr);
             if (backend == nullptr) {
                 throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev.dev)));
@@ -421,6 +524,29 @@ llama_context::llama_context(
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+
+        if (stage_b > 0) {
+            llama_context_params pf = params_orig;
+            pf.n_ubatch     = params.n_ubatch; // both stages split a batch the same way
+            pf.stage_il0    = 0;
+            pf.stage_il1    = stage_b;
+            pf.stage_device = 0;
+            pf.samplers     = nullptr;
+            pf.n_samplers   = 0;
+            pf.embeddings   = false;
+            pf.ctx_other    = nullptr;
+            stage_first.reset(new llama_context(model, pf));
+            memory.reset(new llama_memory_stage_pair(std::move(memory), stage_first->memory.get()));
+
+            // the buffers between the stages are made by each decode for its ubatches (stage_buffers): none during the
+            // reservation of the graphs, which reads a placeholder input
+            for (int i = 0; i < 2; ++i) {
+                stage_ev_read[i] = ggml_backend_event_new(model.devices[1].dev);
+                if (!stage_ev_read[i]) {
+                    throw std::runtime_error("failed to create the pipeline stage events");
+                }
+            }
+        }
     }
 
     // init backends
@@ -536,6 +662,24 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    // the first pipeline stage goes first: its copies land in this context's buffers. The boundary buffers before it:
+    // they are borrowed from its MoE cache session and from this context's, both destroyed with their schedulers, and
+    // freed with the members they handed their bytes back to destroyed sessions (a segfault at shutdown)
+    if (stage_first) {
+        stage_first->synchronize();
+        for (int i = 0; i < 2; i++) {
+            stage_buf_out[i].reset();
+            stage_buf_in [i].reset();
+        }
+        stage_first.reset();
+    }
+    for (auto & ev : stage_ev_read) {
+        if (ev) {
+            ggml_backend_event_free(ev);
+            ev = nullptr;
+        }
+    }
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -1471,8 +1615,38 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
 }
 
 bool llama_context::set_mtp_h_from(llama_context & tgt, const float * row_first) {
-    if (!tgt.h_nextn_dev || !row_first) {
+    if (!row_first) {
         return false;
+    }
+    if (!tgt.h_nextn_dev) {
+        // the rows in the target's host output buffer, in batch order: copied to this context's GPU (where the
+        // graph's callback puts its input, mtp_h_input_dev)
+        if (tgt.h_nextn_host_rows <= 0 || !tgt.embd_nextn.data) {
+            return false;
+        }
+        ggml_backend_t dst = nullptr;
+        for (auto & b : backends) {
+            if (ggml_backend_dev_type(ggml_backend_get_device(b.get())) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                dst = b.get();
+                break;
+            }
+        }
+        if (!dst) {
+            return false;
+        }
+        tgt.synchronize();
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            LLAMA_LOG_INFO("%s: the draft reads the target's hidden rows from its host output buffer (%lld rows)\n",
+                    __func__, (long long) tgt.h_nextn_host_rows);
+        }
+        mtp_h_src = {};
+        mtp_h_src.n_rows      = tgt.h_nextn_host_rows;
+        mtp_h_src.row_first   = row_first;
+        mtp_h_src.backend_dst = dst;
+        mtp_h_src.host        = tgt.embd_nextn.data;
+        return true;
     }
     // this context's backend on the device of the target's rows
     ggml_backend_dev_t dev = ggml_backend_get_device(tgt.h_nextn_backend);
@@ -1658,7 +1832,7 @@ void llama_context::kv_lent_from_update() {
     }
 }
 
-llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret, bool launch) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1675,6 +1849,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
     bool reuse = !graph_reuse_disable && res->can_reuse(gparams);
+    // a pipeline stage's graph reads or writes the buffers between the stages through views: kept only for the same ones
+    if (reuse && (cparams.stage_in || cparams.stage_out)) {
+        const auto it = stage_graph_bufs.find(res);
+        reuse = it != stage_graph_bufs.end() && it->second.first == cparams.stage_in && it->second.second == cparams.stage_out;
+    }
     if (reuse && gf_res_prev_active != res) {
         // the graph of another shape ran since: its kept split and allocation, if the buffers have not moved
         reuse = small && ggml_backend_sched_plan_use(sched.get(), gf);
@@ -1711,6 +1890,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
+        stage_graph_bufs[res] = { cparams.stage_in, cparams.stage_out };
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
@@ -1739,22 +1919,26 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // the KV rows this graph reads leave the MoE expert cache first (only when a step boundary is crossed; the cache
     // zeroes them), the rows past the step above them go back to it. After the allocation: the pools may have been
-    // built by it, with the KV tail lent from the first step
+    // built by it, with the KV tail lent from the first step. The rows the decode call's later ubatches will read are
+    // taken now too: taking them synchronizes every device, and with a step (~10k rows) close to the ubatch size,
+    // almost every prefill ubatch crossed one, so the host waited for the last card to finish the previous ubatch
+    // before it queued the next and the cards of a pipeline computed in turn
     if (mctx && mctx->get_kv_rows() > 0) {
         kv_lent_from_update();
-        ggml_backend_sched_moe_cache_kv_set_rows(sched.get(), mctx->get_kv_rows());
+        ggml_backend_sched_moe_cache_kv_set_rows(sched.get(), (int64_t) mctx->get_kv_rows() + std::max<int64_t>(0, kv_rows_ahead));
     }
 
+    ret = launch ? process_ubatch_launch(res, ubatch) : GGML_STATUS_SUCCESS;
+
+    return ret == GGML_STATUS_SUCCESS ? res : nullptr;
+}
+
+ggml_status llama_context::process_ubatch_launch(llm_graph_result * res, const llama_ubatch & ubatch) {
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
-        ret = status;
-        return nullptr;
     }
-
-    ret = GGML_STATUS_SUCCESS;
-
-    return res;
+    return status;
 }
 
 int llama_context::encode(const llama_batch_ext & batch_inp) {
@@ -1996,6 +2180,108 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
+int llama_context::stage_begin(const llama_batch_ext & batch_inp, const std::vector<int32_t> & breaks, bool embd_all) {
+    GGML_ASSERT(memory && cparams.stage_il1 >= 0);
+    // the batch carries the memory of the context it was made for (the last stage's): the positions are checked against
+    // this stage's own. Against the last stage's, the check raced with it: when it had already placed the ubatch, the
+    // positions looked stale (the warm-up run failed when this ran in the first stage's thread)
+    if (!balloc->init(batch_inp, model.vocab, false, memory.get())) {
+        LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
+        return -1;
+    }
+    balloc->set_breaks(std::vector<int32_t>(breaks));
+    stage_n_left = balloc->get_n_tokens();
+
+    sched_reserve();
+    memory_update(false);
+
+    stage_mctx = memory->init_batch(*balloc, cparams.n_ubatch, embd_all);
+    if (!stage_mctx || stage_mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
+        LLAMA_LOG_ERROR("%s: the first stage could not place the batch (status %d)\n", __func__,
+                stage_mctx ? (int) stage_mctx->get_status() : -1);
+        stage_mctx.reset();
+        return -2;
+    }
+    stage_more = true;
+    return 0;
+}
+
+bool llama_context::stage_buffers(uint32_t n_rows) {
+    // a prefill's: the whole ubatch, taken from the MoE caches (the compute buffers' types: borrowed while a cache lends
+    // them); else a few rows. Each is 2 x 372 MiB at -ub 9536: kept for good, it took that much from each device's cache,
+    // and the generation (4 rows at most) lost ~11 % of the experts the second device's cache held
+    constexpr uint32_t n_small = 64;
+    const uint32_t want = n_rows > n_small ? cparams.n_ubatch : n_small;
+    if (want == stage_rows) {
+        return true;
+    }
+    // nothing of either stage may still read or write them
+    synchronize();
+    stage_first->synchronize();
+    cparams.stage_in = nullptr;
+    for (int i = 0; i < 2; ++i) {
+        stage_buf_out[i].reset();
+        stage_buf_in [i].reset();
+        stage_out[i] = stage_in[i] = nullptr;
+    }
+    stage_rows = 0;
+    const int64_t n_row = (int64_t) model.hparams.n_embd * model.hparams.dsv4_hc_mult;
+    ggml_init_params ip = { 4*ggml_tensor_overhead(), nullptr, true };
+    stage_ctx.reset(ggml_init(ip));
+    ggml_backend_t be_first = stage_first->backends[0].get();
+    ggml_backend_t be_last  = backends[0].get();
+    ggml_backend_buffer_type_t buft_first = stage_first->sched ?
+        ggml_backend_sched_get_buffer_type(stage_first->sched.get(), be_first) : ggml_backend_get_default_buffer_type(be_first);
+    ggml_backend_buffer_type_t buft_last  = sched ?
+        ggml_backend_sched_get_buffer_type(sched.get(), be_last) : ggml_backend_get_default_buffer_type(be_last);
+    for (int i = 0; i < 2; ++i) {
+        stage_out[i] = ggml_new_tensor_2d(stage_ctx.get(), GGML_TYPE_F32, n_row, want);
+        stage_in [i] = ggml_new_tensor_2d(stage_ctx.get(), GGML_TYPE_F32, n_row, want);
+        const size_t size = ggml_nbytes(stage_out[i]);
+        stage_buf_out[i].reset(ggml_backend_buft_alloc_buffer(buft_first, size));
+        stage_buf_in [i].reset(ggml_backend_buft_alloc_buffer(buft_last,  size));
+        if (!stage_buf_out[i] || !stage_buf_in[i]) {
+            LLAMA_LOG_ERROR("%s: failed to allocate the pipeline stage buffers (%u rows)\n", __func__, want);
+            return false;
+        }
+        ggml_backend_tensor_alloc(stage_buf_out[i].get(), stage_out[i], ggml_backend_buffer_get_base(stage_buf_out[i].get()));
+        ggml_backend_tensor_alloc(stage_buf_in [i].get(), stage_in [i], ggml_backend_buffer_get_base(stage_buf_in [i].get()));
+    }
+    stage_rows = want;
+    LLAMA_LOG_DEBUG("%s: pipeline stage buffers: 2 x %.1f MiB on each device (%u rows)\n", __func__,
+            ggml_nbytes(stage_out[0])/1048576.0, want);
+    return true;
+}
+
+bool llama_context::stage_step(ggml_tensor * out, uint32_t & n_tokens) {
+    if (!stage_more) {
+        return false;
+    }
+    const auto & ubatch = stage_mctx->get_ubatch();
+    n_tokens = ubatch.n_tokens;
+    n_outputs = 0;
+    stage_n_left -= ubatch.n_tokens;
+    kv_rows_ahead = stage_n_left;
+    cparams.stage_out = out;
+
+    ggml_status status;
+    const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_DECODER, stage_mctx.get(), status);
+    cparams.stage_out = nullptr;
+    kv_rows_ahead = 0;
+    if (!res) {
+        LLAMA_LOG_ERROR("%s: the first stage failed (status %d)\n", __func__, (int) status);
+        stage_more = false;
+        return false;
+    }
+    stage_more = stage_mctx->next();
+    return true;
+}
+
+void llama_context::stage_end() {
+    stage_mctx.reset();
+    stage_more = false;
+}
+
 int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
@@ -2014,13 +2300,35 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     }
 
     // a hidden-state source set by llama_set_mtp_h_from serves this decode only
-    struct mtp_h_clear { llama_mtp_h_src & s; ~mtp_h_clear() { s = {}; } } mtp_h_guard { mtp_h_src };
-    if (mtp_h_src.src && (batch_inp.n_embd > 0 || (int64_t) batch_inp.tokens.size() > mtp_h_src.n_rows + 1)) {
+    // the copies from the target's host rows must be done before the target's next decode writes them again
+    struct mtp_h_clear {
+        llama_context & c;
+        ~mtp_h_clear() {
+            if (c.mtp_h_src.host) {
+                c.synchronize();
+            }
+            c.mtp_h_src = {};
+        }
+    } mtp_h_guard { *this };
+    if ((mtp_h_src.src || mtp_h_src.host) && (batch_inp.n_embd > 0 || (int64_t) batch_inp.tokens.size() > mtp_h_src.n_rows + 1)) {
         LLAMA_LOG_ERROR("%s: a device hidden-state source needs a batch of tokens only, of at most %lld rows\n",
                 __func__, (long long) mtp_h_src.n_rows + 1);
         return -1;
     }
     h_nextn_dev = nullptr;
+    h_rows = nullptr;
+    h_rows_buf.reset();
+    h_rows_ctx.reset();
+    h_rows_backend = nullptr;
+    h_rows_n  = 0;
+    // the rows gathered on the device only on request (LLAMA_MTP_H_ROWS_DEV=1): borrowed from the cache, the buffer did
+    // not always find room there (2 x A4000: allocated past the cache, then a cuBLAS handle could not be created); the
+    // draft reads the host rows instead (h_nextn_host_rows)
+    static const bool h_rows_dev = getenv("LLAMA_MTP_H_ROWS_DEV") && atoi(getenv("LLAMA_MTP_H_ROWS_DEV")) != 0;
+    h_rows_ok = h_rows_dev;
+    h_nextn_host_rows = 0;
+    h_host_n  = 0;
+    h_host_ok = true;
 
     const auto & vocab   = model.vocab;
     const auto & hparams = model.hparams;
@@ -2066,6 +2374,23 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (!balloc->init(batch_inp, vocab, output_all)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
+    }
+
+    // a ubatch ends before each requested snapshot (llama_set_seq_snapshots)
+    std::vector<int32_t> breaks;
+    if (!snaps.empty()) {
+        const llama_batch & b = balloc->get_batch();
+        for (int32_t i = 0; i < b.n_tokens; i++) {
+            if (b.n_seq_id[i] != 1 || b.seq_id[i][0] != snap_seq) {
+                continue;
+            }
+            for (const auto & sn : snaps) {
+                if (b.pos[i] == sn.pos && i > 0) {
+                    breaks.push_back(i);
+                }
+            }
+        }
+        balloc->set_breaks(std::vector<int32_t>(breaks));
     }
 
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
@@ -2162,6 +2487,116 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         llama_sampler_backend_begin(entry.second);
     }
 
+    // a pipeline over several GPUs: the first stage splits the batch the same way and runs in its own thread, at most two
+    // ubatches ahead (the two buffers). For ubatch k it queues its graph, then on its GPU the copy of its output to this
+    // GPU's stage_in[k % 2] (behind this stage's graph that read that buffer for ubatch k - 2), and tells it k is queued:
+    // the only point where the two threads meet
+    struct stage_run {
+        std::mutex              mu;
+        std::condition_variable cv;
+        int64_t  queued   = 0;      // ubatches the first stage has queued, its copy included
+        int64_t  consumed = 0;      // ubatches whose graph this stage has queued (stage_ev_read recorded behind it)
+        bool     failed   = false;  // either side
+        bool     ended    = false;  // the first stage has no more ubatches
+        std::vector<uint32_t> n_tokens;
+        std::thread worker;
+        llama_context * first = nullptr;
+        ~stage_run() {
+            {
+                std::lock_guard<std::mutex> lock(mu);
+                failed = failed || !ended;   // this stage stopped early: the first stops too
+            }
+            cv.notify_all();
+            if (worker.joinable()) {
+                worker.join();
+            }
+            if (first) {
+                first->stage_end();
+            }
+        }
+    } stage_r;
+    // no view of a stage buffer survives this decode, whatever way it returns (a reservation would build on it)
+    struct stage_in_clear {
+        llama_cparams & c;
+        ~stage_in_clear() { c.stage_in = nullptr; }
+    } stage_in_g { cparams };
+    if (stage_first) {
+        if (!stage_buffers(std::min<uint32_t>(n_tokens_all, cparams.n_ubatch))) {
+            return -2;
+        }
+        stage_r.first = stage_first.get();
+    }
+    // one ubatch of the first stage: its graph, then on its GPU the copy of its output to this GPU (behind this stage's
+    // graph that read that buffer for ubatch k - 2); 1: queued, 0: no more ubatches, -1: failed
+    const auto stage_first_step = [this, &stage_r](int64_t k) -> int {
+        const int slot = (int) (k % 2);
+        uint32_t n = 0;
+        if (!stage_first->stage_step(stage_out[slot], n)) {
+            std::lock_guard<std::mutex> lock(stage_r.mu);
+            stage_r.ended  = true;
+            stage_r.failed = stage_r.failed || stage_first->stage_more;
+            stage_r.cv.notify_all();
+            return stage_r.failed ? -1 : 0;
+        }
+        ggml_backend_t be_first = stage_first->backends[0].get();
+        ggml_backend_t be_last  = backends[0].get();
+        if (k >= 2) {
+            ggml_backend_event_wait(be_first, stage_ev_read[slot]);
+        }
+        ggml_init_params ip = { 2*ggml_tensor_overhead(), nullptr, true };
+        ggml_context_ptr vctx(ggml_init(ip));
+        const int64_t ne = stage_out[slot]->ne[0]*n;
+        ggml_tensor * src = ggml_view_1d(vctx.get(), stage_out[slot], ne, 0);
+        ggml_tensor * dst = ggml_view_1d(vctx.get(), stage_in [slot], ne, 0);
+        ggml_backend_view_init(src);
+        ggml_backend_view_init(dst);
+        ggml_backend_tensor_copy_async(be_first, be_last, src, dst);
+        std::lock_guard<std::mutex> lock(stage_r.mu);
+        stage_r.n_tokens.push_back(n);
+        stage_r.queued = k + 1;
+        stage_r.ended  = !stage_first->stage_more;
+        stage_r.cv.notify_all();
+        return 1;
+    };
+    // a prefill: the first stage in its own thread, ahead of this one (the ubatches overlap). Otherwise (generation, a
+    // few tokens) the stages cannot overlap, the second waits for the first: it runs in this thread, so that the experts
+    // missing on both GPUs are computed by one OpenMP team (two teams pinned to the same cores spin while the other works:
+    // the verification pass took 6.5 ms more, -18 % of the generation speed)
+    // with the hosted MoE served by one thread (GGML_CUDA_MOE_HOSTED_SERVER=1), the first stage runs in its own thread for
+    // a few tokens too: this one prepares its ubatch meanwhile, and one OpenMP team computes both devices' missing experts
+    static const bool hosted_server = getenv("GGML_CUDA_MOE_HOSTED_SERVER") && atoi(getenv("GGML_CUDA_MOE_HOSTED_SERVER")) != 0;
+    const bool stage_threaded = stage_first && (n_tokens_all > 64 || hosted_server);
+    if (stage_first && !stage_threaded) {
+        if (stage_first->stage_begin(batch_inp, breaks, embd_all) != 0) {
+            return -2;
+        }
+    }
+    if (stage_threaded) {
+        // the first stage prepares its batch (split, memory placement) in its thread, while this one prepares its own
+        stage_r.worker = std::thread([this, &stage_r, &batch_inp, &breaks, embd_all, stage_first_step]() {
+            if (stage_first->stage_begin(batch_inp, breaks, embd_all) != 0) {
+                std::lock_guard<std::mutex> lock(stage_r.mu);
+                stage_r.ended  = true;
+                stage_r.failed = true;
+                stage_r.cv.notify_all();
+                return;
+            }
+            for (int64_t k = 0; ; ++k) {
+                {
+                    std::unique_lock<std::mutex> lock(stage_r.mu);
+                    stage_r.cv.wait(lock, [&] { return stage_r.consumed >= k - 1 || stage_r.failed; });
+                    if (stage_r.failed) {
+                        return;
+                    }
+                }
+                if (stage_first_step(k) <= 0 || stage_r.ended) {
+                    return;
+                }
+            }
+        });
+    }
+    int64_t stage_k = 0;
+
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
@@ -2187,7 +2622,53 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         ggml_status status;
 
         mtp_h_src.row0 = n_tokens_prev;
-        const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        kv_rows_ahead  = (int64_t) n_tokens_all - n_tokens_prev - ubatch.n_tokens;
+
+        llm_graph_result * res = nullptr;
+        if (stage_first) {
+            // this stage prepares its ubatch first (memory, graph, allocation, inputs: none of it reads the first stage's
+            // output, only the address of the buffer it lands in), then the first stage runs it, then this graph is
+            // launched: the preparation no longer waits for the first stage's GPU (~2.7 ms of each generation step)
+            const int64_t k = stage_k;
+            cparams.stage_in = stage_in[k % 2];
+            res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status, /*launch =*/ false);
+            if (res) {
+                if (!stage_threaded) {
+                    stage_first_step(k);
+                }
+                // the first stage has queued this ubatch and the copy of its output to this device
+                uint32_t n_first = 0;
+                {
+                    std::unique_lock<std::mutex> lock(stage_r.mu);
+                    stage_r.cv.wait(lock, [&] { return stage_r.queued > k || stage_r.failed || stage_r.ended; });
+                    if (stage_r.queued > k) {
+                        n_first = stage_r.n_tokens[k];
+                    }
+                }
+                if (n_first != ubatch.n_tokens) {
+                    LLAMA_LOG_ERROR("%s: the pipeline stages split the batch differently (%u against %u tokens)\n",
+                            __func__, n_first, ubatch.n_tokens);
+                    return -3;
+                }
+                status = process_ubatch_launch(res, ubatch);
+                if (status != GGML_STATUS_SUCCESS) {
+                    res = nullptr;
+                }
+            }
+        } else {
+            res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        }
+
+        // the stage buffers may move before the next graph is built (stage_buffers, a reservation): no stale view
+        cparams.stage_in = nullptr;
+
+        if (stage_first) {
+            // stage_in[k % 2] is free once this graph has run: the first stage may copy ubatch k + 2 there
+            ggml_backend_event_record(stage_ev_read[stage_k % 2], backends[0].get());
+            std::lock_guard<std::mutex> lock(stage_r.mu);
+            stage_r.consumed = ++stage_k;
+            stage_r.cv.notify_all();
+        }
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -2334,10 +2815,52 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 for (uint32_t i = 0; whole && i < ubatch.n_tokens; ++i) {
                     whole = ubatch.data->batch_idxs[i] == (int32_t) i;
                 }
+                // the host rows in batch order (a single sequence split in order)
+                {
+                    bool seq = !masked && n_tokens_prev == h_host_n && (int64_t) ubatch.n_tokens == n_rows &&
+                        ubatch.data && ubatch.data->batch_idxs.size() == ubatch.n_tokens;
+                    for (uint32_t i = 0; seq && i < ubatch.n_tokens; ++i) {
+                        seq = ubatch.data->batch_idxs[i] == (int32_t) (n_tokens_prev + i);
+                    }
+                    h_host_ok = h_host_ok && seq;
+                    h_host_n += n_rows;
+                }
                 if (whole) {
                     h_nextn_dev      = t_h_nextn;
                     h_nextn_backend  = backend_h;
                     h_nextn_dev_rows = n_rows;
+                } else if (h_rows_ok) {
+                    // one ubatch of several: its rows, in batch order, copied after the previous ones on the device
+                    bool seq = !masked && n_tokens_prev == h_rows_n && (int64_t) ubatch.n_tokens == n_rows &&
+                        ubatch.data && ubatch.data->batch_idxs.size() == ubatch.n_tokens && ggml_is_contiguous(t_h_nextn) &&
+                        (!h_rows_backend || h_rows_backend == backend_h);
+                    for (uint32_t i = 0; seq && i < ubatch.n_tokens; ++i) {
+                        seq = ubatch.data->batch_idxs[i] == (int32_t) (n_tokens_prev + i);
+                    }
+                    if (seq && !h_rows) {
+                        ggml_init_params params = {
+                            /*.mem_size   =*/ 1024*ggml_tensor_overhead(),
+                            /*.mem_buffer =*/ NULL,
+                            /*.no_alloc   =*/ true,
+                        };
+                        h_rows_ctx.reset(ggml_init(params));
+                        h_rows = ggml_new_tensor_2d(h_rows_ctx.get(), GGML_TYPE_F32, n_embd, n_tokens_all);
+                        h_rows_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(h_rows_ctx.get(),
+                                ggml_backend_sched_get_buffer_type(sched.get(), backend_h)));
+                        if (!h_rows_buf) {
+                            h_rows = nullptr;
+                            seq = false;
+                        }
+                        h_rows_backend = backend_h;
+                    }
+                    if (seq && ggml_get_mem_size(h_rows_ctx.get()) - ggml_used_mem(h_rows_ctx.get()) > 2*ggml_tensor_overhead()) {
+                        ggml_tensor * dst = ggml_view_2d(h_rows_ctx.get(), h_rows, n_embd, n_rows, h_rows->nb[1], h_rows_n*h_rows->nb[1]);
+                        ggml_backend_view_init(dst);
+                        ggml_backend_tensor_copy_async(backend_h, backend_h, t_h_nextn, dst);
+                        h_rows_n += n_rows;
+                    } else {
+                        h_rows_ok = false;
+                    }
                 }
             }
         }
@@ -2361,7 +2884,21 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
+
+        if (!snaps.empty()) {
+            seq_snapshots_capture(ubatch);
+        }
     } while (mctx->next());
+    kv_rows_ahead = 0;
+    // every row gathered on the device: the MTP draft reads them there
+    if (h_rows && h_rows_ok && h_rows_n == (int64_t) n_tokens_all) {
+        h_nextn_dev      = h_rows;
+        h_nextn_backend  = h_rows_backend;
+        h_nextn_dev_rows = h_rows_n;
+    }
+    if (!h_nextn_dev && h_host_ok && h_host_n == (int64_t) n_tokens_all) {
+        h_nextn_host_rows = h_host_n;
+    }
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
@@ -3531,6 +4068,146 @@ size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
 
 static constexpr uint32_t io_magic = 0xaf143cd8;
 
+// the serialized state written straight into pinned host memory, the tensors' bytes by copies queued on the stream of
+// the backend that holds them (a snapshot inside a decode: ordered after the ubatch that wrote them, before the next)
+class llama_io_write_snapshot : public llama_io_write_i {
+public:
+    llama_io_write_snapshot(uint8_t * p, size_t len, const std::vector<ggml_backend_ptr> & backends) :
+        ptr(p), buf_size(len), backends(backends) {}
+
+    void write(const void * src, size_t size) override {
+        if (size > buf_size) {
+            throw std::runtime_error("unexpectedly reached end of buffer");
+        }
+        memcpy(ptr, src, size);
+        ptr += size;
+        size_written += size;
+        buf_size -= size;
+    }
+
+    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        if (size > buf_size) {
+            throw std::runtime_error("unexpectedly reached end of buffer");
+        }
+        ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+        ggml_backend_t backend = nullptr;
+        if (buf && !ggml_backend_buffer_is_host(buf)) {
+            for (const auto & b : backends) {
+                if (ggml_backend_get_default_buffer_type(b.get()) == ggml_backend_buffer_get_type(buf)) {
+                    backend = b.get();
+                    break;
+                }
+            }
+        }
+        if (backend) {
+            ggml_backend_tensor_get_async(backend, tensor, ptr, offset, size);
+        } else {
+            ggml_backend_tensor_get(tensor, ptr, offset, size);
+        }
+        ptr += size;
+        size_written += size;
+        buf_size -= size;
+    }
+
+    size_t n_bytes() override {
+        return size_written;
+    }
+
+private:
+    uint8_t * ptr;
+    size_t buf_size = 0;
+    size_t size_written = 0;
+    const std::vector<ggml_backend_ptr> & backends;
+};
+
+void llama_context::set_seq_snapshots(llama_seq_id seq_id, const llama_pos * pos, int32_t n_pos, llama_state_seq_flags flags) {
+    // the pinned buffers are kept for the next requests
+    std::vector<ggml_backend_buffer_ptr> bufs;
+    for (auto & sn : snaps) {
+        if (sn.buf) {
+            bufs.push_back(std::move(sn.buf));
+        }
+    }
+    snaps.clear();
+    snap_seq   = seq_id;
+    snap_flags = flags;
+    for (int32_t i = 0; i < n_pos; i++) {
+        seq_snapshot sn;
+        sn.pos = pos[i];
+        if (!bufs.empty()) {
+            sn.buf = std::move(bufs.back());
+            bufs.pop_back();
+        }
+        snaps.push_back(std::move(sn));
+    }
+}
+
+void llama_context::seq_snapshots_capture(const llama_ubatch & ubatch) {
+    llama_pos last = -1;
+    for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
+        for (int32_t s = 0; s < ubatch.n_seq_id[i]; s++) {
+            if (ubatch.seq_id[i][s] == snap_seq) {
+                last = std::max(last, ubatch.pos[i]);
+            }
+        }
+    }
+    if (last < 0) {
+        return;
+    }
+    for (auto & sn : snaps) {
+        if (sn.taken || sn.pos != last + 1) {
+            continue;
+        }
+        const size_t size = state_seq_get_size(snap_seq, snap_flags);
+        if (size == 0) {
+            continue;
+        }
+        if (!sn.buf || ggml_backend_buffer_get_size(sn.buf.get()) < size) {
+            ggml_backend_buffer_type_t buft = nullptr;
+            for (const auto & b : backends) {
+                ggml_backend_dev_t dev = ggml_backend_get_device(b.get());
+                if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU && (buft = ggml_backend_dev_host_buffer_type(dev))) {
+                    break;
+                }
+            }
+            sn.buf.reset(ggml_backend_buft_alloc_buffer(buft ? buft : ggml_backend_cpu_buffer_type(), size));
+            if (!sn.buf) {
+                continue;
+            }
+        }
+        llama_io_write_snapshot io((uint8_t *) ggml_backend_buffer_get_base(sn.buf.get()), size, backends);
+        try {
+            io.write(&io_magic, sizeof(io_magic));
+            io.write(&snap_seq, sizeof(snap_seq));
+            state_seq_write_data(io, snap_seq, snap_flags);
+            sn.size  = io.n_bytes();
+            sn.taken = true;
+        } catch (const std::exception & err) {
+            LLAMA_LOG_ERROR("%s: error capturing the state before pos %d: %s\n", __func__, sn.pos, err.what());
+        }
+    }
+}
+
+size_t llama_context::get_seq_snapshot(llama_seq_id seq_id, llama_pos pos, uint8_t * dst, size_t size) {
+    if (seq_id != snap_seq) {
+        return 0;
+    }
+    for (const auto & sn : snaps) {
+        if (sn.pos != pos || !sn.taken) {
+            continue;
+        }
+        if (dst) {
+            synchronize();
+            if (size < sn.size) {
+                return 0;
+            }
+            memcpy(dst, ggml_backend_buffer_get_base(sn.buf.get()), sn.size);
+        }
+        return sn.size;
+    }
+    return 0;
+}
+
 size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags) {
     llama_io_write_dummy io(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
     try {
@@ -4145,6 +4822,9 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
+        /*.stage_il0                   =*/ 0,
+        /*.stage_il1                   =*/ -1,
+        /*.stage_device                =*/ -1,
     };
 
     return result;
@@ -4753,6 +5433,14 @@ size_t llama_state_seq_get_data_ext(llama_context * ctx, uint8_t * dst, size_t s
 
     return ctx->state_seq_get_data(seq_id, dst, size, flags);
 }
+void llama_set_seq_snapshots(llama_context * ctx, llama_seq_id seq_id, const llama_pos * pos, int32_t n_pos, llama_state_seq_flags flags) {
+    ctx->set_seq_snapshots(seq_id, pos, n_pos, flags);
+}
+
+size_t llama_get_seq_snapshot(llama_context * ctx, llama_seq_id seq_id, llama_pos pos, uint8_t * dst, size_t size) {
+    return ctx->get_seq_snapshot(seq_id, pos, dst, size);
+}
+
 size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
     ctx->synchronize();
 

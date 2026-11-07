@@ -5,6 +5,7 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include <map>
 #include <unordered_map>
 #include <vector>
 
@@ -234,6 +235,9 @@ public:
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
 
+    // rot (the tensor returned by build_input_k_rot / build_input_v_rot) as kept in the buffer type of layer il's K
+    ggml_tensor * layer_rot(ggml_tensor * rot, int32_t il) const;
+
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
 
@@ -304,6 +308,16 @@ private:
     ggml_tensor * rot_v = nullptr;
     ggml_context_ptr        rot_ctx;
     ggml_backend_buffer_ptr rot_buf;
+
+    // copies of rot_k / rot_v in the other buffer types of the K cache (layers split over devices), so that a layer's
+    // rotations run on its own device instead of a round trip to the first one
+    struct rot_copy {
+        ggml_tensor * k = nullptr;
+        ggml_tensor * v = nullptr;
+        ggml_context_ptr        ctx;
+        ggml_backend_buffer_ptr buf;
+    };
+    std::map<ggml_backend_buffer_type_t, rot_copy> rot_copies;
 
 
     // env: LLAMA_KV_CACHE_DEBUG
@@ -449,6 +463,9 @@ public:
 
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
+
+    // rot (the tensor returned by build_input_k_rot / build_input_v_rot) as kept in the buffer type of layer il's K
+    ggml_tensor * layer_rot(ggml_tensor * rot, int32_t il) const;
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;

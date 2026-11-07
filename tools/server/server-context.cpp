@@ -1038,6 +1038,19 @@ private:
 
     common_speculative_ptr spec;
 
+    // context checkpoints inside a prompt batch (llama_set_seq_snapshots): the batch is no longer ended where a
+    // checkpoint is due, so that its ubatches stay in one decode (they overlap in a pipeline over several GPUs); the
+    // state there is captured by the decode and the checkpoint created after it. LLAMA_SERVER_SNAPSHOTS=0: the batch
+    // ends at each checkpoint as before
+    struct snapshot_req {
+        llama_pos pos;      // the state before this position
+        int64_t   n_tokens; // prompt tokens before it
+        llama_pos pos_min;  // the sequence's first position (the checkpoint's range)
+    };
+    int snap_slot = -1;
+    std::vector<snapshot_req> snap_reqs;
+    bool snap_set = false;
+
     bool add_bos_token = true;
 
     int32_t n_ctx; // total context for all clients / slots
@@ -2605,7 +2618,8 @@ private:
     }
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
-    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max,
+            const std::vector<uint8_t> * data_tgt = nullptr) {
         const int id_task = slot.task->id;
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
@@ -2659,7 +2673,13 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
-        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        if (data_tgt) {
+            cur.data_tgt = *data_tgt;
+        } else {
+            cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        }
+        // a checkpoint from a snapshot takes the draft's state after the whole batch: a restore removes the later
+        // positions (seq_rm) after loading it
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
@@ -4128,8 +4148,14 @@ private:
                     // as much as a full one when the experts are uploaded for each ubatch (prefetch), and the cost of a
                     // ubatch, max(compute ~ tokens, upload), is convex in its size: 19k tokens at -ub 8192, 8192 / 2634 / 8188
                     // become 5413 / 5413 / 8188. One ubatch per server batch then
+                    // with snapshots, a single sequence's prompt batch is filled up to n_batch and llama makes the equal
+                    // ubatches between the checkpoints (llama_set_seq_snapshots)
+                    static const bool snaps_env = !getenv("LLAMA_SERVER_SNAPSHOTS") || atoi(getenv("LLAMA_SERVER_SNAPSHOTS")) != 0;
+                    const bool use_snaps = snaps_env && do_checkpoint && n_swa == 0 && params_base.n_parallel == 1 && !has_mtmd &&
+                        !input_tokens.has_mtmd && batch.size() == 0;
+                    std::vector<snapshot_req> snaps_cur;
                     int32_t n_batch_cur = n_batch;
-                    {
+                    if (!use_snaps) {
                         const int32_t pos   = slot.prompt.n_tokens();
                         int32_t       stop  = slot.task->n_tokens();
                         if (do_checkpoint) {
@@ -4191,12 +4217,20 @@ private:
                         slot.prompt.tokens.push_back(cur_tok);
 
                         // break at the last user message, or at user messages at least min step past the last checkpoint
+                        // (with snapshots: a checkpoint there, created after the decode)
                         if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
+                            const int64_t last_ckpt = use_snaps && !snaps_cur.empty() ? snaps_cur.back().n_tokens :
+                                                      checkpoints.empty() ? -1 : checkpoints.back().n_tokens;
 
-                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
-                                break;
+                            if (pos == last_user_pos || last_ckpt < 0 || pos > last_ckpt + params_base.checkpoint_min_step) {
+                                if (!use_snaps) {
+                                    break;
+                                }
+                                if (slot.prompt.n_tokens() < slot.task->n_tokens()) {
+                                    snaps_cur.push_back({ slot.prompt.tokens.pos_next(), slot.prompt.n_tokens(), -1 });
+                                }
                             }
                         }
 
@@ -4212,6 +4246,14 @@ private:
                             for (int offset : checkpoint_offsets) {
                                 const int n_last = std::min(n_batch, offset);
                                 if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
+                                    // the last 4 tokens stay a batch of their own (the prompt's logits); a checkpoint
+                                    // one ubatch before them is a snapshot inside this batch
+                                    if (use_snaps && offset != 4 && batch.size() > n_tokens_prev) {
+                                        if (snaps_cur.empty() || snaps_cur.back().n_tokens != slot.prompt.n_tokens()) {
+                                            snaps_cur.push_back({ slot.prompt.tokens.pos_next(), slot.prompt.n_tokens(), -1 });
+                                        }
+                                        continue;
+                                    }
                                     should_break = true;
                                     break;
                                 }
@@ -4276,6 +4318,17 @@ private:
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
                         create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
+                    }
+
+                    // the checkpoints inside this batch: created after the decode from its snapshots
+                    if (use_snaps && !snaps_cur.empty() && !has_mtmd) {
+                        // the state of the recurrent memory there covers its last position only (as the memory's pos_min
+                        // reads between two batches)
+                        for (auto & sn : snaps_cur) {
+                            sn.pos_min = sn.pos - 1;
+                        }
+                        snap_slot = slot.id;
+                        snap_reqs = std::move(snaps_cur);
                     }
                 }
 
@@ -4379,6 +4432,23 @@ private:
 
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
+        // the checkpoints inside the prompt batch (snapshot_req): only when the view is the whole batch
+        const bool snaps_here = !snap_reqs.empty() && off == 0 && batch.view.size() == batch.size();
+        if (snaps_here) {
+            std::vector<llama_pos> ps;
+            for (const auto & sn : snap_reqs) {
+                ps.push_back(sn.pos);
+            }
+            llama_set_seq_snapshots(ctx_tgt, snap_slot, ps.data(), (int32_t) ps.size(), LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            snap_set = true;
+        } else {
+            snap_reqs.clear();
+            if (snap_set) {
+                llama_set_seq_snapshots(ctx_tgt, -1, nullptr, 0, 0);
+                snap_set = false;
+            }
+        }
+
         int ret = 0;
         const int64_t dt0 = ggml_time_us(); int64_t dw0 = 0, dw1 = 0;
         queue_tasks.yield_to_queue([&]() {
@@ -4392,6 +4462,7 @@ private:
         if (g_spec_timing.on && batch.view.size() <= 8) g_spec_timing.add(1, dt0, dw0, dw1);
 
         if (ret != 0) {
+            snap_reqs.clear();
             {
                 std::string err;
 
@@ -4463,6 +4534,23 @@ private:
                 // TODO: handle error
                 throw std::runtime_error("failed to process speculative batch");
             }
+        }
+
+        if (snaps_here) {
+            for (auto & slot : slots) {
+                if (slot.id != snap_slot) {
+                    continue;
+                }
+                for (const auto & sn : snap_reqs) {
+                    std::vector<uint8_t> data(llama_get_seq_snapshot(ctx_tgt, snap_slot, sn.pos, nullptr, 0));
+                    if (data.empty() || llama_get_seq_snapshot(ctx_tgt, snap_slot, sn.pos, data.data(), data.size()) != data.size()) {
+                        SLT_WRN(slot, "no state snapshot before pos %d: checkpoint skipped\n", sn.pos);
+                        continue;
+                    }
+                    create_checkpoint(slot, slot.prompt.n_tokens() - sn.n_tokens, sn.pos_min, sn.pos - 1, &data);
+                }
+            }
+            snap_reqs.clear();
         }
 
         // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too
