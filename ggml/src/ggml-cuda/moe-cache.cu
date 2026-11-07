@@ -255,6 +255,16 @@ struct moe_cache_pool {
     int64_t gpu_extent = 0;     // largest gpu index + 1, passed to kernels as a bound
 
     std::vector<moe_cache_kv_range> kv;   // KV tails lent to this pool
+
+    // BANDS (moe_cache_allocate_banded): the pools of a device share one slab cut into bands of band_bytes, each band
+    // holding band_per entries of every pool at band_off; slot s of range 0 sits in band s / band_per. A run of bands
+    // is a run of slots in every pool, at its tail: zones and loans take whole bands, from every expert shape alike.
+    char * band_base = nullptr;
+    size_t band_bytes = 0;
+    size_t band_off = 0;
+    int band_per = 0;
+    int band_slots = 0;   // band_per x the device's bands
+    std::vector<uint8_t> band_refs;   // per slot of the bands: the loans covering it (an entry astride two loans: 2)
 };
 
 static inline int32_t moe_cache_gpu_index(const moe_cache_pool & pool, int index) {
@@ -267,6 +277,10 @@ static inline int32_t moe_cache_gpu_index(const moe_cache_pool & pool, int index
 }
 
 static inline char * moe_cache_slot_ptr(const moe_cache_pool & pool, int index) {
+    if (index < pool.band_slots) {
+        return pool.band_base + (size_t)(index / pool.band_per) * pool.band_bytes + pool.band_off +
+               (size_t)(index % pool.band_per) * pool.expert_size;
+    }
     return pool.gpu_base + (size_t)moe_cache_gpu_index(pool, index) * pool.expert_size;
 }
 
@@ -510,6 +524,16 @@ struct moe_arena_readers {
 struct moe_cache_device {
     // the largest piece one pool lends while the prefetch holds its zones, set once with the zones (moe_cache_largest_lend)
     std::atomic<size_t> largest_lend_bytes{0};
+    // BANDS: the slab of the banded pools (moe_cache_allocate_banded). Zones and loans are byte ranges of it: the
+    // prefetch zones at its top (band_zones slots of band_zone_bytes from band_zone_begin), the compute buffer chunks in
+    // the free space under them (band_loans, sorted), above a floor of 5 % that stays cached
+    char * band_slab = nullptr;
+    size_t band_bytes = 0;
+    int n_bands = 0;
+    size_t band_zone_begin = 0;
+    size_t band_zone_bytes = 0;
+    int band_zones = 0;
+    std::vector<std::pair<size_t, size_t>> band_loans;
     moe_cache_device(int logical, int physical) : logical(logical), physical(physical) {}
 
     int logical;
@@ -571,6 +595,7 @@ struct moe_cache_device {
     size_t automatic_reserve_bytes = 0;
     size_t budget_reserve_bytes = 0;
     size_t budget_limit = 0;
+    size_t preload_bytes = 0;   // what moe_cache_preload installed (EXPERT SPLIT, DEAL=2: where the next card's band starts)
     size_t coordinator_allocated_bytes = 0;
     size_t allocated_bytes = 0;
     moe_cache_scratch scratch_reserve;
@@ -936,6 +961,11 @@ static size_t moe_cache_budget_claim(
     const int remaining_participants = std::max(
             state.participants - state.prepared, 1);
     size_t claim = unclaimed / (size_t)remaining_participants;
+    // DIAGNOSTIC (GGML_MOE_CACHE_VIRTUAL_DEVICES=1): free_memory is already this virtual device's own
+    // (ggml_cuda_virtual_memory), not the physical GPU's to split between its caches
+    if (getenv("GGML_MOE_CACHE_VIRTUAL_DEVICES") && atoi(getenv("GGML_MOE_CACHE_VIRTUAL_DEVICES")) != 0) {
+        claim = available_after_reserve;
+    }
     if (session.config.budget_mb > 0) {
         claim = std::min(claim, session.config.budget_mb << 20);
     }
@@ -2343,6 +2373,9 @@ static const moe_cache_layer * moe_cache_layer_of(const moe_cache_device & devic
 // the pool of an expert tensor's layer, -1 if none
 // EXPERT SPLIT (GGML_MOE_CACHE_EXPERT_SPLIT=1): see moe_split_find_locked
 #define MOE_SPLIT_MAX_CARDS 4
+// EXPERT SPLIT, PSUM: up to this many tokens, another card returns one weighted sum per token of its rows instead of
+// each row (GGML_MOE_SPLIT_PSUM=0: each row)
+#define MOE_SPLIT_PSUM_TOKENS 8
 #define MOE_SPLIT_MAX_SLOTS 256
 // a wait of the cards' chains or of the merge for a card longer than this (clock ticks: 100 MHz under HIP, ns under
 // CUDA) gives up and is reported (moe_split_diag) rather than freezing the GPU
@@ -2540,6 +2573,17 @@ static bool moe_cache_prepare_budget(
     }
 #endif
 
+    // DIAGNOSTIC (GGML_MOE_CACHE_VIRTUAL_DEVICES=1, one cache per virtual device): the memory of a card of its own
+    if (getenv("GGML_MOE_CACHE_VIRTUAL_DEVICES") && atoi(getenv("GGML_MOE_CACHE_VIRTUAL_DEVICES")) != 0) {
+        size_t vfree = free_memory, vtotal = total_memory;
+        ggml_cuda_virtual_memory(device.logical, &vfree, &vtotal);
+        if (vtotal != total_memory) {
+            MOE_CACHE_LOG("[moe-cache] CUDA%d virtual device %d: free %zu of %zu MiB\n", device.physical, device.logical,
+                    vfree >> 20, vtotal >> 20);
+            free_memory = vfree;
+        }
+    }
+
     size_t reserve_bytes = 0;
     const size_t available = moe_cache_budget_claim(
             session, device, free_memory, reserve_bytes);
@@ -2656,6 +2700,251 @@ static bool moe_cache_allocate_pool(
         MOE_CACHE_LOG("[moe-cache] enabled: first pool allocated on CUDA%d\n", device.physical);
     }
 
+    return true;
+}
+
+// BANDS: the pools of a device in one slab of bands of 128 MiB; GGML_MOE_CACHE_BAND_MB=N another band size, 0 a slab
+// per pool (as before)
+static size_t moe_cache_band_bytes() {
+    static const size_t bytes = [] () -> size_t {
+        const char * text = getenv("GGML_MOE_CACHE_BAND_MB");
+        const long long value = text && text[0] ? atoll(text) : 128;
+        return value > 0 ? (size_t)value << 20 : 0;
+    }();
+    return bytes;
+}
+
+// BANDS: the bytes of the slab and its floor (the bottom 5 %, never lent)
+static size_t moe_cache_band_total(const moe_cache_device & device) {
+    return (size_t)device.n_bands * device.band_bytes;
+}
+static size_t moe_cache_band_floor(const moe_cache_device & device) {
+    return moe_cache_band_total(device) - moe_cache_band_total(device) * moe_cache_lend_percent / 100;
+}
+
+// BANDS: where a chunk of 'bytes' goes under the zones and above the floor (aligned to 4 KiB), SIZE_MAX: nowhere. The
+// small ones (under 256 MiB: the MTP draft's compute buffer, kept for good, and generation's, kept for an answer) at the
+// bottom of the lowest gap that holds them, the large ones (a prefill's, given back after each ubatch) at the top of the
+// highest: the small ones lasting, a draft's 127 MiB placed between a prefill's chunks would cut the free space in two
+static size_t moe_cache_band_find(const moe_cache_device & device, size_t bytes) {
+    const bool small = bytes < ((size_t)256 << 20);
+    const size_t n = device.band_loans.size();
+    for (size_t k = 0; k <= n; k++) {
+        const size_t i = small ? k : n - k;   // the gap between loan i - 1 and loan i
+        const size_t bottom = i > 0 ? device.band_loans[i - 1].second : moe_cache_band_floor(device);
+        const size_t top = i < n ? device.band_loans[i].first : device.band_zone_begin;
+        if (top < bottom || top - bottom < bytes) {
+            continue;
+        }
+        const size_t start = small ? ((bottom + 4095) & ~(size_t)4095) : ((top - bytes) & ~(size_t)4095);
+        if (start >= bottom && start + bytes <= top) {
+            return start;
+        }
+    }
+    return SIZE_MAX;
+}
+static void moe_cache_band_room(const moe_cache_device & device, size_t & free_bytes, size_t & largest) {
+    free_bytes = largest = 0;
+    size_t bottom = moe_cache_band_floor(device);
+    for (size_t i = 0; i <= device.band_loans.size(); i++) {
+        const size_t top = i < device.band_loans.size() ? device.band_loans[i].first : device.band_zone_begin;
+        const size_t gap = top > bottom ? top - bottom : 0;
+        free_bytes += gap;
+        largest = std::max(largest, gap);
+        if (i < device.band_loans.size()) {
+            bottom = device.band_loans[i].second;
+        }
+    }
+}
+
+// BANDS: the slots of a banded pool that the byte range [a, b) of the slab overlaps: one run [s0, s1) (an entry that
+// starts before a or ends after b included)
+static void moe_cache_band_slots(const moe_cache_pool & pool, size_t a, size_t b, int & s0, int & s1) {
+    s0 = s1 = 0;
+    if (!pool.band_per || b <= a) {
+        return;
+    }
+    const size_t es = pool.expert_size, seg = (size_t)pool.band_per * es;
+    const size_t ca = a / pool.band_bytes, oa = a % pool.band_bytes;
+    // the first slot: in a's band, the entry holding oa (or the first of the segment if oa is before it); past the
+    // segment, the first of the next band
+    if (oa < pool.band_off) {
+        s0 = (int)ca * pool.band_per;
+    } else if (oa - pool.band_off < seg) {
+        s0 = (int)ca * pool.band_per + (int)((oa - pool.band_off) / es);
+    } else {
+        s0 = (int)(ca + 1) * pool.band_per;
+    }
+    // one past the last: in the band of b - 1, the entries starting before b's offset there
+    const size_t cb = (b - 1) / pool.band_bytes, ob = b - cb * pool.band_bytes;   // ob in (0, band_bytes]
+    int j1 = 0;
+    if (ob > pool.band_off) {
+        j1 = (int)std::min<size_t>((size_t)pool.band_per, (ob - pool.band_off + es - 1) / es);
+    }
+    s1 = (int)cb * pool.band_per + j1;
+    s1 = std::min(s1, pool.band_slots);
+    if (s1 < s0) {
+        s1 = s0;
+    }
+}
+
+static void moe_cache_evacuate(moe_cache_device & device, moe_cache_pool & pool, int b, int e, std::vector<int> & moved);
+
+// BANDS: lend [a, b) of the slab: in every banded pool, the slots it overlaps leave the cache (those not already lent
+// by a neighbour moved out or evicted), their loan count up. The caller synchronizes moe_cache_zone_stream after.
+static void moe_cache_band_take(moe_cache_device & device, size_t a, size_t b,
+        std::vector<std::pair<moe_cache_pool *, std::vector<int>>> & moved) {
+    for (auto & pool_ptr : device.pools) {
+        moe_cache_pool & pool = *pool_ptr;
+        int s0, s1;
+        moe_cache_band_slots(pool, a, b, s0, s1);
+        if (s0 >= s1) {
+            continue;
+        }
+        int e0 = s0, e1 = s1;   // a neighbour's loan can only share the first or the last slot
+        while (e0 < e1 && pool.band_refs[(size_t)e0] > 0) {
+            e0++;
+        }
+        while (e1 > e0 && pool.band_refs[(size_t)e1 - 1] > 0) {
+            e1--;
+        }
+        moved.push_back({&pool, {}});
+        if (e0 < e1) {
+            moe_cache_evacuate(device, pool, e0, e1, moved.back().second);
+        }
+        for (int i = s0; i < s1; i++) {
+            pool.band_refs[(size_t)i]++;
+        }
+    }
+}
+
+// BANDS: give [a, b) of the slab back: a slot no other loan covers returns to the free list (it is free, unlinked and
+// unmapped since its loan)
+static void moe_cache_band_release(moe_cache_device & device, size_t a, size_t b) {
+    for (auto & pool_ptr : device.pools) {
+        moe_cache_pool & pool = *pool_ptr;
+        int s0, s1;
+        moe_cache_band_slots(pool, a, b, s0, s1);
+        for (int i = s1 - 1; i >= s0; i--) {
+            if (pool.band_refs[(size_t)i] > 0 && --pool.band_refs[(size_t)i] == 0) {
+                pool.free_slots.push_back(i);
+            }
+        }
+    }
+}
+
+// BANDS: the shapes' pools in one slab of bands. Each band holds a whole number of entries of every shape, in proportion
+// to its weight (entry size x experts, as the pools' budgets), the band's tail filled with the smallest entries that fit:
+// what stays is lost for good (~0.7 % at 128 MiB). A run of bands is then a run of slots at the same place in every
+// pool, so a loan of any size up to the slab takes from every shape alike and finds one contiguous piece.
+static bool moe_cache_allocate_banded(moe_cache_session & session, moe_cache_device & device,
+        const std::vector<moe_cache_shape *> & shapes, size_t budget) {
+    const size_t band = moe_cache_band_bytes();
+    if (!band || shapes.empty()) {
+        return false;
+    }
+    long double total = 0.0;
+    for (const moe_cache_shape * sh : shapes) {
+        if (sh->expert_size == 0 || sh->n_layers <= 0 || sh->n_entries == 0 || ggml_type_is_exl3((ggml_type)sh->role_type[MOE_ROLE_GATE]) ||
+                sh->expert_size > band) {
+            return false;
+        }
+        total += (long double)sh->expert_size * (long double)sh->n_entries;
+    }
+    std::vector<int> per(shapes.size());
+    size_t used = 0;
+    for (size_t i = 0; i < shapes.size(); i++) {
+        const long double weight = (long double)shapes[i]->expert_size * (long double)shapes[i]->n_entries;
+        per[i] = (int)((long double)band * weight / total / (long double)shapes[i]->expert_size);
+        used += (size_t)per[i] * shapes[i]->expert_size;
+    }
+    std::vector<size_t> by_size(shapes.size());
+    for (size_t i = 0; i < shapes.size(); i++) {
+        by_size[i] = i;
+    }
+    std::sort(by_size.begin(), by_size.end(), [&](size_t a, size_t b) { return shapes[a]->expert_size < shapes[b]->expert_size; });
+    for (size_t i : by_size) {
+        while (used + shapes[i]->expert_size <= band) {
+            per[i]++;
+            used += shapes[i]->expert_size;
+        }
+    }
+    for (int p : per) {
+        if (p <= 0) {
+            return false;   // a band too small for a share of every shape
+        }
+    }
+    int n_bands = (int)std::min<size_t>(budget / band, INT_MAX / 2);
+    ggml_cuda_set_device(device.logical);
+    char * slab = nullptr;
+    while (n_bands >= 8) {
+        if (!moe_cache_fail(session, "slab") && cudaMalloc((void **)&slab, (size_t)n_bands * band) == cudaSuccess) {
+            break;
+        }
+        (void)cudaGetLastError();
+        slab = nullptr;
+        n_bands /= 2;
+    }
+    if (!slab) {
+        MOE_CACHE_LOG("[moe-cache] CUDA%d banded slab refused: a slab per pool\n", device.physical);
+        return false;
+    }
+    const size_t allocated = (size_t)n_bands * band;
+    moe_cache_budget_allocation(device, allocated, true);
+    device.band_slab = slab;
+    device.band_bytes = band;
+    device.n_bands = n_bands;
+    device.band_zone_begin = (size_t)n_bands * band;
+    size_t off = 0;
+    for (size_t i = 0; i < shapes.size(); i++) {
+        moe_cache_shape & shape = *shapes[i];
+        shape.finished = true;
+        std::unique_ptr<moe_cache_pool> pool(new moe_cache_pool());
+        const int slot_count = per[i] * n_bands;
+        pool->expert_size = moe_cache_entry_layout(shape.role_bytes, shape.role_pad, pool->role_offset);
+        for (int r = 0; r < MOE_ROLES; r++) {
+            pool->role_bytes[r] = shape.role_bytes[r];
+            pool->role_pad[r] = shape.role_pad[r];
+        }
+        pool->wtype = shape.role_type[MOE_ROLE_GATE];
+        pool->slab = slab;   // shared: freed once, with the device's band_slab
+        pool->n_slots = slot_count;
+        pool->gpu_base = slab;
+        pool->gpu_extent = (int64_t)slot_count;
+        pool->zone_end = slot_count;
+        pool->ranges.push_back({slab, 0, slot_count, 0});
+        pool->covers_all_entries = (uint64_t)slot_count >= shape.n_entries;
+        pool->band_base = slab;
+        pool->band_bytes = band;
+        pool->band_off = off;
+        pool->band_per = per[i];
+        pool->band_slots = slot_count;
+        pool->band_refs.assign((size_t)slot_count, 0);
+        pool->slots.resize(slot_count);
+        pool->free_slots.reserve(slot_count);
+        pool->map.reserve(slot_count);
+        for (int index = slot_count - 1; index >= 0; index--) {
+            pool->free_slots.push_back(index);   // the low bands fill first, the tail (lent first) last
+        }
+        off += (size_t)per[i] * pool->expert_size;
+        device.pools.push_back(std::move(pool));
+        shape.pool = (int)device.pools.size() - 1;
+        MOE_CACHE_LOG("[moe-cache] CUDA%d pool[%d]: experts %s/%s/%s (up/gate/down) entry=%zu KiB slots=%d (%d a band) experts=%llu coverage=%s total=%zu MiB\n",
+                device.physical, shape.pool, ggml_type_name((ggml_type)shape.role_type[MOE_ROLE_UP]),
+                ggml_type_name((ggml_type)shape.role_type[MOE_ROLE_GATE]), ggml_type_name((ggml_type)shape.role_type[MOE_ROLE_DOWN]),
+                shape.expert_size >> 10, slot_count, per[i], (unsigned long long)shape.n_entries,
+                device.pools.back()->covers_all_entries ? "complete" : "partial", ((size_t)slot_count * shape.expert_size) >> 20);
+    }
+    device.allocated_bytes += allocated;
+    MOE_CACHE_LOG("[moe-cache] CUDA%d banded slab: %d bands of %zu MiB (%zu MiB), %zu KiB of each band unused (%.2f %%)\n",
+            device.physical, n_bands, band >> 20, allocated >> 20, (band - off) >> 10, 100.0 * (double)(band - off) / (double)band);
+    if (!moe_cache_start_worker(session, device)) {
+        GGML_ABORT("moe-cache: the fill worker did not start");
+    }
+    bool expected = false;
+    if (session.enabled_announced.compare_exchange_strong(expected, true)) {
+        MOE_CACHE_LOG("[moe-cache] enabled: first pool allocated on CUDA%d\n", device.physical);
+    }
     return true;
 }
 
@@ -3611,6 +3900,10 @@ static void moe_cache_build_pending(
     // each shape's share of the budget by weight, so that every layer holds the same share of its experts whatever its
     // entry size; the floor (moe_cache_pool_slots_min entries) is a minimum, not a bonus (added to the share, it gave
     // the one-layer pools of a seven-shape model +50 % of their part), and the shapes after this one keep theirs
+    // BANDS: the first build of a device, every shape in one slab of bands
+    if (device.pools.empty() && moe_cache_allocate_banded(session, device, pending, remaining)) {
+        pending.clear();
+    }
     for (moe_cache_shape * shape : pending) {
         const long double weight =
             (long double)shape->expert_size * (long double)shape->n_entries;
@@ -4029,12 +4322,22 @@ static void moe_cache_free_device(moe_cache_device & device) {
         cudaStreamSynchronize(device.compute_stream);
     }
     for (auto & pool_ptr : device.pools) {
-        if (pool_ptr->slab) {
+        if (pool_ptr->slab && pool_ptr->band_per) {
+            pool_ptr->slab = nullptr;   // BANDS: the device's slab, freed below
+        } else if (pool_ptr->slab) {
             cudaFree(pool_ptr->slab);
             moe_cache_budget_allocation(
                     device, (size_t)pool_ptr->n_slots * pool_ptr->expert_size, false);
             pool_ptr->slab = nullptr;
         }
+    }
+    if (device.band_slab) {
+        cudaFree(device.band_slab);
+        moe_cache_budget_allocation(device, (size_t)device.n_bands * device.band_bytes, false);
+        device.band_slab = nullptr;
+        device.n_bands = 0;
+        device.band_loans.clear();
+        device.band_zones = 0;
     }
     if (device.d_input) {
         cudaFree(device.d_input);
@@ -4874,6 +5177,42 @@ static void moe_cache_setup_zone(moe_cache_device & device, size_t zone_bytes, i
     if (!zone_bytes || n_zones <= 0) {
         return;
     }
+    // BANDS: the zones at the top of the slab, one after the other (a prefetch slot: zone_bytes rounded to 4 KiB), at
+    // most half of it; each banded pool's zone is the run of its slots they overlap
+    if (device.band_slab) {
+        if (device.band_zones > 0) {
+            return;
+        }
+        const size_t total = moe_cache_band_total(device);
+        const size_t slot = (zone_bytes + 4095) & ~(size_t)4095;
+        int zones = n_zones;
+        while (zones > 0 && (size_t)zones * slot > total / 2) {
+            zones--;
+        }
+        device.band_zones = zones;
+        device.band_zone_bytes = slot;
+        device.band_zone_begin = total - (size_t)zones * slot;
+        for (auto & pool_ptr : device.pools) {
+            moe_cache_pool & pool = *pool_ptr;
+            if (!pool.band_per || zones == 0) {
+                continue;
+            }
+            int s0, s1;
+            moe_cache_band_slots(pool, device.band_zone_begin, total, s0, s1);
+            pool.zone_begin = s0;
+            pool.zone_end = s1;
+            pool.zone_slice = s1 - s0;   // the whole zone: the device's lend gives the slots' pointers
+        }
+        device.largest_lend_bytes.store(device.band_zone_begin > moe_cache_band_floor(device) ?
+                device.band_zone_begin - moe_cache_band_floor(device) : 0);
+        MOE_CACHE_LOG("[moe-cache] CUDA%d zone: %d prefetch slot(s) of %zu MiB at %zu MiB of %zu\n", device.physical, zones,
+                slot >> 20, device.band_zone_begin >> 20, total >> 20);
+        if (zones < n_zones) {
+            MOE_CACHE_LOG("[moe-cache] CUDA%d zone: only %d of %d prefetch slots reserved%s\n",
+                    device.physical, zones, n_zones, zones < 2 ? ", the prefetch will not borrow" : "");
+        }
+        return;
+    }
     // the pools that can lend, and the entries of one slot in each
     std::vector<moe_cache_pool *> eligible;
     std::vector<int> slice, count;
@@ -5482,6 +5821,12 @@ static void moe_cache_arena_seed(moe_cache_device & device) {
             device.physical, n_read, bytes / 1073741824.0, sec, sec > 0 ? bytes / sec / 1e9 : 0.0, n_failed);
 }
 
+// GGML_CUDA_MOE_CACHE_PRELOAD_ZONES=0: the preload leaves the prefetch zones empty (as before)
+static bool moe_cache_preload_zones() {
+    static const bool on = !getenv("GGML_CUDA_MOE_CACHE_PRELOAD_ZONES") || atoi(getenv("GGML_CUDA_MOE_CACHE_PRELOAD_ZONES")) != 0;
+    return on;
+}
+
 static void moe_cache_preload(const moe_cache_session & session, moe_cache_device & device) {
     const char * path = getenv("GGML_CUDA_MOE_CACHE_PRELOAD");
     if (!path || !*path) {
@@ -5493,11 +5838,67 @@ static void moe_cache_preload(const moe_cache_session & session, moe_cache_devic
         MOE_CACHE_LOG("[moe-cache] CUDA%d preload: %s is not an expert ranking (or is truncated)\n", device.physical, path);
         return;
     }
-    const uint32_t n_ranked = (uint32_t) ranking.size();
     double heat_total = 0;
     for (const auto & r : ranking) {
         heat_total += r.heat;
     }
+    // EXPERT SPLIT: the ranking dealt to the cards in proportion to their budgets, so that every band of it is shared
+    // the same way and no expert is preloaded (or restored after a prefill) on two cards; every card deals the same
+    // ranking with the same budgets and keeps its own hand. GGML_MOE_SPLIT_DEAL=0: every card takes the whole ranking
+    // GGML_MOE_SPLIT_DEAL=2: in bands instead, the hottest to card 0 up to its budget, the next ones to card 1, ...
+    static const int deal_mode = getenv("GGML_MOE_SPLIT_DEAL") ? atoi(getenv("GGML_MOE_SPLIT_DEAL")) : 1;
+    const bool deal = deal_mode != 0;
+    if (deal && moe_cache_expert_split() && session.devices.size() > 1) {
+        std::vector<double> budget, dealt;
+        int self = -1;
+        for (int di = 0; di < (int) session.devices.size(); di++) {
+            const moe_cache_device & dk = *session.devices[di];
+            // DEAL=2: a card that preloaded already ends its band where its slots ran out
+            budget.push_back(dk.dead.load() ? 0.0 : deal_mode == 2 && &dk != &device && dk.preload_bytes ? (double) dk.preload_bytes : (double) dk.budget_limit);
+            dealt.push_back(0.0);
+            if (&dk == &device) {
+                self = di;
+            }
+        }
+        std::vector<moe_cache_ranked_expert> hand;
+        int band = 0;   // DEAL=2: the card being filled; dealt[] in bytes, each entry at this card's size for its layer
+        for (const auto & r : ranking) {
+            if (deal_mode == 2) {
+                const auto l = device.layers.find(r.layer);
+                const int pi = l == device.layers.end() || l->second.shape < 0 ? -1 : device.shapes[l->second.shape].pool;
+                const double size = pi >= 0 && pi < (int) device.pools.size() ? (double) device.pools[pi]->expert_size : 0.0;
+                while (band < (int) budget.size() && dealt[band] + size > budget[band]) {
+                    band++;
+                }
+                if (band < (int) budget.size()) {
+                    dealt[band] += size;
+                    if (band == self) {
+                        hand.push_back(r);
+                    }
+                }
+                continue;
+            }
+            int t = -1;
+            double best = 0;
+            for (int di = 0; di < (int) budget.size(); di++) {
+                const double v = (dealt[di] + 1) / budget[di];
+                if (budget[di] > 0 && (t < 0 || v < best)) {
+                    t = di;
+                    best = v;
+                }
+            }
+            if (t >= 0) {
+                dealt[t] += 1;
+            }
+            if (t == self) {
+                hand.push_back(r);
+            }
+        }
+        MOE_CACHE_LOG("[moe-cache] CUDA%d preload: %zu of %zu ranked experts dealt to this card (budgets %s)\n", device.physical,
+                hand.size(), ranking.size(), [&] { std::string b; for (double x : budget) { b += std::to_string((long long) (x / (1 << 20))) + " MiB "; } return b; }().c_str());
+        ranking.swap(hand);
+    }
+    const uint32_t n_ranked = (uint32_t) ranking.size();
     device.ranking_src.clear();
     for (const auto & r : ranking) {
         device.ranking_src.push_back({r.layer, r.expert, heat_total > 0 ? (float) (r.heat / heat_total) : 0.0f});
@@ -5528,20 +5929,32 @@ static void moe_cache_preload(const moe_cache_session & session, moe_cache_devic
         if (pool.map.count(key)) {
             continue;
         }
-        // not into the prefetch zone or the KV's rows: a prefill or a long context takes them before they serve; the
-        // restoration after the first prefill fills them
-        int s = -1;
+        // first the entries no loan takes (the hottest experts there), then the prefetch zone: a short prompt's
+        // answers (no prefetch, nothing lent) find a full cache, the first long prompt lends the zone (its experts,
+        // the ranking's least demanded, moved or evicted, then restored as any lent entry); never the KV's rows, which
+        // a long context takes back
+        int s = -1, zone_slot = -1;
+        size_t zone_f = 0;
         for (size_t f = pool.free_slots.size(); f-- > 0;) {
             const int c = pool.free_slots[f];
-            bool lendable = c >= pool.zone_begin && c < pool.zone_end;
+            const bool zone = c >= pool.zone_begin && c < pool.zone_end;
+            bool kv_row = false;
             for (const auto & kv : pool.kv) {
-                lendable = lendable || (c >= kv.first && c < kv.first + kv.count);
+                kv_row = kv_row || (c >= kv.first && c < kv.first + kv.count);
             }
-            if (!lendable) {
+            if (!zone && !kv_row) {
                 s = c;
                 pool.free_slots.erase(pool.free_slots.begin() + f);
                 break;
             }
+            if (zone && !kv_row && zone_slot < 0) {
+                zone_slot = c;
+                zone_f = f;
+            }
+        }
+        if (s < 0 && zone_slot >= 0 && moe_cache_preload_zones()) {
+            s = zone_slot;
+            pool.free_slots.erase(pool.free_slots.begin() + zone_f);
         }
         if (s < 0) {
             continue;
@@ -5602,6 +6015,7 @@ static void moe_cache_preload(const moe_cache_session & session, moe_cache_devic
         MOE_CACHE_LOG("[moe-cache] CUDA%d preload failed: %s\n", device.physical, cudaGetErrorString(err));
         return;
     }
+    device.preload_bytes = bytes;
     MOE_CACHE_LOG("[moe-cache] CUDA%d preload: %zu experts (%.2f GiB) from %s in %.2f s, %zu of %u pairs outside the model\n",
             device.physical, loaded, bytes / 1073741824.0, path, (ggml_time_us() - t0) / 1e6, skipped, n_ranked);
 }
@@ -5798,6 +6212,9 @@ static moe_cache_device * moe_cache_device_for_backend(
     return nullptr;
 }
 
+// the first tie wins: every scheduler rebuilt by a reservation (llama_context::sched_reserve) computes the layers' devices
+// again (the free memory has moved), and a tensor moved to another device would find its layer's block there without
+// its registration (MUL_MAT_ID with host weights outside a hosted MoE block)
 static void moe_cache_assign(void * opaque, const void * host_base, void * backend) {
     moe_cache_session * session = (moe_cache_session *)opaque;
     if (!session || !host_base) {
@@ -5806,8 +6223,22 @@ static void moe_cache_assign(void * opaque, const void * host_base, void * backe
     std::lock_guard<std::mutex> lock(session->mu);
     const moe_cache_device * device = moe_cache_device_for_backend(*session, backend);
     if (device) {
-        session->tensor_devices[host_base] = device->logical;
+        session->tensor_devices.emplace(host_base, device->logical);
     }
+}
+
+static int moe_cache_assigned(void * opaque, const void * host_base, void * backend) {
+    moe_cache_session * session = (moe_cache_session *)opaque;
+    if (!session || !host_base) {
+        return -1;
+    }
+    std::lock_guard<std::mutex> lock(session->mu);
+    const auto tied = session->tensor_devices.find(host_base);
+    if (tied == session->tensor_devices.end()) {
+        return -1;
+    }
+    const moe_cache_device * device = moe_cache_device_for_backend(*session, backend);
+    return device && device->logical == tied->second ? 1 : 0;
 }
 
 static void moe_cache_set_lend_size(void * opaque, size_t bytes, int n_zones) {
@@ -6045,7 +6476,22 @@ static int moe_cache_lend(void * opaque, void * backend, size_t bytes, void ** z
     // the pools whose zone has room, and the slots each gives (a slot: zone_slice contiguous entries)
     std::vector<moe_cache_pool *> chosen;
     int n_slots = 0;
+    // BANDS: the zones are a byte range at the top of the slab, every banded pool lending the slots it overlaps
+    const bool banded = device->band_slab && device->band_zones > 0;
+    bool band_ready = false;
+    if (banded && device->band_zone_bytes >= bytes) {
+        band_ready = true;
+        for (auto & pool_ptr : device->pools) {
+            if (pool_ptr->band_per && pool_ptr->zone_lent) {
+                band_ready = false;
+            }
+        }
+        n_slots = band_ready ? std::min(n_zones, device->band_zones) : 0;
+    }
     for (auto & pool_ptr : device->pools) {
+        if (banded) {
+            break;
+        }
         moe_cache_pool & pool = *pool_ptr;
         if (n_slots < n_zones && moe_cache_pool_has_zone(pool) && !pool.zone_lent && pool.zone_slice > 0 &&
                 (size_t)pool.zone_slice * pool.expert_size >= bytes) {
@@ -6065,8 +6511,11 @@ static int moe_cache_lend(void * opaque, void * backend, size_t bytes, void ** z
     if (device->dead.load()) {
         return 0;
     }
-    for (moe_cache_pool * pool : chosen) {
-        for (const moe_cache_slot & slot : pool->slots) {
+    for (auto & pool_ptr : device->pools) {
+        if (std::find(chosen.begin(), chosen.end(), pool_ptr.get()) == chosen.end() && !(banded && pool_ptr->band_per)) {
+            continue;
+        }
+        for (const moe_cache_slot & slot : pool_ptr->slots) {
             if (slot.readers > 0) {
                 MOE_CACHE_LOG("[moe-cache] CUDA%d lend refused: expert still being read\n",
                         device->physical);
@@ -6082,6 +6531,13 @@ static int moe_cache_lend(void * opaque, void * backend, size_t bytes, void ** z
     for (size_t i = 0; i < chosen.size(); i++) {
         moe_cache_evacuate(*device, *chosen[i], chosen[i]->zone_begin, chosen[i]->zone_end, moved[i]);
     }
+    std::vector<std::pair<moe_cache_pool *, std::vector<int>>> band_moved;
+    if (banded) {
+        moe_cache_band_take(*device, device->band_zone_begin, moe_cache_band_total(*device), band_moved);
+        for (auto & m : band_moved) {
+            m.first->zone_lent = true;
+        }
+    }
     const cudaError_t error = cudaStreamSynchronize(moe_cache_zone_stream);
     if (error != cudaSuccess) {
         // the bookkeeping already points at the destinations: the copies must land
@@ -6091,9 +6547,12 @@ static int moe_cache_lend(void * opaque, void * backend, size_t bytes, void ** z
     for (size_t i = 0; i < chosen.size(); i++) {
         moe_cache_pool & pool = *chosen[i];
         pool.zone_lent = true;
-        for (int first = pool.zone_begin; first + pool.zone_slice <= pool.zone_end && given < n_zones; first += pool.zone_slice) {
+        for (int first = pool.zone_begin; !banded && first + pool.zone_slice <= pool.zone_end && given < n_zones; first += pool.zone_slice) {
             zones[given++] = moe_cache_slot_ptr(pool, first);   // range 0: contiguous
         }
+    }
+    for (int z = 0; banded && z < n_slots; z++) {
+        zones[given++] = device->band_slab + device->band_zone_begin + (size_t)z * device->band_zone_bytes;
     }
     device->zone_lends++;
     device->zone_lend_ms = std::chrono::duration<double, std::milli>(
@@ -6234,6 +6693,21 @@ static void moe_cache_plan_borrows(ggml_backend_buffer_type_t buft, const size_t
         return;
     }
 
+    // BANDS: no seating to plan, only the room to count
+    if (device->band_slab) {
+        size_t left = 0, largest = 0, need = 0;
+        moe_cache_band_room(*device, left, largest);
+        std::string desc;
+        for (int i = 0; i < n_sizes; i++) {
+            if (sizes[i]) {
+                need += (sizes[i] + 4095) & ~(size_t)4095;
+                desc += " " + std::to_string((sizes[i] + (1 << 19)) >> 20);
+            }
+        }
+        MOE_CACHE_LOG("[moe-cache] CUDA%d loan plan: chunks MiB%s, %zu MiB of %zu free (largest gap %zu)%s\n", device->physical,
+                desc.c_str(), need >> 20, left >> 20, largest >> 20, need <= left ? "" : ": NO ROOM");
+        return;
+    }
     std::vector<moe_cache_pool *> lenders;
     for (auto & pool_ptr : device->pools) {
         if (moe_cache_pool_lendable(*pool_ptr) > 0) {
@@ -6271,6 +6745,19 @@ static void moe_cache_plan_borrows(ggml_backend_buffer_type_t buft, const size_t
     }
     search.place(0);
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    // what the plan was given: the chunks, and per pool its entry size, lendable entries, lowest lent entry, range 0
+    {
+        std::string desc = "chunks MiB";
+        for (size_t i = 0; i < n; i++) {
+            desc += " " + std::to_string((blocks[i] + (1 << 19)) >> 20);
+        }
+        desc += "; pools (entry KiB, room, low, region0)";
+        for (size_t k = 0; k < np; k++) {
+            desc += " (" + std::to_string(lenders[k]->expert_size >> 10) + "," + std::to_string(search.room[k]) + "," +
+                    std::to_string(search.low[k]) + "," + std::to_string(search.region0[k]) + ")";
+        }
+        MOE_CACHE_LOG("[moe-cache] CUDA%d loan plan input: %s\n", device->physical, desc.c_str());
+    }
     if (search.best.empty()) {
         MOE_CACHE_LOG("[moe-cache] CUDA%d loan plan: no seating for %zu chunks (%.2f ms)\n",
                 device->physical, n, ms);
@@ -6301,6 +6788,55 @@ static void * moe_cache_borrow(void * opaque, void * backend, size_t bytes) {
     }
 
     moe_cache_rewarm_stop_locked(*device);
+
+    // BANDS: the highest free gap under the zones that holds the chunk, above the floor of 5 %; every banded pool gives
+    // the slots the chunk overlaps (a slot astride a neighbouring loan is already out)
+    if (device->band_slab) {
+        const size_t size = (bytes + 4095) & ~(size_t)4095;
+        const size_t a = moe_cache_band_find(*device, size);
+        if (a == SIZE_MAX) {
+            size_t left = 0, largest = 0;
+            moe_cache_band_room(*device, left, largest);
+            MOE_CACHE_LOG("[moe-cache] CUDA%d borrow: no room for %zu MiB (%zu MiB free, largest gap %zu)\n", device->physical,
+                    bytes >> 20, left >> 20, largest >> 20);
+            return nullptr;
+        }
+        session->idle_cv.wait(lock, [&] {
+            return device->queue.empty() && !device->inflight;
+        });
+        if (device->dead.load()) {
+            return nullptr;
+        }
+        for (auto & pool_ptr : device->pools) {
+            for (const moe_cache_slot & slot : pool_ptr->slots) {
+                if (pool_ptr->band_per && slot.readers > 0) {
+                    MOE_CACHE_LOG("[moe-cache] CUDA%d borrow refused: expert still being read\n", device->physical);
+                    return nullptr;
+                }
+            }
+        }
+        ggml_cuda_set_device(device->logical);
+        const auto t0 = std::chrono::steady_clock::now();
+        std::vector<std::pair<moe_cache_pool *, std::vector<int>>> moved;
+        moe_cache_band_take(*device, a, a + size, moved);
+        const cudaError_t error = cudaStreamSynchronize(moe_cache_zone_stream);
+        if (error != cudaSuccess) {
+            moe_cache_cuda_ok(*device, error, "borrow evacuation", true);
+        }
+        device->band_loans.insert(std::upper_bound(device->band_loans.begin(), device->band_loans.end(), std::make_pair(a, a + size)),
+                std::make_pair(a, a + size));
+        device->zone_lends++;
+        device->zone_lend_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        MOE_CACHE_LOG("[moe-cache] CUDA%d borrow: %zu MiB at %zu MiB of the slab, %.2f ms\n", device->physical, bytes >> 20, a >> 20,
+                device->zone_lend_ms);
+        const long long period = moe_cache_verify_period();
+        for (auto & m : moved) {
+            for (size_t k = 0; period && k < m.second.size(); k += (size_t)period) {
+                moe_cache_zone_check(*device, *m.first, m.second[k]);
+            }
+        }
+        return device->band_slab + a;
+    }
 
     // The plan first: the pool it chose for a chunk of this size, if it can still take it.
     moe_cache_pool * chosen = nullptr;
@@ -6429,6 +6965,23 @@ static void moe_cache_give_back(void * opaque, void * backend, void * ptr) {
         return;
     }
     std::lock_guard<std::mutex> lock(session->mu);
+    // BANDS: a byte range of the slab, back to every banded pool
+    if (device->band_slab && (char *)ptr >= device->band_slab && (char *)ptr < device->band_slab + moe_cache_band_total(*device)) {
+        const size_t a = (size_t)((char *)ptr - device->band_slab);
+        for (size_t i = 0; i < device->band_loans.size(); i++) {
+            if (device->band_loans[i].first != a) {
+                continue;
+            }
+            const size_t b = device->band_loans[i].second;
+            device->band_loans.erase(device->band_loans.begin() + i);
+            moe_cache_band_release(*device, a, b);
+            device->zone_restores++;
+            MOE_CACHE_LOG("[moe-cache] CUDA%d give back: %zu MiB at %zu MiB\n", device->physical, (b - a) >> 20, a >> 20);
+            return;
+        }
+        MOE_CACHE_LOG("[moe-cache] CUDA%d give back: unknown range of the slab\n", device->physical);
+        return;
+    }
     for (auto & pool_ptr : device->pools) {
         moe_cache_pool & pool = *pool_ptr;
         for (size_t i = 0; i < pool.lent.size(); i++) {
@@ -6468,6 +7021,18 @@ static void moe_cache_restore(void * opaque, void * backend) {
     }
     std::lock_guard<std::mutex> lock(session->mu);
     bool restored = false;
+    // BANDS: the zones' byte range back, a slot astride a loan staying out until that loan returns
+    bool band_lent = false;
+    for (auto & pool_ptr : device->pools) {
+        if (pool_ptr->band_per && pool_ptr->zone_lent) {
+            band_lent = true;
+            pool_ptr->zone_lent = false;
+        }
+    }
+    if (band_lent) {
+        moe_cache_band_release(*device, device->band_zone_begin, moe_cache_band_total(*device));
+        restored = true;
+    }
     for (auto & pool_ptr : device->pools) {
         moe_cache_pool & pool = *pool_ptr;
         if (!pool.zone_lent) {
@@ -6557,6 +7122,8 @@ struct moe_hosted_layer {
     int32_t * m_pred = nullptr;
     uint64_t * m_plan = nullptr;
     float * m_res = nullptr;
+    float * h_w = nullptr;          // EXPERT SPLIT, PSUM: the rows' routing weights, read by the other cards
+    float * m_w = nullptr;
     float * m_act = nullptr;
     block_q8_0 * m_act8 = nullptr;
     int32_t * m_ids = nullptr;
@@ -6601,6 +7168,8 @@ struct moe_split_card {
     float * d_glu = nullptr;
     char * d_q8_mid = nullptr;
     unsigned * d_q8_count = nullptr;
+    float * d_res = nullptr;          // PSUM: its rows' down outputs (MOE_SPLIT_PSUM_TOKENS x n_used x n_embd), summed here
+    float * d_w = nullptr;            // PSUM: the routing weights, copied here with the activations (read once over the link)
     int64_t n_embd = 0, n_ff = 0;
 };
 
@@ -6632,6 +7201,7 @@ struct moe_hosted_state {
     float * h_act = nullptr;
     block_q8_0 * h_act8 = nullptr;
     float * h_res = nullptr;
+    float * h_w = nullptr;          // EXPERT SPLIT, PSUM: the rows' routing weights (rows)
     int32_t * h_ids = nullptr;
     uint64_t * h_plan = nullptr;
     uint64_t * h_plan2 = nullptr;
@@ -6651,6 +7221,10 @@ struct moe_hosted_state {
     int split_tensors = 0;                                   // SPLIT: tensors copied for the last layer's moved experts
     // SPLIT: the CPU term of the dispatcher's model scaled to this machine (moe_split_calibrate), measured once
     std::atomic<double> cpu_scale{1.0};
+    // SPLIT: the GPU terms of the dispatcher's model scaled to this card, measured once at the first layer
+    // (moe_split_gpu_bench; GGML_CUDA_MOE_SPLIT_GPU_SCALE=x: fixed, not measured)
+    double gpu_scale = 1.0;
+    bool gpu_benched = false;
     int cal_left = moe_split_cal_skip + moe_split_cal_layers;   // GGML_CUDA_MOE_SPLIT_CPU_SCALE=x: fixed, not measured
     double cal_measured = 0.0, cal_model = 0.0;
     // served by the thread that waits for the stream (ggml_cuda_moe_hosted_wait)
@@ -6675,6 +7249,7 @@ struct moe_hosted_state {
     // written, CPU rows' flag written (ns); sums of the derived intervals; the host's stream queries
     std::vector<int64_t> tl_host;
     double tl_sum[20] = {0};
+    double tlk_sum[8][10] = {};   // EXPERT SPLIT: per other card, its chain (moe_tl_account)
     int64_t tl_n = 0, tl_nw = 0, tl_q_n = 0, tl_q_ns = 0;
     double tl_tick_ns = 0;
     // CPU rows by what they have resident: up+gate (not down), down only, up or gate only, nothing
@@ -6708,6 +7283,8 @@ struct moe_hosted_pending {
     moe_sgate_args sg;    // the shared expert's gate, or none
     bool cards = false;   // EXPERT SPLIT: rows of other cards (each waits for its producer's flag)
     uint32_t * diag = nullptr;
+    int n_used = 0;
+    bool psum = false;    // EXPERT SPLIT, PSUM: each card's rows of a token come as one weighted sum
 };
 static thread_local moe_hosted_pending g_hosted_pending;
 
@@ -6741,6 +7318,11 @@ static T * moe_hosted_device_ptr(T * host) {
 #define MOE_TL_RING 1024
 static unsigned long long * g_tl_h = nullptr;   // host view
 static unsigned long long * g_tl_m = nullptr;   // device view of the same memory
+// EXPERT SPLIT: each other card's chain, per publication (seq % MOE_TL_RING) x 8, its own clock: [0] the chain reached the
+// plan wait, [1] plan seen, [2] plan and activations copied, [3] the moved experts' wait reached, [4] passed, [5] done,
+// [6] the publication
+static unsigned long long * g_tlk_h[8] = {};
+static unsigned long long * g_tlk_m[8] = {};
 static int64_t moe_tl_now_ns() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
@@ -7131,7 +7713,8 @@ static __global__ void k_moe_hosted_enter(const float * act, float * h_act, bloc
                                           uint32_t * d_seq, uint32_t * d_expect, volatile moe_hosted_mailbox * mail,
                                           uint32_t slot, const volatile uint32_t * flag,
                                           const volatile uint64_t * m_plan, uint64_t * d_plan, int n_plan,
-                                          volatile unsigned long long * tl, const moe_router_args rt) {
+                                          volatile unsigned long long * tl, const moe_router_args rt,
+                                          const float * w_src, float * h_w) {
     // this layer's publication number (d_seq[0] moves at the publication, after block 0 has read the router's rows): the
     // tag of the router's rows
     const uint32_t pub_tag = d_seq[0] + 1;
@@ -7216,12 +7799,18 @@ static __global__ void k_moe_hosted_enter(const float * act, float * h_act, bloc
             for (int i = threadIdx.x; i < n_ids; i += blockDim.x) {
                 const int tt = i / n_used;
                 h_ids[i] = *(const int32_t *) ((const char *) ids + (int64_t) tt * ids_nb1 + (int64_t) (i % n_used) * sizeof(int32_t));
+                if (h_w) {
+                    h_w[i] = tk_weights[i];   // PSUM: the weights the top-k just wrote, for the other cards
+                }
             }
         }
     } else {
         for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_ids; i += n_blocks * blockDim.x) {
             const int t = i / n_used;
             h_ids[i] = *(const int32_t *) ((const char *) ids + (int64_t) t * ids_nb1 + (int64_t) (i % n_used) * sizeof(int32_t));
+            if (h_w) {
+                h_w[i] = w_src[i];   // PSUM: the routing weights (computed before the block), for the other cards
+            }
         }
     }
     // this block's writes reach the host before it counts itself
@@ -7396,7 +7985,9 @@ static __device__ __forceinline__ unsigned long long moe_tl_clock();
 static __global__ void k_split_card_wait(const volatile uint32_t * flag0, uint32_t * d_last, uint32_t * d_seq,
                                          const uint64_t * m_plan, uint64_t * d_plan, int n_plan,
                                          const float * m_act, float * d_act, int n_act,
-                                         volatile uint32_t * diag, int card, int slot) {
+                                         volatile uint32_t * diag, int card, int slot, volatile unsigned long long * tlk,
+                                         int n_tokens, const float * m_w, float * d_w, int n_w) {
+    __shared__ uint32_t seen;
     if (threadIdx.x == 0) {
         const uint32_t last = *d_last;
         uint32_t v = *flag0;
@@ -7416,24 +8007,67 @@ static __global__ void k_split_card_wait(const volatile uint32_t * flag0, uint32
         __threadfence_system();
         *d_last = v;
         *d_seq = v;
+        seen = v;
+        if (tlk) {
+            tlk[(v % MOE_TL_RING) * 8 + 0] = t0;
+            tlk[(v % MOE_TL_RING) * 8 + 1] = moe_tl_clock();
+        }
     }
     __syncthreads();
     for (int i = threadIdx.x; i < n_plan; i += blockDim.x) {
         d_plan[i] = ((const volatile uint64_t *) m_plan)[i];
     }
-    for (int i = threadIdx.x; i < n_act; i += blockDim.x) {
-        d_act[i] = ((const volatile float *) m_act)[i];
+    // PSUM: the routing weights, written with the activations (the plan's flag comes after both)
+    for (int i = threadIdx.x; m_w && i < n_w; i += blockDim.x) {
+        d_w[i] = ((const volatile float *) m_w)[i];
+    }
+    // the plan's chunk list after it, as the hosting card makes it: the rows of one expert computed together
+    if (n_tokens >= 2 && n_plan / 3 <= MOE_GROUP_MAX_ROWS) {
+        __syncthreads();
+        moe_group_list(d_plan, n_plan / 3, (int32_t *) (d_plan + n_plan));
+    }
+    // the activations over the link: on CUDA 16-byte reads that skip the caches (__ldcv: the buffer is rewritten every layer),
+    // four in flight per thread (one 4-byte volatile read at a time took ~35 us for 3 tokens)
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (n_act % 4 == 0 && ((uintptr_t) m_act % 16) == 0 && ((uintptr_t) d_act % 16) == 0) {
+        const float4 * src = (const float4 *) m_act;
+        float4 * dst = (float4 *) d_act;
+        const int n4 = n_act / 4, step = blockDim.x;
+        int i = threadIdx.x;
+        for (; i + 3 * step < n4; i += 4 * step) {
+            const float4 a = __ldcv(src + i), b = __ldcv(src + i + step), c = __ldcv(src + i + 2 * step), e = __ldcv(src + i + 3 * step);
+            dst[i] = a; dst[i + step] = b; dst[i + 2 * step] = c; dst[i + 3 * step] = e;
+        }
+        for (; i < n4; i += step) {
+            dst[i] = __ldcv(src + i);
+        }
+    } else
+#endif
+    {
+        for (int i = threadIdx.x; i < n_act; i += blockDim.x) {
+            d_act[i] = ((const volatile float *) m_act)[i];
+        }
+    }
+    if (tlk) {
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            tlk[(seen % MOE_TL_RING) * 8 + 2] = moe_tl_clock();
+        }
     }
 }
 
 // EXPERT SPLIT: the experts the dispatcher moved to this card arrived (its flag reached the publication): their rows' part of
 // the plan
 static __global__ void k_split_card_wait2(const volatile uint32_t * flag, const uint32_t * d_seq, const uint64_t * m_plan2,
-                                          uint64_t * d_plan2, int n_plan, volatile uint32_t * diag, int card) {
+                                          uint64_t * d_plan2, int n_plan, volatile uint32_t * diag, int card,
+                                          volatile unsigned long long * tlk, int n_tokens) {
     __shared__ uint32_t seq;
     if (threadIdx.x == 0) {
         seq = *d_seq;
         const unsigned long long t0 = moe_tl_clock();
+        if (tlk) {
+            tlk[(seq % MOE_TL_RING) * 8 + 3] = t0;
+        }
         while ((int32_t) (*flag - seq) < 0) {
             if (moe_tl_clock() - t0 > MOE_SPLIT_WAIT_BUDGET) {
                 if (diag && diag[0] == 0) {
@@ -7446,17 +8080,62 @@ static __global__ void k_split_card_wait2(const volatile uint32_t * flag, const 
             ggml_cuda_poll_pause();
         }
         __threadfence_system();
+        if (tlk) {
+            tlk[(seq % MOE_TL_RING) * 8 + 4] = moe_tl_clock();
+        }
     }
     __syncthreads();
     for (int i = threadIdx.x; i < n_plan; i += blockDim.x) {
         d_plan2[i] = ((const volatile uint64_t *) m_plan2)[i];
     }
+    if (n_tokens >= 2 && n_plan / 3 <= MOE_GROUP_MAX_ROWS) {
+        __syncthreads();
+        moe_group_list(d_plan2, n_plan / 3, (int32_t *) (d_plan2 + n_plan));
+    }
 }
 
 // EXPERT SPLIT: this card's rows are in the hosting card's result buffer: its flag
-static __global__ void k_split_card_done(const uint32_t * d_seq, volatile uint32_t * flag) {
+static __global__ void k_split_card_done(const uint32_t * d_seq, volatile uint32_t * flag, volatile unsigned long long * tlk) {
     __threadfence_system();
-    *flag = *d_seq;
+    const uint32_t seq = *d_seq;
+    *flag = seq;
+    if (tlk) {
+        tlk[(seq % MOE_TL_RING) * 8 + 5] = moe_tl_clock();
+        tlk[(seq % MOE_TL_RING) * 8 + 6] = seq;
+    }
+}
+
+// EXPERT SPLIT, PSUM: on another card, a block per token: its rows of the token (resident in its cache or moved to it)
+// summed with their routing weights, written to the result row of the first of them divided by that row's weight; the
+// merge writes 0 to the others, and the weighting that follows the block gives back the sum
+static __global__ void k_split_card_psum(const uint64_t * d_plan, const uint64_t * d_plan2, int rows, int n_used,
+                                         const float * d_w, const float * d_res, float * m_res, int n_embd) {
+    const int t = blockIdx.x;
+    int own[16];
+    int n = 0;
+    for (int s = 0; s < n_used && n < 16; s++) {
+        const int r = t * n_used + s;
+        if (d_plan[2 * rows + r] != 0 || d_plan2[2 * rows + r] != 0) {
+            own[n++] = r;
+        }
+    }
+    if (n == 0) {
+        return;
+    }
+    // the weights from this card's memory: read from host memory, every thread's own reads crossed the link (a round
+    // trip each, in turn), in proportion to the card's rows
+    const float wd = d_w[own[0]];
+    float scale[16];
+    for (int j = 0; j < n; j++) {
+        scale[j] = wd != 0.0f ? d_w[own[j]] / wd : (j == 0 ? 1.0f : 0.0f);
+    }
+    for (int i = threadIdx.x; i < n_embd; i += blockDim.x) {
+        float sum = d_res[(size_t) own[0] * n_embd + i];
+        for (int j = 1; j < n; j++) {
+            sum += scale[j] * d_res[(size_t) own[j] * n_embd + i];
+        }
+        m_res[(size_t) own[0] * n_embd + i] = sum;
+    }
 }
 
 static __global__ void k_moe_hosted_merge(const uint32_t * d_expect, const volatile uint32_t * flag,
@@ -7464,7 +8143,7 @@ static __global__ void k_moe_hosted_merge(const uint32_t * d_expect, const volat
                                           const volatile float * m_res, float * dst, int n_embd,
                                           volatile unsigned long long * tl, const moe_sgate_args sg,
                                           const volatile int8_t * m_src, const volatile uint32_t * flags,
-                                          volatile uint32_t * diag) {
+                                          volatile uint32_t * diag, int n_used, int psum) {
     if (sg.x && blockIdx.x == gridDim.x - 1) {
         moe_sgate_body(sg);   // the last workgroup: the shared expert's gate
         return;
@@ -7474,7 +8153,9 @@ static __global__ void k_moe_hosted_merge(const uint32_t * d_expect, const volat
         return;   // resident, or moved to the GPU (SPLIT)
     }
     __shared__ uint32_t expect;
+    __shared__ int zero;
     if (threadIdx.x == 0) {
+        zero = 0;
         expect = *d_expect;
         const unsigned long long t0 = tl ? moe_tl_clock() : 0;
         while ((int32_t) (*flag - expect) < 0) {
@@ -7484,7 +8165,13 @@ static __global__ void k_moe_hosted_merge(const uint32_t * d_expect, const volat
         // EXPERT SPLIT: a row of another card waits for that card's flag too; its producer is read after the CPU's flag,
         // which the host raises after the dispatcher wrote the rows it moved to a card
         const int src = m_src ? m_src[row] : 0;
-        if (src > 0) {
+        // PSUM: a card's row after its first one in the token: in that first row's weighted sum, here 0
+        if (src > 0 && psum) {
+            for (int r = (row / n_used) * n_used; r < row && !zero; r++) {
+                zero = m_src[r] == src;
+            }
+        }
+        if (src > 0 && !zero) {
             const volatile uint32_t * kflag = flags + 32 + 8 * src;
             const unsigned long long tw = moe_tl_clock();
             while ((int32_t) (*kflag - expect) < 0) {
@@ -7507,7 +8194,7 @@ static __global__ void k_moe_hosted_merge(const uint32_t * d_expect, const volat
     }
     __syncthreads();
     for (int i = threadIdx.x; i < n_embd; i += blockDim.x) {
-        dst[(size_t) row * n_embd + i] = m_res[(size_t) row * n_embd + i];
+        dst[(size_t) row * n_embd + i] = zero ? 0.0f : m_res[(size_t) row * n_embd + i];
     }
 }
 
@@ -8180,11 +8867,12 @@ static int moe_hosted_split(moe_hosted_state * st, moe_hosted_layer * layer, int
             const auto cpu_time = [scale, n_threads](int d, int r, int tensors) {
                 return d > 0 ? scale * moe_split_cpu_model_us(n_threads, d, r, tensors) : 0.0;
             };
-            const double gpu_before = moe_split_gpu_before_us + moe_split_gpu_row_us * (rows - n_cpu);
+            const double gs = st->gpu_scale;   // the GPU terms scaled to this card (moe_split_gpu_bench)
+            const double gpu_before = gs * (moe_split_gpu_before_us + moe_split_gpu_row_us * (rows - n_cpu));
             // kernel copy (packed layers): it runs after the resident rows on the same stream, so it adds to the GPU's path
             const auto window = [&](int d, int r, int moved_rows, int tensors, double copies) {
                 const double arrival = tensors == 0 ? 0.0 : by_kernel && packed ? gpu_before + copies : moe_split_copy_start_us + copies;
-                const double gpu_after = moe_split_gpu_after_us + moe_split_gpu_moved_row_us * moved_rows;
+                const double gpu_after = gs * (moe_split_gpu_after_us + moe_split_gpu_moved_row_us * moved_rows);
                 return std::max(cpu_time(d, r, tensors), std::max(gpu_before, arrival) + gpu_after);
             };
             const int D = (int) c.size();
@@ -8355,11 +9043,12 @@ static int moe_hosted_split(moe_hosted_state * st, moe_hosted_layer * layer, int
                 }
                 const double cross_us = 10.0;   // a card's rows through host memory and its flag (tests/mgproto: ~18 us a layer)
                 const auto card_end = [&](int k, int moved_rows, double arrival) {
-                    const double before = krows[k] ? moe_split_gpu_before_us + moe_split_gpu_row_us * krows[k] : 0.0;
+                    // the other cards scaled as this one (the same kind of card, as in the setups tested)
+                    const double before = krows[k] ? gs * (moe_split_gpu_before_us + moe_split_gpu_row_us * krows[k]) : 0.0;
                     if (moved_rows == 0) {
                         return krows[k] ? before + cross_us : 0.0;
                     }
-                    return std::max(before, arrival) + moe_split_gpu_moved_row_us * moved_rows + 2 * cross_us;
+                    return std::max(before, arrival) + gs * moe_split_gpu_moved_row_us * moved_rows + 2 * cross_us;
                 };
                 for (int k = 1; k <= ncard; k++) {
                     kend[k] = card_end(k, 0, 0.0);
@@ -8375,7 +9064,7 @@ static int moe_hosted_split(moe_hosted_state * st, moe_hosted_layer * layer, int
                 }
                 const double arrival0 = moved0_tensors == 0 ? 0.0 : by_kernel && packed ? gpu_before + moved0_copies :
                                         moe_split_copy_start_us + moved0_copies;
-                const double gpu0 = std::max(gpu_before, arrival0) + moe_split_gpu_after_us + moe_split_gpu_moved_row_us * moved0_rows;
+                const double gpu0 = std::max(gpu_before, arrival0) + gs * (moe_split_gpu_after_us + moe_split_gpu_moved_row_us * moved0_rows);
                 int d_left = 0;
                 for (size_t i = 0; i < c.size(); i++) {
                     d_left += !taken[i];
@@ -8476,6 +9165,101 @@ static int moe_hosted_split(moe_hosted_state * st, moe_hosted_layer * layer, int
     }
     moe_split_cards_release(st, layer, seq);
     return n_cpu;
+}
+
+// SPLIT: the dispatcher's GPU terms were fitted on a 7900 XT (moe_split_gpu_*). Once, outside any graph capture, the
+// resident rows' kernels (up + gate fused, then down) of a verification pass (3 tokens, 28 rows) run on the card's own
+// cache: distinct entries every call, as generation reads them (cold), timed by events after a warm-up; their time over
+// the same bench's on the 7900 XT (moe_split_gpu_bench_ref_us) scales every GPU term
+static constexpr double moe_split_gpu_bench_ref_us = 147.2;   // the 7900 XT (ROCm 7.2.4): 147.7 and 146.7 us on two starts
+static void moe_split_gpu_bench(moe_hosted_state * st, moe_cache_device & device, const moe_hosted_layer * layer,
+                                ggml_type wtype, ggml_type dtype) {
+    st->gpu_benched = true;
+    if (const char * fixed = getenv("GGML_CUDA_MOE_SPLIT_GPU_SCALE")) {
+        st->gpu_scale = atof(fixed);
+        return;
+    }
+    const int R = 28, tokens = 3, iters = 40, warm = 20;
+    std::vector<uint64_t> h_plan;
+    {
+        std::lock_guard<std::mutex> lock(st->session->mu);
+        const moe_cache_pool & pool = *device.pools[layer->pool_index];
+        const int n_entries = pool.band_slots ? pool.band_slots : pool.ranges[0].count;
+        if (n_entries < R) {
+            return;
+        }
+        h_plan.resize((size_t) (warm + iters) * 3 * R);
+        for (int it = 0; it < warm + iters; it++) {
+            for (int r = 0; r < R; r++) {
+                const int slot = (int) (((int64_t) it * R + r) % n_entries);
+                const uint64_t e = moe_cache_entry_addr(pool, slot);
+                for (int k = 0; k < MOE_ROLES; k++) {
+                    h_plan[((size_t) it * 3 + k) * R + r] = e + pool.role_offset[k];
+                }
+            }
+        }
+    }
+    const int64_t n_embd = layer->n_embd, n_ff = layer->n_ff;
+    const int64_t padded_embd = GGML_PAD(n_embd, MATRIX_ROW_PADDING), padded_ff = GGML_PAD(n_ff, MATRIX_ROW_PADDING);
+    uint64_t * d_plan = nullptr; int32_t * d_ids = nullptr; char * d_act = nullptr, * d_mid = nullptr;
+    float * d_glu = nullptr, * d_out = nullptr; unsigned * d_count = nullptr;
+    cudaStream_t stream = nullptr; cudaEvent_t e0 = nullptr, e1 = nullptr;
+    const size_t mid_blocks = (size_t) R * (padded_ff / QK8_1);
+    bool ok = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) == cudaSuccess &&
+              cudaEventCreateWithFlags(&e0, 0) == cudaSuccess && cudaEventCreateWithFlags(&e1, 0) == cudaSuccess &&
+              cudaMalloc((void **) &d_plan, h_plan.size() * sizeof(uint64_t)) == cudaSuccess &&
+              cudaMalloc((void **) &d_ids, R * sizeof(int32_t)) == cudaSuccess &&
+              cudaMalloc((void **) &d_act, (size_t) tokens * (padded_embd / QK8_1) * sizeof(block_q8_1)) == cudaSuccess &&
+              cudaMalloc((void **) &d_mid, mid_blocks * sizeof(block_q8_1)) == cudaSuccess &&
+              cudaMalloc((void **) &d_count, mid_blocks * sizeof(unsigned)) == cudaSuccess &&
+              cudaMalloc((void **) &d_glu, (size_t) R * n_ff * sizeof(float)) == cudaSuccess &&
+              cudaMalloc((void **) &d_out, (size_t) R * n_embd * sizeof(float)) == cudaSuccess;
+    if (ok) {
+        std::vector<int32_t> ids(R);
+        for (int r = 0; r < R; r++) {
+            ids[r] = r * tokens / R;
+        }
+        ok = cudaMemcpyAsync(d_plan, h_plan.data(), h_plan.size() * sizeof(uint64_t), cudaMemcpyHostToDevice, stream) == cudaSuccess &&
+             cudaMemcpyAsync(d_ids, ids.data(), R * sizeof(int32_t), cudaMemcpyHostToDevice, stream) == cudaSuccess &&
+             cudaMemsetAsync(d_act, 0, (size_t) tokens * (padded_embd / QK8_1) * sizeof(block_q8_1), stream) == cudaSuccess &&
+             cudaMemsetAsync(d_count, 0, mid_blocks * sizeof(unsigned), stream) == cudaSuccess;
+    }
+    double us = 0.0;
+    if (ok) {
+        const auto call = [&](int it) {
+            const uint64_t * plan = d_plan + (size_t) it * 3 * R;
+            ggml_cuda_moe_cache_mmv_fused(wtype, d_act, plan, plan + R, d_ids, d_glu, n_embd, n_ff, R, tokens,
+                                          -INFINITY, INFINITY, -INFINITY, INFINITY, stream, d_mid, padded_ff / QK8_1, d_count,
+                                          nullptr, tokens);
+            ggml_cuda_moe_cache_mmv(dtype, d_mid, plan + 2 * R, nullptr, d_out, n_ff, n_embd, R, R, stream, nullptr, tokens);
+        };
+        for (int it = 0; it < warm; it++) {
+            call(it);
+        }
+        cudaEventRecord(e0, stream);
+        for (int it = warm; it < warm + iters; it++) {
+            call(it);
+        }
+        cudaEventRecord(e1, stream);
+        float ms = 0.0f;
+        ok = cudaEventSynchronize(e1) == cudaSuccess && cudaEventElapsedTime(&ms, e0, e1) == cudaSuccess;
+        us = 1e3 * ms / iters;
+    }
+    (void) cudaGetLastError();
+    if (stream) cudaStreamSynchronize(stream);
+    cudaFree(d_plan); cudaFree(d_ids); cudaFree(d_act); cudaFree(d_mid); cudaFree(d_count); cudaFree(d_glu); cudaFree(d_out);
+    if (e0) cudaEventDestroy(e0);
+    if (e1) cudaEventDestroy(e1);
+    if (stream) cudaStreamDestroy(stream);
+    if (!ok || us <= 0.0) {
+        MOE_CACHE_LOG("[moe-cache] CUDA%d split: GPU bench failed, the model's GPU terms kept\n", device.physical);
+        return;
+    }
+    if (moe_split_gpu_bench_ref_us > 0.0) {
+        st->gpu_scale = us / moe_split_gpu_bench_ref_us;
+    }
+    MOE_CACHE_LOG("[moe-cache] CUDA%d split: GPU bench %.1f us for %d resident rows (3 tokens), %.2f x the model's GPU terms\n",
+                  device.physical, us, R, st->gpu_scale);
 }
 
 // SPLIT: one timed layer of the calibration (moe_split_cal_skip): its CPU time from the plan to the CPU rows' flag (what
@@ -8617,7 +9401,36 @@ static void moe_tl_account(moe_hosted_state * st, uint32_t seq) {
         st->tl_sum[16] += (double) (gp[4] - ge2) * k - copy_wait;
         st->tl_sum[17] += win_host;
     }
+    // EXPERT SPLIT: each other card's chain for the layer p, against the hosting card's publication and merge (two clocks:
+    // %globaltimer on CUDA, assumed close; the durations within a card need no assumption)
+    for (const moe_split_card & card : st->split_cards) {
+        const volatile unsigned long long * c = g_tlk_h[card.index] ? g_tlk_h[card.index] + (p % MOE_TL_RING) * 8 : nullptr;
+        if (!c || c[6] != p || c[0] == 0 || c[5] < c[0]) {
+            continue;
+        }
+        double * a = st->tlk_sum[card.index];
+        a[0] += 1;
+        a[1] += ((double) c[1] - (double) ge1) * k;   // publication -> plan seen there
+        a[2] += ((double) c[2] - (double) c[1]) * k;  // plan and activations copied
+        a[3] += ((double) c[3] - (double) c[2]) * k;  // its rows (quantize, up+gate, down)
+        a[4] += ((double) c[4] - (double) c[3]) * k;  // the moved experts' wait
+        a[5] += ((double) c[5] - (double) c[4]) * k;  // their rows (and the weighted sum)
+        a[6] += ((double) c[5] - (double) c[1]) * k;  // plan seen -> done
+        a[7] += gp[4] ? ((double) gp[2] - (double) c[5]) * k : 0;   // done -> merge passed on the hosting card
+        a[8] += gp[4] ? ((double) gp[4] - (double) ge2) * k : 0;    // hosting card: plan seen -> merge reached
+        a[9] += ((double) c[1] - (double) c[0]) > 0 ? ((double) c[1] - (double) c[0]) * k : 0;   // idle before the plan
+    }
     if (st->tl_n % every == 0) {
+        for (const moe_split_card & card : st->split_cards) {
+            const double * a = st->tlk_sum[card.index];
+            if (a[0] > 0) {
+                const double m = a[0] * 1e3;
+                GGML_LOG_INFO("moe timeline: card %d chain, us per layer (%lld): publication -> plan seen %.1f; copies %.1f; "
+                        "its rows %.1f; moved experts' wait %.1f, their rows %.1f; plan seen -> done %.1f; done -> merge passed "
+                        "%.1f (hosting card plan seen -> merge reached %.1f); idle before the plan %.1f\n", card.index,
+                        (long long) a[0], a[1] / m, a[2] / m, a[3] / m, a[4] / m, a[5] / m, a[6] / m, a[7] / m, a[8] / m, a[9] / m);
+            }
+        }
         const double n = (double) st->tl_n, nw = std::max<double>(1, (double) st->tl_nw);
         const double plan_rt = st->tl_sum[0] / n, plan_host = st->tl_sum[1] / n;
         const double win_gpu = st->tl_sum[2] / nw, win_host = st->tl_sum[3] / nw, seg = st->tl_sum[4] / nw, gap = st->tl_sum[5] / nw;
@@ -8966,11 +9779,105 @@ bool ggml_cuda_moe_hosted_active() {
 // Wait for the stream (or the event) like cudaStreamSynchronize / cudaEventSynchronize, answering the
 // hosted MoE blocks it publishes meanwhile: the thread that waits for the GPU computes the missed
 // experts. Returns false when no block is hosted (the caller synchronizes as usual).
+// GGML_CUDA_MOE_HOSTED_SERVER=1: the hosted blocks of every device are served by one thread, with one OpenMP team for the
+// missing experts, while any thread waits for a GPU; the waiting threads only poll their stream. Without it each waiting
+// thread serves: with the layers split in pipeline stages, each stage's thread served its device's blocks with its own
+// OpenMP team, and the two teams, pinned to the same cores, spun while the other computed
+static bool moe_hosted_server_on() {
+    static const bool on = getenv("GGML_CUDA_MOE_HOSTED_SERVER") && atoi(getenv("GGML_CUDA_MOE_HOSTED_SERVER")) != 0;
+    return on;
+}
+static std::atomic<int>        g_srv_waiters{0};
+static std::mutex              g_srv_mu;
+static std::condition_variable g_srv_cv;
+
+static void moe_hosted_server_loop() {
+    constexpr int max_states = 8;
+    for (;;) {
+        {
+            std::unique_lock<std::mutex> lock(g_srv_mu);
+            g_srv_cv.wait(lock, [] { return g_srv_waiters.load(std::memory_order_acquire) > 0; });
+        }
+        moe_hosted_state * sts[max_states];
+        int n_st = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_hosted_mu);
+            for (auto & entry : g_hosted) {
+                if (entry.second && n_st < max_states) {
+                    sts[n_st++] = entry.second.get();
+                }
+            }
+        }
+        std::unique_lock<std::mutex> serving[max_states];
+        for (int k = 0; k < n_st; k++) {
+            serving[k] = std::unique_lock<std::mutex>(sts[k]->serve_mu, std::try_to_lock);
+        }
+        while (g_srv_waiters.load(std::memory_order_acquire) > 0) {
+            bool served = false;
+            for (int k = 0; k < n_st; k++) {
+                moe_hosted_state * s = sts[k];
+                const uint32_t seq = __atomic_load_n(&s->h_mail->seq, __ATOMIC_ACQUIRE);
+                if (serving[k].owns_lock() && seq != s->last_seq) {
+                    s->last_seq = seq;
+                    moe_hosted_serve_one(s, seq);
+                    served = true;
+                } else if (!serving[k].owns_lock()) {
+                    serving[k].try_lock();
+                }
+            }
+            if (!served) {
+#if defined(__x86_64__)
+                __builtin_ia32_pause();
+#endif
+            }
+        }
+    }
+}
+
 bool ggml_cuda_moe_hosted_wait(void * stream_ptr, void * event_ptr, int device) {
     cudaStream_t stream = (cudaStream_t) stream_ptr;
     cudaEvent_t event = (cudaEvent_t) event_ptr;
     // the rows a launched graph waits for, before anything else (and without a hosted MoE: the wait would never end)
     moe_host_rows_run();
+    if (moe_hosted_server_on()) {
+        {
+            std::lock_guard<std::mutex> lock(g_hosted_mu);
+            if (g_hosted.empty()) {
+                return false;
+            }
+        }
+        static std::once_flag started;
+        std::call_once(started, [] { std::thread(moe_hosted_server_loop).detach(); });
+        {
+            std::lock_guard<std::mutex> lock(g_srv_mu);
+            g_srv_waiters.fetch_add(1, std::memory_order_acq_rel);
+        }
+        g_srv_cv.notify_one();
+        for (;;) {
+            const cudaError_t done = event ? cudaEventQuery(event) : cudaStreamQuery(stream);
+            if (done != cudaErrorNotReady) {
+                g_srv_waiters.fetch_sub(1, std::memory_order_acq_rel);
+                CUDA_CHECK(done);
+                if (!event) {
+                    // as below: the stream's device's rows, once its stream is done
+                    std::lock_guard<std::mutex> lock(g_hosted_mu);
+                    for (auto & entry : g_hosted) {
+                        moe_hosted_state * s = entry.second.get();
+                        if (!s || (g_hosted.size() > 1 && s->device->logical != device)) {
+                            continue;
+                        }
+                        std::lock_guard<std::mutex> lock_s(s->session->mu);
+                        moe_hosted_unpin_locked(*s);
+                        moe_cache_prefill_unpin_locked(*s->session);
+                    }
+                }
+                return true;
+            }
+#if defined(__x86_64__)
+            __builtin_ia32_pause();
+#endif
+        }
+    }
     // one state per (session, device): every mailbox is served while waiting, whichever device the stream is on (with the
     // layers split over several GPUs, a block of one device may wait for its CPU rows while the host waits for another)
     constexpr int max_states = 8;
@@ -9308,8 +10215,8 @@ static void moe_hosted_shutdown(moe_cache_session * session) {
             st->server_cv.notify_one();
             st->server.join();
         }
-        for (void * h : {(void *) st->h_act, (void *) st->h_act8, (void *) st->h_res, (void *) st->h_ids, (void *) st->h_plan,
-                         (void *) st->h_plan2}) {
+        for (void * h : {(void *) st->h_act, (void *) st->h_act8, (void *) st->h_res, (void *) st->h_w, (void *) st->h_ids,
+                         (void *) st->h_plan, (void *) st->h_plan2}) {
             if (h) cudaFreeHost(h);
         }
         for (void * d : {(void *) st->d_plan, (void *) st->d_plan2}) {
@@ -9377,6 +10284,7 @@ static moe_hosted_layer * moe_hosted_register(moe_hosted_state & st, moe_cache_d
         if (!moe_hosted_host_alloc((void **) &st.h_act, (size_t) tokens * layer->n_embd * sizeof(float)) ||
             !moe_hosted_host_alloc((void **) &st.h_act8, (size_t) tokens * (layer->n_embd / QK8_0) * sizeof(block_q8_0)) ||
             !moe_hosted_host_alloc((void **) &st.h_res, (size_t) rows * layer->n_embd * sizeof(float)) ||
+            !moe_hosted_host_alloc((void **) &st.h_w, rows * sizeof(float)) ||
             !moe_hosted_host_alloc((void **) &st.h_ids, rows * sizeof(int32_t)) ||
             !moe_hosted_host_alloc((void **) &st.h_plan, 3 * rows * sizeof(uint64_t)) ||
             !moe_hosted_host_alloc((void **) &st.h_plan2, 3 * rows * sizeof(uint64_t)) ||
@@ -9390,6 +10298,7 @@ static moe_hosted_layer * moe_hosted_register(moe_hosted_state & st, moe_cache_d
     layer->h_act = st.h_act;
     layer->h_act8 = st.h_act8;
     layer->h_res = st.h_res;
+    layer->h_w = st.h_w;
     layer->h_ids = st.h_ids;
     layer->h_plan = st.h_plan;
     layer->h_plan2 = st.h_plan2;
@@ -9406,6 +10315,7 @@ static moe_hosted_layer * moe_hosted_register(moe_hosted_state & st, moe_cache_d
     ok = ok && (layer->m_act = moe_hosted_device_ptr(layer->h_act)) && (layer->m_act8 = (block_q8_0 *) moe_hosted_device_ptr(layer->h_act8)) &&
          (layer->m_ids = moe_hosted_device_ptr(layer->h_ids)) &&
          (layer->m_plan = moe_hosted_device_ptr(layer->h_plan)) && (layer->m_res = moe_hosted_device_ptr(layer->h_res)) &&
+         (layer->m_w = moe_hosted_device_ptr(layer->h_w)) &&
          (layer->m_flags = moe_hosted_device_ptr(layer->h_flags)) && (layer->m_pred = moe_hosted_device_ptr(layer->h_pred)) &&
          (layer->m_plan2 = moe_hosted_device_ptr(layer->h_plan2)) && (layer->m_chk = moe_hosted_device_ptr(layer->h_chk)) &&
          (layer->m_fetch = moe_hosted_device_ptr(layer->h_fetch)) &&
@@ -9640,8 +10550,9 @@ static void moe_split_cards_create(moe_cache_session & session, moe_hosted_state
             cudaMalloc((void **) &card.d_last, MOE_SPLIT_MAX_SLOTS * sizeof(uint32_t)) == cudaSuccess &&
             cudaMemset(card.d_last, 0, MOE_SPLIT_MAX_SLOTS * sizeof(uint32_t)) == cudaSuccess &&
             cudaMalloc((void **) &card.d_seq, sizeof(uint32_t)) == cudaSuccess &&
-            cudaMalloc((void **) &card.d_plan, (size_t) 3 * rows * sizeof(uint64_t)) == cudaSuccess &&
-            cudaMalloc((void **) &card.d_plan2, (size_t) 3 * rows * sizeof(uint64_t)) == cudaSuccess &&
+            // each plan followed by its chunk list (moe_group_list), as on the hosting card
+            cudaMalloc((void **) &card.d_plan, (size_t) 3 * rows * sizeof(uint64_t) + MOE_GROUP_WORDS * sizeof(int32_t)) == cudaSuccess &&
+            cudaMalloc((void **) &card.d_plan2, (size_t) 3 * rows * sizeof(uint64_t) + MOE_GROUP_WORDS * sizeof(int32_t)) == cudaSuccess &&
             cudaMalloc((void **) &card.d_act_ids, rows * sizeof(int32_t)) == cudaSuccess &&
             cudaMemcpy(card.d_act_ids, act_ids.data(), rows * sizeof(int32_t), cudaMemcpyHostToDevice) == cudaSuccess &&
             cudaMalloc((void **) &card.d_q8_act, (size_t) tokens * (padded_embd / QK8_1) * sizeof(block_q8_1)) == cudaSuccess &&
@@ -9649,6 +10560,8 @@ static void moe_split_cards_create(moe_cache_session & session, moe_hosted_state
             cudaMalloc((void **) &card.d_glu, (size_t) rows * n_ff * sizeof(float)) == cudaSuccess &&
             cudaMalloc((void **) &card.d_q8_mid, mid_blocks * sizeof(block_q8_1)) == cudaSuccess &&
             cudaMalloc((void **) &card.d_q8_count, mid_blocks * sizeof(unsigned)) == cudaSuccess &&
+            cudaMalloc((void **) &card.d_res, (size_t) MOE_SPLIT_PSUM_TOKENS * n_used * n_embd * sizeof(float)) == cudaSuccess &&
+            cudaMalloc((void **) &card.d_w, (size_t) rows * sizeof(float)) == cudaSuccess &&
             cudaMemset(card.d_q8_count, 0, mid_blocks * sizeof(unsigned)) == cudaSuccess;
         if (!ok) {
             (void) cudaGetLastError();
@@ -9670,6 +10583,10 @@ static void moe_split_cards_create(moe_cache_session & session, moe_hosted_state
         MOE_CACHE_LOG("[moe-cache] CUDA%d expert split: device %d computes the rows of its cache for device %d's blocks "
                 "(card %d, %.1f GB/s for a copy)\n", card.device->physical, card.device->logical, host.logical, card.index,
                 card.rate / 1000.0);
+        if (g_tl_h && !g_tlk_h[card.index] &&
+                moe_hosted_host_alloc((void **) &g_tlk_h[card.index], MOE_TL_RING * 8 * sizeof(unsigned long long))) {
+            g_tlk_m[card.index] = moe_hosted_device_ptr(g_tlk_h[card.index]);
+        }
         st.split_cards.push_back(card);
         if (g_split_capture_owner && g_split_capture_device == host.logical) {
             moe_split_capture_card(card);   // made during a capture of the hosting card's graph
@@ -9727,6 +10644,13 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
     if (!layer) {
         return -1;
     }
+    if (!st->gpu_benched) {
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(ctx.stream(), &capture) == cudaSuccess && capture == cudaStreamCaptureStatusNone) {
+            moe_split_gpu_bench(st, *device, layer, gate->src[0]->type, down->src[0]->type);
+        }
+        (void) cudaGetLastError();
+    }
 
     cudaStream_t stream = ctx.stream();
     const int64_t n_embd = layer->n_embd;
@@ -9745,6 +10669,47 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
     GGML_ASSERT(!tk || (tp.n_rows == n_tokens && tp.n_used == n_used && n_tokens * WARP_SIZE <= 256));
     if (tp.logits && !tk) {
         ggml_cuda_topk_moe_pending_flush(ctx);
+    }
+
+    // EXPERT SPLIT, PSUM: the routing weights the weighting after the block reads (the first node to read its output),
+    // published with the ids for the other cards' weighted sums; computed by this kernel's top-k, or before the block
+    const float * w_src = nullptr;
+    static const bool psum_on = !getenv("GGML_MOE_SPLIT_PSUM") || atoi(getenv("GGML_MOE_SPLIT_PSUM")) != 0;
+    if (psum_on && !st->split_cards.empty() && n_tokens <= MOE_SPLIT_PSUM_TOKENS) {
+        for (int g = i + 4; g < std::min(i + 24, cgraph->n_nodes); g++) {
+            const ggml_tensor * node = cgraph->nodes[g];
+            const ggml_tensor * dsrc = nullptr, * wt = nullptr;
+            for (int j = 0; j < 2; j++) {
+                const ggml_tensor * a = node->src[j];
+                if (a && (a == down || a->view_src == down)) {
+                    dsrc = a;
+                    wt = node->src[1 - j];
+                }
+            }
+            if (!dsrc) {
+                bool reads = false;
+                for (int j = 0; j < GGML_MAX_SRC && !reads; j++) {
+                    reads = node->src[j] && (node->src[j] == down || node->src[j]->view_src == down);
+                }
+                if (reads) {
+                    break;
+                }
+                continue;
+            }
+            if (node->op == GGML_OP_MUL && wt && wt->type == GGML_TYPE_F32 && ggml_nelements(wt) == rows &&
+                    ggml_is_contiguous(wt)) {
+                bool ready = true;   // not written by a node between the block and its weighting
+                for (int h = i + 4; h < g && ready; h++) {
+                    ready = cgraph->nodes[h] != wt && cgraph->nodes[h] != wt->view_src;
+                }
+                if (tk && (const float *) wt->data == tp.weights) {
+                    w_src = tp.weights;
+                } else if (ready) {
+                    w_src = (const float *) wt->data;
+                }
+            }
+            break;
+        }
     }
 
     // activations and ids to the host, then the mailbox
@@ -9789,7 +10754,8 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
                                               tk ? tp.logits : nullptr, tk ? tp.weights : nullptr, tp.clamp, tp.scale,
                                               (int32_t *) ids->data, ids->nb[1], layer->m_ids, n_used, n_tokens,
                                               st->d_seq, layer->d_expect, st->m_mail, (uint32_t) slot, layer->m_flags,
-                                              layer->m_plan, layer->d_plan, 3 * rows, g_tl_m, rta);
+                                              layer->m_plan, layer->d_plan, 3 * rows, g_tl_m, rta,
+                                              w_src, w_src ? layer->m_w : nullptr);
     // a block launched now (not recorded into a graph) waits for its mailbox: the server thread serves it
     {
         cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
@@ -9910,47 +10876,67 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
     // EXPERT SPLIT: every other card's chain for this block: wait for the plan, its rows into the result buffer, its flag
     bool cards = false;
     if (moe_cache_expert_split() && session.devices.size() > 1 && layer->h_plank && slot >= 0 && slot < MOE_SPLIT_MAX_SLOTS) {
+        // a plan's chunk list (written after it by the card's wait kernels), as for the hosting card's kernels
+        static const bool card_grouped = !getenv("GGML_MOE_SPLIT_GROUPS") || atoi(getenv("GGML_MOE_SPLIT_GROUPS")) != 0;
+        const auto card_groups = [&](const uint64_t * plan) -> const int32_t * {
+            return card_grouped && n_tokens >= 2 && rows <= MOE_GROUP_MAX_ROWS ? (const int32_t *) (plan + 3 * rows) : nullptr;
+        };
         for (moe_split_card & card : st->split_cards) {
             ggml_cuda_set_device(card.device->logical);
             k_split_card_wait<<<1, 256, 0, card.stream>>>(layer->m_flags, card.d_last + slot, card.d_seq,
                                                           layer->m_plank + (size_t) (card.index - 1) * 3 * rows, card.d_plan,
                                                           3 * rows, layer->m_act, card.d_act, (int) (n_tokens * n_embd),
-                                                          st->m_split_diag, card.index, slot);
+                                                          st->m_split_diag, card.index, slot, g_tlk_m[card.index], (int) n_tokens,
+                                                          w_src ? layer->m_w : nullptr, card.d_w, rows);
             quantize_row_q8_1_cuda(card.d_act, nullptr, card.d_q8_act, wtype, n_embd, n_embd, n_tokens * n_embd,
                                    n_tokens * n_embd, padded_embd, n_tokens, 1, 1, card.stream);
             if (q8_fused && n_ff % QK8_1 == 0) {
                 ggml_cuda_moe_cache_mmv_fused(wtype, card.d_q8_act, card.d_plan, card.d_plan + rows, card.d_act_ids, card.d_glu,
                                               n_embd, n_ff, rows, n_tokens, -INFINITY, INFINITY, -INFINITY, INFINITY,
-                                              card.stream, card.d_q8_mid, padded_ff / QK8_1, card.d_q8_count, nullptr,
+                                              card.stream, card.d_q8_mid, padded_ff / QK8_1, card.d_q8_count, card_groups(card.d_plan),
                                               (int) n_tokens);
             } else {
                 ggml_cuda_moe_cache_mmv_fused(wtype, card.d_q8_act, card.d_plan, card.d_plan + rows, card.d_act_ids, card.d_glu,
                                               n_embd, n_ff, rows, n_tokens, -INFINITY, INFINITY, -INFINITY, INFINITY,
-                                              card.stream, nullptr, 0, nullptr, nullptr, (int) n_tokens);
+                                              card.stream, nullptr, 0, nullptr, card_groups(card.d_plan), (int) n_tokens);
                 quantize_row_q8_1_cuda(card.d_glu, nullptr, card.d_q8_mid, wtype, n_ff, n_ff, (int64_t) rows * n_ff,
                                        (int64_t) rows * n_ff, padded_ff, rows, 1, 1, card.stream);
             }
-            ggml_cuda_moe_cache_mmv(down->src[0]->type, card.d_q8_mid, card.d_plan + 2 * rows, nullptr, layer->m_res, n_ff,
-                                    n_embd, rows, rows, card.stream, nullptr, (int) n_tokens);
+            float * card_out = w_src ? card.d_res : layer->m_res;   // PSUM: summed below
+            ggml_cuda_moe_cache_mmv(down->src[0]->type, card.d_q8_mid, card.d_plan + 2 * rows, nullptr, card_out, n_ff,
+                                    n_embd, rows, rows, card.stream, card_groups(card.d_plan), (int) n_tokens);
             // the experts the dispatcher moved to this card, once copied (the flag comes without any)
             k_split_card_wait2<<<1, 256, 0, card.stream>>>(layer->m_flags + 34 + 8 * card.index, card.d_seq,
                                                            layer->m_plan2k + (size_t) (card.index - 1) * 3 * rows, card.d_plan2,
-                                                           3 * rows, st->m_split_diag, card.index);
-            ggml_cuda_moe_cache_mmv_fused(wtype, card.d_q8_act, card.d_plan2, card.d_plan2 + rows, card.d_act_ids, card.d_glu,
-                                          n_embd, n_ff, rows, n_tokens, -INFINITY, INFINITY, -INFINITY, INFINITY,
-                                          card.stream, nullptr, 0, nullptr, nullptr, (int) n_tokens);
-            quantize_row_q8_1_cuda(card.d_glu, nullptr, card.d_q8_mid, wtype, n_ff, n_ff, (int64_t) rows * n_ff,
-                                   (int64_t) rows * n_ff, padded_ff, rows, 1, 1, card.stream);
-            ggml_cuda_moe_cache_mmv(down->src[0]->type, card.d_q8_mid, card.d_plan2 + 2 * rows, nullptr, layer->m_res, n_ff,
-                                    n_embd, rows, rows, card.stream, nullptr, (int) n_tokens);
-            k_split_card_done<<<1, 1, 0, card.stream>>>(card.d_seq, layer->m_flags + 32 + 8 * card.index);
+                                                           3 * rows, st->m_split_diag, card.index, g_tlk_m[card.index], (int) n_tokens);
+            // their rows quantized by the fused kernel as above (a separate quantization went over every row, moved or not)
+            static const bool fused2 = !getenv("GGML_MOE_SPLIT_FUSED2") || atoi(getenv("GGML_MOE_SPLIT_FUSED2")) != 0;
+            if (fused2 && q8_fused && n_ff % QK8_1 == 0) {
+                ggml_cuda_moe_cache_mmv_fused(wtype, card.d_q8_act, card.d_plan2, card.d_plan2 + rows, card.d_act_ids, card.d_glu,
+                                              n_embd, n_ff, rows, n_tokens, -INFINITY, INFINITY, -INFINITY, INFINITY,
+                                              card.stream, card.d_q8_mid, padded_ff / QK8_1, card.d_q8_count, card_groups(card.d_plan2),
+                                              (int) n_tokens);
+            } else {
+                ggml_cuda_moe_cache_mmv_fused(wtype, card.d_q8_act, card.d_plan2, card.d_plan2 + rows, card.d_act_ids, card.d_glu,
+                                              n_embd, n_ff, rows, n_tokens, -INFINITY, INFINITY, -INFINITY, INFINITY,
+                                              card.stream, nullptr, 0, nullptr, card_groups(card.d_plan2), (int) n_tokens);
+                quantize_row_q8_1_cuda(card.d_glu, nullptr, card.d_q8_mid, wtype, n_ff, n_ff, (int64_t) rows * n_ff,
+                                       (int64_t) rows * n_ff, padded_ff, rows, 1, 1, card.stream);
+            }
+            ggml_cuda_moe_cache_mmv(down->src[0]->type, card.d_q8_mid, card.d_plan2 + 2 * rows, nullptr, card_out, n_ff,
+                                    n_embd, rows, rows, card.stream, card_groups(card.d_plan2), (int) n_tokens);
+            if (w_src) {
+                k_split_card_psum<<<(unsigned) n_tokens, 256, 0, card.stream>>>(card.d_plan, card.d_plan2, rows, n_used,
+                                                                               card.d_w, card.d_res, layer->m_res, (int) n_embd);
+            }
+            k_split_card_done<<<1, 1, 0, card.stream>>>(card.d_seq, layer->m_flags + 32 + 8 * card.index, g_tlk_m[card.index]);
             CUDA_CHECK(cudaGetLastError());
             cards = true;
         }
         ggml_cuda_set_device(ctx.device);
     }
     g_hosted_pending = {layer, down, rows, split_on, moe_sgate_find(ctx, cgraph, i, act, down, (int) n_tokens), cards,
-                        st->m_split_diag};
+                        st->m_split_diag, n_used, cards && w_src != nullptr};
     return 3;
 }
 
@@ -9975,7 +10961,7 @@ void ggml_cuda_moe_hosted_flush(ggml_backend_cuda_context & ctx, const ggml_tens
                                                           p.layer->m_res,
                                                           (float *) p.down->data, (int) p.layer->n_embd, g_tl_m, p.sg,
                                                           p.cards ? p.layer->m_src : nullptr, p.layer->m_flags,
-                                                          p.cards ? p.diag : nullptr);
+                                                          p.cards ? p.diag : nullptr, p.n_used, p.psum ? 1 : 0);
     CUDA_CHECK(cudaGetLastError());
     p = {};
 }
@@ -9999,6 +10985,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.session_leave = moe_cache_session_leave;
     ggml_moe_cache.begin = moe_cache_begin;
     ggml_moe_cache.assign = moe_cache_assign;
+    ggml_moe_cache.assigned = moe_cache_assigned;
     ggml_moe_cache.prepare_queues = moe_cache_prepare_queues;
     ggml_moe_cache.hosted_max_rows = moe_hosted_max_rows;
     ggml_moe_cache.largest_lend = moe_cache_largest_lend;

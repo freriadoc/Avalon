@@ -95,6 +95,7 @@
 #include <set>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -127,7 +128,72 @@ static int ggml_cuda_get_physical_device(int device) {
 
 // this is faster on Windows
 // probably because the Windows CUDA libraries forget to make this check before invoking the drivers
+static int ggml_cuda_physical_device_share_count(int device);
+
+// the logical (possibly virtual) device last set by this thread, for the VRAM count of virtual devices
+static thread_local int g_cuda_logical_device = -1;
+
+#if defined(GGML_USE_HIP)
+bool ggml_cuda_vtrack_on = false;
+static std::mutex g_vtrack_mu;
+static std::unordered_map<void *, std::pair<int, size_t>> g_vtrack_ptrs;
+static size_t g_vtrack_used[GGML_CUDA_MAX_DEVICES] = {};
+
+void ggml_cuda_vtrack_alloc(void * ptr, size_t size) {
+    const int dev = g_cuda_logical_device;
+    if (!ptr || dev < 0 || dev >= GGML_CUDA_MAX_DEVICES) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_vtrack_mu);
+    g_vtrack_ptrs[ptr] = {dev, size};
+    g_vtrack_used[dev] += size;
+}
+
+void ggml_cuda_vtrack_free(void * ptr) {
+    std::lock_guard<std::mutex> lock(g_vtrack_mu);
+    const auto it = g_vtrack_ptrs.find(ptr);
+    if (it != g_vtrack_ptrs.end()) {
+        g_vtrack_used[it->second.first] -= it->second.second;
+        g_vtrack_ptrs.erase(it);
+    }
+}
+#endif
+
+// virtual devices sharing one physical GPU: from the physical free / total memory, those of logical device `device`
+// as if it were a card of its own of total/N: its share of the total, minus what it allocated, minus its share of what
+// nobody counted (runtime, queues, other processes)
+void ggml_cuda_virtual_memory(int device, size_t * free, size_t * total) {
+    const int share_count = ggml_cuda_physical_device_share_count(device);
+    if (share_count <= 1) {
+        return;
+    }
+    const size_t used_phys = *total > *free ? *total - *free : 0;
+    *total /= share_count;
+#if defined(GGML_USE_HIP)
+    if (ggml_cuda_vtrack_on) {
+        const int physical = ggml_cuda_get_physical_device(device);
+        size_t counted = 0;
+        size_t own     = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_vtrack_mu);
+            for (int d = 0; d < ggml_cuda_info().device_count; d++) {
+                if (ggml_cuda_get_physical_device(d) == physical) {
+                    counted += g_vtrack_used[d];
+                }
+            }
+            own = g_vtrack_used[device];
+        }
+        const size_t other = used_phys > counted ? (used_phys - counted) / share_count : 0;
+        const size_t used  = own + other;
+        *free = *total > used ? *total - used : 0;
+        return;
+    }
+#endif
+    *free /= share_count;
+}
+
 void ggml_cuda_set_device(int device) {
+    g_cuda_logical_device = device;
     // translate the (possibly virtual) device id to the physical CUDA device that backs it
     const int physical_device = ggml_cuda_get_physical_device(device);
 
@@ -319,6 +385,9 @@ static ggml_cuda_device_info ggml_cuda_init() {
     if (info.device_count != info.physical_device_count) {
         GGML_LOG_INFO("%s: emulating %d virtual device(s) on %d physical device(s) (GGML_CUDA_DEVICES)\n",
                       __func__, info.device_count, info.physical_device_count);
+#if defined(GGML_USE_HIP)
+        ggml_cuda_vtrack_on = true;
+#endif
     }
     total_vram = 0;
 
@@ -4245,6 +4314,18 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
         }
     }
 
+    // DIAGNOSTIC (GGML_CUDA_FUSION_REFUSALS=1): the fusions the placement refuses, each node name once
+    if (!is_ok && getenv("GGML_CUDA_FUSION_REFUSALS")) {
+        static std::mutex mu;
+        static std::set<std::string> seen;
+        std::lock_guard<std::mutex> lock(mu);
+        const std::string name = std::string(ggml_op_desc(cgraph->nodes[node_idx])) + " " + cgraph->nodes[node_idx]->name +
+            " x" + std::to_string(node_count) + " ne1=" + std::to_string(cgraph->nodes[node_idx]->ne[1]);
+        if (seen.insert(name).second) {
+            GGML_LOG_INFO("fusion refused by overlap: %s\n", name.c_str());
+        }
+    }
+
     return is_ok;
 }
 
@@ -7544,10 +7625,8 @@ void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * tot
 
     CUDA_CHECK(cudaMemGetInfo(free, total));
 
-    // virtual devices sharing one physical GPU share its memory pool; split it between them
-    const int share_count = ggml_cuda_physical_device_share_count(device);
-    *free  /= share_count;
-    *total /= share_count;
+    // virtual devices sharing one physical GPU: each reports the memory of a card of its own of total/N
+    ggml_cuda_virtual_memory(device, free, total);
 }
 
 bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
@@ -7714,10 +7793,8 @@ static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t *
     }
 #endif // defined(__linux__) && !defined(GGML_USE_HIP)
 
-    // virtual devices sharing one physical GPU share its memory pool; split it between them
-    const int share_count = ggml_cuda_physical_device_share_count(ctx->device);
-    *free  /= share_count;
-    *total /= share_count;
+    // virtual devices sharing one physical GPU: each reports the memory of a card of its own of total/N
+    ggml_cuda_virtual_memory(ctx->device, free, total);
 }
 
 static enum ggml_backend_dev_type ggml_backend_cuda_device_get_type(ggml_backend_dev_t dev) {

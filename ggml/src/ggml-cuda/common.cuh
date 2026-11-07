@@ -1248,6 +1248,10 @@ const ggml_cuda_device_info & ggml_cuda_info();
 void ggml_cuda_set_device(int device);
 int ggml_cuda_get_device();
 
+// virtual devices sharing one physical GPU (GGML_CUDA_DEVICES): the physical free / total memory turned into those of
+// a card of its own of total/N for logical device `device`
+void ggml_cuda_virtual_memory(int device, size_t * free, size_t * total);
+
 struct ggml_cuda_pool {
     virtual ~ggml_cuda_pool() = default;
 

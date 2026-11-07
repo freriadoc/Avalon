@@ -65,6 +65,7 @@
 #define cudaDeviceGetStreamPriorityRange hipDeviceGetStreamPriorityRange
 #define cudaErrorPeerAccessNotEnabled hipErrorPeerAccessNotEnabled
 #define cudaEventCreateWithFlags hipEventCreateWithFlags
+#define cudaEventElapsedTime hipEventElapsedTime
 #define cudaEventDisableTiming hipEventDisableTiming
 #define cudaEventRecord hipEventRecord
 #define cudaEventSynchronize hipEventSynchronize
@@ -73,7 +74,7 @@
 #define cudaErrorNotReady hipErrorNotReady
 #define cudaEvent_t hipEvent_t
 #define cudaEventDestroy hipEventDestroy
-#define cudaFree hipFree
+#define cudaFree ggml_hip_free_tracked
 #define cudaFreeHost hipHostFree
 #define cudaGetDevice hipGetDevice
 #define cudaGetDeviceCount hipGetDeviceCount
@@ -92,7 +93,7 @@
 #define cudaHostUnregister hipHostUnregister
 #define cudaLaunchCooperativeKernel hipLaunchCooperativeKernel
 #define cudaLaunchHostFunc hipLaunchHostFunc
-#define cudaMalloc hipMalloc
+#define cudaMalloc ggml_hip_malloc_tracked
 #define cudaMallocHost(ptr, size) hipHostMalloc(ptr, size, hipHostMallocDefault)
 #define cudaMallocManaged hipMallocManaged
 #define cudaMemAdvise hipMemAdvise
@@ -328,4 +329,24 @@ static __device__ __forceinline__ unsigned int __vcmpne4(unsigned int a, unsigne
     const unsigned int ne_any_bit = ne_low_7bits | ne_high_1bit;
 
     return (ne_any_bit >> 7) * 0xff;
+}
+
+// VRAM of each logical device counted while virtual devices share a physical GPU (GGML_CUDA_DEVICES), so that each
+// reports its share of the memory as a card of its own would (ggml_cuda_virtual_memory); a test otherwise
+void ggml_cuda_vtrack_alloc(void * ptr, size_t size);
+void ggml_cuda_vtrack_free(void * ptr);
+extern bool ggml_cuda_vtrack_on;
+template <typename T>
+static inline hipError_t ggml_hip_malloc_tracked(T ** ptr, size_t size) {
+    const hipError_t err = hipMalloc((void **) ptr, size);
+    if (err == hipSuccess && ggml_cuda_vtrack_on) {
+        ggml_cuda_vtrack_alloc((void *) *ptr, size);
+    }
+    return err;
+}
+static inline hipError_t ggml_hip_free_tracked(void * ptr) {
+    if (ggml_cuda_vtrack_on) {
+        ggml_cuda_vtrack_free(ptr);
+    }
+    return hipFree(ptr);
 }
