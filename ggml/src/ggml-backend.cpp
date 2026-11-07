@@ -1184,6 +1184,7 @@ struct ggml_backend_sched {
     int prefetch_slots_wanted;   // slots per GPU (GGML_SCHED_PREFETCH_EXPERTS)
     size_t prefetch_ring_half;   // GGML_SCHED_PREFETCH_RING_MB: the ring's two zones, each this size (0: slots)
     size_t prefetch_slot_bytes;  // the slot size the MoE cache lays its zones out for (prime)
+    int prefetch_ring_zones;     // GGML_CUDA_MOE_RING_PREFILL=MiB: the ring's zones (2), else 0 (the prefetch's slots)
     // one prefetch per backend: each GPU copies the experts of the layers it computes over its own link, into its own
     // slots (a layer split over several GPUs)
     struct ggml_sched_prefetch pf[GGML_SCHED_MAX_BACKENDS];
@@ -2674,7 +2675,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             ggml_backend_t backend = sched->backends[b];
             if (!pf.lent && ggml_backend_sched_prefetch_backend_init(sched, pf, backend->device)) {
                 void * zones[GGML_SCHED_MAX_PREFETCH_SLOTS] = {};
-                const int n = ggml_moe_cache.lend(sched->moe_cache_session, backend, sched->prefetch_slot_bytes, zones, pf.n_slots);
+                const int n = ggml_moe_cache.lend(sched->moe_cache_session, backend, sched->prefetch_slot_bytes, zones,
+                        sched->prefetch_ring_zones ? sched->prefetch_ring_zones : pf.n_slots);
                 if (n >= 2) {
                     bool contiguous = true;
                     const ptrdiff_t step = (char *) zones[1] - (char *) zones[0];
@@ -4170,16 +4172,24 @@ static void ggml_backend_sched_prime_moe_cache(ggml_backend_sched_t sched, struc
     }
 
     if (sched->prefetch_experts && slot_bytes && ggml_moe_cache.set_lend_size) {
-        if (ggml_sched_prefetch_ring_bytes() && ggml_moe_cache.prefill_residents) {
+        // GGML_CUDA_MOE_RING_PREFILL=MiB (more than 1): the prompt's expert ring in two zones of half that each, instead
+        // of the prefetch's slots (the cache keeps the rest)
+        static const long ring_mib = getenv("GGML_CUDA_MOE_RING_PREFILL") ? atol(getenv("GGML_CUDA_MOE_RING_PREFILL")) : 0;
+        if (ring_mib > 1) {
+            sched->prefetch_slot_bytes = GGML_PAD((size_t) ring_mib << 19, 4096);   // half, 4 KiB aligned
+            sched->prefetch_ring_zones = 2;
+            ggml_moe_cache.set_lend_size(sched->moe_cache_session, sched->prefetch_slot_bytes, 2);
+        } else if (ggml_sched_prefetch_ring_bytes() && ggml_moe_cache.prefill_residents) {
             sched->prefetch_ring_half = ggml_sched_prefetch_ring_half(slot_bytes);
             GGML_LOG_INFO("%s: prefetch ring of %zu MiB (two zones of %zu MiB) instead of %d slots of %zu MiB\n", __func__,
                     (2*sched->prefetch_ring_half) >> 20, sched->prefetch_ring_half >> 20, sched->prefetch_slots_wanted,
                     slot_bytes >> 20);
             ggml_moe_cache.set_lend_size(sched->moe_cache_session, sched->prefetch_ring_half, 2);
+            sched->prefetch_slot_bytes = slot_bytes;
         } else {
             ggml_moe_cache.set_lend_size(sched->moe_cache_session, slot_bytes, sched->prefetch_slots_wanted);
+            sched->prefetch_slot_bytes = slot_bytes;
         }
-        sched->prefetch_slot_bytes = slot_bytes;
     }
 
     int accepted[2] = {0, 0};

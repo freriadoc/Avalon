@@ -895,7 +895,14 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
     }
     std::vector<int32_t> hb(n_expert + 1);
     CUDA_CHECK(cudaMemcpyAsync(hb.data(), bounds.get(), (n_expert + 1)*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    // GGML_CUDA_MOE_GROUPED_TIMING=1: the host's wait in this synchronization, and the stream's idle time after it (the
+    // time to queue the first group), every 48 blocks
+    static const bool timing = getenv("GGML_CUDA_MOE_GROUPED_TIMING") && atoi(getenv("GGML_CUDA_MOE_GROUPED_TIMING")) != 0;
+    const int64_t t_sync0 = timing ? ggml_time_us() : 0;
     CUDA_CHECK(cudaStreamSynchronize(stream));
+    static int64_t t_wait = 0, n_blocks = 0, t_gap = 0;
+    const int64_t t_sync1 = timing ? ggml_time_us() : 0;
+
     if (hooks && hooks->synced) {
         (*hooks->synced)();
     }
@@ -920,8 +927,14 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
         GGML_UNUSED(fallback);
         ggml_cuda_mul_mat_q_switch_type(ctx, a, stream, GGML_PREC_Q8);
     };
+    bool first_launch = true;
     for (int64_t g0 = 0; g0 < n_expert; g0 += G) {
         const int r0 = hb[g0], r1 = hb[g0 + G];
+        if (timing && first_launch && r1 > r0) {
+            // the stream idles from the synchronization to the first group's launch
+            t_gap += ggml_time_us() - t_sync1;
+            first_launch = false;
+        }
         if (hooks && hooks->before) {
             (*hooks->before)(g0 / G);
         }
@@ -946,6 +959,13 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
         }
     }
     CUDA_CHECK(cudaGetLastError());
+    if (timing) {
+        t_wait += t_sync1 - t_sync0;
+        if (++n_blocks % 48 == 0) {
+            GGML_LOG_INFO("%s: %lld blocks: host wait in the synchronizations %.1f ms, stream idle after them %.2f ms (%.1f us a block)\n",
+                    __func__, (long long) n_blocks, t_wait / 1e3, t_gap / 1e3, (double) t_gap / n_blocks);
+        }
+    }
 
     // GGML_CUDA_MOE_GROUPED_CHECK=1: the block again the ungrouped way into copies of its outputs, compared bit for bit
     static const bool check = getenv("GGML_CUDA_MOE_GROUPED_CHECK") && atoi(getenv("GGML_CUDA_MOE_GROUPED_CHECK")) != 0;
