@@ -14,6 +14,7 @@ struct ssm_conv_cached_args {
     int64_t n_ch, n_t; bool apply_silu;
     ggml_cuda_ssm_conv_slots slots;
     float * qk_out; int64_t n_qk; float qk_eps, qk_scale;
+    bool qk_dst_unused;   // with qk_out: nothing reads dst's first n_qk channels, they are not written (long kernel)
     int n_s;   // sequences (the grid's y)
 };
 

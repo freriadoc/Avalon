@@ -20,8 +20,10 @@ struct ggml_cuda_ssm_conv_slots {
 // (rows of state_row floats, row ids[s], or row s when ids is null) followed by x [n_t, n_ch, n_s]
 // (strided), optionally followed by silu, writing the new tails into the cache slots
 // qk_out (optional): the l2 norm of the first n_qk output channels, heads of 128 (rms_norm with eps qk_eps, then
-// scale qk_scale), [n_qk, n_t, n_s], computed as rms_norm_f32 does (the same bytes)
+// scale qk_scale), [n_qk, n_t, n_s], computed as rms_norm_f32 does (the same bytes); qk_dst_unused: dst's first n_qk
+// channels are read by nothing else, a prompt batch's kernel leaves them unwritten
 void ggml_cuda_op_ssm_conv_cached(ggml_backend_cuda_context & ctx, const float * state, const int32_t * ids, int64_t state_row,
         const ggml_tensor * x, const ggml_tensor * w, float * dst, int64_t n_ch, int64_t n_t, int64_t n_s, bool apply_silu,
         const ggml_cuda_ssm_conv_slots & slots,
-        float * qk_out = nullptr, int64_t n_qk = 0, float qk_eps = 0.0f, float qk_scale = 1.0f);
+        float * qk_out = nullptr, int64_t n_qk = 0, float qk_eps = 0.0f, float qk_scale = 1.0f,
+        bool qk_dst_unused = false);

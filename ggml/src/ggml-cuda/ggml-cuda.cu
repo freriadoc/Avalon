@@ -3897,6 +3897,59 @@ static const ggml_tensor * ggml_cuda_view_root(const ggml_tensor * t) {
 // The gated delta net's l2 norm of q and k (rms_norm over heads of 128 of a view of the conv output's first
 // channels, then scale) right after the cached conv that produces them (views in between): the conv computes
 // it (ggml_cuda_op_ssm_conv_cached, qk_out). Returns the scale node's index, -1 if not.
+// true when no node after `from` reads the first n_ch_lo channels of conv_out ([n_ch, n_t, n_s], a row per token): every
+// later reader of it is a view whose bytes in a row start at or past them (the gated delta net's v view); a reader
+// of conv_out itself, or a view across rows in another way, says no
+static bool ggml_cuda_conv_low_channels_unread(const ggml_cgraph * cgraph, int from, const ggml_tensor * conv_out,
+        int64_t n_ch_lo) {
+    const int64_t rowb = conv_out->nb[1];
+    const char * base = (const char *) conv_out->data;
+    for (int j = from + 1; j < cgraph->n_nodes; j++) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(n)) {
+            continue;
+        }
+        for (int k = 0; k < GGML_MAX_SRC; k++) {
+            const ggml_tensor * t = n->src[k];
+            if (!t) {
+                continue;
+            }
+            const ggml_tensor * r = t;
+            while (r->view_src) {
+                r = r->view_src;
+            }
+            if (r != conv_out && t != conv_out) {
+                continue;
+            }
+            if (t == conv_out || !t->view_src) {
+                return false;
+            }
+            const int64_t off = (const char *) t->data - base;
+            if (off < 0) {
+                return false;
+            }
+            // the bytes of a row this view covers: its dimensions below the row stride; those at multiples of it
+            // step over rows
+            int64_t in_row = ggml_element_size(t);
+            for (int d = 0; d < GGML_MAX_DIMS; d++) {
+                if (t->ne[d] <= 1) {
+                    continue;
+                }
+                if (t->nb[d] < rowb) {
+                    in_row += (t->ne[d] - 1) * t->nb[d];
+                } else if (t->nb[d] % rowb != 0) {
+                    return false;
+                }
+            }
+            const int64_t c0 = off % rowb;
+            if (c0 < n_ch_lo * (int64_t) sizeof(float) || c0 + in_row > rowb) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 static int ggml_cuda_match_conv_l2_norm(const ggml_cgraph * cgraph, int last, const ggml_tensor * conv_out) {
     int j = last + 1;
     while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
@@ -5316,10 +5369,20 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 if (ok) {
                     float eps;
                     memcpy(&eps, rms->op_params, sizeof(float));
+                    const int64_t n_qk = rms->src[0]->ne[0] * rms->src[0]->ne[1];
+                    // a prompt batch: q and k are read from the norm's output only, their raw channels go unwritten
+                    // (156 MB per layer at a 9536-token ubatch). GGML_CUDA_CONV_QK_DST=1 writes them anyway
+                    static const bool qk_dst = getenv("GGML_CUDA_CONV_QK_DST") && atoi(getenv("GGML_CUDA_CONV_QK_DST")) != 0;
+                    const bool qk_unused = !qk_dst && ggml_cuda_conv_low_channels_unread(cgraph, sc_idx, m.out, n_qk);
+                    static bool qk_said = false;
+                    if (qk_unused && !qk_said) {
+                        qk_said = true;
+                        GGML_LOG_INFO("%s: a prompt batch's conv leaves the raw q/k channels unwritten\n", __func__);
+                    }
                     ggml_cuda_op_ssm_conv_cached(*cuda_ctx, st, ids, row, m.x, m.w, (float *) m.out->data,
                                                  state->ne[1], m.x->ne[0], state->ne[2], m.silu, m.slots,
-                                                 (float *) sc->data, rms->src[0]->ne[0] * rms->src[0]->ne[1], eps,
-                                                 ggml_get_op_params_f32(sc, 0));
+                                                 (float *) sc->data, n_qk, eps,
+                                                 ggml_get_op_params_f32(sc, 0), qk_unused);
                     return sc_idx - i;
                 }
             }

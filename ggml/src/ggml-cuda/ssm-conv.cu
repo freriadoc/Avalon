@@ -260,7 +260,9 @@ static __global__ void ssm_conv_cached_long_f32(const ssm_conv_cached_args a) {
         }
         sumf += 0.0f;   // the bias term of ssm_conv_f32, absent here: same rounding
         const float y = a.apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
-        dst[(t0 + t) * n_ch + c] = y;
+        if (!(qk && a.qk_dst_unused)) {
+            dst[(t0 + t) * n_ch + c] = y;
+        }
         if (qk) {
             float sq = block_reduce<block_reduce_method::SUM, 128>(y * y, qk_sum);
             const float scale = rsqrtf(sq / 128 + a.qk_eps);
@@ -284,7 +286,8 @@ static __global__ void ssm_conv_cached_long_f32(const ssm_conv_cached_args a) {
 
 void ggml_cuda_op_ssm_conv_cached(ggml_backend_cuda_context & ctx, const float * state, const int32_t * ids, int64_t state_row,
         const ggml_tensor * x, const ggml_tensor * w, float * dst, int64_t n_ch, int64_t n_t, int64_t n_s, bool apply_silu,
-        const ggml_cuda_ssm_conv_slots & slots, float * qk_out, int64_t n_qk, float qk_eps, float qk_scale) {
+        const ggml_cuda_ssm_conv_slots & slots, float * qk_out, int64_t n_qk, float qk_eps, float qk_scale,
+        bool qk_dst_unused) {
     GGML_ASSERT(w->ne[0] == 4 && (n_t <= GGML_CUDA_SSM_CONV_CACHED_MAX_T || n_s == 1));
     const int threads = 128;
     GGML_ASSERT(qk_out == nullptr || (n_qk % threads == 0 && n_qk <= n_ch));
@@ -294,6 +297,7 @@ void ggml_cuda_op_ssm_conv_cached(ggml_backend_cuda_context & ctx, const float *
     a.x = (const char *) x->data; a.x_nb0 = x->nb[0]; a.x_nb1 = x->nb[1]; a.x_nb2 = x->nb[2];
     a.w = (const float *) w->data; a.w_nb1 = w->nb[1]; a.dst = dst; a.n_ch = n_ch; a.n_t = n_t; a.apply_silu = apply_silu;
     a.slots = slots; a.qk_out = qk_out; a.n_qk = n_qk; a.qk_eps = qk_eps; a.qk_scale = qk_scale; a.n_s = (int) n_s;
+    a.qk_dst_unused = qk_out != nullptr && qk_dst_unused;
     if (n_t > GGML_CUDA_SSM_CONV_CACHED_MAX_T) {
         const dim3 grid_long((n_ch + threads - 1) / threads, 1,
                              (n_t + GGML_CUDA_SSM_CONV_CACHED_MAX_T - 1) / GGML_CUDA_SSM_CONV_CACHED_MAX_T);
