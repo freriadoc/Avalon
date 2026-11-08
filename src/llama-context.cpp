@@ -920,17 +920,29 @@ void llama_context::sched_reserve() {
     const int64_t t_start_us = ggml_time_us();
 
     const uint32_t n_seqs = cparams.n_seq_max;
-    uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+    uint32_t n_tokens = std::min(cparams.n_ctx, ubatch_reserved());
 
     const size_t max_nodes = this->graph_max_nodes(n_tokens);
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
+    // the graph capacity: the kept scheduler's while it holds the new worst case, else the worst case with room for a few
+    // more nodes (a change of sampler chain); the graph results of that capacity are kept and cleared, not made again (each
+    // holds ggml_tensor_overhead() x nodes of metadata, ~140 MiB at -ub 9536, ~100 ms to free and fill again)
+    const size_t cap_nodes = sched && sched_max_nodes >= max_nodes ? sched_max_nodes : max_nodes + 1024;
     for (auto & res : gf_res_prev) {
-        res.reset();
+        if (res && (size_t) res->get_max_nodes() == cap_nodes) {
+            res->reset();
+        } else {
+            res.reset();
+        }
     }
     gf_res_small.clear();
-    gf_res_reserve.reset(new llm_graph_result(max_nodes));
+    if (gf_res_reserve && (size_t) gf_res_reserve->get_max_nodes() == cap_nodes) {
+        gf_res_reserve->reset();
+    } else {
+        gf_res_reserve.reset(new llm_graph_result(cap_nodes));
+    }
     sampling.samplers_reserved = sampling.samplers;
     gf_res_prev_active = nullptr;
 
@@ -971,17 +983,33 @@ void llama_context::sched_reserve() {
         }
     };
 
+    // a scheduler kept whose compute buffers are borrowed from the MoE cache measures the new worst case without
+    // allocating it (a change of sampler chain, of a pipeline stage's ubatch): allocated, it took the reservation's whole
+    // ubatch from the cache, evicting experts, and the next prompt kept it all when shorter (as Strata, which lays out its
+    // buffers for each prompt's chunk only); the next graph takes what it needs. LLAMA_RESERVE_MEASURE=0: allocated
+    static const bool reserve_measure = !getenv("LLAMA_RESERVE_MEASURE") || atoi(getenv("LLAMA_RESERVE_MEASURE")) != 0;
+    // not for a context on another's cache (the MTP draft): its reservation sizes one buffer for all of its batch shapes,
+    // whose graphs are replayed as captured
+    const bool measure_kept = reserve_measure && !moe_cache_shared && sched && sched_max_nodes >= max_nodes &&
+        ggml_backend_sched_compute_borrowed(sched.get());
+    if (measure_kept) {
+        LLAMA_LOG_INFO("%s: compute buffers borrowed: no worst case reserved, the next graph takes what it needs\n", __func__);
+    }
+
     // a scheduler of the same size is kept: its compute buffers are reused if the new worst case fits (a new one
     // freed them and allocated buffers of the same size, both counted for a moment by the driver: a 694 MiB step
     // above the VRAM peak when the MTP draft re-reserves for its backend sampler)
-    if (sched && sched_max_nodes == max_nodes) {
+    // kept while its graph capacity holds the new worst case: a sampler chain changes it by a few nodes (381 443 to 381 449
+    // at -ub 9536), and a scheduler made again at each change of chain took the reservation's whole worst case from the
+    // cache again; a new one is made with room for such changes
+    if (sched && sched_max_nodes >= max_nodes) {
         ggml_backend_sched_reset(sched.get());
     } else {
         // a new scheduler: its MoE cache session carries over (contents kept, not resized on a free-memory
         // figure that lags behind the frees of the old scheduler)
         void * moe_cache_kept = sched ? ggml_backend_sched_detach_moe_cache(sched.get()) : nullptr;
-        sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
-        sched_max_nodes = max_nodes;
+        sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), cap_nodes, cparams.pipeline_parallel, cparams.op_offload));
+        sched_max_nodes = cap_nodes;
         if (!moe_cache_guest_weights.empty()) {
             ggml_backend_sched_set_moe_guest_weights(sched.get(), moe_cache_guest_weights.data(), (int) moe_cache_guest_weights.size());
         }
@@ -1008,10 +1036,13 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_DEBUG("%s: worst-case: n_tokens = %d, n_seqs = %d, n_outputs = %d\n", __func__, n_tokens, n_seqs, n_outputs);
 
-    resolve_fused_ops(mctx.get(), n_seqs);
+    // the fused ops were checked against the placement when this scheduler first reserved: it has not changed
+    if (!measure_kept) {
+        resolve_fused_ops(mctx.get(), n_seqs);
+    }
 
     // reserve worst-case graph
-    const bool split_only = model.hparams.no_alloc || sched_measure_only;
+    const bool split_only = model.hparams.no_alloc || sched_measure_only || measure_kept;
     int n_splits_pp        = -1;
     int n_nodes_pp         = -1;
     int n_inputs_pp        = -1;
@@ -1024,6 +1055,9 @@ void llama_context::sched_reserve() {
 
     const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
 
+    // compute buffers borrowed and the scheduler kept: no worst-case graph is built at all (~130 ms at -ub 9536 for a
+    // change of sampler chain), the next graph is split and allocated when it runs
+    if (!measure_kept) {
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
@@ -1032,7 +1066,8 @@ void llama_context::sched_reserve() {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
-                sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), cap_nodes, false, cparams.op_offload));
+                sched_max_nodes = cap_nodes;
                 set_moe_cache();
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
@@ -1040,6 +1075,13 @@ void llama_context::sched_reserve() {
             // piece (the routed experts' outputs before their weighted sum, n_embd x n_expert_used x n_ubatch: 931 MiB
             // at 9536 on a 12 GB card), and nothing else has room. The batch is halved until the graph fits;
             // the prompt is then split into more batches (slower prefill), generation is unchanged.
+            // pipeline stages reserved for their whole ubatch: back at the half they split a short batch into first
+            if (!gf && n_tokens > cparams.n_ubatch) {
+                LLAMA_LOG_WARN("%s: compute buffer allocation failed, pipeline stages kept at ubatch %u\n", __func__, cparams.n_ubatch);
+                stage_ub_full = stage_ub_half;
+                n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+                gf = graph_reserve(n_tokens, n_seqs, std::min(n_tokens, cparams.n_outputs_max), mctx.get());
+            }
             while (!gf && cparams.n_ubatch > 512) {
                 cparams.n_ubatch = std::max<uint32_t>(512, cparams.n_ubatch / 2 / 256 * 256);
                 n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
@@ -1108,6 +1150,8 @@ void llama_context::sched_reserve() {
         }
     }
 
+    } // !measure_kept
+
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
         ggml_backend_t             backend = backend_ptrs[i];
         ggml_backend_buffer_type_t buft    = backend_buft[i];
@@ -1121,7 +1165,7 @@ void llama_context::sched_reserve() {
         }
     }
 
-    {
+    if (!measure_kept) {
         const bool diff = n_nodes_pp != n_nodes_tg || n_splits_pp != n_splits_tg ||
                           n_inputs_pp != n_inputs_tg || n_input_tensors_pp != n_input_tensors_tg;
 
@@ -2226,24 +2270,25 @@ int llama_context::stage_begin(const llama_batch_ext & batch_inp, const std::vec
     return 0;
 }
 
-// pipeline stages, LLAMA_STAGES_FULL_UBATCH_FROM=N: the ubatch of a batch of n_tokens, half the requested one below N
-// tokens (as without it: the same graphs, reserved at that size), the requested one from N on; a change of size
-// reserves the graphs again before the batch (a long prompt after short ones, and back at the next batch below N that
-// fills the pipeline at half; the small batches keep the reservation they find)
+// pipeline stages, LLAMA_STAGES_FULL_UBATCH_FROM=N: the graphs are reserved once for the requested ubatch (the largest a
+// batch takes, so the scheduler and its sizes never change), and each batch is split at half the requested ubatch below
+// N tokens, at the whole one from N on. A change of size reserves nothing (as Strata's relayout, which only lays its
+// buffers out again for the chunk of each prompt): the compute buffers borrowed from the cache follow the graph that
+// runs (reallocated at each change of phase, cut to the first graph after a reservation), the stage buffers too
 void llama_context::stage_ubatch_for(uint32_t n_tokens) {
     const uint32_t from = llama_stage_full_ubatch_from();
     if (!from || !stage_ub_full || stage_ub_full == stage_ub_half) {
         return;
     }
-    // back at half only for a batch that fills the pipeline at half (two ubatches or more): not for the prompt's tail
-    // of a few tokens, the generation or a verification, which do not pipeline and fit either reservation (each
-    // change reserves the graphs again, ~370 ms on 2 x RTX 5060 Ti)
-    const uint32_t want = n_tokens >= from ? stage_ub_full : n_tokens >= 2*stage_ub_half ? stage_ub_half : cparams.n_ubatch;
+    const uint32_t want = n_tokens >= from ? stage_ub_full : stage_ub_half;
     if (cparams.n_ubatch != want) {
         LLAMA_LOG_INFO("%s: pipeline stage ubatch %u -> %u (a batch of %u tokens)\n", __func__, cparams.n_ubatch, want, n_tokens);
         cparams.n_ubatch = want;
-        sched_need_reserve = true;
     }
+}
+
+uint32_t llama_context::ubatch_reserved() const {
+    return llama_stage_full_ubatch_from() && stage_ub_full > cparams.n_ubatch ? stage_ub_full : cparams.n_ubatch;
 }
 
 bool llama_context::stage_buffers(uint32_t n_rows) {

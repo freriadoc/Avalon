@@ -162,7 +162,8 @@ struct llama_context {
     // the buffers between the stages, for ubatches of up to n_rows tokens: a prefill's taken from the MoE caches of the
     // two devices (as the compute buffers are), a few rows otherwise; false when they cannot be allocated
     bool stage_buffers(uint32_t n_rows);
-    void stage_ubatch_for(uint32_t n_tokens);   // LLAMA_STAGES_FULL_UBATCH_FROM: this batch's ubatch, reserved again on a change
+    void stage_ubatch_for(uint32_t n_tokens);   // LLAMA_STAGES_FULL_UBATCH_FROM: this batch's ubatch (no reservation)
+    uint32_t ubatch_reserved() const;           // the ubatch the graphs are reserved for: the largest a batch may take
     bool stage_step(ggml_tensor * out, uint32_t & n_tokens);
     void stage_end();
 

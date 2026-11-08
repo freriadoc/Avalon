@@ -71,6 +71,11 @@ GGML_API bool ggml_gallocr_reserve_n(
 // while set, a (re)reservation also shrinks buffers borrowed from a cache (ggml_moe_cache.borrows)
 // when the graph needs less; set it only for graphs about to run, not for worst-case reservations
 GGML_API void ggml_gallocr_set_shrink(ggml_gallocr_t galloc, bool shrink);
+// while set with shrink, a borrowed buffer is cut to what the graph needs whenever that returns 256 MiB or more, not
+// only at half (the first graph after a reservation: the worst case of the ubatch, a shorter prompt needs less)
+GGML_API void ggml_gallocr_set_shrink_fit(ggml_gallocr_t galloc, bool fit);
+// true if every device buffer allocated is borrowed from a MoE cache (and there is one)
+GGML_API bool ggml_gallocr_borrowed(ggml_gallocr_t galloc);
 // changes whenever a buffer is allocated again or freed (the tensors allocated before have moved)
 GGML_API uint64_t ggml_gallocr_get_generation(ggml_gallocr_t galloc);
 

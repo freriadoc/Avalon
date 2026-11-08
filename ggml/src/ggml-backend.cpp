@@ -1181,6 +1181,9 @@ struct ggml_backend_sched {
     bool prefill_pinned;
     // the MoE cache has been created from the first graph (see ggml_backend_sched_prime_moe_cache)
     bool moe_cache_primed;
+    // a reservation has just allocated the worst case: the next graph that runs is planned again, borrowed buffers cut
+    // to what it needs (ggml_gallocr_set_shrink_fit)
+    bool fit_next;
 
     // the graph size the per-graph arrays were made for, and the kept plans (ggml_backend_sched_plan_*); the current
     // state's key: the graph it was allocated for when plan_set marked it
@@ -2217,8 +2220,14 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
         }
     }
 
+    // the first graph after a reservation lends back what the worst case took beyond its own needs: a prompt shorter than
+    // the ubatch fits the reserved buffers, so it would not be planned again and would keep them all (as Strata, which
+    // lends each prompt what its own chunk needs)
+    const bool fit = sched->fit_next && ggml_moe_cache.borrows != nullptr;
+    sched->fit_next = false;
+
     // allocate graph
-    if (backend_ids_changed || !ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
+    if (backend_ids_changed || fit || !ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: failed to allocate graph, reserving (backend_ids_changed = %d)\n", __func__, backend_ids_changed);
 #endif
@@ -2244,7 +2253,9 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 
         // this graph runs next: a buffer borrowed from the cache may shrink to what it needs
         ggml_gallocr_set_shrink(sched->galloc, true);
+        ggml_gallocr_set_shrink_fit(sched->galloc, fit);
         const bool reserved = ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
+        ggml_gallocr_set_shrink_fit(sched->galloc, false);
         ggml_gallocr_set_shrink(sched->galloc, false);
         if (!reserved) {
             GGML_LOG_ERROR("%s: failed to reserve graph buffers\n", __func__);
@@ -3659,6 +3670,10 @@ void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
 
 static void ggml_backend_sched_prime_moe_cache(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
 
+bool ggml_backend_sched_compute_borrowed(ggml_backend_sched_t sched) {
+    return ggml_gallocr_borrowed(sched->galloc);
+}
+
 bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph) {
     GGML_ASSERT(sched);
     GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
@@ -3677,6 +3692,7 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
     }
 
     ggml_backend_sched_reset(sched);
+    sched->fit_next = true;
 
     return true;
 }

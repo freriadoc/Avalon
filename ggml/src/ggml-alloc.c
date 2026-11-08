@@ -524,6 +524,7 @@ struct ggml_gallocr {
     int n_leafs;
 
     bool shrink; // see ggml_gallocr_set_shrink
+    bool shrink_fit; // see ggml_gallocr_set_shrink_fit
 
     // the blocks of a reservation's walk, recorded for the offline placement (ggml_gallocr_plan)
     bool plan_rec;
@@ -1254,7 +1255,7 @@ static bool ggml_gallocr_reserve_n_impl(
         // another draft length could no longer be replayed; 24 MiB back in the cache would be ~0.06 point of hits
         const size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;
         bool shrinking = false;
-        if (shrink && !realloc && new_size * 2 <= cur_size && cur_size - new_size >= ((size_t) 256 << 20)) {
+        if (shrink && !realloc && (new_size * 2 <= cur_size || galloc->shrink_fit) && cur_size - new_size >= ((size_t) 256 << 20)) {
             realloc = true;
             shrinking = true;
         }
@@ -1323,6 +1324,24 @@ uint64_t ggml_gallocr_get_generation(ggml_gallocr_t galloc) {
 
 void ggml_gallocr_set_shrink(ggml_gallocr_t galloc, bool shrink) {
     galloc->shrink = shrink;
+}
+
+bool ggml_gallocr_borrowed(ggml_gallocr_t galloc) {
+    bool any = false;
+    for (int i = 0; i < galloc->n_buffers; i++) {
+        if (!galloc->buffers[i] || ggml_backend_buft_is_host(galloc->bufts[i])) {
+            continue;
+        }
+        if (!ggml_moe_cache.borrows || !ggml_moe_cache.borrows(galloc->bufts[i])) {
+            return false;
+        }
+        any = true;
+    }
+    return any;
+}
+
+void ggml_gallocr_set_shrink_fit(ggml_gallocr_t galloc, bool fit) {
+    galloc->shrink_fit = fit;
 }
 
 bool ggml_gallocr_reserve(ggml_gallocr_t galloc, struct ggml_cgraph *graph) {
