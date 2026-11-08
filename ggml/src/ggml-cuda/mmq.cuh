@@ -1678,4 +1678,4 @@ int ggml_cuda_moe_block_grouped_host(ggml_backend_cuda_context & ctx, const ggml
 #include <vector>
 int ggml_cuda_moe_block_grouped_xe(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i, int G,
         const std::vector<uint64_t> * xe, std::function<void(int64_t)> * before, std::function<void(int64_t)> * after,
-        std::function<void()> * synced);
+        std::function<void()> * synced, std::vector<int32_t> * bounds = nullptr);

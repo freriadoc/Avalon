@@ -714,6 +714,7 @@ struct moe_grouped_hooks {
     int G = 0;                                     // the group size (0: moe_grouped_size())
     std::function<void(int64_t)> * before = nullptr, * after = nullptr;   // around each group (empty ones too)
     std::function<void()> * synced = nullptr;      // once the stream is synchronized (the rows read back)
+    std::vector<int32_t> * bounds = nullptr;       // the rows' bounds by expert, read back (n_expert + 1)
 };
 
 static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i,
@@ -726,10 +727,10 @@ int ggml_cuda_moe_block_grouped(ggml_backend_cuda_context & ctx, const ggml_cgra
 
 int ggml_cuda_moe_block_grouped_xe(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i, int G,
         const std::vector<uint64_t> * xe, std::function<void(int64_t)> * before, std::function<void(int64_t)> * after,
-        std::function<void()> * synced) {
+        std::function<void()> * synced, std::vector<int32_t> * bounds) {
     const ggml_tensor * gate = cgraph->nodes[i], * up = cgraph->nodes[i + 1], * down = cgraph->nodes[i + 3];
     moe_grouped_hooks h;
-    h.G = G; h.before = before; h.after = after; h.synced = synced;
+    h.G = G; h.before = before; h.after = after; h.synced = synced; h.bounds = bounds;
     return moe_block_grouped_impl(ctx, cgraph, i, gate->src[0], up->src[0], down->src[0], xe, &h);
 }
 
@@ -928,6 +929,9 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
     static int64_t t_wait = 0, n_blocks = 0, t_gap = 0;
     const int64_t t_sync1 = timing ? ggml_time_us() : 0;
 
+    if (hooks && hooks->bounds) {
+        *hooks->bounds = hb;
+    }
     if (hooks && hooks->synced) {
         (*hooks->synced)();
     }

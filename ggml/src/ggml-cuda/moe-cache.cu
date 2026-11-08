@@ -11138,8 +11138,36 @@ int ggml_cuda_moe_ring_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cgra
     std::function<void()> synced = [&]() {   // the previous block's reads are done: its pins go
         moe_ring_unpin(session, r.pins_prev);
     };
-    const int covered = ggml_cuda_moe_block_grouped_xe(ctx, cgraph, i, G, xe, &before, &after, &synced);
+    // GGML_CUDA_MOE_RING_DUMP=FILE: each block's routing appended (tests/ringsim reads it): "RNG1", layer, tokens,
+    // experts, the expert's stride, gate and down types, the rows of each expert, whether the cache held it
+    static const char * dump_path = getenv("GGML_CUDA_MOE_RING_DUMP");
+    std::vector<int32_t> hb;
+    std::vector<uint8_t> held(n_expert);
+    for (int64_t e = 0; e < n_expert; e++) {
+        held[e] = !(xe[0][e] >= (uint64_t) (uintptr_t) r.base && xe[0][e] < (uint64_t) (uintptr_t) (r.base + r.bytes));
+    }
+    const int covered = ggml_cuda_moe_block_grouped_xe(ctx, cgraph, i, G, xe, &before, &after, &synced, dump_path ? &hb : nullptr);
     GGML_ASSERT(covered > 0 && "a ring prompt MoE block the grouped path does not take");
+    if (dump_path && (int64_t) hb.size() == n_expert + 1) {
+        static FILE * f = fopen(dump_path, "ab");
+        if (f) {
+            int layer = -1;
+            sscanf(w[0]->name, "blk.%d.", &layer);
+            const int32_t hdr[4] = { 0x31474e52, layer, (int32_t) gate->src[2]->ne[1], (int32_t) n_expert };
+            const uint64_t st = stride;
+            const int32_t types[2] = { (int32_t) w[0]->type, (int32_t) w[2]->type };
+            std::vector<int32_t> rows(n_expert);
+            for (int64_t e = 0; e < n_expert; e++) {
+                rows[e] = hb[e + 1] - hb[e];
+            }
+            fwrite(hdr, sizeof(hdr), 1, f);
+            fwrite(&st, sizeof(st), 1, f);
+            fwrite(types, sizeof(types), 1, f);
+            fwrite(rows.data(), sizeof(int32_t), n_expert, f);
+            fwrite(held.data(), 1, n_expert, f);
+            fflush(f);
+        }
+    }
     r.seq = seq0 + n_groups;
     r.pins_prev.insert(r.pins_prev.end(), r.pins.begin(), r.pins.end());
     r.pins.clear();
