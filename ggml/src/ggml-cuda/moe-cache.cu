@@ -10854,6 +10854,7 @@ struct moe_ring_state {
     static constexpr int P = 4096;   // events: groups in flight stay far below
     std::vector<cudaEvent_t> done, copied;
     int64_t seq = 0;                 // the next group's number
+    int64_t waited = -1;             // the last group whose done event the copy stream waits for (they are in order)
     std::vector<std::pair<moe_cache_pool *, int>> pins, pins_prev;
     uint64_t copies = 0, in_place = 0;
 };
@@ -11101,8 +11102,11 @@ int ggml_cuda_moe_ring_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cgra
                     all = false;
                     break;
                 }
-                if (p.wait >= 0) {
+                // one wait per group read, not per copy: the done events are recorded in order on the compute stream, a
+                // later one covers the earlier (ROCm 7.2.4: a wait before every copy cost the copy stream 3.7 %, ringsim)
+                if (p.wait > r.waited) {
                     CUDA_CHECK(cudaStreamWaitEvent(r.copy, r.done[p.wait % moe_ring_state::P], 0));
+                    r.waited = p.wait;
                 }
                 CUDA_CHECK(cudaMemcpyAsync(r.base + (size_t) p.entry * r.entry, lo + (size_t) p.e*stride, stride,
                                            cudaMemcpyHostToDevice, r.copy));
