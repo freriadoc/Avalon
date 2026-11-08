@@ -4343,6 +4343,7 @@ struct ggml_cuda_moe_weighted_reduction_match {
     const ggml_tensor * experts      = nullptr;
     const ggml_tensor * expert_scale = nullptr;
     const ggml_tensor * weights      = nullptr;
+    ggml_tensor *       weighted     = nullptr;   // the last MUL (experts x weights), whose views the adds sum
     ggml_tensor *       dst          = nullptr;
     int                 node_count   = 0;
 };
@@ -4472,6 +4473,7 @@ static bool ggml_cuda_match_moe_weighted_reduction(
     }
 
     match.experts      = experts;
+    match.weighted     = const_cast<ggml_tensor *>(weighted);
     match.expert_scale = expert_scale;
     match.weights      = weights;
     match.dst          = cgraph->nodes[output_idx];
@@ -7287,7 +7289,12 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                         }
                     }
                 }
-                params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.experts), until);
+                // the experts kept through the product that weights them, not as a second reader: their only reader
+                // then is that MUL, which ggml-alloc places in their memory (an elementwise op on its parent's last
+                // use; the fused kernel never runs it) - a second reader gave the weighted products a block of their
+                // own, n_embd x n_expert_used x n_ubatch F32 that nothing writes (931 MiB at -ub 9536, a third of the
+                // prompt's compute buffer). Same bytes kept alive, until the same node
+                params->add_alloc_dep(params->user_data, match.weighted, until);
                 params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.weights), until);
                 if (match.expert_scale != nullptr) {
                     params->add_alloc_dep(
