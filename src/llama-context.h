@@ -529,4 +529,5 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+    int64_t ut_after_us = 0;      // LLAMA_UBATCH_TIMING: when the previous timed ubatch ended
 };

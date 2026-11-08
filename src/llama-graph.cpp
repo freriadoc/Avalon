@@ -1,5 +1,7 @@
 #include "llama-graph.h"
 
+#include <typeinfo>
+
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-batch.h"
@@ -1510,8 +1512,22 @@ void llm_graph_result::reset() {
 }
 
 void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
+    // DIAGNOSTIC (LLAMA_UBATCH_TIMING=1): the host time of each input of a ubatch of more than 1024 tokens
+    static const bool timing = getenv("LLAMA_UBATCH_TIMING") && atoi(getenv("LLAMA_UBATCH_TIMING")) != 0;
+    const bool t_on = timing && ubatch->n_tokens > 1024;
+    std::string t_line;
     for (auto & input : inputs) {
+        const int64_t t0 = t_on ? ggml_time_us() : 0;
         input->set_input(ubatch);
+        if (t_on) {
+            const int64_t dt = ggml_time_us() - t0;
+            if (dt >= 500) {
+                t_line += format(" %s %.1f", typeid(*input).name(), dt / 1e3);
+            }
+        }
+    }
+    if (t_on) {
+        LLAMA_LOG_INFO("%s: inputs over 0.5 ms (%u tokens):%s\n", __func__, ubatch->n_tokens, t_line.c_str());
     }
 }
 

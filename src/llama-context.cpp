@@ -1986,7 +1986,17 @@ void llama_context::kv_lent_from_update() {
     }
 }
 
+// DIAGNOSTIC (LLAMA_UBATCH_TIMING=1): the host's phases of each ubatch of more than 1024 tokens (memory, graph build,
+// allocation, inputs, KV lending, launch, the wait for the GPU and the outputs' extraction after it), in ms
+static bool llama_ubatch_timing() {
+    static const bool on = getenv("LLAMA_UBATCH_TIMING") && atoi(getenv("LLAMA_UBATCH_TIMING")) != 0;
+    return on;
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret, bool launch) {
+    const bool ut = llama_ubatch_timing() && ubatch.n_tokens > 1024;
+    int64_t ut_t[8] = {};
+    if (ut) { ut_t[0] = ggml_time_us(); }
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -2037,7 +2047,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //const auto t_start_us = ggml_time_us();
 
+        if (ut) { ut_t[1] = ggml_time_us(); }
         gf = model.build_graph(gparams);
+        if (ut) { ut_t[2] = ggml_time_us(); }
 
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
@@ -2058,6 +2070,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         gf_res_prev_active = res;
     }
 
+    if (ut) { ut_t[3] = ggml_time_us(); }
     // set the input data for the input tensors
     {
         //const auto t_start_us = ggml_time_us();
@@ -2077,12 +2090,26 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // taken now too: taking them synchronizes every device, and with a step (~10k rows) close to the ubatch size,
     // almost every prefill ubatch crossed one, so the host waited for the last card to finish the previous ubatch
     // before it queued the next and the cards of a pipeline computed in turn
+    if (ut) { ut_t[4] = ggml_time_us(); }
     if (mctx && mctx->get_kv_rows() > 0) {
         kv_lent_from_update();
         ggml_backend_sched_moe_cache_kv_set_rows(sched.get(), (int64_t) mctx->get_kv_rows() + std::max<int64_t>(0, kv_rows_ahead));
     }
+    if (ut) { ut_t[5] = ggml_time_us(); }
 
     ret = launch ? process_ubatch_launch(res, ubatch) : GGML_STATUS_SUCCESS;
+    if (ut) {
+        ut_t[6] = ggml_time_us();
+        // the GPU's end of this graph, to tell the launch from the wait for the device
+        ggml_backend_sched_synchronize(sched.get());
+        ut_t[7] = ggml_time_us();
+        const auto ms = [&](int a, int b) { return ut_t[a] && ut_t[b] ? (ut_t[b] - ut_t[a]) / 1e3 : 0.0; };
+        LLAMA_LOG_INFO("%s: ubatch timing (%u tokens%s): since the previous one's end %.1f, apply %.1f, build %.1f, alloc %.1f, "
+                "inputs %.1f, kv %.1f, launch %.1f, gpu wait %.1f ms\n",
+                __func__, ubatch.n_tokens, ut_t[1] ? "" : ", graph reused", ut_after_us ? (ut_t[0] - ut_after_us) / 1e3 : 0.0,
+                ut_t[1] ? ms(0, 1) : ms(0, 3), ms(1, 2), ms(2, 3), ms(3, 4), ms(4, 5), ms(5, 6), ms(6, 7));
+        ut_after_us = ut_t[7];
+    }
 
     return ret == GGML_STATUS_SUCCESS ? res : nullptr;
 }
