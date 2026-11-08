@@ -590,6 +590,134 @@ static bool top_k_radix_fused_cuda(int * histograms, size_t hist_count, const fl
     return true;
 }
 
+// A row by one block (GGML_CUDA_TOPK_ROW=N: for N rows or more; 0, the default, keeps the kernels below): the four
+// radix passes and the gather of the step kernels, in the same order with the same rule (keys above the k-th value's in
+// column order first, then the lowest columns of those equal to it at the end), so the same output. The step kernels
+// read every row from memory once per pass (9 launches over the whole [ncols, nrows] scores: 268 MiB per slice of the
+// QSA indexer at 131k cells); a block reads its row five times while it stays in the L2 (the rows of the resident
+// blocks: ~128 KiB each at 131k cells).
+#define TOP_K_ROW_THREADS 1024
+#define TOP_K_ROW_SUBHIST 8   // sub-histograms (warps modulo 8) against the atomics' contention
+
+template<int RADIX_BITS>
+__launch_bounds__(TOP_K_ROW_THREADS, 1)
+static __global__ void top_k_radix_row(
+        const float * __restrict__ src, int * __restrict__ dst, int ncols, int k, const int * __restrict__ n_live) {
+    constexpr int NBINS = 1 << RADIX_BITS;
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int n_warps = TOP_K_ROW_THREADS / warp_size;
+    __shared__ int hist[TOP_K_ROW_SUBHIST][NBINS];
+    __shared__ int scan[NBINS];
+    __shared__ uint32_t s_prefix, s_mask;
+    __shared__ int s_rank;
+    __shared__ int warp_g[n_warps];
+    __shared__ int warp_e[n_warps];
+
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int lane = tid % warp_size;
+    const int warp = tid / warp_size;
+    const float * row_src = src + (size_t) row * ncols;
+    int * row_dst = dst + (size_t) row * k;
+    const int live = top_k_ncols_live(ncols, k, n_live);
+
+    if (tid == 0) {
+        s_prefix = 0;
+        s_mask = 0;
+        s_rank = k;
+    }
+    for (int shift = 32 - RADIX_BITS; shift >= 0; shift -= RADIX_BITS) {
+        for (int i = tid; i < TOP_K_ROW_SUBHIST * NBINS; i += TOP_K_ROW_THREADS) {
+            (&hist[0][0])[i] = 0;
+        }
+        __syncthreads();
+        const uint32_t prefix = s_prefix, mask = s_mask;
+        int * h = hist[warp % TOP_K_ROW_SUBHIST];
+        for (int col = tid; col < live; col += TOP_K_ROW_THREADS) {
+            const uint32_t key = top_k_float_to_ordered(row_src[col]);
+            if ((key & mask) == prefix) {
+                atomicAdd(&h[(key >> shift) & (NBINS - 1)], 1);
+            }
+        }
+        __syncthreads();
+        // the bin of the rank-th largest key by a suffix sum over the bins, as top_k_radix_select
+        const int rank = s_rank;
+        if (tid < NBINS) {
+            int c = 0;
+#pragma unroll
+            for (int j = 0; j < TOP_K_ROW_SUBHIST; ++j) {
+                c += hist[j][tid];
+            }
+            scan[tid] = c;
+        }
+        __syncthreads();
+        for (int off = 1; off < NBINS; off <<= 1) {
+            const int add = tid < NBINS && tid + off < NBINS ? scan[tid + off] : 0;
+            __syncthreads();
+            if (tid < NBINS) {
+                scan[tid] += add;
+            }
+            __syncthreads();
+        }
+        if (tid < NBINS) {
+            const int suffix = scan[tid];
+            const int above = tid + 1 < NBINS ? scan[tid + 1] : 0;
+            if ((suffix >= rank || tid == 0) && above < rank) {
+                s_rank = rank - above;
+                s_prefix = prefix | ((uint32_t) tid << shift);
+                s_mask = mask | ((uint32_t) (NBINS - 1) << shift);
+            }
+        }
+        __syncthreads();
+    }
+
+    // the gather of top_k_radix_gather with one block for the row
+    const uint32_t prefix = s_prefix;
+    const int rank = s_rank;
+    const uint64_t below = (1ull << lane) - 1;
+    int g_off = 0;
+    int e_off = 0;
+    for (int base = 0; base < live; base += TOP_K_ROW_THREADS) {
+        const int col = base + tid;
+        const uint32_t key = col < live ? top_k_float_to_ordered(row_src[col]) : 0;
+        const bool is_g = col < live && key > prefix;
+        const bool is_e = col < live && key == prefix;
+        const uint64_t mg = top_k_ballot(is_g);
+        const uint64_t me = top_k_ballot(is_e);
+        if (lane == 0) {
+            warp_g[warp] = __popcll(mg);
+            warp_e[warp] = __popcll(me);
+        }
+        __syncthreads();
+        int pg = 0, pe = 0, tg = 0, te = 0;
+        for (int w = 0; w < n_warps; ++w) {
+            if (w < warp) {
+                pg += warp_g[w];
+                pe += warp_e[w];
+            }
+            tg += warp_g[w];
+            te += warp_e[w];
+        }
+        if (is_g) {
+            row_dst[g_off + pg + __popcll(mg & below)] = col;
+        }
+        if (is_e) {
+            const int pos = e_off + pe + __popcll(me & below);
+            if (pos < rank) {
+                row_dst[k - rank + pos] = col;
+            }
+        }
+        g_off += tg;
+        e_off += te;
+        __syncthreads();
+    }
+}
+
+static int top_k_row_min_rows() {
+    static const int n = [] { const char * e = getenv("GGML_CUDA_TOPK_ROW"); return e ? atoi(e) : 0; }();
+    return n;
+}
+
 static void top_k_radix_cuda(
         ggml_cuda_pool & pool, char * scratch,
         const float * src, int * dst, int ncols, int nrows, int k, cudaStream_t stream, const int * n_live) {
@@ -597,6 +725,12 @@ static void top_k_radix_cuda(
     constexpr int RADIX_BITS = 8;
     constexpr int NBINS = 1 << RADIX_BITS;
     static_assert(NBINS == top_k_radix_bins, "top-k radix bins");
+    if (top_k_row_min_rows() > 0 && nrows >= top_k_row_min_rows()) {
+        top_k_radix_row<RADIX_BITS><<<nrows, TOP_K_ROW_THREADS, 0, stream>>>(src, dst, ncols, k, n_live);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
     const int blocks_per_row = top_k_radix_blocks_per_row(ncols);
 
     ggml_cuda_pool_alloc<top_k_radix_state> states_alloc(pool);
