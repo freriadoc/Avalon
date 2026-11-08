@@ -848,8 +848,41 @@ size_t ggml_cuda_flash_attn_ext_scratch_size(ggml_backend_cuda_context & ctx, gg
     return size;
 }
 
+// GGML_CUDA_QSA_TILE_STATS=1 (diagnostic): for a tile mask (ggml_qsa_select_tiles), the cells each 16-query tile
+// gathers (the union of its queries' selections): mean, max, per layer and batch, against the context. Synchronizes
+// (not under a graph capture: run with GGML_CUDA_DISABLE_GRAPHS=1)
+static void ggml_cuda_qsa_tile_stats(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
+    static const bool on = getenv("GGML_CUDA_QSA_TILE_STATS") && atoi(getenv("GGML_CUDA_QSA_TILE_STATS")) != 0;
+    const ggml_tensor * mask = dst->src[3];
+    if (!on || !mask || mask->op != GGML_OP_QSA_SELECT || ggml_get_op_params_i32(mask, 1) != GGML_QSA_SELECT_TILE_MASK) {
+        return;
+    }
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &capture));
+    if (capture != cudaStreamCaptureStatusNone) {
+        return;
+    }
+    const ggml_tensor * lists  = mask->src[4];
+    const int64_t      n_list  = ggml_get_op_params_i32(mask, 3);
+    const int64_t      n_tiles = mask->ne[2];
+    std::vector<int32_t> cnt(n_tiles);
+    CUDA_CHECK(cudaMemcpyAsync(cnt.data(), (const int32_t *) lists->data + n_list*n_tiles, n_tiles*sizeof(int32_t),
+        cudaMemcpyDeviceToHost, ctx.stream()));
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+    double sum = 0;
+    int32_t mx = 0;
+    for (int32_t c : cnt) {
+        sum += c;
+        mx = std::max(mx, c);
+    }
+    fprintf(stderr, "qsa tiles %s: %lld queries, %lld cells, %lld tiles of %d: gathered cells per tile mean %.0f, max %d (list %lld)\n",
+        dst->name, (long long) dst->src[0]->ne[1], (long long) dst->src[1]->ne[1], (long long) n_tiles, (int) mask->ne[1],
+        sum / std::max<int64_t>(n_tiles, 1), mx, (long long) n_list);
+}
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+    ggml_cuda_qsa_tile_stats(ctx, dst);
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
