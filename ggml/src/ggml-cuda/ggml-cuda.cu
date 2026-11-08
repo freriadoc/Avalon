@@ -100,6 +100,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
@@ -1950,6 +1951,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
             const auto convert_func = traits::convert(src1->type);
             GGML_ASSERT(convert_func != nullptr);
             if (!src1_reuse) {
+                ggml_cuda_f16_image_lost(dst, src1);
                 convert_func(src1->data, src1_conv, ggml_nelements(src1), main_stream);
             }
             // GGML_CUDA_F16_IMAGE_CHECK=1 (diagnostic, synchronizes: with GGML_CUDA_DISABLE_GRAPHS=1): a src1 image found in
@@ -2506,6 +2508,54 @@ static ggml_cuda_mul_mat_path ggml_cuda_mul_mat_get_path(const ggml_tensor * src
 static bool ggml_cuda_f16_image_enabled() {
     static const bool on = !getenv("GGML_CUDA_F16_IMAGE") || atoi(getenv("GGML_CUDA_F16_IMAGE")) != 0;
     return on;
+}
+
+// A product about to convert (or quantize) its src1 although a producer of it was given the group's scratch to write
+// the image there (ggml_cuda_add_mmq_scratch's image_producer): the kernel that ran in the producer's place did not write
+// it. It happened once silently (e917e6e53: a new fused kernel took the place of the hc norm, the image's writer, and
+// 0.8 s of conversions came back at 131k on a 4090): now said once per producer (an INFO line), whatever fused it.
+// The producer is src1's root or a node at most two sources above it (the RMS_NORM under a MUL by the weights, under
+// a MUL by a sigmoid), the node that holds the scratch as its own source.
+void ggml_cuda_f16_image_lost(const ggml_tensor * dst, const ggml_tensor * src1) {
+    const ggml_tensor * scratch_t = dst->src[GGML_SCHED_SCRATCH_SRC];
+    if (!ggml_cuda_f16_image_enabled() || scratch_t == nullptr) {
+        return;
+    }
+    const ggml_tensor * root = src1->view_src ? src1->view_src : src1;
+    const ggml_tensor * cand[7] = { root };
+    int n = 1;
+    for (int a = 0; a < 2; a++) {
+        const ggml_tensor * s1 = root->src[a];
+        if (s1 == nullptr) {
+            continue;
+        }
+        cand[n++] = s1;
+        for (int b = 0; b < 2; b++) {
+            if (s1->src[b]) {
+                cand[n++] = s1->src[b];
+            }
+        }
+    }
+    for (int k = 0; k < n; k++) {
+        const ggml_tensor * p = cand[k];
+        if (p == dst || p->src[GGML_SCHED_SCRATCH_SRC] != scratch_t) {
+            continue;
+        }
+        static std::mutex mu;
+        static std::unordered_set<std::string> said;
+        std::string stem = p->name;
+        const size_t dash = stem.rfind('-');
+        if (dash != std::string::npos && dash + 1 < stem.size() && isdigit((unsigned char) stem[dash + 1])) {
+            stem.resize(dash);
+        }
+        const std::string key = std::string(ggml_op_desc(p)) + " " + stem;
+        std::lock_guard<std::mutex> lock(mu);
+        if (said.insert(key).second) {
+            GGML_LOG_INFO("%s: %s %s should have written the image of %s for %s, which converts it (a fusion took its place?)\n",
+                    __func__, ggml_op_desc(p), p->name, src1->name, dst->name);
+        }
+        return;
+    }
 }
 
 // the image a product of out can read (ggml_cuda_img_kind), -1: none

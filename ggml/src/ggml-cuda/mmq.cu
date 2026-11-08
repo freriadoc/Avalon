@@ -356,6 +356,7 @@ void ggml_cuda_mul_mat_q(
         }
 
         if (!scratch_reuse) {
+            ggml_cuda_f16_image_lost(dst, src1);
             const int64_t s11 = src1->nb[1] / ts_src1;
             const int64_t s12 = src1->nb[2] / ts_src1;
             const int64_t s13 = src1->nb[3] / ts_src1;

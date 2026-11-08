@@ -1508,6 +1508,8 @@ struct ggml_cuda_stream_context {
 
 struct ggml_backend_cuda_context;
 // live backend contexts, for ggml_cuda_prime_queues
+// a product converting its src1 although a producer was given its scratch to write the image there (ggml-cuda.cu)
+void ggml_cuda_f16_image_lost(const ggml_tensor * dst, const ggml_tensor * src1);
 void ggml_cuda_register_context(ggml_backend_cuda_context * ctx);
 void ggml_cuda_unregister_context(ggml_backend_cuda_context * ctx);
 // before the MoE cache sizes itself on the free device memory: every live context's stream dispatches once (ROCm
