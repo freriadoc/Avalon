@@ -716,21 +716,10 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
 // token over its nrows rows: the norm as rms_norm_f32 computes it (1024 threads, a float4 each, the same reduction: the
 // same bits), then each value times the dequantized weights, accumulated in F32 and reduced once per output. The
 // product (a cuBLAS or MMQ launch over the whole activation for 4 outputs) is not made
-// post (the prompt's hc_combine before the norm, kern3): the rows normalized are residual + bo * 2*sigmoid(raw/hc) per
-// stream, computed here in hc_post's order (dsv4_hc_post_f32) and written to post_dst, x being the residual; the
-// block reads the token's bo row once for its streams
-struct rms_norm_inject_post {
-    const float * bo = nullptr; int64_t sbo1 = 0;      // the block output [ncols, nt]
-    const float * raw = nullptr; int64_t sp0 = 0, sp1 = 0;   // the gate before SCALE -> SIGMOID -> SCALE [nrows, nt]
-    float gin = 1.0f, gout = 1.0f;
-    float * dst = nullptr;                              // the combined streams, contiguous [ncols, nrows, nt]
-};
-
-template <int block_size, int n_out, bool post = false>
+template <int block_size, int n_out>
 static __global__ void __launch_bounds__(block_size) rms_norm_mul_inject_f32(
         const float * x, const float * w, float * dst, const ggml_cuda_img img, const block_q8_0 * wq, const int64_t wq_s1,
-        float * inj, const int ncols, const int nrows, const int64_t sx1, const int64_t sx2, const float eps,
-        const rms_norm_inject_post pp = rms_norm_inject_post()) {
+        float * inj, const int ncols, const int nrows, const int64_t sx1, const int64_t sx2, const float eps) {
     const int64_t t   = blockIdx.x;
     const int     tid = threadIdx.x;
     const int     ncols4 = ncols / 4;
@@ -747,17 +736,6 @@ static __global__ void __launch_bounds__(block_size) rms_norm_mul_inject_f32(
         float  tmp = 0.0f;
         if (tid < ncols4) {
             xs  = x4[tid];
-            if constexpr (post) {
-                float p = pp.raw[c*pp.sp0 + t*pp.sp1];
-                p = pp.gout * (1.0f / (1.0f + expf(-(pp.gin * p))));
-                const float4 b = ((const float4 *) (pp.bo + t*pp.sbo1))[tid];
-                float sum;
-                sum = b.x * p; sum += xs.x; xs.x = sum;
-                sum = b.y * p; sum += xs.y; xs.y = sum;
-                sum = b.z * p; sum += xs.z; xs.z = sum;
-                sum = b.w * p; sum += xs.w; xs.w = sum;
-                ((float4 *) (pp.dst + (t*nrows + c)*ncols))[tid] = xs;
-            }
             tmp = xs.x*xs.x + xs.y*xs.y + xs.z*xs.z + xs.w*xs.w;
         }
         tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
@@ -819,24 +797,8 @@ bool ggml_cuda_rms_norm_mul_inject_supported(const ggml_tensor * rms_norm, const
 }
 
 void ggml_cuda_op_rms_norm_mul_inject(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, ggml_tensor * mul,
-        ggml_tensor * mm, ggml_cuda_img img, const ggml_tensor * gate_scale_in, const ggml_tensor * gate_scale_out) {
+        ggml_tensor * mm, ggml_cuda_img img) {
     const ggml_tensor * x  = rms_norm->src[0];
-    // with the gate chain: rms_norm's source is the gated hc_post, computed here from its sources
-    const bool post = gate_scale_in != nullptr;
-    rms_norm_inject_post pp;
-    if (post) {
-        const ggml_tensor * hp  = x;
-        const ggml_tensor * raw = gate_scale_in->src[0];
-        pp.bo   = (const float *) hp->src[0]->data;
-        pp.sbo1 = hp->src[0]->nb[1] / sizeof(float);
-        pp.raw  = (const float *) raw->data;
-        pp.sp0  = raw->nb[0] / sizeof(float);
-        pp.sp1  = raw->nb[1] / sizeof(float);
-        pp.gin  = ggml_get_op_params_f32(gate_scale_in,  0);
-        pp.gout = ggml_get_op_params_f32(gate_scale_out, 0);
-        pp.dst  = (float *) hp->data;
-        x = hp->src[1];   // the residual
-    }
     const ggml_tensor * w  = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
     const ggml_tensor * wq = mm->src[0];
     float eps = 0.0f;
@@ -844,13 +806,7 @@ void ggml_cuda_op_rms_norm_mul_inject(ggml_backend_cuda_context & ctx, const ggm
     constexpr int block_size = 1024;
     const dim3 grid((unsigned) x->ne[2]);
     const int64_t wq_s1 = wq->nb[1] / sizeof(block_q8_0);
-    if (post) {
-        GGML_ASSERT(wq->ne[1] == 4);
-        rms_norm_mul_inject_f32<block_size, 4, true><<<grid, block_size, 32 * sizeof(float), ctx.stream()>>>(
-            (const float *) x->data, (const float *) w->data, (float *) mul->data, img, (const block_q8_0 *) wq->data, wq_s1,
-            (float *) mm->data, (int) x->ne[0], (int) x->ne[1], (int64_t) (x->nb[1] / sizeof(float)),
-            (int64_t) (x->nb[2] / sizeof(float)), eps, pp);
-    } else if (wq->ne[1] == 4) {
+    if (wq->ne[1] == 4) {
         rms_norm_mul_inject_f32<block_size, 4><<<grid, block_size, 32 * sizeof(float), ctx.stream()>>>(
             (const float *) x->data, (const float *) w->data, (float *) mul->data, img, (const block_q8_0 *) wq->data, wq_s1,
             (float *) mm->data, (int) x->ne[0], (int) x->ne[1], (int64_t) (x->nb[1] / sizeof(float)),
