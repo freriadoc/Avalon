@@ -3930,6 +3930,30 @@ bool ggml_backend_sched_compute_borrowed(ggml_backend_sched_t sched) {
     return ggml_gallocr_borrowed(sched->galloc);
 }
 
+size_t ggml_backend_sched_compute_room(ggml_backend_sched_t sched) {
+    if (!sched->moe_cache_session || !ggml_moe_cache.lend_room || !ggml_moe_cache.borrows) {
+        return 0;
+    }
+    size_t room = 0;
+    bool any = false;
+    for (int i = 0; i < sched->n_backends; i++) {
+        ggml_backend_buffer_type_t buft = sched->bufts[i];
+        if (ggml_backend_buft_is_host(buft) || !ggml_moe_cache.borrows(buft)) {
+            continue;
+        }
+        const size_t lend = ggml_moe_cache.lend_room(sched->moe_cache_session, sched->backends[i]);
+        if (lend == 0) {
+            return 0;
+        }
+        // this scheduler's own chunks go back before the next graph's are borrowed (ggml_gallocr_reserve_n frees, then
+        // allocates)
+        const size_t r = lend + ggml_gallocr_get_buffer_size(sched->galloc, i);
+        room = any ? std::min(room, r) : r;
+        any = true;
+    }
+    return any ? room : 0;
+}
+
 bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph) {
     GGML_ASSERT(sched);
     GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);

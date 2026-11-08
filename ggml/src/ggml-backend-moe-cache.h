@@ -224,6 +224,9 @@ struct ggml_moe_cache_api {
     // the largest piece one pool of the backend's device can lend now, 0 when not known (the compute buffers borrowed
     // from the cache are asked in chunks no larger: a small card's pools are smaller than the default chunk)
     size_t (*largest_lend)(void * session, void * backend);
+    // what the backend's device could lend the compute buffers now, in bytes: the free room above the cache's floor and
+    // under the prefetch zones (the banded slab), or every pool's lendable entries; 0 when not known
+    size_t (*lend_room)(void * session, void * backend);
     // the hosted MoE's cost, to choose it over the prefetch: a block of 'rows' routed rows takes fixed_us + rows * row_us
     // hosted, its expert tensors' bytes / copy_bytes_per_us prefetched; false when not known (no device yet)
     bool (*hosted_cost)(void * session, double * copy_bytes_per_us, double * fixed_us, double * row_us);

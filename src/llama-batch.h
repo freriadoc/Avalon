@@ -174,6 +174,8 @@ public:
     // batch indices before which a ubatch must end (a state snapshot, llama_set_seq_snapshots), single-sequence batches
     // only; between two breaks the ubatches get equal sizes. Cleared by init()
     void set_breaks(std::vector<int32_t> idxs);
+    // one sequence: the batch in equal parts of at most n_ubatch even without breaks (a ubatch lowered by llama_context::ubatch_fit)
+    void set_equal_parts(bool on) { equal_parts = on; }
 
     // simple split, unknown number of sequence sets of unequal lengths
     llama_ubatch split_simple(uint32_t n_ubatch);
@@ -198,6 +200,7 @@ private:
     uint32_t break_cap(uint32_t n_ubatch) const;
 
     std::vector<int32_t> breaks;
+    bool                 equal_parts = false;   // set_equal_parts
 
     // create the next ubatch based on the provided batch indices (idxs) and the number of sequence sets (n_seqs)
     // return llama_ubatch.n_tokens == 0 if the entire batch was consumed

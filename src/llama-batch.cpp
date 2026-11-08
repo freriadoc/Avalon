@@ -573,7 +573,7 @@ void llama_batch_allocr::set_breaks(std::vector<int32_t> idxs) {
 }
 
 uint32_t llama_batch_allocr::break_cap(uint32_t n_ubatch) const {
-    if (breaks.empty() || seq_id_unq.size() != 1 || n_ubatch == 0) {
+    if ((breaks.empty() && !equal_parts) || seq_id_unq.size() != 1 || n_ubatch == 0) {
         return n_ubatch;
     }
     int32_t first = 0;
@@ -855,6 +855,7 @@ void llama_batch_allocr::clear() {
     n_outputs = 0;
 
     breaks.clear();
+    equal_parts = false;
 
     batch = {};
 

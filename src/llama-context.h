@@ -166,6 +166,9 @@ struct llama_context {
     bool stage_buffers(uint32_t n_rows);
     void stage_ubatch_for(uint32_t n_tokens);   // LLAMA_STAGES_FULL_UBATCH_FROM: this batch's ubatch (no reservation)
     uint32_t ubatch_reserved() const;           // the ubatch the graphs are reserved for: the largest a batch may take
+    // the ubatch a prompt batch of n_tokens is split at: n_ubatch, or less when the compute buffers are borrowed from the
+    // MoE cache and it cannot lend a ubatch that large now (llama_context::ubatch_fit)
+    uint32_t ubatch_fit(uint32_t n_tokens);
     bool stage_step(ggml_tensor * out, uint32_t & n_tokens);
     void stage_end();
 
@@ -330,6 +333,12 @@ private:
     uint32_t stage_rows = 0;   // the ubatch size the buffers hold
     uint32_t stage_ub_half = 0;   // pipeline stages: the ubatch they split a batch into (the requested one halved)
     uint32_t stage_ub_full = 0;   // and the requested one (LLAMA_STAGES_FULL_UBATCH_FROM)
+
+    // the device compute buffer of a prompt ubatch, a + b x tokens (b in bytes per token), from two measures of the
+    // worst-case graph at the first reservation whose buffers are borrowed (ubatch_fit); 0: not known
+    double   ub_cb_fixed     = 0.0;
+    double   ub_cb_per_token = 0.0;
+    uint32_t ub_fit_last     = 0;
     // the stage buffers each kept graph was built with (process_ubatch reuses a graph for the same ones only)
     std::map<const void *, std::pair<const ggml_tensor *, const ggml_tensor *>> stage_graph_bufs;
     ggml_tensor * stage_out[2] = { nullptr, nullptr };

@@ -1153,6 +1153,35 @@ void llama_context::sched_reserve() {
         n_input_tensors_tg = this->n_input_tensors;
     }
 
+    // the device compute buffer of a prompt ubatch as a + b x tokens (ubatch_fit): the worst case is measured again at
+    // half the ubatch (planned, nothing allocated); with the size just reserved, two points of a line. Once, at the
+    // first reservation with borrowed buffers: the layout of the graph does not change after that
+    if (!model.hparams.no_alloc && ub_cb_per_token == 0.0 && n_tokens >= 2048 && cparams.causal_attn &&
+            ggml_backend_sched_compute_borrowed(sched.get())) {
+        auto device_bytes = [&](const size_t * sz) {
+            size_t b = 0;
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                if (!ggml_backend_buft_is_host(backend_buft[i])) {
+                    b = std::max(b, sz ? sz[i] : ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]));
+                }
+            }
+            return b;
+        };
+        const size_t   full   = device_bytes(nullptr);
+        const uint32_t n_half = n_tokens / 2 / 256 * 256;
+        std::vector<size_t> sz(backend_ptrs.size(), 0);
+        if (full > 0 && n_half >= 256 &&
+                graph_reserve(n_half, n_seqs, std::min(n_half, cparams.n_outputs_max), mctx.get(), true, sz.data())) {
+            const size_t half = device_bytes(sz.data());
+            if (half > 0 && half < full) {
+                ub_cb_per_token = (double) (full - half) / (double) (n_tokens - n_half);
+                ub_cb_fixed     = std::max(0.0, (double) full - ub_cb_per_token * n_tokens);
+                LLAMA_LOG_INFO("%s: prompt compute buffer: %.1f MiB at %u tokens, %.1f MiB at %u: %.1f MiB + %.1f KiB per token\n",
+                        __func__, full / 1048576.0, n_tokens, half / 1048576.0, n_half, ub_cb_fixed / 1048576.0, ub_cb_per_token / 1024.0);
+            }
+        }
+    }
+
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
     {
         // TODO: the worst case graph is not always reached for `n_seqs > 1`
@@ -2349,6 +2378,37 @@ void llama_context::stage_ubatch_for(uint32_t n_tokens) {
     }
 }
 
+// Strata's prompt chunk (src/program/generate.cpp, plan_lend and the serve path's lend; MIT): the largest chunk whose
+// buffers the expert cache can lend, each request lending only what its own chunk needs. Here the compute buffers of a
+// prompt ubatch are borrowed from the cache and planned for each graph, so a request needs only its ubatch: the largest
+// on the 256-token grid, up to n_ubatch, whose compute buffer (a + b x tokens, measured at the reservation) fits in
+// what the cache can lend now (its free room above the floor and under the prefetch zones, with what the buffers
+// already hold), with a margin of 256 MiB + 10 % (the placement into chunks; the line measured at n_ubatch and its half
+// underestimates small ubatches: 1 025 MiB for 1 330 at 4096, qwen4exp); the prompt then goes in equal parts of at most
+// that (llama_batch_allocr::break_cap). Bookkeeping already kept, nothing measured. LLAMA_UBATCH_FIT=0: n_ubatch always
+uint32_t llama_context::ubatch_fit(uint32_t n_tokens) {
+    static const bool on = !getenv("LLAMA_UBATCH_FIT") || atoi(getenv("LLAMA_UBATCH_FIT")) != 0;
+    const uint32_t n_max = cparams.n_ubatch;
+    if (!on || n_tokens <= 512 || ub_cb_per_token <= 0.0 || !sched || !cparams.causal_attn) {
+        return n_max;
+    }
+    const size_t room = ggml_backend_sched_compute_room(sched.get());
+    if (room == 0) {
+        return n_max;
+    }
+    const double margin = 256.0 * 1048576.0;
+    const double avail  = ((double) room - margin) / 1.10 - ub_cb_fixed;
+    const double fit    = avail > 0.0 ? avail / ub_cb_per_token : 0.0;
+    uint32_t n_ub = fit >= (double) n_max ? n_max : std::max<uint32_t>(512, (uint32_t) fit / 256 * 256);
+    n_ub = std::min(n_ub, n_max);
+    if (n_ub != ub_fit_last && n_tokens > n_ub) {
+        LLAMA_LOG_INFO("%s: prompt ubatch %u (n_ubatch %u): the cache can lend %.0f MiB, a ubatch takes %.0f MiB + %.1f KiB per token\n",
+                __func__, n_ub, n_max, room / 1048576.0, ub_cb_fixed / 1048576.0, ub_cb_per_token / 1024.0);
+        ub_fit_last = n_ub;
+    }
+    return n_ub;
+}
+
 uint32_t llama_context::ubatch_reserved() const {
     return llama_stage_full_ubatch_from() && stage_ub_full > cparams.n_ubatch ? stage_ub_full : cparams.n_ubatch;
 }
@@ -2583,8 +2643,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     llama_memory_context_ptr mctx;
 
+    // a prompt batch in ubatches the MoE cache can lend (pipeline stages: their own choice, stage_ubatch_for)
+    const uint32_t n_ubatch_cur = stage_first ? cparams.n_ubatch : ubatch_fit(n_tokens_all);
+    balloc->set_equal_parts(n_ubatch_cur < cparams.n_ubatch);
+
     while (true) {
-        mctx = memory->init_batch(*balloc, cparams.n_ubatch, embd_all);
+        mctx = memory->init_batch(*balloc, n_ubatch_cur, embd_all);
         if (!mctx) {
             return -2;
         }

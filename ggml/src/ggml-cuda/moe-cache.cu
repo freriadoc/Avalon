@@ -6815,6 +6815,31 @@ static size_t moe_cache_largest_lend(void * opaque, void * backend) {
     return device && !device->dead.load() ? device->largest_lend_bytes.load() : 0;
 }
 
+static size_t moe_cache_lend_room(void * opaque, void * backend) {
+    moe_cache_session * session = (moe_cache_session *) opaque;
+    if (!session) {
+        return 0;
+    }
+    moe_cache_device * device = moe_cache_device_for_backend(*session, backend);
+    if (!device || device->dead.load()) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(session->mu);
+    if (!device->budget_ready) {
+        return 0;
+    }
+    if (device->band_slab) {
+        size_t free_bytes = 0, largest = 0;
+        moe_cache_band_room(*device, free_bytes, largest);
+        return free_bytes;
+    }
+    size_t room = 0;
+    for (const auto & pool_ptr : device->pools) {
+        room += (size_t) moe_cache_pool_lendable(*pool_ptr) * pool_ptr->expert_size;
+    }
+    return room;
+}
+
 // Seat a whole list of chunks at once: every assignment of the chunks to the pools that
 // can lend, keeping the one whose most-lent pool is the least lent (then the smallest sum
 // of squared loads). No rule looking at one chunk at a time finds it in every case, and a
@@ -11497,6 +11522,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.prepare_queues = moe_cache_prepare_queues;
     ggml_moe_cache.hosted_max_rows = moe_hosted_max_rows;
     ggml_moe_cache.largest_lend = moe_cache_largest_lend;
+    ggml_moe_cache.lend_room = moe_cache_lend_room;
     ggml_moe_cache.hosted_cost = moe_hosted_cost;
     ggml_moe_cache.plan = nullptr;   // nodes are served by the hosted MoE only (moe_cache_begin)
     ggml_moe_cache.dispatch = nullptr;   // nodes are served by the hosted MoE only (moe_cache_begin)
