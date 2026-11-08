@@ -1569,6 +1569,14 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
     }
 }
 
+size_t llama_model_loader::make_resident(const ggml_tensor * t, int n_threads) {
+    const auto * w = get_weight(ggml_get_name(t));
+    if (!w || w->idx >= mappings.size() || !mappings.at(w->idx)) {
+        return 0;
+    }
+    return mappings.at(w->idx)->make_resident(files.at(w->idx).get(), w->offs, w->offs + ggml_nbytes(t), n_threads);
+}
+
 using mapping_ranges = std::vector<llama_model_loader::mapping_range>;
 
 // merge a list of [first, last) ranges into a sorted, non-overlapping list

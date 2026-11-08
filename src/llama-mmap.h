@@ -58,6 +58,12 @@ struct llama_mmap {
 
     void unmap_fragment(size_t first, size_t last);
 
+    // Linux: the whole pages inside [first, last) (offsets in the file) replaced by anonymous memory at the same
+    // addresses (MAP_FIXED), filled from the file with O_DIRECT by n_threads readers in 64 MiB pieces, then read-only.
+    // The same bytes at the same addresses, no longer read through the page cache. A piece whose read fails is mapped
+    // from the file again. Returns the bytes now in anonymous memory (0 elsewhere)
+    size_t make_resident(const struct llama_file * file, size_t first, size_t last, int n_threads);
+
     static const bool SUPPORTED;
 
 private:
@@ -90,3 +96,8 @@ using llama_memory_ranges = std::vector<llama_memory_range>;
 void llama_prefetch(llama_memory_ranges mr);
 
 size_t llama_path_max();
+
+// the host memory this process can still take without swapping: the smaller of MemAvailable and, under every cgroup v2
+// limit above it, the limit less what cannot be reclaimed (anonymous, shared, kernel); SIZE_MAX if unknown (not Linux).
+// The rule of the expert arena (ggml-cuda moe_cache_room_bytes)
+size_t llama_host_room_bytes();

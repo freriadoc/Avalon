@@ -251,6 +251,10 @@ struct llama_model_loader {
 
     void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
 
+    // a mapped tensor (TENSOR_READ_LAZY) read once into anonymous memory at its address (llama_mmap::make_resident);
+    // returns the bytes made resident
+    size_t make_resident(const ggml_tensor * t, int n_threads);
+
     // byte range within a mapped file
     struct mapping_range {
         size_t first; // inclusive

@@ -2057,6 +2057,45 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // The PLE table in RAM: read once now, in order, with O_DIRECT into anonymous memory at its mapped address
+    // (llama_mmap::make_resident), so that a prefill's rows no longer wait on the page cache or the disk (rows read at
+    // random through MADV_WILLNEED: GPU idle 2.3 - 3.6 s per ubatch where the page cache held ~10 of its 35.8 GiB).
+    // LLAMA_PLE_RAM=1 forces it, 0 refuses it; by default, only if the table fits beside every other weight in host
+    // memory (the experts first: the arena or their registration measures its room later, after this) with twice the
+    // arena's margin (GGML_CUDA_MOE_ARENA_MARGIN_MB, 4096: one for what comes between this and the arena's decision, the
+    // draft and the context, one for after it). Never in part: its rows are hashed, so a part in RAM serves as many
+    // reads as the same bytes of page cache would. Else the rows stay mapped and prefetched as before
+    if (per_layer_tok_embd && ml.lazy.has(per_layer_tok_embd) && per_layer_tok_embd->data) {
+        const size_t ple = ggml_nbytes(per_layer_tok_embd);
+        size_t host = 0;
+        for (const auto & [name, t] : tensors_by_name) {
+            if (t != per_layer_tok_embd && t->buffer && ggml_backend_buffer_is_host(t->buffer)) {
+                host += ggml_nbytes(t);
+            }
+        }
+        const char * margin_env = getenv("GGML_CUDA_MOE_ARENA_MARGIN_MB");
+        const size_t margin = (margin_env ? (size_t) atoll(margin_env) : 4096) << 20;
+        const size_t room = llama_host_room_bytes();
+        const bool fits = room != SIZE_MAX && host + ple + 2 * margin <= room;
+        const char * env = getenv("LLAMA_PLE_RAM");
+        const bool on = env ? atoi(env) != 0 : fits;
+        const double mib = 1024.0 * 1024.0;
+        LLAMA_LOG_INFO("%s: PLE table in RAM: %s (%s; table %.0f MiB, other host weights %.0f MiB, margin 2 x %.0f MiB, "
+                       "room %.0f MiB)\n", __func__, on ? "yes" : "no", env ? "LLAMA_PLE_RAM" : fits ? "fits" : "does not fit",
+                       ple / mib, host / mib, margin / mib, room == SIZE_MAX ? -1.0 : room / mib);
+        if (on) {
+            const int64_t t0 = ggml_time_us();
+            const size_t got = ml.make_resident(per_layer_tok_embd, 8);
+            const double s = (ggml_time_us() - t0) / 1e6;
+            LLAMA_LOG_INFO("%s: PLE table in RAM: %.0f MiB read in %.1f s (%.2f GB/s)\n", __func__, got / mib, s,
+                           s > 0 ? got / s / 1e9 : 0.0);
+            // the two pages at its ends stay mapped (shared with the neighbours): their rows need no prefetch to speak of
+            if (got + 2 * 65536 >= ple) {
+                can_prefetch.erase(per_layer_tok_embd);
+            }
+        }
+    }
+
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));

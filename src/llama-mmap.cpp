@@ -10,6 +10,11 @@
 #include <stdexcept>
 #include <cerrno>
 #include <algorithm>
+#include <atomic>
+#include <cctype>
+#include <fstream>
+#include <string>
+#include <thread>
 
 #ifdef __has_include
     #if __has_include(<unistd.h>)
@@ -576,6 +581,87 @@ struct llama_mmap::impl {
         mapped_fragments = std::move(new_mapped_fragments);
     }
 
+    size_t make_resident(int fd, size_t first, size_t last, int n_threads) {
+#ifdef __linux__
+        const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+        first = (first + page - 1) & ~(page - 1);
+        last  = std::min(last, size) & ~(page - 1);
+        bool inside = false;
+        for (const auto & frag : mapped_fragments) {
+            inside = inside || (frag.first <= first && last <= frag.second);
+        }
+        if (last <= first || !inside) {
+            return 0;
+        }
+        // a descriptor of its own, so the loader's reads keep their flags; buffered if the file system has no O_DIRECT
+        char path[64];
+        snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
+        int rfd = open(path, O_RDONLY | O_DIRECT);
+        if (rfd < 0) {
+            rfd = open(path, O_RDONLY);
+        }
+        if (rfd < 0) {
+            return 0;
+        }
+        char * base = (char *) addr;
+        // the file's pages again over [a, b), as mapped by the constructor
+        auto remap_file = [&](size_t a, size_t b) {
+            if (mmap(base + a, b - a, PROT_READ, MAP_SHARED | MAP_FIXED, fd, (off_t) a) != base + a) {
+                LLAMA_LOG_WARN("%s: mmap of the file again failed: %s\n", __func__, strerror(errno));
+            }
+        };
+        if (mmap(base + first, last - first, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE,
+                 -1, 0) != base + first) {
+            remap_file(first, last);   // a failed MAP_FIXED may already have unmapped the range
+            close(rfd);
+            return 0;
+        }
+        const size_t piece = (size_t) 64 << 20;
+        const size_t n_pieces = (last - first + piece - 1) / piece;
+        std::atomic<size_t> next{0};
+        std::atomic<size_t> done{0};
+        auto reader = [&] {
+            for (size_t k; (k = next.fetch_add(1)) < n_pieces;) {
+                const size_t a = first + k * piece;
+                const size_t len = std::min(piece, last - a);
+                size_t got = 0;
+                while (got < len) {
+                    const ssize_t n = pread(rfd, base + a + got, len - got, (off_t) (a + got));
+                    if (n < 0 && errno == EINTR) {
+                        continue;
+                    }
+                    if (n <= 0) {
+                        break;
+                    }
+                    got += (size_t) n;
+                }
+                if (got == len) {
+                    done.fetch_add(len);
+                } else {
+                    remap_file(a, a + len);
+                }
+            }
+        };
+        std::vector<std::thread> threads;
+        for (int t = 1; t < std::max(1, n_threads); t++) {
+            threads.emplace_back(reader);
+        }
+        reader();
+        for (auto & t : threads) {
+            t.join();
+        }
+        close(rfd);
+        // read-only as before (the pieces mapped from the file again already are)
+        if (mprotect(base + first, last - first, PROT_READ) != 0) {
+            LLAMA_LOG_WARN("%s: mprotect failed: %s\n", __func__, strerror(errno));
+        }
+        return done.load();
+#else
+        GGML_UNUSED(fd); GGML_UNUSED(first); GGML_UNUSED(last); GGML_UNUSED(n_threads);
+        return 0;
+#endif
+    }
+
     ~impl() {
         for (const auto & frag : mapped_fragments) {
             if (munmap((char *) addr + frag.first, frag.second - frag.first)) {
@@ -684,6 +770,15 @@ size_t llama_mmap::size() const { return pimpl->size; }
 void * llama_mmap::addr() const { return pimpl->addr; }
 
 void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
+
+size_t llama_mmap::make_resident(const struct llama_file * file, size_t first, size_t last, int n_threads) {
+#ifdef _POSIX_MAPPED_FILES
+    return pimpl->make_resident(file->file_id(), first, last, n_threads);
+#else
+    GGML_UNUSED(file); GGML_UNUSED(first); GGML_UNUSED(last); GGML_UNUSED(n_threads);
+    return 0;
+#endif
+}
 
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
 const bool llama_mmap::SUPPORTED  = true;
@@ -913,4 +1008,51 @@ void llama_prefetch(llama_memory_ranges mr) {
 
 size_t llama_path_max() {
     return PATH_MAX;
+}
+
+#if defined(__linux__)
+// a number after key in a file (the first one with key nullptr), SIZE_MAX if there is none ("max" in memory.max)
+static size_t llama_read_number(const std::string & path, const char * key) {
+    std::ifstream in(path);
+    std::string line;
+    while (std::getline(in, line)) {
+        if (!key) {
+            return line.empty() || !isdigit((unsigned char) line[0]) ? SIZE_MAX : (size_t) strtoull(line.c_str(), nullptr, 10);
+        }
+        if (line.compare(0, strlen(key), key) == 0) {
+            return (size_t) strtoull(line.c_str() + strlen(key), nullptr, 10);
+        }
+    }
+    return SIZE_MAX;
+}
+#endif
+
+size_t llama_host_room_bytes() {
+#if defined(__linux__)
+    size_t room = llama_read_number("/proc/meminfo", "MemAvailable:");
+    room = room == SIZE_MAX ? SIZE_MAX : room << 10;
+    std::ifstream cg("/proc/self/cgroup");
+    std::string line;
+    while (std::getline(cg, line)) {
+        if (line.compare(0, 3, "0::") != 0) {
+            continue;
+        }
+        std::string dir = "/sys/fs/cgroup" + line.substr(3);
+        while (dir.size() > strlen("/sys/fs/cgroup")) {
+            const size_t limit = llama_read_number(dir + "/memory.max", nullptr);
+            if (limit != SIZE_MAX) {
+                size_t used = 0;
+                for (const char * key : {"anon ", "shmem ", "kernel "}) {
+                    const size_t b = llama_read_number(dir + "/memory.stat", key);
+                    used += b == SIZE_MAX ? 0 : b;
+                }
+                room = std::min(room, used < limit ? limit - used : 0);
+            }
+            dir.resize(dir.rfind('/'));
+        }
+    }
+    return room;
+#else
+    return SIZE_MAX;
+#endif
 }
