@@ -132,7 +132,10 @@ static inline bool ggml_type_is_exl3(ggml_type) { return false; }
 
 static constexpr int    moe_cache_cc_forced_min               = 700;
 static constexpr int    moe_cache_cc_ampere                   = 800;
-static constexpr size_t moe_cache_expert_bytes_ampere_min     = 512u << 10;
+// the floor applies to each expert tensor, but an entry is a whole expert (up, gate, down): 256 KiB, not buun's 512,
+// so that a layer's Q2_0 down (640 x 2560, 450 KiB: ISTA's experts, the IQ3_KS hybrid and Strata's IQ3_S GGUF) is
+// cached with its gate and up. The reference has run at 256 (GGML_CUDA_MOE_CACHE_MIN_EXPERT_KB) since Oct 15
+static constexpr size_t moe_cache_expert_bytes_ampere_min     = 256u << 10;
 static constexpr size_t moe_cache_expert_bytes_pre_ampere_min = 1u << 20;
 static constexpr int    moe_cache_batch_max                   = 10;
 static constexpr int    moe_cache_pool_slots_min              = 64;
