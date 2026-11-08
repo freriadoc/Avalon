@@ -682,6 +682,11 @@ llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
+    // the nextn staging buffer is borrowed from the MoE cache session: given back before it goes, once the draft read it
+    h_stage_release();
+    if (h_stage_ready) { ggml_backend_event_free(h_stage_ready); h_stage_ready = nullptr; }
+    if (h_stage_done)  { ggml_backend_event_free(h_stage_done);  h_stage_done  = nullptr; }
+
     // the first pipeline stage goes first: its copies land in this context's buffers. The boundary buffers before it:
     // they are borrowed from its MoE cache session and from this context's, both destroyed with their schedulers, and
     // freed with the members they handed their bytes back to destroyed sessions (a segfault at shutdown)
@@ -1793,11 +1798,21 @@ bool llama_context::set_mtp_h_from(llama_context & tgt, const float * row_first)
     return true;
 }
 
+// LLAMA_MTP_ROWS_CB_SINGLE=1: one device too, the MTP draft takes the nextn rows of a batch of several ubatches ubatch by
+// ubatch on the device (nextn_cb), as the pipeline stages do, instead of their round trip through the host output buffer
+// (the target's 390 MB per 9536-token ubatch down, the draft's whole batch back up after the batch)
+// LLAMA_MTP_ROWS_ASYNC=1 implies it (the draft then reads a staging copy of the rows, without the target waiting for it)
+static bool llama_mtp_rows_cb_single() {
+    static const bool on = (getenv("LLAMA_MTP_ROWS_CB_SINGLE") && atoi(getenv("LLAMA_MTP_ROWS_CB_SINGLE")) != 0) ||
+                           (getenv("LLAMA_MTP_ROWS_ASYNC")     && atoi(getenv("LLAMA_MTP_ROWS_ASYNC"))     != 0);
+    return on;
+}
+
 void llama_context::set_nextn_rows_cb(llama_nextn_rows_cb cb, void * user) {
     nextn_cb      = cb;
     nextn_cb_user = user;
     // with the stages, the host buffer holds the rows of one ubatch (a batch the cb does not take grows it at decode)
-    nextn_rows_want = cb && stage_first ? (int64_t) cparams.n_ubatch : -1;
+    nextn_rows_want = cb && (stage_first || llama_mtp_rows_cb_single()) ? (int64_t) cparams.n_ubatch : -1;
 }
 
 bool llama_context::set_mtp_h_rows(const ggml_tensor * rows, int64_t n_rows, ggml_backend_t backend, const float * row_first) {
@@ -1816,6 +1831,43 @@ bool llama_context::set_mtp_h_rows(const ggml_tensor * rows, int64_t n_rows, ggm
     }
     mtp_h_src = { rows, n_rows, row_first, 0, backend, dst };
     return true;
+}
+
+bool llama_context::set_mtp_h_rows_ev(const ggml_tensor * rows, int64_t n_rows, ggml_backend_t backend, const float * row_first,
+        ggml_backend_event_t ev_ready) {
+    if (!set_mtp_h_rows(rows, n_rows, backend, row_first)) {
+        return false;
+    }
+    if (ev_ready) {
+        // the draft's copies go on its stream (llm_graph_input_embd::set_input): behind the target's staging copy
+        ggml_backend_event_wait(mtp_h_src.backend_dst, ev_ready);
+    }
+    return true;
+}
+
+bool llama_context::mtp_h_rows_record(ggml_backend_t backend, ggml_backend_event_t ev) {
+    if (!backend || !ev) {
+        return false;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    for (auto & b : backends) {
+        if (ggml_backend_get_device(b.get()) == dev) {
+            ggml_backend_event_record(ev, b.get());
+            return true;
+        }
+    }
+    return false;
+}
+
+void llama_context::h_stage_release() {
+    if (h_stage_busy && h_stage_done) {
+        ggml_backend_event_synchronize(h_stage_done);
+    }
+    h_stage_busy = false;
+    h_stage = nullptr;
+    h_stage_buf.reset();
+    h_stage_ctx.reset();
+    h_stage_backend = nullptr;
 }
 
 void llama_context::set_causal_attn(bool value) {
@@ -2720,7 +2772,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // pipeline stages, a batch of several ubatches: the MTP draft takes its nextn rows ubatch by ubatch (nextn_cb), the
     // host buffer none of them; otherwise it holds them all (grown to the batch)
     nextn_cb_on = false;
-    if (nextn_cb && stage_first) {
+    if (nextn_cb && (stage_first || llama_mtp_rows_cb_single())) {
         if (cparams.embeddings_nextn && !cparams.embeddings_nextn_masked && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE &&
             n_tokens_all > cparams.n_ubatch) {
             const llama_batch & b = balloc->get_batch();
@@ -2728,10 +2780,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             for (uint32_t i = 0; seq >= 0 && i < n_tokens_all; i++) {
                 seq = b.n_seq_id[i] == 1 && b.seq_id[i][0] == seq ? seq : -1;
             }
-            const llama_nextn_rows q = { b.token, b.pos, seq, 0, 0, (int64_t) n_tokens_all, nullptr, nullptr };
+            const llama_nextn_rows q = { b.token, b.pos, seq, 0, 0, (int64_t) n_tokens_all, nullptr, nullptr, nullptr, nullptr, nullptr };
             nextn_cb_on = seq >= 0 && nextn_cb(nextn_cb_user, &q);
         }
         nextn_rows_want = std::max<int64_t>(cparams.n_ubatch, nextn_cb_on ? 0 : (int64_t) n_tokens_all);
+    }
+    if (!nextn_cb_on && h_stage) {
+        h_stage_release();
     }
 
     // reserve output buffer
@@ -3071,13 +3126,68 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                     return -3;
                 }
                 ggml_backend_sched_synchronize(sched.get());
-                const llama_nextn_rows q = { ubatch.token, ubatch.pos, ubatch.seq_id[0][0], n_tokens_prev, n_rows,
-                    (int64_t) n_tokens_all, t_h_nextn, backend_h };
+                llama_nextn_rows q = { ubatch.token, ubatch.pos, ubatch.seq_id[0][0], n_tokens_prev, n_rows,
+                    (int64_t) n_tokens_all, t_h_nextn, backend_h, nullptr, nullptr, nullptr };
+                // LLAMA_MTP_ROWS_ASYNC=1, one device: the rows go to the staging buffer on the target's stream and the
+                // draft reads them there while the target goes on (no wait for the draft's pass here)
+                static const bool rows_async = getenv("LLAMA_MTP_ROWS_ASYNC") && atoi(getenv("LLAMA_MTP_ROWS_ASYNC")) != 0;
+                if (rows_async && !stage_first) {
+                    const int64_t n_embd_h = t_h_nextn->ne[0];
+                    if (h_stage && (h_stage_backend != backend_h || h_stage->ne[0] != n_embd_h || h_stage->ne[1] < n_rows)) {
+                        h_stage_release();
+                    }
+                    if (!h_stage) {
+                        ggml_init_params params = {
+                            /*.mem_size   =*/ 4*ggml_tensor_overhead(),
+                            /*.mem_buffer =*/ NULL,
+                            /*.no_alloc   =*/ true,
+                        };
+                        h_stage_ctx.reset(ggml_init(params));
+                        h_stage = ggml_new_tensor_2d(h_stage_ctx.get(), GGML_TYPE_F32, n_embd_h,
+                                std::max<int64_t>(n_rows, (int64_t) cparams.n_ubatch));
+                        h_stage_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(h_stage_ctx.get(),
+                                ggml_backend_sched_get_buffer_type(sched.get(), backend_h)));
+                        if (!h_stage_buf) {
+                            h_stage = nullptr;
+                            h_stage_ctx.reset();
+                        } else {
+                            h_stage_backend = backend_h;
+                            LLAMA_LOG_INFO("%s: MTP nextn staging buffer %.1f MiB (%s)\n", __func__,
+                                    ggml_backend_buffer_get_size(h_stage_buf.get()) / 1048576.0,
+                                    ggml_backend_buffer_name(h_stage_buf.get()));
+                        }
+                        if (h_stage && !h_stage_ready) {
+                            h_stage_ready = ggml_backend_event_new(ggml_backend_get_device(backend_h));
+                            h_stage_done  = ggml_backend_event_new(ggml_backend_get_device(backend_h));
+                        }
+                    }
+                    if (h_stage && h_stage_ready && h_stage_done && t_h_nextn->type == GGML_TYPE_F32) {
+                        // the draft's reads of the previous rows (queued a ubatch ago, done long since in general)
+                        if (h_stage_busy) {
+                            ggml_backend_event_wait(backend_h, h_stage_done);
+                        }
+                        ggml_tensor s = *t_h_nextn;
+                        ggml_tensor d = *h_stage;
+                        d.ne[1] = s.ne[1] = n_rows;
+                        s.nb[2] = s.nb[3] = d.nb[2] = d.nb[3] = n_rows*d.nb[1];
+                        s.view_src = d.view_src = nullptr;
+                        ggml_backend_tensor_copy_async(backend_h, backend_h, &s, &d);
+                        ggml_backend_event_record(h_stage_ready, backend_h);
+                        h_stage_last.resize(n_embd_h);
+                        ggml_backend_tensor_get(t_h_nextn, h_stage_last.data(), (size_t) (n_rows - 1)*t_h_nextn->nb[1],
+                                (size_t) n_embd_h*sizeof(float));
+                        q.rows     = h_stage;
+                        q.ev_ready = h_stage_ready;
+                        q.ev_done  = h_stage_done;
+                        q.last_row = h_stage_last.data();
+                    }
+                }
                 if (!nextn_cb(nextn_cb_user, &q)) {
                     LLAMA_LOG_ERROR("%s: the MTP draft failed on the nextn rows [%lld, %lld)\n", __func__,
                             (long long) n_tokens_prev, (long long) (n_tokens_prev + n_rows));
                     return -3;
                 }
+                h_stage_busy = h_stage_busy || q.ev_done != nullptr;
                 h_host_ok = false;
             } else if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
                 ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
@@ -5419,6 +5529,15 @@ void llama_set_nextn_rows_cb(llama_context * ctx, llama_nextn_rows_cb cb, void *
 bool llama_set_mtp_h_rows(llama_context * ctx, const ggml_tensor * rows, int64_t n_rows, ggml_backend_t backend,
                           const float * row_first) {
     return ctx->set_mtp_h_rows(rows, n_rows, backend, row_first);
+}
+
+bool llama_set_mtp_h_rows_ev(llama_context * ctx, const ggml_tensor * rows, int64_t n_rows, ggml_backend_t backend,
+                             const float * row_first, ggml_backend_event_t ev_ready) {
+    return ctx->set_mtp_h_rows_ev(rows, n_rows, backend, row_first, ev_ready);
+}
+
+bool llama_mtp_h_rows_record(llama_context * ctx, ggml_backend_t backend, ggml_backend_event_t ev) {
+    return ctx->mtp_h_rows_record(backend, ev);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

@@ -120,6 +120,9 @@ struct llama_context {
     uint32_t reserve_outputs(int32_t n_outputs) { return output_reserve(n_outputs); }   // llama_output_reserve
     void set_nextn_rows_cb(llama_nextn_rows_cb cb, void * user);
     bool set_mtp_h_rows(const ggml_tensor * rows, int64_t n_rows, ggml_backend_t backend, const float * row_first);
+    bool set_mtp_h_rows_ev(const ggml_tensor * rows, int64_t n_rows, ggml_backend_t backend, const float * row_first,
+            ggml_backend_event_t ev_ready);
+    bool mtp_h_rows_record(ggml_backend_t backend, ggml_backend_event_t ev);
     bool share_moe_cache(llama_context & owner);                                            // llama_share_moe_cache
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
@@ -395,6 +398,21 @@ private:
     void *              nextn_cb_user = nullptr;
     bool                nextn_cb_on   = false;   // the current decode's batch is consumed by the cb
     int64_t             nextn_rows_want = -1;
+
+    // LLAMA_MTP_ROWS_ASYNC=1 (one device, the cb on): each ubatch's nextn rows copied on the device into this staging
+    // buffer (one ubatch of rows, borrowed from the expert cache like the compute buffers), the draft reading them there
+    // behind h_stage_ready while the target goes on; the next copy waits on the GPU for h_stage_done (the draft's reads of
+    // the previous ones). Kept over the prompt's decodes, released (after h_stage_done) at the first decode the cb does not
+    // take
+    ggml_context_ptr        h_stage_ctx;
+    ggml_backend_buffer_ptr h_stage_buf;
+    ggml_tensor *           h_stage         = nullptr;
+    ggml_backend_t          h_stage_backend = nullptr;
+    ggml_backend_event_t    h_stage_ready   = nullptr;
+    ggml_backend_event_t    h_stage_done    = nullptr;
+    bool                    h_stage_busy    = false;   // h_stage_done recorded behind reads not waited for yet
+    std::vector<float>      h_stage_last;
+    void h_stage_release();
 
     // tokens of the decode call still to come after the current ubatch: the KV rows they will need are taken from the MoE
     // expert cache with the current ubatch's (process_ubatch)

@@ -1434,6 +1434,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    std::vector<bool> kv_hash_due;   // LLAMA_MTP_KV_HASH: a prompt batch was processed since the last draft
+
     // pipeline stages: the target's batch of several ubatches taken during its decode, ubatch by ubatch, from its rows
     // on the device (llama_set_nextn_rows_cb); process() then has nothing to replay
     bool         rows_cb_ok   = false;   // the current target batch is taken by on_rows
@@ -1531,6 +1533,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
 
+        kv_hash_due.assign(n_seq, false);
         defer_tok.assign(n_seq, {});
         defer_pos.assign(n_seq, {});
         defer_h.assign(n_seq, {});
@@ -1611,7 +1614,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
             }
         }
-        if (!llama_set_mtp_h_rows(ctx_dft, r.rows, r.n_rows, r.backend, pending_h[seq_id].data())) {
+        if (!llama_set_mtp_h_rows_ev(ctx_dft, r.rows, r.n_rows, r.backend, pending_h[seq_id].data(), r.ev_ready)) {
             SPC_ERR("%s", "the draft has no backend on the device of the target's rows\n");
             return false;
         }
@@ -1625,10 +1628,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     (long long) (r.row0 + r.n_rows), (int) rc);
             return false;
         }
-        // its copies from the target's rows done before the target's next ubatch overwrites them
-        llama_synchronize(ctx_dft);
-        ggml_backend_tensor_get(r.rows, pending_h[seq_id].data(), (size_t) (r.n_rows - 1) * r.rows->nb[1],
-                (size_t) n_embd * sizeof(float));
+        if (r.ev_done) {
+            // the target's staging copy (LLAMA_MTP_ROWS_ASYNC): its next copy waits on the GPU for these reads, the draft
+            // runs beside the target's next ubatch; its own later passes are behind it on its stream
+            if (!llama_mtp_h_rows_record(ctx_dft, r.backend, r.ev_done)) {
+                SPC_ERR("%s", "the draft has no backend on the device of the target's rows\n");
+                return false;
+            }
+            memcpy(pending_h[seq_id].data(), r.last_row, (size_t) n_embd * sizeof(float));
+        } else {
+            // its copies from the target's rows done before the target's next ubatch overwrites them
+            llama_synchronize(ctx_dft);
+            ggml_backend_tensor_get(r.rows, pending_h[seq_id].data(), (size_t) (r.n_rows - 1) * r.rows->nb[1],
+                    (size_t) n_embd * sizeof(float));
+        }
         rows_cb_n += r.n_rows;
         if (rows_cb_n == r.n_total) {
             rows_cb_done = r.n_total;
@@ -1685,6 +1698,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         const int32_t n_tokens = batch_in.size();
+        if (n_tokens > 64) {   // LLAMA_MTP_KV_HASH: a prompt batch
+            for (int k = 0; k < n_tokens; ++k) {
+                const llama_seq_id sq = batch_in.tokens[k].seq_id;
+                if (sq >= 0 && sq < (llama_seq_id) n_seq) {
+                    kv_hash_due[sq] = true;
+                }
+            }
+        }
 
         // remember the first and last batch index for each sequence
         std::fill(i_batch_beg.begin(), i_batch_beg.end(), -1);
@@ -1875,6 +1896,44 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
+
+        // DIAGNOSTIC (LLAMA_MTP_KV_HASH=1): the draft's state of each drafting sequence at the first draft after a
+        // prompt batch (its K/V of the prompt) and its deferred rows, hashed: the paths that feed it (host rows, device
+        // rows per ubatch) compare on it
+        {
+            static const bool kv_hash = getenv("LLAMA_MTP_KV_HASH") && atoi(getenv("LLAMA_MTP_KV_HASH")) != 0;
+            if (kv_hash) {
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    if (!dparams[seq_id].drafting || !kv_hash_due[seq_id]) {
+                        continue;
+                    }
+                    kv_hash_due[seq_id] = false;
+                    std::vector<uint8_t> st(llama_state_seq_get_size(ctx_dft, seq_id));
+                    const size_t n = llama_state_seq_get_data(ctx_dft, st.data(), st.size(), seq_id);
+                    uint64_t h = 1469598103934665603ull;
+                    for (size_t i = 0; i < n; ++i) {
+                        h = (h ^ st[i]) * 1099511628211ull;
+                    }
+                    uint64_t hd = 1469598103934665603ull;
+                    for (float v : defer_h[seq_id]) {
+                        uint32_t u; memcpy(&u, &v, 4);
+                        hd = (hd ^ u) * 1099511628211ull;
+                    }
+                    if (const char * dump = getenv("LLAMA_MTP_KV_DUMP")) {   // the state itself, to compare offsets
+                        static int n_dump = 0;
+                        const std::string path = std::string(dump) + "." + std::to_string(n_dump++);
+                        if (FILE * f = fopen(path.c_str(), "wb")) {
+                            fwrite(st.data(), 1, n, f);
+                            fclose(f);
+                        }
+                    }
+                    LOG_INF("%s: MTP KV hash seq %d: state %zu bytes %016llx, pos_max %d, %zu deferred rows %016llx\n",
+                            __func__, (int) seq_id, n, (unsigned long long) h,
+                            (int) llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id), defer_tok[seq_id].size(),
+                            (unsigned long long) hd);
+                }
+            }
+        }
 
         batch.clear();
 

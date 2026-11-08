@@ -132,6 +132,12 @@ struct llama_nextn_rows {
     int64_t             n_total;
     const struct ggml_tensor * rows;
     ggml_backend_t      backend;
+    // LLAMA_MTP_ROWS_ASYNC (one device): rows is the target's own staging copy, valid until ev_done: cb queues the
+    // draft's reads behind ev_ready (llama_set_mtp_h_rows_ev), records ev_done behind them (llama_mtp_h_rows_record) and
+    // returns without waiting for the draft; last_row: the ubatch's last row on the host. NULL: rows valid until cb returns
+    ggml_backend_event_t ev_ready;
+    ggml_backend_event_t ev_done;
+    const float *        last_row;
 };
 typedef bool (*llama_nextn_rows_cb)(void * user, const struct llama_nextn_rows * r);
 LLAMA_API void llama_set_nextn_rows_cb(struct llama_context * ctx, llama_nextn_rows_cb cb, void * user);
@@ -141,6 +147,12 @@ LLAMA_API void llama_set_nextn_rows_cb(struct llama_context * ctx, llama_nextn_r
 // row_first. False, nothing set, when ctx has no backend on that device
 LLAMA_API bool llama_set_mtp_h_rows(struct llama_context * ctx, const struct ggml_tensor * rows, int64_t n_rows,
                                     ggml_backend_t backend, const float * row_first);
+// The same, the draft's copies from rows queued behind ev_ready (recorded on the device of rows) instead of the caller
+// having waited for rows
+LLAMA_API bool llama_set_mtp_h_rows_ev(struct llama_context * ctx, const struct ggml_tensor * rows, int64_t n_rows,
+                                       ggml_backend_t backend, const float * row_first, ggml_backend_event_t ev_ready);
+// Records ev behind everything ctx queued on its backend on the device of backend (the draft's reads of the rows)
+LLAMA_API bool llama_mtp_h_rows_record(struct llama_context * ctx, ggml_backend_t backend, ggml_backend_event_t ev);
 
 // Marks the entries that a joint decision head (clef) reads, the default is 0
 // See https://github.com/ggml-org/llama.cpp/pull/29831 for details
