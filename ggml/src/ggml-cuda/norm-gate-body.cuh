@@ -13,12 +13,13 @@ struct rms_norm_gate_args {
     float eps;
     block_q8_1 * dst_q8_1;
     int nrows, nchannels, nsamples;   // the grid
-    ggml_cuda_img img;                // the image of dst for the cuBLAS products after it (none: p nullptr)
 };
 
-template <int block_size>
+// has_img: also the image of dst for the cuBLAS products after it (a prompt batch only; out of the arguments and of the
+// code of the decode's kernels, which it made slower: 32 -> 40 VGPR, 1.96 -> 2.40 us per launch on the RX 7900 XT)
+template <int block_size, bool has_img = false>
 static __device__ __forceinline__ void rms_norm_mul_sigmoid_gate_body(const rms_norm_gate_args & a, const int row,
-        const int channel, const int sample, const int tid) {
+        const int channel, const int sample, const int tid, const ggml_cuda_img img = ggml_cuda_img()) {
     const float * x = a.x; const float * w = a.w; const float * gate = a.gate; float * dst = a.dst;
     const int ncols = a.ncols;
     const int64_t sx1 = a.sx1, sx2 = a.sx2, sx3 = a.sx3, sg1 = a.sg1, sg2 = a.sg2, sg3 = a.sg3;
@@ -44,8 +45,8 @@ static __device__ __forceinline__ void rms_norm_mul_sigmoid_gate_body(const rms_
         const float g = 1.0f / (1.0f + expf(-gate[col]));
         const float v = scale * x[col] * w[col] * g;
         dst[col] = v;
-        if (a.img.p) {
-            a.img.store1(dst_off + col, v);   // q8_1: whole warps (ncols % 128 == 0, ggml_cuda_f16_image_target)
+        if constexpr (has_img) {
+            img.store1(dst_off + col, v);   // q8_1: whole warps (ncols % 128 == 0, ggml_cuda_f16_image_target)
         }
         if (dst_q8_1) {
             // the q8_1 block of the 32 values of this warp, as quantize_q8_1 writes it (lane = index in the block;

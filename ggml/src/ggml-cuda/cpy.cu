@@ -465,10 +465,11 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
     char * src1_ddc = (char *) src1->data;
 
     const bool contiguous_srcs = ggml_is_contiguous(src0) && ggml_is_contiguous(src1);
-    // a transposed matrix, dense, or a single one with a padded row pitch (a window of a longer one)
+    // a transposed matrix, dense, or a single one with a padded row pitch (a window of a longer one) of a tile's rows at
+    // least: below (the decode's windows of 1 - 3 tokens), the generic copy is faster (1.36 against 2.00 us, RX 7900 XT)
     const int64_t es0 = (int64_t) ggml_element_size(src0);
     const bool can_be_transposed = nb01 == es0 && src0->ne[3] == 1 && ggml_is_contiguous(src1) &&
-        (nb02 == ne00 * ne01 * es0 || (ne02 == 1 && nb00 % es0 == 0 && nb00 >= ne01 * es0));
+        (nb02 == ne00 * ne01 * es0 || (ne02 == 1 && nb00 % es0 == 0 && nb00 >= ne01 * es0 && ne01 >= CUDA_CPY_TILE_DIM_2D));
 
     size_t mc_width = 0, mc_height = 0, mc_spitch = 0, mc_dpitch = 0;
 

@@ -954,9 +954,9 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 // rms_norm(x) * w * sigmoid(gate) per row (a gated norm, as qwen4exp ends its linear attention); w is
 // one vector of ncols. A block reads its row of x and of gate before writing it: dst may alias x or
 // gate exactly. The body: norm-gate-body.cuh.
-template <int block_size>
-static __global__ void rms_norm_mul_sigmoid_gate_f32(const rms_norm_gate_args a) {
-    rms_norm_mul_sigmoid_gate_body<block_size>(a, blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x);
+template <int block_size, bool has_img>
+static __global__ void rms_norm_mul_sigmoid_gate_f32(const rms_norm_gate_args a, const ggml_cuda_img img) {
+    rms_norm_mul_sigmoid_gate_body<block_size, has_img>(a, blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, img);
 }
 
 void ggml_cuda_op_rms_norm_mul_sigmoid_gate(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm,
@@ -973,10 +973,13 @@ void ggml_cuda_op_rms_norm_mul_sigmoid_gate(ggml_backend_cuda_context & ctx, con
     a.x = (const float *) x->data; a.w = (const float *) w->data; a.gate = (const float *) gate->data; a.dst = (float *) dst->data;
     a.ncols = (int) ncols; a.sx1 = sx1; a.sx2 = sx2; a.sx3 = sx3; a.sg1 = sg1; a.sg2 = sg2; a.sg3 = sg3; a.eps = eps;
     a.dst_q8_1 = (block_q8_1 *) dst_q8_1;
-    a.img = img;
     a.nrows = (int) x->ne[1]; a.nchannels = (int) x->ne[2]; a.nsamples = (int) x->ne[3];
+    if (img.p) {
+        rms_norm_mul_sigmoid_gate_f32<block_size, true><<<blocks_num, block_size, 32 * sizeof(float), ctx.stream()>>>(a, img);
+        return;
+    }
     if (ctx.mk && ggml_cuda_mk_add_norm_gate(ctx.mk, a)) {   // the multi-task kernel takes it (mk.cuh)
         return;
     }
-    rms_norm_mul_sigmoid_gate_f32<block_size><<<blocks_num, block_size, 32 * sizeof(float), ctx.stream()>>>(a);
+    rms_norm_mul_sigmoid_gate_f32<block_size, false><<<blocks_num, block_size, 32 * sizeof(float), ctx.stream()>>>(a, img);
 }
