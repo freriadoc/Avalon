@@ -746,6 +746,7 @@ static void rms_norm_mul_rope_cuda(
     if (ncols < 1024 && std::is_same_v<D, float> && mk && ggml_cuda_mk_add_rope(mk, a, freq_factors != nullptr)) {
         return;
     }
+    ggml_cuda_mk_direct(mk, stream);
 
     if (ncols < 1024) {
         const dim3 block_dims(256, 1, 1);

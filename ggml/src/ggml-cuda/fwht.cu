@@ -466,6 +466,7 @@ int ggml_cuda_try_fuse_fwht_set_rows(ggml_backend_cuda_context & ctx, ggml_cgrap
     if (ctx.mk && ggml_cuda_mk_add_fwht_set_rows(ctx.mk, a)) {   // the multi-task kernel takes it (mk.cuh)
         return k - i;
     }
+    ggml_cuda_mk_direct(ctx.mk, ctx.stream());
     if (a.q4_0) {
         fwht_set_rows_cuda<64, block_q4_0><<<grid, block, 0, ctx.stream()>>>(a);
     } else {

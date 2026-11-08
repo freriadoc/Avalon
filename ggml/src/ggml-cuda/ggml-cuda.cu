@@ -5268,6 +5268,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     return 1;
                 }
             }
+            ggml_cuda_mk_direct(cuda_ctx->mk, cuda_ctx->stream());
             ggml_cuda_op_get_rows(*cuda_ctx, &rows_f16);
             return 1;
         }

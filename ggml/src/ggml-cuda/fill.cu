@@ -29,6 +29,7 @@ void ggml_cuda_op_fill(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     if (dst->type == GGML_TYPE_F32 && ctx.mk && ggml_cuda_mk_add_fill(ctx.mk, { (float *) dst_d, k, value })) {
         return;
     }
+    ggml_cuda_mk_direct(ctx.mk, stream);
 
     switch (dst->type) {
         case GGML_TYPE_F32:

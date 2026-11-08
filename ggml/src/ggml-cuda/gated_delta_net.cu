@@ -53,6 +53,7 @@ static void launch_gated_delta_net(
             warp_size == 32 && ggml_cuda_mk_add_gdn(mk, a)) {
         return;
     }
+    ggml_cuda_mk_direct(mk, stream);
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
     switch (S_v) {

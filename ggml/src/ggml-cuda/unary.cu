@@ -796,5 +796,6 @@ void ggml_cuda_op_gdn_gates(ggml_backend_cuda_context & ctx, const ggml_tensor *
     if (ctx.mk && ggml_cuda_mk_add_gdn_gates(ctx.mk, ga)) {   // the multi-task kernel takes it (mk.cuh)
         return;
     }
+    ggml_cuda_mk_direct(ctx.mk, ctx.stream());
     k_gdn_gates<<<(n + threads - 1) / threads, threads, 0, ctx.stream()>>>(ga);
 }

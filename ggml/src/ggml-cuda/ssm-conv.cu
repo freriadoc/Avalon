@@ -301,11 +301,13 @@ void ggml_cuda_op_ssm_conv_cached(ggml_backend_cuda_context & ctx, const float *
     if (n_t > GGML_CUDA_SSM_CONV_CACHED_MAX_T) {
         const dim3 grid_long((n_ch + threads - 1) / threads, 1,
                              (n_t + GGML_CUDA_SSM_CONV_CACHED_MAX_T - 1) / GGML_CUDA_SSM_CONV_CACHED_MAX_T);
+        ggml_cuda_mk_direct(ctx.mk, ctx.stream());
         ssm_conv_cached_long_f32<4, GGML_CUDA_SSM_CONV_CACHED_MAX_T><<<grid_long, threads, 0, ctx.stream()>>>(a);
         return;
     }
     if (ctx.mk && ggml_cuda_mk_add_ssm_conv(ctx.mk, a)) {   // the multi-task kernel takes it (mk.cuh)
         return;
     }
+    ggml_cuda_mk_direct(ctx.mk, ctx.stream());
     ssm_conv_cached_f32<4, GGML_CUDA_SSM_CONV_CACHED_MAX_T><<<grid, threads, 0, ctx.stream()>>>(a);
 }

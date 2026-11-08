@@ -434,6 +434,7 @@ void ggml_cuda_op_set_rows_padded(ggml_backend_cuda_context & ctx, ggml_tensor *
             return;
         }
     }
+    ggml_cuda_mk_direct(ctx.mk, ctx.stream());
     if (src1->type == GGML_TYPE_I64) {
         set_rows_cuda_quant<int64_t, block_q8_0, QK8_0, quantize_f32_q8_0_block>(
             (const float *) values->data, (const int64_t *) src1->data, (block_q8_0 *) dst->data,

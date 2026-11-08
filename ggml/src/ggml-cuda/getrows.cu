@@ -94,6 +94,7 @@ bool ggml_cuda_get_rows_mean(ggml_backend_cuda_context & ctx, const ggml_tensor 
             return true;
         }
     }
+    ggml_cuda_mk_direct(ctx.mk, stream);
     switch (src0->type) {
         case GGML_TYPE_Q4_0:
             get_rows_mean_cuda<QK4_0, QR4_0, dequantize_q4_0>(src0->data, ids, dst, ne00, src0->nb[1], n_out, n_group, scale, bias, stream);

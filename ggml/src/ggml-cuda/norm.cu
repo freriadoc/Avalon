@@ -1019,11 +1019,13 @@ void ggml_cuda_op_rms_norm_mul_sigmoid_gate(ggml_backend_cuda_context & ctx, con
     a.dst_q8_1 = (block_q8_1 *) dst_q8_1;
     a.nrows = (int) x->ne[1]; a.nchannels = (int) x->ne[2]; a.nsamples = (int) x->ne[3];
     if (img.p) {
+        ggml_cuda_mk_direct(ctx.mk, ctx.stream());   // the image's variant is not recorded: the pending tasks first
         rms_norm_mul_sigmoid_gate_f32<block_size, true><<<blocks_num, block_size, 32 * sizeof(float), ctx.stream()>>>(a, img);
         return;
     }
     if (ctx.mk && ggml_cuda_mk_add_norm_gate(ctx.mk, a)) {   // the multi-task kernel takes it (mk.cuh)
         return;
     }
+    ggml_cuda_mk_direct(ctx.mk, ctx.stream());
     rms_norm_mul_sigmoid_gate_f32<block_size, false><<<blocks_num, block_size, 32 * sizeof(float), ctx.stream()>>>(a, img);
 }

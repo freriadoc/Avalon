@@ -122,5 +122,14 @@ bool ggml_cuda_mk_unit_done(ggml_cuda_mk * mk, const ggml_cgraph * cgraph, int f
 bool ggml_cuda_mk_conflicts(const ggml_cuda_mk * mk, const ggml_tensor * node);
 bool ggml_cuda_mk_unit_conflicts(const ggml_cuda_mk * mk, const ggml_cgraph * cgraph, const int * idx, int n);
 void ggml_cuda_mk_flush(ggml_cuda_mk * mk, cudaStream_t stream);
+// a launcher of a kind the multi-task kernel records that launches its kernel itself (a variant it does not record, or
+// the recorder declined it: full, classes that do not mix): the pending tasks first. The evaluation let the unit chain
+// behind them as a task and does not flush before it; launched before them, it would read what they have not written
+// yet (the gated norm's image variant after a pending gated delta net, a prompt's 54-token tail: written() aborted)
+static inline void ggml_cuda_mk_direct(ggml_cuda_mk * mk, cudaStream_t stream) {
+    if (mk && mk->tasks.n > 0) {
+        ggml_cuda_mk_flush(mk, stream);
+    }
+}
 void ggml_cuda_mk_begin_graph(ggml_cuda_mk * mk, const ggml_cgraph * cgraph);
 static inline int ggml_cuda_mk_pending(const ggml_cuda_mk * mk) { return mk->tasks.n; }

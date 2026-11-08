@@ -35,6 +35,7 @@ static void qsa_select_launch(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (mode != GGML_QSA_SELECT_DENSE && ctx.mk && ggml_cuda_mk_add_qsa_select(ctx.mk, a)) {
         return;
     }
+    ggml_cuda_mk_direct(ctx.mk, stream);
     k_qsa_select<mode, by_pos><<<grid, threads, 0, stream>>>(a);
 }
 
