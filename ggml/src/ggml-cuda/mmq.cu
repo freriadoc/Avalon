@@ -872,7 +872,7 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
     ctx.mmq_scratch_last = nullptr;   // what the scratch holds is no longer what a next product would expect
     const size_t q8_gu_bytes = rows*ne10p_gu*sizeof(block_q8_1_mmq)/QK8_1_MMQ + mmq_src1_tail;
     const size_t q8_d_bytes  = rows*ne10p_d *sizeof(block_q8_1_mmq)/QK8_1_MMQ + mmq_src1_tail;
-    ggml_cuda_pool_alloc<int32_t> ids_src1_p(ctx.pool()), ids_dst_p(ctx.pool()), bounds_p(ctx.pool()), prefix(ctx.pool(), G + 1);
+    ggml_cuda_pool_alloc<int32_t> ids_src1_p(ctx.pool()), ids_dst_p(ctx.pool()), bounds_p(ctx.pool());
     ggml_cuda_pool_alloc<char> q8_gu_p(ctx.pool()), q8_d_p(ctx.pool());
     struct ptr_i32 { int32_t * p; int32_t * get() const { return p; } };
     struct ptr_c { char * p; char * get() const { return p; } };
@@ -881,6 +881,9 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
     const ptr_i32 bounds   { sg ? (int32_t *) (sg + lg.expert_bounds) : bounds_p.alloc(n_expert + 1) };
     const ptr_c   q8_gu    { sg ? sg + lg.src1_q8_1 : q8_gu_p.alloc(q8_gu_bytes) };
     const ptr_c   q8_d     { sd ? sd + ld.src1_q8_1 : q8_d_p.alloc(q8_d_bytes) };
+    // the pool frees in reverse order of its allocations (VMM pool: asserted): allocated after the ones above, which
+    // their declarations precede
+    ggml_cuda_pool_alloc<int32_t> prefix(ctx.pool(), G + 1);
 
     // the rows by expert (the inverse map for the broadcast activation), the activation quantized once for gate and up
     ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(), n_expert, n_tok,
