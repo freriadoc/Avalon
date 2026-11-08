@@ -1106,8 +1106,10 @@ static __global__ void mul_mat_q(
         const int tile_x_max_i = nrows_x  - it*I - 1;
         const int tile_y_max_j = col_diff - jt*J - 1;
 
-        // x_experts (MUL_MAT_ID, a prefill reading experts in place): each expert at its own address
-        const char * x_tile = x_experts ? (const char *) x_experts[fastdiv(zt, channel_ratio)] : x;
+        // x_experts (MUL_MAT_ID, a prefill reading experts in place): each expert at its own address, read as a byte
+        // offset from x: a pointer chosen between the table's and x at run time lost x's __restrict__ provenance, and
+        // the tile loop's loads were scheduled worse (RTX 4090, 186 rows per expert: IQ4_NL 43 -> 27 ns per row)
+        const char * x_tile = x + (x_experts ? (int64_t) (x_experts[fastdiv(zt, channel_ratio)] - (uint64_t) x) : 0);
         const int offset_x = x_experts ? it*I*stride_row_x :
             fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
 
@@ -1207,8 +1209,10 @@ static __global__ void mul_mat_q(
         const int tile_x_max_i = nrows_x  - it*I - 1;
         const int tile_y_max_j = col_diff - jt*J - 1;
 
-        // x_experts (MUL_MAT_ID, a prefill reading experts in place): each expert at its own address
-        const char * x_tile = x_experts ? (const char *) x_experts[fastdiv(zt, channel_ratio)] : x;
+        // x_experts (MUL_MAT_ID, a prefill reading experts in place): each expert at its own address, read as a byte
+        // offset from x: a pointer chosen between the table's and x at run time lost x's __restrict__ provenance, and
+        // the tile loop's loads were scheduled worse (RTX 4090, 186 rows per expert: IQ4_NL 43 -> 27 ns per row)
+        const char * x_tile = x + (x_experts ? (int64_t) (x_experts[fastdiv(zt, channel_ratio)] - (uint64_t) x) : 0);
         const int offset_x = x_experts ? it*I*stride_row_x :
             fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
 
@@ -1297,7 +1301,7 @@ static __global__ void mul_mat_q(
     const int tile_x_max_i = nrows_x  - it*I - 1;
     const int tile_y_max_j = col_diff - jt*J - 1;
 
-    const char * x_tile = x_experts ? (const char *) x_experts[fastdiv(zt, channel_ratio)] : x;
+    const char * x_tile = x + (x_experts ? (int64_t) (x_experts[fastdiv(zt, channel_ratio)] - (uint64_t) x) : 0);
     const int offset_x = x_experts ? it*I*stride_row_x :
         fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
 
