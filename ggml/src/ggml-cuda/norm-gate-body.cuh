@@ -4,6 +4,7 @@
 // block_size threads per row
 
 #include "common.cuh"
+#include "convert.cuh"
 
 struct rms_norm_gate_args {
     const float * x; const float * w; const float * gate; float * dst;
@@ -12,6 +13,7 @@ struct rms_norm_gate_args {
     float eps;
     block_q8_1 * dst_q8_1;
     int nrows, nchannels, nsamples;   // the grid
+    ggml_cuda_img img;                // the image of dst for the cuBLAS products after it (none: p nullptr)
 };
 
 template <int block_size>
@@ -42,6 +44,9 @@ static __device__ __forceinline__ void rms_norm_mul_sigmoid_gate_body(const rms_
         const float g = 1.0f / (1.0f + expf(-gate[col]));
         const float v = scale * x[col] * w[col] * g;
         dst[col] = v;
+        if (a.img.p) {
+            a.img.store(dst_off + col, v);
+        }
         if (dst_q8_1) {
             // the q8_1 block of the 32 values of this warp, as quantize_q8_1 writes it (lane = index in the block;
             // ncols % QK8_1 == 0, so every warp is whole)

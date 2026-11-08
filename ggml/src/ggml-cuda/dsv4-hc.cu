@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "dsv4-hc.cuh"
+#include "convert.cuh"
 
 
 static constexpr int DSV4_HC = 4;
@@ -117,7 +118,8 @@ static __global__ void dsv4_hc_pre_f32(
         int64_t sw2,
         int sd0,
         int64_t sd1,
-        float   scale) {
+        float   scale,
+        const ggml_cuda_img img) {
     ggml_cuda_pdl_lc();
     const int i0 = blockIdx.x * blockDim.x + threadIdx.x;
     if (i0 >= n_embd) {
@@ -140,6 +142,10 @@ static __global__ void dsv4_hc_pre_f32(
         }
 
         dst[i0*sd0 + it*sd1] = scale * sum;
+        if (img.p) {
+            // the image of a contiguous dst (ggml_cuda_f16_image_target)
+            img.store((int64_t) it*n_embd + i0, scale * sum);
+        }
     }
 }
 
@@ -249,7 +255,7 @@ void ggml_cuda_op_dsv4_hc_comb(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             eps, n_iter);
 }
 
-void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_cuda_img img) {
     const ggml_tensor * x       = dst->src[0];
     const ggml_tensor * weights = dst->src[1];
 
@@ -280,7 +286,7 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             nbx0 / sizeof(float), nbx1 / sizeof(float), nbx2 / sizeof(float),
             nbw0 / sizeof(float), nbw1 / sizeof(float), nbw2 / sizeof(float),
             nbd0 / sizeof(float), nbd1 / sizeof(float),
-            scale);
+            scale, img);
 }
 
 void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst,

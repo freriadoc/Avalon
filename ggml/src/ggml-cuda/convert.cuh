@@ -64,3 +64,18 @@ template<typename dst_t, typename src_t>
         return float(x);
     }
 }
+
+// the F16 or BF16 image of an F32 result, written by the kernel that computes it in the scratch of the cuBLAS products
+// that read it (ggml_cuda_f16_image_target): the same values as their conversion of src1 (ggml_cuda_cast)
+struct ggml_cuda_img {
+    void * p    = nullptr;   // nullptr: no image
+    bool   bf16 = false;
+
+    __device__ __forceinline__ void store(int64_t i, float v) const {
+        if (bf16) {
+            ((nv_bfloat16 *) p)[i] = ggml_cuda_cast<nv_bfloat16>(v);
+        } else {
+            ((half *) p)[i] = ggml_cuda_cast<half>(v);
+        }
+    }
+};

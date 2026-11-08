@@ -1952,6 +1952,25 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
             if (!src1_reuse) {
                 convert_func(src1->data, src1_conv, ggml_nelements(src1), main_stream);
             }
+            // GGML_CUDA_F16_IMAGE_CHECK=1 (diagnostic, synchronizes: with GGML_CUDA_DISABLE_GRAPHS=1): a src1 image found in
+            // the scratch (left by the group's previous product or written by the producer, ggml_cuda_f16_image_target)
+            // compared with a conversion made now
+            static const bool img_check = getenv("GGML_CUDA_F16_IMAGE_CHECK") != nullptr;
+            if (img_check && src1_reuse && sizeof(cuda_t) == 2) {
+                const int64_t n = ggml_nelements(src1);
+                ggml_cuda_pool_alloc<cuda_t> ref(ctx.pool(), n);
+                convert_func(src1->data, ref.get(), n, main_stream);
+                std::vector<uint16_t> a(n), b(n);
+                CUDA_CHECK(cudaMemcpyAsync(a.data(), src1_conv, n*2, cudaMemcpyDeviceToHost, main_stream));
+                CUDA_CHECK(cudaMemcpyAsync(b.data(), ref.get(), n*2, cudaMemcpyDeviceToHost, main_stream));
+                CUDA_CHECK(cudaStreamSynchronize(main_stream));
+                int64_t bad = 0;
+                for (int64_t k = 0; k < n; k++) bad += a[k] != b[k];
+                static int64_t n_checked = 0, n_bad = 0;
+                n_checked++; n_bad += bad != 0;
+                fprintf(stderr, "F16_IMAGE_CHECK %s (%s): %lld / %lld differ; products %lld, with differences %lld\n", dst->name,
+                        src1->name, (long long) bad, (long long) n, (long long) n_checked, (long long) n_bad);
+            }
             const size_t src1_bs = ggml_blck_size(src1->type);
             s11 *= src1_bs;
             s12 *= src1_bs;
@@ -2472,6 +2491,74 @@ static ggml_cuda_mul_mat_path ggml_cuda_mul_mat_get_path(const ggml_tensor * src
         return GGML_CUDA_MM_MMQ;
     }
     return GGML_CUDA_MM_CUBLAS;
+}
+
+// The F16 (or BF16) image of an activation written by the kernel that produces it, in the scratch of the cuBLAS products
+// that read it (at offset 0, where ggml_cuda_mul_mat_cublas_impl converts src1): the conversion (a read of the F32
+// activation and a write of its image) is skipped, the producer writes the image along with its result. The prompt's
+// products on NVIDIA (dense Q8_0 by cuBLAS): the hyper-connection norm (10240 values per token, read by the down and
+// inject products; 4090, 131k: 646 us per norm, 0.85 s of conversions), the streams' mix (DSV4_HC_PRE, read by the
+// q/k/v products or the BF16 router), the gated norm of the GDN output. Here the products whose src1 a node can image:
+// the cuBLAS path computing in F16 or BF16, src1 contiguous and of the producer's size. GGML_CUDA_F16_IMAGE=0: the
+// products convert it themselves (to compare).
+static bool ggml_cuda_f16_image_enabled() {
+    static const bool on = !getenv("GGML_CUDA_F16_IMAGE") || atoi(getenv("GGML_CUDA_F16_IMAGE")) != 0;
+    return on;
+}
+
+static bool ggml_cuda_f16_image_product(const ggml_tensor * mm, const ggml_tensor * out, int device) {
+    if (mm->op != GGML_OP_MUL_MAT || out->type != GGML_TYPE_F32 || !ggml_is_contiguous(out)) {
+        return false;
+    }
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * src1 = mm->src[1];
+    const ggml_tensor * root = src1->view_src ? src1->view_src : src1;
+    if (root != out || src1->view_offs != 0 || src1->type != GGML_TYPE_F32 || !ggml_is_contiguously_allocated(src1) ||
+            ggml_nelements(src1) != ggml_nelements(out)) {
+        return false;
+    }
+    const int cc = ggml_cuda_info().devices[device].cc;
+    if (ggml_cuda_mul_mat_get_path(src0, src1, mm, device) != GGML_CUDA_MM_CUBLAS) {
+        return false;
+    }
+    const ggml_type t = ggml_cuda_cublas_compute_type(src0, src1, mm, cc);
+    return t == GGML_TYPE_F16 || t == GGML_TYPE_BF16;
+}
+
+// at the producer node i (writing out): where to write the image, nullptr if nowhere. The scratch is the producer's own
+// source (ggml_cuda_add_mmq_scratch gave it the products' scratch), live from it to the last product: nothing in between
+// writes there. *mm_out: the first product of the group, whose key ggml_cuda_f16_image_written records
+static ggml_cuda_img ggml_cuda_f16_image_target(const ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i,
+        const ggml_tensor * out, const ggml_tensor ** mm_out) {
+    const ggml_tensor * scratch_t = cgraph->nodes[i]->src[GGML_SCHED_SCRATCH_SRC];
+    if (!ggml_cuda_f16_image_enabled() || scratch_t == nullptr || scratch_t->data == nullptr) {
+        return {};
+    }
+    for (int j = i + 1; j < cgraph->n_nodes && j <= i + 16; j++) {
+        const ggml_tensor * mm = cgraph->nodes[j];
+        if (mm->op != GGML_OP_MUL_MAT || mm->src[GGML_SCHED_SCRATCH_SRC] != scratch_t) {
+            continue;
+        }
+        if (!ggml_cuda_f16_image_product(mm, out, ctx.device) ||
+                ggml_nbytes(scratch_t) < (size_t) ggml_nelements(out) * sizeof(half)) {
+            return {};
+        }
+        *mm_out = mm;
+        ggml_cuda_img img;
+        img.p    = scratch_t->data;
+        img.bf16 = ggml_cuda_cublas_compute_type(mm->src[0], mm->src[1], mm, ggml_cuda_info().devices[ctx.device].cc) == GGML_TYPE_BF16;
+        return img;
+    }
+    return {};
+}
+
+// after the producer's launch: the products of mm's group find their src1 converted (their reuse test)
+static void ggml_cuda_f16_image_written(ggml_backend_cuda_context & ctx, const ggml_tensor * mm) {
+    int64_t key[GGML_CUDA_MMQ_SCRATCH_KEY];
+    const ggml_type t = ggml_cuda_cublas_compute_type(mm->src[0], mm->src[1], mm, ggml_cuda_info().devices[ctx.device].cc);
+    ggml_cuda_cublas_src1_key(mm->src[1], mm, t, key);
+    ctx.mmq_scratch_last = mm->src[GGML_SCHED_SCRATCH_SRC];
+    memcpy(ctx.mmq_scratch_key, key, sizeof(key));
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -6022,7 +6109,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             if (ggml_can_fuse_subgraph_ext(cgraph, nodes, 4, ops, &out_idx, 1) && aliasing_ok()) {
                 // the q8_1 of the output too when the next product reads it (whole warps per q8_1 block)
                 void * q8_1 = x->ne[0] % QK8_1 == 0 ? ggml_cuda_q8_1_produce(*cuda_ctx, cgraph, out_idx) : nullptr;
-                ggml_cuda_op_rms_norm_mul_sigmoid_gate(*cuda_ctx, node, w, gate, out, q8_1);
+                const ggml_tensor * img_mm = nullptr;
+                const ggml_cuda_img img = ggml_cuda_f16_image_target(*cuda_ctx, cgraph, i, out, &img_mm);
+                ggml_cuda_op_rms_norm_mul_sigmoid_gate(*cuda_ctx, node, w, gate, out, q8_1, img);
+                if (img.p) {
+                    ggml_cuda_f16_image_written(*cuda_ctx, img_mm);
+                }
                 return count - 1;
             }
         }
@@ -6111,8 +6203,48 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
+    // rms_norm(x) * w and its product by a Q8_0 matrix of 4 or 8 rows (qwen4exp's hc inject) in a prompt batch: one kernel
+    // (ggml_cuda_op_rms_norm_mul_inject), not a cuBLAS or MMQ launch over the whole activation for 4 outputs (4090,
+    // 131k: 249 us per launch, 0.31 s). GGML_CUDA_NORM_INJECT=0: the product apart
+    static const bool norm_inject = !getenv("GGML_CUDA_NORM_INJECT") || atoi(getenv("GGML_CUDA_NORM_INJECT")) != 0;
+    if (norm_inject && node->op == GGML_OP_RMS_NORM && i + 2 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_MUL) {
+        int k = i + 2;
+        while (k < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[k])) {
+            k++;
+        }
+        ggml_tensor * mul = cgraph->nodes[i + 1];
+        ggml_tensor * mm  = k < cgraph->n_nodes ? cgraph->nodes[k] : nullptr;
+        if (mm && mm->op == GGML_OP_MUL_MAT && mm->ne[1] > 8 && (mul->src[0] == node || mul->src[1] == node) &&
+                ggml_get_op_params_i32(mm, 3) == GGML_PREC_DEFAULT &&
+                ggml_cuda_rms_norm_mul_inject_supported(node, mul, mm)) {
+            const int nodes[3] = { i, i + 1, k };
+            const enum ggml_op ops[3] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL_MAT };
+            const int outputs[2] = { i + 1, k };
+            const auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+                const char * a0 = (const char *) a->data, * a1 = a0 + ggml_nbytes(a);
+                const char * b0 = (const char *) b->data, * b1 = b0 + ggml_nbytes(b);
+                return a0 < b1 && b0 < a1;
+            };
+            if (ggml_can_fuse_subgraph_ext(cgraph, nodes, 3, ops, outputs, 2) && !overlaps(mm, node->src[0]) &&
+                    !overlaps(mm, mul) && !overlaps(mul, node->src[0])) {
+                const ggml_tensor * img_mm = nullptr;
+                const ggml_cuda_img img = ggml_cuda_f16_image_target(*cuda_ctx, cgraph, i, mul, &img_mm);
+                ggml_cuda_op_rms_norm_mul_inject(*cuda_ctx, node, mul, mm, img);
+                if (img.p) {
+                    ggml_cuda_f16_image_written(*cuda_ctx, img_mm);
+                }
+                return k - i;
+            }
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
-        ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        const ggml_tensor * img_mm = nullptr;
+        const ggml_cuda_img img = ggml_cuda_f16_image_target(*cuda_ctx, cgraph, i, cgraph->nodes[i + 1], &img_mm);
+        ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1], img);
+        if (img.p) {
+            ggml_cuda_f16_image_written(*cuda_ctx, img_mm);
+        }
         return 1;
     }
 
@@ -6834,7 +6966,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
-                bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                // a producer that writes the F16 image of its result for the cuBLAS products after it
+                bool imaged = false;
+                if (node->op == GGML_OP_DSV4_HC_PRE && node->src[GGML_SCHED_SCRATCH_SRC] != nullptr) {
+                    const ggml_tensor * img_mm = nullptr;
+                    const ggml_cuda_img img = ggml_cuda_f16_image_target(*cuda_ctx, cgraph, i, node, &img_mm);
+                    if (img.p) {
+                        ggml_cuda_op_dsv4_hc_pre(*cuda_ctx, node, img);
+                        ggml_cuda_f16_image_written(*cuda_ctx, img_mm);
+                        imaged = true;
+                    }
+                }
+                bool ok = imaged || ggml_cuda_compute_forward(*cuda_ctx, node);
                 written(i, i);
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
@@ -7088,8 +7231,69 @@ static void ggml_cuda_add_mmq_scratch(ggml_backend_cuda_context * cuda_ctx, ggml
     } else {
         cuda_ctx->mmq_continues.erase(cgraph);
     }
+    // the producer of a cuBLAS group's activation that can write its F16 image (ggml_cuda_f16_image_target): a fused
+    // RMS_NORM + MUL right before; it takes the group's scratch as its own source, so that ggml-alloc keeps it from it on
+    std::unordered_map<const ggml_tensor *, int> node_pos;
+    if (ggml_cuda_f16_image_enabled()) {
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            node_pos[cgraph->nodes[i]] = i;
+        }
+    }
+    // or the hyper-connections' DSV4_HC_PRE; no further than the run-time search looks (ggml_cuda_f16_image_target),
+    // and no MoE block or attention in between (the scratch would be live over their peak)
+    const auto image_producer = [&](const ggml_tensor * first) -> ggml_tensor * {
+        if (node_pos.empty() || group_src1 == nullptr || !ggml_cuda_f16_image_product(first, group_src1, cuda_ctx->device)) {
+            return nullptr;
+        }
+        const auto it = node_pos.find(group_src1);
+        const auto it_first = node_pos.find(first);
+        if (it == node_pos.end() || it_first == node_pos.end() || it->second < 1) {
+            return nullptr;
+        }
+        ggml_tensor * producer = nullptr;
+        int           p_pos    = -1;
+        if (group_src1->op == GGML_OP_MUL) {
+            ggml_tensor * norm = cgraph->nodes[it->second - 1];
+            if (norm->op == GGML_OP_RMS_NORM && (group_src1->src[0] == norm || group_src1->src[1] == norm)) {
+                producer = norm;
+                p_pos    = it->second - 1;
+            }
+            // rms_norm(x) * w * sigmoid(gate) (the GDN's gated norm, one kernel): the RMS_NORM under the MUL by w
+            for (int k = 0; k < 2 && producer == nullptr; k++) {
+                const ggml_tensor * mul_w = group_src1->src[k];
+                const ggml_tensor * sig   = group_src1->src[1 - k];
+                if (mul_w && sig && mul_w->op == GGML_OP_MUL && sig->op == GGML_OP_UNARY &&
+                        ggml_get_unary_op(sig) == GGML_UNARY_OP_SIGMOID) {
+                    for (int l = 0; l < 2 && producer == nullptr; l++) {
+                        ggml_tensor * norm = mul_w->src[l];
+                        const auto itn = norm ? node_pos.find(norm) : node_pos.end();
+                        if (itn != node_pos.end() && norm->op == GGML_OP_RMS_NORM && it->second - itn->second <= 8) {
+                            producer = norm;
+                            p_pos    = itn->second;
+                        }
+                    }
+                }
+            }
+        } else if (group_src1->op == GGML_OP_DSV4_HC_PRE) {
+            producer = cgraph->nodes[it->second];
+            p_pos    = it->second;
+        }
+        if (producer == nullptr || producer->src[GGML_SCHED_SCRATCH_SRC] != nullptr || it_first->second - p_pos > 16) {
+            return nullptr;
+        }
+        for (int k = p_pos + 1; k < it_first->second; k++) {
+            const ggml_op op = cgraph->nodes[k]->op;
+            if (op == GGML_OP_MUL_MAT_ID || op == GGML_OP_FLASH_ATTN_EXT || op == GGML_OP_GATED_DELTA_NET) {
+                return nullptr;
+            }
+        }
+        return producer;
+    };
     const auto flush = [&]() {
         if (!group.empty()) {
+            if (ggml_tensor * producer = image_producer(group[0])) {
+                group.push_back(producer);
+            }
             params->add_scratch(params->user_data, group.data(), (int) group.size(), group_size);
             group.clear();
         }
