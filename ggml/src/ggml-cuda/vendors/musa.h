@@ -53,6 +53,7 @@
 #define cudaError_t musaError_t
 #define cudaErrorMemoryAllocation musaErrorMemoryAllocation
 #define cudaErrorPeerAccessAlreadyEnabled musaErrorPeerAccessAlreadyEnabled
+#define cudaErrorNotSupported musaErrorNotSupported
 #define cudaErrorPeerAccessNotEnabled musaErrorPeerAccessNotEnabled
 #define cudaEventCreateWithFlags musaEventCreateWithFlags
 #define cudaEventElapsedTime musaEventElapsedTime

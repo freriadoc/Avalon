@@ -61,6 +61,7 @@
 #define cudaErrorMemoryAllocation hipErrorOutOfMemory
 #define cudaErrorPeerAccessAlreadyEnabled hipErrorPeerAccessAlreadyEnabled
 #define cudaErrorInvalidValue hipErrorInvalidValue
+#define cudaErrorNotSupported hipErrorNotSupported
 #define cudaErrorUnknown hipErrorUnknown
 #define cudaDeviceGetStreamPriorityRange hipDeviceGetStreamPriorityRange
 #define cudaErrorPeerAccessNotEnabled hipErrorPeerAccessNotEnabled

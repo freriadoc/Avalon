@@ -7674,6 +7674,11 @@ bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
 
 #if CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA) || defined(GGML_USE_HIP)
     cudaError_t err = cudaHostRegister(buffer, size, cudaHostRegisterPortable | cudaHostRegisterReadOnly);
+    if (err == cudaErrorNotSupported) {
+        // a platform without read-only registration (cudaDevAttrHostRegisterReadOnlySupported 0): registered read-write
+        (void)cudaGetLastError();
+        err = cudaHostRegister(buffer, size, cudaHostRegisterPortable);
+    }
     if (err != cudaSuccess) {
         // clear the error
         (void)cudaGetLastError();

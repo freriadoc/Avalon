@@ -3102,8 +3102,16 @@ static bool moe_cache_pin_tensor(const moe_cache_session & session, moe_cache_de
             }
         }
     }
-    // mapped: the dispatcher's kernel copy reads a moved expert there (moe_split_copy_by_kernel)
-    if (cudaHostRegister((void *) ib, ie - ib, cudaHostRegisterReadOnly | cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
+    // mapped: the dispatcher's kernel copy reads a moved expert there (moe_split_copy_by_kernel). Read-only where the
+    // platform has it: some refuse the flag (cudaDevAttrHostRegisterReadOnlySupported 0, a rented RTX 4090 with HMM
+    // addressing), which then registered nothing at all, read as KFD's limit
+    const unsigned flags = cudaHostRegisterPortable | cudaHostRegisterMapped;
+    cudaError_t err = cudaHostRegister((void *) ib, ie - ib, flags | cudaHostRegisterReadOnly);
+    if (err == cudaErrorNotSupported) {
+        (void) cudaGetLastError();
+        err = cudaHostRegister((void *) ib, ie - ib, flags);
+    }
+    if (err != cudaSuccess) {
         (void) cudaGetLastError();
         (void) moe_cache_remap_any(device, ib, ie);   // the half-done registration goes with the old mapping
         device.pin_full = true;
