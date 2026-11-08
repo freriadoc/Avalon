@@ -705,6 +705,60 @@ static __global__ void k_moe_grouped_swiglu(const float * __restrict__ gate, con
     }
 }
 
+// ggml_mul_mat_id_sum's down by groups: each compact row's index within its group (the down writes the group's rows
+// into a buffer of its own), block g for group g; the J - 1 rows past the end (MMQ reads them) zero
+static __global__ void k_moe_rows_in_group(const int32_t * __restrict__ bounds, const int G, int32_t * __restrict__ rel,
+        const int rows, const int tail) {
+    const int g = blockIdx.x;
+    const int r0 = bounds[g*G], r1 = bounds[(g + 1)*G];
+    for (int r = r0 + threadIdx.x; r < r1; r += blockDim.x) {
+        rel[r] = r - r0;
+    }
+    if (g == (int) gridDim.x - 1) {
+        for (int r = rows + threadIdx.x; r < rows + tail; r += blockDim.x) {
+            rel[r] = 0;
+        }
+    }
+}
+
+// the compact row of each (token, slot): ids_dst's inverse
+static __global__ void k_moe_rows_inverse(const int32_t * __restrict__ ids_dst, int32_t * __restrict__ inv, const int rows) {
+    const int r = blockIdx.x*blockDim.x + threadIdx.x;
+    if (r < rows) {
+        inv[ids_dst[r]] = r;
+    }
+}
+
+// out[t] += w[t, s] * C[row(t, s) - r0] for the slots s of token t whose expert is in the group [g0, g0 + G), in the
+// order of the slots: the groups in order, each token's sum is the same on every run (a block per token)
+static __global__ void k_moe_down_combine(float * __restrict__ out, const float * __restrict__ C, const int32_t * __restrict__ ids,
+        const int64_t ids_s1, const float * __restrict__ w, const int32_t * __restrict__ inv, const int r0, const int g0,
+        const int G, const int n_used, const int n_embd) {
+    const int t = blockIdx.x;
+    int rows[16];
+    float ws[16];
+    int n = 0;
+    for (int s = 0; s < n_used; s++) {
+        const int e = ids[t*ids_s1 + s];
+        if (e >= g0 && e < g0 + G) {
+            rows[n] = inv[t*n_used + s] - r0;
+            ws[n] = w[t*n_used + s];
+            n++;
+        }
+    }
+    if (n == 0) {
+        return;
+    }
+    float * o = out + (int64_t) t*n_embd;
+    for (int i = threadIdx.x; i < n_embd; i += blockDim.x) {
+        float a = o[i];
+        for (int k = 0; k < n; k++) {
+            a += ws[k] * C[(int64_t) rows[k]*n_embd + i];
+        }
+        o[i] = a;
+    }
+}
+
 static int mmq_pick_J(ggml_type type, int64_t ncols_opt, bool fallback, int cc, size_t smpbo, ggml_prec prec_src1) {
     int J_best = 0, ntiles_J_best = INT_MAX;
     for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
@@ -833,6 +887,9 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
         return 0;
     }
     const ggml_tensor * x = gate->src[1], * ids = gate->src[2];
+    // ggml_mul_mat_id_sum: the down weighted and summed into [n_embd, 1, n_tokens], group by group
+    const bool dsum = ggml_mul_mat_id_is_sum(down);
+    const ggml_tensor * wr = dsum ? down->src[3] : nullptr;
     const bool host_w = wg_dev != nullptr;   // the weights copied to the device (ggml_cuda_moe_block_grouped_host)
     const ggml_tensor * wg = host_w ? wg_dev : gate->src[0], * wu = host_w ? wu_dev : up->src[0], * wd = host_w ? wd_dev : down->src[0];
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -844,6 +901,10 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
             !ggml_is_contiguous(gate) || !ggml_is_contiguous(up) || !ggml_is_contiguous(glu) || !ggml_is_contiguous(down) ||
             !ggml_is_contiguous(x) || wg->type != wu->type || wg->ne[1] != wu->ne[1] ||
             ggml_cuda_moe_prefill_table(wg->data) || ggml_cuda_moe_prefill_table(wu->data) || ggml_cuda_moe_prefill_table(wd->data)) {
+        return 0;
+    }
+    if (dsum && (n_used > 16 || down->ne[0] != wd->ne[1] || down->ne[1] != 1 || down->ne[2] != n_tok ||
+            wr->ne[1] != n_used || wr->ne[2] != n_tok)) {
         return 0;
     }
     for (const ggml_tensor * w : { wg, wu, wd }) {
@@ -881,6 +942,7 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
     const size_t smpbo = ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo;
     const int64_t rows = n_tok * n_used;
     const int64_t n_embd = x->ne[0], n_ff = gate->ne[0];
+    const int64_t n_embd_d = down->ne[0];
     const int64_t ne10p_gu = GGML_PAD(n_embd, MATRIX_ROW_PADDING), ne10p_d = GGML_PAD(n_ff, MATRIX_ROW_PADDING);
     const bool fb_gu = ggml_cuda_mmq_needs_fallback(wg->ne[1]), fb_d = ggml_cuda_mmq_needs_fallback(wd->ne[1]);
     int64_t ncols_opt = n_tok;
@@ -976,15 +1038,34 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
     static const bool fuse_gu = getenv("GGML_CUDA_MOE_FUSE_GU") && atoi(getenv("GGML_CUDA_MOE_FUSE_GU")) != 0;
     const bool pair_ok = fuse_gu && wg->nb[1] == wu->nb[1] && wg->nb[2] == wu->nb[2] && gate->nb[1] == up->nb[1] &&
         gate->nb[2] == up->nb[2] && ((const char *) up->data - (const char *) gate->data) % sizeof(float) == 0;
+    // ggml_mul_mat_id_sum: each group's down into a buffer of the group's rows (one per stream), then added into the
+    // output, which starts at zero; the compact rows' index in their group and the (token, slot) -> row map first
+    int64_t max_group_rows = 0;
+    for (int64_t g0 = 0; g0 < n_expert; g0 += G) {
+        max_group_rows = std::max<int64_t>(max_group_rows, hb[g0 + G] - hb[g0]);
+    }
+    ggml_cuda_pool_alloc<int32_t> rel_p(ctx.pool()), inv_p(ctx.pool());
+    ggml_cuda_pool_alloc<float> cbuf_p(ctx.pool());
+    if (dsum) {
+        const int tail = std::max(J_gu, J_d);
+        rel_p.alloc(rows + tail);
+        inv_p.alloc(rows);
+        cbuf_p.alloc((two ? 2 : 1)*std::max<int64_t>(max_group_rows, 1)*n_embd_d + 64);
+        k_moe_rows_in_group<<<(unsigned) (n_expert / G), 256, 0, stream>>>(bounds.get(), G, rel_p.get(), (int) rows, tail);
+        k_moe_rows_inverse<<<(unsigned) ((rows + 255) / 256), 256, 0, stream>>>(ids_dst.get(), inv_p.get(), (int) rows);
+        CUDA_CHECK(cudaMemsetAsync(down->data, 0, ggml_nbytes(down), stream));
+    }
     if (prefix_once) {
         k_mmq_tile_prefix_groups<<<(unsigned) (n_expert / G), 32, 0, stream>>>(bounds.get(), G, J_gu, J_d, prefix.get());
     }
-    static cudaEvent_t ev_fork[GGML_CUDA_MAX_DEVICES] = {}, ev_join[GGML_CUDA_MAX_DEVICES] = {};
+    static cudaEvent_t ev_fork[GGML_CUDA_MAX_DEVICES] = {}, ev_join[GGML_CUDA_MAX_DEVICES] = {}, ev_comb[GGML_CUDA_MAX_DEVICES] = {};
+    bool combined_any = false;
     cudaStream_t gs[2] = { stream, stream };
     if (two) {
         if (!ev_fork[ctx.device]) {
             CUDA_CHECK(cudaEventCreateWithFlags(&ev_fork[ctx.device], cudaEventDisableTiming));
             CUDA_CHECK(cudaEventCreateWithFlags(&ev_join[ctx.device], cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&ev_comb[ctx.device], cudaEventDisableTiming));
         }
         gs[1] = ctx.stream(ctx.device, GGML_CUDA_MAX_STREAMS - 1);
         CUDA_CHECK(cudaEventRecord(ev_fork[ctx.device], stream));
@@ -998,12 +1079,14 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
         return t;
     };
     auto launch = [&](const ggml_tensor * w, ggml_tensor * dst, const char * q8, int64_t ne10p, int64_t ne11, int J, bool fallback,
-                      int64_t g0, int r0, int r1, int role, cudaStream_t ls) {
+                      int64_t g0, int r0, int r1, int role, cudaStream_t ls, float * dst_buf = nullptr) {
         const size_t ts = ggml_type_size(w->type);
+        // dst_buf (ggml_mul_mat_id_sum's down): the group's rows, at their index in the group, n_embd floats each
         mmq_args a = {
-            (const char *) w->data + g0*w->nb[2], w->type, (const int *) q8, ids_dst.get(), bounds.get() + g0, (float *) dst->data,
+            (const char *) w->data + g0*w->nb[2], w->type, (const int *) q8, dst_buf ? rel_p.get() : ids_dst.get(), bounds.get() + g0,
+            dst_buf ? dst_buf : (float *) dst->data,
             nullptr,
-            w->ne[0], w->ne[1], rows, (int64_t) (w->nb[1]/ts), rows, (int64_t) (dst->nb[1]/sizeof(float)),
+            w->ne[0], w->ne[1], rows, (int64_t) (w->nb[1]/ts), rows, dst_buf ? (int64_t) w->ne[1] : (int64_t) (dst->nb[1]/sizeof(float)),
             G, G, (int64_t) (w->nb[2]/ts), (int64_t) (ne11*ne10p*sizeof(block_q8_1)/(QK8_1*sizeof(int))), (int64_t) (dst->nb[2]/sizeof(float)),
             1, 1, (int64_t) (w->nb[3]/ts), 0, (int64_t) (dst->nb[3]/sizeof(float)),
             n_tok, J};
@@ -1062,7 +1145,22 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
         }
         quantize_mmq_q8_1_rows_cuda((const float *) glu->data, ids_dst.get(), q8_d.get(), wd->type, n_ff,
             glu->nb[1]/sizeof(float), ne10p_d, r0, r1 - r0, (int) rows, sg);
-        launch(wd, down, q8_d.get(), ne10p_d, n_used, J_d, fb_d, g0, r0, r1, 2, sg);
+        if (dsum) {
+            float * cb = cbuf_p.get() + ((g0 / G) & 1 && two ? max_group_rows*n_embd_d : 0);
+            launch(wd, down, q8_d.get(), ne10p_d, n_used, J_d, fb_d, g0, r0, r1, 2, sg, cb);
+            // the groups' sums into the output one after the other (two streams: in their order)
+            if (two && combined_any) {
+                CUDA_CHECK(cudaStreamWaitEvent(sg, ev_comb[ctx.device], 0));
+            }
+            k_moe_down_combine<<<(unsigned) n_tok, 256, 0, sg>>>((float *) down->data, cb, (const int32_t *) ids->data,
+                (int64_t) (ids->nb[1] / sizeof(int32_t)), (const float *) wr->data, inv_p.get(), r0, (int) g0, G, (int) n_used, (int) n_embd_d);
+            if (two) {
+                CUDA_CHECK(cudaEventRecord(ev_comb[ctx.device], sg));
+            }
+            combined_any = true;
+        } else {
+            launch(wd, down, q8_d.get(), ne10p_d, n_used, J_d, fb_d, g0, r0, r1, 2, sg);
+        }
         if (hooks && hooks->after) {
             (*hooks->after)(g0 / G);
         }
@@ -1087,8 +1185,12 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
     static const bool check = getenv("GGML_CUDA_MOE_GROUPED_CHECK") && atoi(getenv("GGML_CUDA_MOE_GROUPED_CHECK")) != 0;
     if (check) {
         ggml_tensor tg = *gate, tu = *up, th = *glu, td = *down;
+        if (dsum) {   // the reference's down: every (token, slot) product, summed below in the order of the slots
+            td.ne[1] = n_used; td.nb[1] = td.ne[0]*sizeof(float); td.nb[2] = td.nb[1]*n_used; td.nb[3] = td.nb[2]*td.ne[2];
+            td.src[3] = nullptr; td.op_params[GGML_MUL_MAT_ID_SUM_PARAM] = 0;
+        }
         ggml_cuda_pool_alloc<char> bg(ctx.pool(), ggml_nbytes(gate)), bu(ctx.pool(), ggml_nbytes(up)),
-            bh(ctx.pool(), ggml_nbytes(glu)), bd(ctx.pool(), ggml_nbytes(down));
+            bh(ctx.pool(), ggml_nbytes(glu)), bd(ctx.pool(), ggml_nbytes(&td));
         tg.data = bg.get(); tu.data = bu.get(); th.data = bh.get(); td.data = bd.get();
         tg.src[GGML_SCHED_SCRATCH_SRC] = tu.src[GGML_SCHED_SCRATCH_SRC] = td.src[GGML_SCHED_SCRATCH_SRC] = nullptr;
         th.src[0] = &tg; th.src[1] = &tu; td.src[1] = &th;
@@ -1105,7 +1207,11 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
         CUDA_CHECK(cudaMemcpyAsync(gb.data(), tg.data,    gb.size(), cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaMemcpyAsync(ua.data(), up->data,   ua.size(), cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaMemcpyAsync(ub.data(), tu.data,    ub.size(), cudaMemcpyDeviceToHost, stream));
-        std::vector<char> a(ggml_nbytes(down)), b(ggml_nbytes(down)), c(ggml_nbytes(glu)), d(ggml_nbytes(glu));
+        std::vector<char> a(ggml_nbytes(down)), b(ggml_nbytes(&td)), c(ggml_nbytes(glu)), d(ggml_nbytes(glu));
+        std::vector<float> wh(dsum ? ggml_nelements(wr) : 0);
+        if (dsum) {
+            CUDA_CHECK(cudaMemcpyAsync(wh.data(), wr->data, wh.size()*sizeof(float), cudaMemcpyDeviceToHost, stream));
+        }
         CUDA_CHECK(cudaMemcpyAsync(a.data(), down->data, a.size(), cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaMemcpyAsync(b.data(), td.data,    b.size(), cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaMemcpyAsync(c.data(), glu->data,  c.size(), cudaMemcpyDeviceToHost, stream));
@@ -1113,7 +1219,40 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
         CUDA_CHECK(cudaStreamSynchronize(stream));
         static int n_checked = 0, n_diff = 0;
         n_checked++;
-        const bool same_d = memcmp(a.data(), b.data(), a.size()) == 0, same_h = memcmp(c.data(), d.data(), c.size()) == 0;
+        // the summed down: against the products weighted and summed in the order of the slots (the graph's own order),
+        // which the groups' order changes: the largest difference relative to the row's largest value
+        double sum_rel = 0.0, sum_abs = 0.0;
+        if (dsum) {
+            const float * pr = (const float *) b.data();
+            std::vector<char> bs(a.size());
+            float * ref = (float *) bs.data();
+            const int64_t ne0 = down->ne[0];
+            for (int64_t t = 0; t < n_tok; t++) {
+                float amax = 0.0f;
+                for (int64_t k = 0; k < ne0; k++) {
+                    float acc = pr[(t*n_used)*ne0 + k]*wh[t*n_used];
+                    for (int64_t s = 1; s < n_used; s++) {
+                        acc += pr[(t*n_used + s)*ne0 + k]*wh[t*n_used + s];
+                    }
+                    ref[t*ne0 + k] = acc;
+                    amax = std::max(amax, fabsf(acc));
+                }
+                for (int64_t k = 0; k < ne0; k++) {
+                    const double dd = fabs((double) ((const float *) a.data())[t*ne0 + k] - ref[t*ne0 + k]);
+                    sum_abs = std::max(sum_abs, dd);
+                    sum_rel = std::max(sum_rel, amax > 0 ? dd/amax : 0.0);
+                }
+            }
+            static double worst_rel = 0.0;
+            worst_rel = std::max(worst_rel, sum_rel);
+            if (n_checked <= 2 || n_checked % 48 == 0) {
+                GGML_LOG_INFO("%s: %s: summed down against the slots' order: max |diff| %.3g, relative to the row's max %.3g "
+                        "(worst so far %.3g)\n", __func__, down->name, sum_abs, sum_rel, worst_rel);
+            }
+            b.swap(bs);
+        }
+        const bool same_d = dsum ? sum_rel < 1e-5 : memcmp(a.data(), b.data(), a.size()) == 0;
+        const bool same_h = memcmp(c.data(), d.data(), c.size()) == 0;
         if (!same_d || !same_h) {
             n_diff++;
         }

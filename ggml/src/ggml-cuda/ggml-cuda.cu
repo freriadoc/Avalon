@@ -2939,6 +2939,22 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         nb1, nb2, nb3, stream);
 }
 
+// ggml_mul_mat_id_sum outside the grouped block (mmq.cu): every product into pool memory, then each token's rows
+// weighted and summed in the order of its slots by the weighted reduction kernel (the graph's mul and adds)
+static void ggml_cuda_mul_mat_id_sum(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * ids = dst->src[2], * w = dst->src[3];
+    const int64_t ne0 = dst->ne[0], nu = ids->ne[0], nt = ids->ne[1];
+    ggml_cuda_pool_alloc<float> prod(ctx.pool(), ne0*nu*nt);
+    ggml_tensor p = *dst;
+    p.ne[1] = nu; p.nb[1] = ne0*sizeof(float); p.nb[2] = p.nb[1]*nu; p.nb[3] = p.nb[2]*nt;
+    p.data = prod.get();
+    p.src[3] = nullptr;
+    p.op_params[GGML_MUL_MAT_ID_SUM_PARAM] = 0;
+    ggml_cuda_mul_mat_id(ctx, &p);
+    // the graph's weighted reduction kernel (the same arithmetic as the mul and adds it fuses): the same bits
+    ggml_cuda_op_moe_weighted_reduction(ctx, &p, nullptr, w, dst, nullptr, nullptr);
+}
+
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     switch (dst->op) {
         case GGML_OP_ARGMAX:
@@ -3135,7 +3151,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_mul_mat(ctx, dst->src[0], dst->src[1], dst);
             break;
         case GGML_OP_MUL_MAT_ID:
-            ggml_cuda_mul_mat_id(ctx, dst);
+            if (ggml_mul_mat_id_is_sum(dst)) {
+                ggml_cuda_mul_mat_id_sum(ctx, dst);
+            } else {
+                ggml_cuda_mul_mat_id(ctx, dst);
+            }
             break;
         case GGML_OP_OUT_PROD:
             ggml_cuda_out_prod(ctx, dst);
@@ -5402,6 +5422,55 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const ggml_tensor * gated = cgraph->nodes[i + 1];
         const ggml_tensor * sh    = gated->op == GGML_OP_MUL ? (gated->src[0] == sig ? gated->src[1] : gated->src[0]) : nullptr;
         ggml_cuda_moe_weighted_reduction_match match;
+        if (logit->type == GGML_TYPE_F32 && ggml_is_contiguous(logit) && logit->ne[0] == 1 && logit->ne[2] == 1 && logit->ne[3] == 1 &&
+                sh && (gated->src[0] == sig || gated->src[1] == sig) && sh->type == GGML_TYPE_F32 && ggml_is_contiguous(sh) &&
+                ggml_is_contiguous(gated) && sh->ne[1] == logit->ne[1] &&
+                !ggml_cuda_match_moe_weighted_reduction(cgraph, i + 2, match)) {
+            // ggml_mul_mat_id_sum's block (LLAMA_MOE_DOWN_SUM): the routed sum is one tensor, the shared expert added
+            // to it by the same kernel and formula (a row of weight 1), the same bits as the reduction's on the same sum
+            int add_idx = i + 2;
+            while (add_idx < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[add_idx])) {
+                add_idx++;
+            }
+            ggml_tensor * add = add_idx < cgraph->n_nodes ? cgraph->nodes[add_idx] : nullptr;
+            const ggml_tensor * routed = add && add->op == GGML_OP_ADD ? (add->src[0] == gated ? add->src[1] : add->src[1] == gated ? add->src[0] : nullptr) : nullptr;
+            const ggml_tensor * summed = routed;
+            while (summed && summed->view_src && summed->op != GGML_OP_MUL_MAT_ID) {
+                summed = summed->view_src;
+            }
+            const int count = add_idx - i + 1;
+            if (summed && ggml_mul_mat_id_is_sum(summed) && ggml_is_contiguous(routed) && ggml_is_contiguous(add) &&
+                    add->type == GGML_TYPE_F32 && ggml_nelements(add) == ggml_nelements(summed) && ggml_are_same_shape(sh, add) &&
+                    summed->ne[2] == logit->ne[1] && count < 32) {
+                // the computing nodes only: the routed sum's reshape in between is a view of a node before the group
+                const int nodes3[3] = { i, i + 1, add_idx };
+                const enum ggml_op ops3[3] = { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD };
+                // what the kernel reads (the sum, the shared expert, its logit) against what it writes: each thread
+                // reads its element before writing it, so the output may be the sum or the shared expert exactly
+                // (the allocator places an ADD over a dead source), never a part of them nor the logit
+                const auto range_ok = [&](const ggml_tensor * in, bool exact_ok) {
+                    const char * a0 = (const char *) add->data, * a1 = a0 + ggml_nbytes(add);
+                    const char * b0 = (const char *) in->data,  * b1 = b0 + ggml_nbytes(in);
+                    return !(a0 < b1 && b0 < a1) || (exact_ok && a0 == b0 && a1 == b1);
+                };
+                if (ggml_can_fuse_subgraph_ext(cgraph, nodes3, 3, ops3, &add_idx, 1) &&
+                        range_ok(summed, true) && range_ok(sh, true) && range_ok(logit, false)) {
+                    ggml_cuda_op_moe_weighted_reduction(*cuda_ctx, summed, nullptr, nullptr, add, sh, logit);
+                    return count - 1;
+                }
+                static int n_refused = 0;
+                if (n_refused++ < 8) {
+                    GGML_LOG_WARN("%s: %s: the shared expert's add on the summed down not fused (subgraph %d, ranges %d %d %d)\n",
+                        __func__, add->name, (int) ggml_can_fuse_subgraph_ext(cgraph, nodes3, 3, ops3, &add_idx, 1),
+                        (int) range_ok(summed, true), (int) range_ok(sh, true), (int) range_ok(logit, false));
+                }
+            } else if (summed && ggml_mul_mat_id_is_sum(summed)) {
+                static int n_nomatch = 0;
+                if (n_nomatch++ < 8) {
+                    GGML_LOG_WARN("%s: %s: the shared expert's add on the summed down does not match\n", __func__, add ? add->name : "?");
+                }
+            }
+        }
         if (logit->type == GGML_TYPE_F32 && ggml_is_contiguous(logit) && logit->ne[0] == 1 && logit->ne[2] == 1 && logit->ne[3] == 1 &&
                 sh && (gated->src[0] == sig || gated->src[1] == sig) && sh->type == GGML_TYPE_F32 && ggml_is_contiguous(sh) &&
                 ggml_is_contiguous(gated) && sh->ne[1] == logit->ne[1] &&

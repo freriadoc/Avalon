@@ -2495,6 +2495,30 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
+    // LLAMA_MOE_DOWN_SUM=1 (with the prefill ring, GGML_CUDA_MOE_RING_PREFILL): a prompt's down projection weighted and
+    // summed in one node (ggml_mul_mat_id_sum, [n_embd, 1, n_tokens]): the [n_embd, n_expert_used, n_tokens] products,
+    // the weighting and the adds stay out of the graph (the grouped block sums them group by group). From 128 tokens
+    // (the grouped block's floor; below, the hosted block and its fusions keep today's nodes)
+    static const bool down_sum = getenv("LLAMA_MOE_DOWN_SUM") && atoi(getenv("LLAMA_MOE_DOWN_SUM")) != 0;
+    if (down_sum && n_tokens >= 128 && !weight_before_ffn && !down_exps_b && !down_exps_s && arch != LLM_ARCH_MISTRAL4 &&
+            loras->empty() && hparams.n_expert_used(il) == (uint32_t) n_expert_used && n_expert_used > 1) {
+        experts = ggml_mul_mat_id_sum(ctx0, down_exps, cur, selected_experts, weights);   // [n_embd, 1, n_tokens]
+        if (prec_policy) {
+            prec_policy->apply(experts);
+        }
+        if (down_exps->type == GGML_TYPE_NVFP4) {
+            ggml_prec_set_acc(experts, GGML_PREC_BF16);
+        }
+        cb(experts, "ffn_moe_down", il);
+        if (moe_interleave) {
+            ggml_build_forward_expand(gf, experts);
+            ggml_build_forward_expand(gf, moe_interleave);
+        }
+        ggml_tensor * moe_out = ggml_reshape_2d(ctx0, experts, n_embd, n_tokens);
+        cb(moe_out, "ffn_moe_out", il);
+        return moe_out;
+    }
+
     experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
     if (arch == LLM_ARCH_MISTRAL4) {
         // src1 can exceed F16 range

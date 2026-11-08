@@ -1897,6 +1897,39 @@ static void ggml_compute_forward_mul_mat_id_impl(
 static void ggml_compute_forward_mul_mat_id(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
+    if (ggml_mul_mat_id_is_sum(dst)) {
+        // ggml_mul_mat_id_sum: the products into the end of the work buffer (ggml_graph_plan), then each token's rows
+        // weighted and summed in the order of its slots, as the graph's mul and adds would
+        const struct ggml_tensor * ids = dst->src[2];
+        const float * w = (const float *) dst->src[3]->data;
+        const int64_t n0 = dst->ne[0], nu = ids->ne[0], nt = ids->ne[1];
+        const size_t tb = (size_t) n0*nu*nt*sizeof(float);
+        GGML_ASSERT(params->wsize >= tb + CACHE_LINE_SIZE);
+        float * prod = (float *) ((char *) params->wdata + ((params->wsize - tb) & ~(size_t) (CACHE_LINE_SIZE - 1)));
+        struct ggml_tensor p = *dst;
+        p.ne[1] = nu; p.ne[2] = nt; p.ne[3] = 1;
+        p.nb[1] = n0*sizeof(float); p.nb[2] = p.nb[1]*nu; p.nb[3] = p.nb[2]*nt;
+        p.data = prod;
+        p.src[3] = NULL;
+        p.op_params[GGML_MUL_MAT_ID_SUM_PARAM] = 0;
+        struct ggml_compute_params pp = *params;
+        pp.wsize = (size_t) ((char *) prod - (char *) params->wdata);
+        ggml_compute_forward_mul_mat_id_impl(&pp, &p, 0, false, false, true);
+        ggml_barrier(params->threadpool);
+        const int64_t t0 = nt*params->ith/params->nth, t1 = nt*(params->ith + 1)/params->nth;
+        for (int64_t t = t0; t < t1; t++) {
+            float * out = (float *) ((char *) dst->data + t*dst->nb[2]);
+            const float * r = prod + t*nu*n0;
+            for (int64_t i = 0; i < n0; i++) {
+                float s = r[i]*w[t*nu];
+                for (int64_t k = 1; k < nu; k++) {
+                    s += r[k*n0 + i]*w[t*nu + k];
+                }
+                out[i] = s;
+            }
+        }
+        return;
+    }
     ggml_compute_forward_mul_mat_id_impl(params, dst, 0, false, true, true);
 }
 
@@ -3098,6 +3131,9 @@ struct ggml_cplan ggml_graph_plan(
                         // Workspace for tiled (see tiled.h)
                         cur = GGML_PAD(cur, 64);
                         cur += ggml_tiled_wdata_size(n_tasks, node);
+                        if (ggml_mul_mat_id_is_sum(node)) {   // the products before their weighted sum
+                            cur += (size_t) node->ne[0]*ids->ne[0]*ids->ne[1]*sizeof(float) + 2*CACHE_LINE_SIZE;
+                        }
                     } break;
                 case GGML_OP_OUT_PROD:
                     {

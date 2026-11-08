@@ -1523,6 +1523,22 @@ extern "C" {
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
 
+    // ggml_mul_mat_id's products weighted by w [1, n_used, n_tokens] and summed over the used experts:
+    // [as->ne[1], 1, n_tokens], each token's sum in the order of its slots (op MUL_MAT_ID, src[3] = w, op_params[10] the
+    // magic below: 0 and 3 hold the precisions).
+    // A MoE block's down projection and its weighting without the [n_embd, n_used, n_tokens] products in the graph
+#define GGML_MUL_MAT_ID_SUM_PARAM 10
+#define GGML_MUL_MAT_ID_SUM_MAGIC 0x53554d31
+    GGML_API struct ggml_tensor * ggml_mul_mat_id_sum(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * as,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * w);
+
+    // whether a MUL_MAT_ID node is ggml_mul_mat_id_sum's
+    GGML_API bool ggml_mul_mat_id_is_sum(const struct ggml_tensor * node);
+
     // A: m columns, n rows,
     // B: p columns, n rows,
     // result is m columns, p rows

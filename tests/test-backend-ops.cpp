@@ -6909,6 +6909,30 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+// ggml_mul_mat_id_sum: the products weighted by w [1, n_used, n] and summed over the used experts (a MoE down
+// projection and its weighting, LLAMA_MOE_DOWN_SUM)
+struct test_mul_mat_id_sum : public test_mul_mat_id {
+    using test_mul_mat_id::test_mul_mat_id;
+    std::string vars() override { return test_mul_mat_id::vars() + ",sum=1"; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(as, "as");
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        if (n_used != n_mats) {
+            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+            ggml_set_name(ids, "view_of_ids");
+        }
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, this->b ? 1 : n_used, n);
+        ggml_set_name(b, "b");
+        ggml_tensor * w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n);
+        ggml_set_name(w, "w");
+        ggml_tensor * out = ggml_mul_mat_id_sum(ctx, as, b, ids, w);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // MUL_MAT_ID with expert ids repeated within a token's row
 struct test_mul_mat_id_dup : public test_mul_mat_id {
     using test_mul_mat_id::test_mul_mat_id;
@@ -12590,6 +12614,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // from 32 tokens up: n = 32, 33, 47, 48, 49 reach it, leaving a last tile of 32, 1, 15, 16 and
     // 17 rows - 16 and 17 straddle the point where the upper half stops being skipped. The smaller
     // n cover the same row counts on the mat-vec path.
+    // ggml_mul_mat_id_sum (a MoE down projection weighted and summed): experts of the shapes of a prompt's down
+    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL}) {
+        for (int n : {1, 33, 130, 300}) {
+            test_cases.emplace_back(new test_mul_mat_id_sum(type_a, GGML_TYPE_F32, 16, 4, false, 256, n, 256));
+            test_cases.emplace_back(new test_mul_mat_id_sum(type_a, GGML_TYPE_F32, 32, 10, false, 256, n, 256));
+        }
+    }
     for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_IQ2_XS, GGML_TYPE_F16}) {
         for (int n : {1, 15, 16, 17, 31, 32, 33, 47, 48, 49}) {
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 4, false, 512, n, 256));

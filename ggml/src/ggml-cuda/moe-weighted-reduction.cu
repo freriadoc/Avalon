@@ -16,7 +16,8 @@ static __global__ void moe_weighted_reduction_f32(const float * __restrict__ exp
 
     const uint64_t first_row   = (uint64_t) token * n_expert_used;
     const float    first_scale = expert_scale != nullptr ? expert_scale[first_row] : 1.0f;
-    float          sum         = (experts[first_row * n_embd + col] * first_scale) * weights[first_row];
+    // weights null: one expert's row as it is (ggml_mul_mat_id_sum's output, its weighting done)
+    float          sum         = (experts[first_row * n_embd + col] * first_scale) * (weights ? weights[first_row] : 1.0f);
 
     for (int expert = 1; expert < n_expert_used; ++expert) {
         const uint64_t row   = first_row + expert;
@@ -54,11 +55,11 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
                                          const ggml_tensor *         sh,
                                          const ggml_tensor *         sh_logit) {
     GGML_ASSERT(experts->type == GGML_TYPE_F32);
-    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(weights == nullptr || weights->type == GGML_TYPE_F32);
     GGML_ASSERT(expert_scale == nullptr || expert_scale->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(experts));
-    GGML_ASSERT(ggml_is_contiguous(weights));
+    GGML_ASSERT(weights == nullptr || ggml_is_contiguous(weights));
     GGML_ASSERT(expert_scale == nullptr || ggml_is_contiguous(expert_scale));
     GGML_ASSERT(ggml_is_contiguous(dst));
 
@@ -69,7 +70,7 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
 
     launch_moe_weighted_reduction((const float *) experts->data,
                                   expert_scale ? (const float *) expert_scale->data : nullptr,
-                                  (const float *) weights->data,
+                                  weights ? (const float *) weights->data : nullptr,
                                   (float *) dst->data, n_embd, n_tokens, (int) n_expert_used,
                                   sh ? (const float *) sh->data : nullptr, sh_logit ? (const float *) sh_logit->data : nullptr, stream);
     CUDA_CHECK(cudaGetLastError());
