@@ -158,6 +158,8 @@ static void ggml_cuda_op_gated_delta_net_impl(
         state_slot_stride = cache->slot_stride;
     }
 
+    const bool wmma = ggml_cuda_gdn_wmma_usable(dst);
+
     gdn_replay_args rp = { nullptr, nullptr, 0, 0, neqk1 };
     if (const ggml_tensor * stash = dst->src[6]) {
         GGML_ASSERT(!keep_rs && n_seqs == 1);
@@ -167,7 +169,18 @@ static void ggml_cuda_op_gated_delta_net_impl(
         rp.w     = stash->ne[1] / 2;
         // the replayed k rows are read by key head with the q/k head size
         GGML_ASSERT(src_k->ne[0] == S_v);
-        if (kda) {
+        if (wmma) {
+            // a batch longer than a window is never deferred (llama_memory_recurrent::gdn_ctl_take): the kept tokens
+            // of the previous window replayed on the input state alone (no token of the batch), the state after them
+            // written where the batch's state goes; then the chunked kernels from there
+            GGML_ASSERT(!kda && n_tokens > rp.w);
+            launch_gated_delta_net<false, false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+                S_v, H, /*n_tokens=*/0, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, state_ids, state_row_stride, rp, stream);
+            s_d              = state_d;
+            state_ids        = nullptr;
+            state_row_stride = 0;
+        } else if (kda) {
             launch_gated_delta_net<true, false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, state_ids, state_row_stride, rp, stream);
@@ -176,10 +189,12 @@ static void ggml_cuda_op_gated_delta_net_impl(
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, state_ids, state_row_stride, rp, stream);
         }
-        return;
+        if (!wmma) {
+            return;
+        }
     }
 
-    if (ggml_cuda_gdn_wmma_usable(dst)) {
+    if (wmma) {
         // a long batch of one sequence: the chunked recurrence on the matrix cores (gdn-wmma.cu), its T and P in the
         // scheduler's scratch (GGML_SCHED_SCRATCH_SRC) when it gave one, else pool memory
         ggml_cuda_gdn_wmma_args wa = { q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, nullptr, n_tokens,

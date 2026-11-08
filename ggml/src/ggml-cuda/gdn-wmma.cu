@@ -598,7 +598,10 @@ bool ggml_cuda_gdn_wmma_usable(const ggml_tensor * dst) {
     return arch_ok && min_tokens > 0 && v->ne[2] >= min_tokens &&
            v->ne[0] == GW_S && q->ne[0] == GW_S && v->ne[1] == GW_HV && q->ne[1] == GW_HK && k->ne[1] == GW_HK &&
            v->ne[3] == 1 && q->ne[3] == 1 && g->ne[0] == 1 &&               // one sequence, a scalar gate (not KDA)
-           ggml_get_op_params_i32(dst, 0) <= 1 && dst->src[6] == nullptr &&  // no snapshots, no replay
+           ggml_get_op_params_i32(dst, 0) <= 1 &&                           // no snapshots
+           // a deferred commit (ggml_gated_delta_net_set_replay) only when the batch is longer than a window: the
+           // caller defers no such batch, its prefix is replayed on the state first (gated_delta_net.cu)
+           (dst->src[6] == nullptr || v->ne[2] > dst->src[6]->ne[1] / 2) &&
            ggml_are_same_stride(q, k) && ggml_is_contiguous(g) && ggml_is_contiguous(beta) && aligned16;
 #else
     GGML_UNUSED(dst);

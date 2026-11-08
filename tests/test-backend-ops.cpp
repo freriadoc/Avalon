@@ -5510,16 +5510,24 @@ struct test_gated_delta_net_replay : public test_case {
     const int     read_half;
     const bool    defer;
     const bool    kda;
+    const bool    gather;   // the state read in a row cache by GET_ROWS (as the recurrent memory does)
     static constexpr int64_t W = 4;
 
     std::string vars() override {
-        return VARS_TO_STR8(head_count, head_size, v_repeat, n_seq_tokens, n_prefix, read_half, defer, kda);
+        return VARS_TO_STR9(head_count, head_size, v_repeat, n_seq_tokens, n_prefix, read_half, defer, kda, gather);
     }
 
+    // a long batch of Qwen3.8's shape takes the chunked recurrence (FP16 operands, gdn-wmma.cu)
+    double max_nmse_err() override {
+        return head_size == 128 && n_seq_tokens >= 128 && !kda ? 5e-7 : 1e-7;
+    }
+
+    bool run_whole_graph() override { return gather; }
+
     test_gated_delta_net_replay(int64_t head_count = 4, int64_t head_size = 32, int v_repeat = 1, int64_t n_seq_tokens = 3,
-            int n_prefix = 2, int read_half = 0, bool defer = true, bool kda = false)
+            int n_prefix = 2, int read_half = 0, bool defer = true, bool kda = false, bool gather = false)
         : head_count(head_count), head_size(head_size), v_repeat(v_repeat), n_seq_tokens(n_seq_tokens), n_prefix(n_prefix),
-          read_half(read_half), defer(defer), kda(kda) {}
+          read_half(read_half), defer(defer), kda(kda), gather(gather) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t H = head_count * v_repeat;
@@ -5532,10 +5540,18 @@ struct test_gated_delta_net_replay : public test_case {
         const int64_t g_ne0 = kda ? head_size : 1;
         ggml_tensor * g     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, g_ne0, H, n_seq_tokens, 1);
         ggml_tensor * beta  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, n_seq_tokens, 1);
-        ggml_tensor * state = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_size, H, 1);
+        ggml_tensor * state = nullptr;
+        if (gather) {
+            ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_size * head_size * H, 3);
+            ggml_tensor * ids   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+            ggml_set_name(ids, "state_ids");
+            state = ggml_reshape_4d(ctx, ggml_get_rows(ctx, cache, ids), head_size, head_size, H, 1);
+        } else {
+            state = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_size, H, 1);
+            ggml_set_name(state, "state");
+        }
         ggml_set_name(g,     "g");
         ggml_set_name(beta,  "beta");
-        ggml_set_name(state, "state");
         const int64_t row = head_size * head_count + head_size * H + g_ne0 * H + H;
         ggml_tensor * stash = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, row, 2 * W);
         ggml_tensor * ctl   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 3);
@@ -5554,6 +5570,9 @@ struct test_gated_delta_net_replay : public test_case {
             if (strcmp(t->name, "ctl") == 0) {
                 const int32_t c[3] = { n_prefix, read_half, defer ? 1 : 0 };
                 ggml_backend_tensor_set(t, c, 0, sizeof(c));
+            } else if (strcmp(t->name, "state_ids") == 0) {
+                const int32_t r = 2;
+                ggml_backend_tensor_set(t, &r, 0, sizeof(r));
             } else if (strcmp(t->name, "g") == 0 || strcmp(t->name, "stash") == 0) {
                 init_tensor_uniform(t, -0.5f, -1e-4f);
             } else if (strcmp(t->name, "beta") == 0) {
@@ -13684,6 +13703,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_gated_delta_net_replay(4, 32, 1, 8, 2, 1, false, false)); // a longer ubatch: no defer
+    // a prompt batch of Qwen3.8's shape after a deferred window: the prefix replayed, then the chunked kernels
+    for (int n_prefix : { 0, 3 }) {
+        for (bool gather : { false, true }) {
+            for (int64_t n_tok : { 129, 2048 }) {
+                test_cases.emplace_back(new test_gated_delta_net_replay(16, 128, 3, n_tok, n_prefix, n_prefix % 2, false, false, gather));
+            }
+        }
+    }
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, false, true));
