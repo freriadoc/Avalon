@@ -613,6 +613,8 @@ static void test_buffer_size_zero() {
 
 // Test re-using gallocr for a different graph. The new graph has the same
 // total size, but one of the chunks is larger, so reallocation is required.
+// A reallocated buffer keeps every chunk at least at its size (the graphs of a speculative decoder's draft lengths
+// settle at the largest of them): chunk 0 stays at 24, chunk 1 takes 20.
 static void test_reallocation() {
     dummy_backend    backend = dummy_backend_init(32, /*align*/ 4);
     ggml_gallocr_ptr galloc;
@@ -642,7 +644,7 @@ static void test_reallocation() {
         bool result = ggml_gallocr_alloc_graph(galloc.get(), graph);
         GGML_ASSERT(result);
         check_all_allocated(graph);
-        GGML_ASSERT(backend.context->allocated_total() == 40);
+        GGML_ASSERT(backend.context->allocated_total() == 44);
     }
 }
 
