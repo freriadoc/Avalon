@@ -42,11 +42,13 @@ static __global__ void cpy_scalar(const char * cx, char * cdst, const int64_t ne
     cpy_1(cx + x_offset, cdst + dst_offset);
 }
 
+// pitch: the source's elements between two consecutive values of the destination's row (ne01 for a dense source; a
+// single matrix may be a view with a larger row pitch, as qwen4exp's PLE conv reads its shifted windows)
 template <typename T>
 static __global__ void cpy_scalar_transpose(const char * cx, char * cdst, const int64_t ne,
                                const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
                                const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11,
-                               const int64_t nb12, const int64_t nb13) {
+                               const int64_t nb12, const int64_t nb13, const int64_t pitch) {
 
     const T* src = reinterpret_cast<const T*>(cx);
     T* dst = reinterpret_cast<T*>(cdst);
@@ -76,7 +78,7 @@ static __global__ void cpy_scalar_transpose(const char * cx, char * cdst, const 
                 const int row = threadIdx.y+j;
                 const int col = threadIdx.x * sizeof(float)/sizeof(T);
                 T *tile2 = reinterpret_cast<T*>(tile[cur_tile_buf][row]);
-                tile2[col] = src[imat*n + (y+j)*ne01 + x];
+                tile2[col] = src[imat*n + (y+j)*pitch + x];
             }
         }
 
@@ -220,14 +222,18 @@ static void ggml_cpy_scalar_cuda(
     if (transposed) {
         GGML_ASSERT(ne == ne00*ne01*ne02);  // ne[3] is 1 assumed
         int64_t ne00n, ne01n, ne02n;
-        if (nb00 <= nb02) { // most likely safe to handle nb00 = nb02 case here
+        int64_t pitch;
+        if (nb00 <= nb02 || ne02 == 1) { // most likely safe to handle nb00 = nb02 case here
             ne00n = ne00;
             ne01n = ne01;
             ne02n = ne02;
+            // one matrix: its own row pitch (a padded view); several: dense (ggml_cuda_cpy checks it)
+            pitch = ne02 == 1 ? nb00 / (int64_t) sizeof(src_t) : ne01;
         } else {
             ne00n = ne00;
             ne01n = ne01*ne02;
             ne02n = 1;
+            pitch = ne01n;
         }
 
         int64_t grid_x = (ne01n + CUDA_CPY_TILE_DIM_2D - 1) / CUDA_CPY_TILE_DIM_2D;
@@ -241,7 +247,7 @@ static void ggml_cpy_scalar_cuda(
             dim3 dimBlock(CUDA_CPY_TILE_DIM_2D, CUDA_CPY_BLOCK_ROWS, 1);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(dimGrid, dimBlock, 0, stream);
             ggml_cuda_kernel_launch(cpy_scalar_transpose<dst_t>, launch_params,
-                cx, cdst, ne, ne00n, ne01n, ne02n, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
+                cx, cdst, ne, ne00n, ne01n, ne02n, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, pitch);
         }
     } else {
         launch_scalar_generic();
@@ -459,9 +465,10 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
     char * src1_ddc = (char *) src1->data;
 
     const bool contiguous_srcs = ggml_is_contiguous(src0) && ggml_is_contiguous(src1);
-    const bool can_be_transposed = nb01 == (int64_t)ggml_element_size(src0) &&
-        src0->ne[3] == 1 && nb02 == ne00 * ne01 * (int64_t)ggml_element_size(src0) &&
-        ggml_is_contiguous(src1);
+    // a transposed matrix, dense, or a single one with a padded row pitch (a window of a longer one)
+    const int64_t es0 = (int64_t) ggml_element_size(src0);
+    const bool can_be_transposed = nb01 == es0 && src0->ne[3] == 1 && ggml_is_contiguous(src1) &&
+        (nb02 == ne00 * ne01 * es0 || (ne02 == 1 && nb00 % es0 == 0 && nb00 >= ne01 * es0));
 
     size_t mc_width = 0, mc_height = 0, mc_spitch = 0, mc_dpitch = 0;
 

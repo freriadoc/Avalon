@@ -3522,6 +3522,26 @@ struct test_cpy : public test_case {
 // GGML_OP_CONT
 // permute = {0, 0, 0, 0} means no permutation: the source is transposed (or
 // view-sliced). A non-identity permute applies ggml_permute before ggml_cont.
+// GGML_OP_CONT of a transposed window of a longer matrix (a padded row pitch), as qwen4exp's PLE conv reads its
+// shifted copies: [n + pad, ch] -> window [n, ch] at column off, transposed to [ch, n]
+struct test_cont_window_t : public test_case {
+    const int64_t n, ch, pad, off;
+
+    std::string vars() override { return VARS_TO_STR4(n, ch, pad, off); }
+    double max_nmse_err() override { return 0.0; }
+
+    test_cont_window_t(int64_t n = 37, int64_t ch = 70, int64_t pad = 9, int64_t off = 3) : n(n), ch(ch), pad(pad), off(off) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * src = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n + pad, ch);
+        ggml_set_name(src, "src");
+        ggml_tensor * w = ggml_view_2d(ctx, src, n, ch, src->nb[1], off * ggml_element_size(src));
+        ggml_tensor * out = ggml_cont(ctx, ggml_transpose(ctx, w));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_cont : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
@@ -11274,6 +11294,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t n_tokens : { 9, 64, 300 }) {
         test_cases.emplace_back(new test_qwen4_hc_norm_inject(2560, 320, n_tokens));
     }
+    // transposed windows of a padded matrix (qwen4exp's PLE conv at a prompt batch: 9 columns of history)
+    test_cases.emplace_back(new test_cont_window_t(37, 70, 9, 3));
+    test_cases.emplace_back(new test_cont_window_t(9536, 10240, 9, 0));
+    test_cases.emplace_back(new test_cont_window_t(9536, 10240, 9, 9));
+    test_cases.emplace_back(new test_cont_window_t(1, 64, 9, 5));
     // a prompt batch's hc boundary (ggml-cuda: hc_post and the next norm in one kernel), at several row widths (the
     // norm's block sizes) and one the kernel leaves to the two ops (n_embd % 4 != 0)
     for (int64_t n_tokens : { 64, 513 }) {
