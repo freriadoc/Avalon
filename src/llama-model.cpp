@@ -2093,6 +2093,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (got + 2 * 65536 >= ple) {
                 can_prefetch.erase(per_layer_tok_embd);
             }
+            // DIAGNOSTIC (LLAMA_PLE_RAM_VERIFY=1): the table compared with the file, read again through the page cache
+            if (getenv("LLAMA_PLE_RAM_VERIFY") && atoi(getenv("LLAMA_PLE_RAM_VERIFY")) != 0) {
+                const auto * w = ml.get_weight(ggml_get_name(per_layer_tok_embd));
+                std::vector<char> buf((size_t) 64 << 20);
+                size_t compared = 0, differ = 0;
+                for (size_t off = 0; w && off < ple; off += buf.size()) {
+                    const size_t n = std::min(buf.size(), ple - off);
+                    ml.files.at(w->idx)->seek(w->offs + off, SEEK_SET);
+                    ml.files.at(w->idx)->read_raw(buf.data(), n);
+                    differ += memcmp(buf.data(), (const char *) per_layer_tok_embd->data + off, n) != 0;
+                    compared += n;
+                }
+                LLAMA_LOG_WARN("%s: PLE table in RAM verified: %.0f MiB compared with the file, %zu pieces of 64 MiB differ\n",
+                               __func__, compared / mib, differ);
+            }
         }
     }
 
