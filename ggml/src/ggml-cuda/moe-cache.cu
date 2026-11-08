@@ -10988,12 +10988,18 @@ int ggml_cuda_moe_ring_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cgra
         lo = lo ? std::min(lo, (const char *) t->data) : (const char *) t->data;
     }
     size_t role_off[3];
+    // the bytes of an expert's row its three parts cover: the row's tail past them is the margin MMQ reads past the
+    // down's last row (256 B), which for a layer's last expert lies past its tensors, maybe outside the registered
+    // memory (blk.22 of the IQ3_KS hybrid: invalid argument from the copy, CUDA and HIP): that one copies its parts
+    // and zeroes the margin
+    size_t span = 0;
     for (int k = 0; k < 3; k++) {
         role_off[k] = (const char *) w[k]->data - lo;
         // a packed layer: the three parts within one row of `stride` bytes
         if (role_off[k] + w[k]->nb[1]*w[k]->ne[1] > stride || stride + 512 > r.entry) {
             return 0;
         }
+        span = std::max(span, role_off[k] + w[k]->nb[1]*w[k]->ne[1]);
     }
     const int G = 32;
     if (n_expert % G != 0 || !r.ring.fits(G)) {
@@ -11108,8 +11114,12 @@ int ggml_cuda_moe_ring_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cgra
                     CUDA_CHECK(cudaStreamWaitEvent(r.copy, r.done[p.wait % moe_ring_state::P], 0));
                     r.waited = p.wait;
                 }
-                CUDA_CHECK(cudaMemcpyAsync(r.base + (size_t) p.entry * r.entry, lo + (size_t) p.e*stride, stride,
-                                           cudaMemcpyHostToDevice, r.copy));
+                char * dst = r.base + (size_t) p.entry * r.entry;
+                const size_t bytes = p.e == n_expert - 1 ? span : stride;
+                CUDA_CHECK(cudaMemcpyAsync(dst, lo + (size_t) p.e*stride, bytes, cudaMemcpyHostToDevice, r.copy));
+                if (bytes < stride) {
+                    CUDA_CHECK(cudaMemsetAsync(dst + bytes, 0, stride - bytes, r.copy));
+                }
                 r.copies++;
                 p.issued = true;
             }
