@@ -11050,6 +11050,22 @@ int ggml_cuda_moe_ring_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cgra
         }
         by_group[e / G].push_back({e, wait, entry, false});
     }
+    // GGML_CUDA_MOE_GROUPED_CHECK computes the block again after its groups, reading the entries: a ring smaller than
+    // the block's copies has overwritten its first entries by then (the reference differs, not the block)
+    static const bool check = getenv("GGML_CUDA_MOE_GROUPED_CHECK") && atoi(getenv("GGML_CUDA_MOE_GROUPED_CHECK")) != 0;
+    size_t n_copies = 0;
+    for (const auto & bg : by_group) {
+        n_copies += bg.size();
+    }
+    if (check && n_copies > r.ring.zone.size()) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            GGML_LOG_WARN("%s: GGML_CUDA_MOE_GROUPED_CHECK with a ring of %zu entries for %llu copies a block: the check reads "
+                    "overwritten entries, use a ring of a layer's experts (GGML_CUDA_MOE_RING_PREFILL=1800)\n", __func__,
+                    r.ring.zone.size(), (unsigned long long) n_copies);
+        }
+    }
     static const bool validate = getenv("GGML_CUDA_MOE_RING_VALIDATE") && atoi(getenv("GGML_CUDA_MOE_RING_VALIDATE")) != 0;
     if (validate) {
         const uint64_t s0 = (uint64_t) (uintptr_t) device->band_slab, s1 = s0 + moe_cache_band_total(*device);
