@@ -1567,6 +1567,11 @@ struct test_case {
             }
 
             double err = ud->tc->err(f1.data(), f2.data(), f1.size());
+            // TEST_BACKEND_OPS_PRINT_ERR=1: the error of every compared node, also below the threshold
+            static const bool print_err = getenv("TEST_BACKEND_OPS_PRINT_ERR") != nullptr;
+            if (print_err && err <= ud->tc->max_err(ud->backend1)) {
+                printf("[%s] err %.3e ", ggml_op_desc(t1), err);
+            }
             if (err > ud->tc->max_err(ud->backend1)) {
                 printf("[%s] ERR = %.9f > %.9f ", ggml_op_desc(t1), err, ud->tc->max_err(ud->backend1));
                 //for (int i = 0; i < (int) f1.size(); i++) {
