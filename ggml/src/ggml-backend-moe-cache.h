@@ -231,6 +231,11 @@ struct ggml_moe_cache_api {
     // spread over: the host RAM they take is decided once for the whole session, at its first card (set before the
     // first graph; a pipeline stage's session does not see the other stage's tensors yet)
     void (*host_experts)(void * session, size_t bytes, int n_devices);
+    // whether the session can host the MoE block of these three expert weights (their data): 0 when a device whose pools
+    // are built knows one of them and the three are not one layer of a pool (a tensor under the cache's floor,
+    // GGML_CUDA_MOE_CACHE_MIN_EXPERT_KB, is never discovered: its layer has no shape); 1 otherwise, an unknown layer
+    // included (a draft's, before its first presentation)
+    int  (*hosts)(void * session, const void * gate, const void * up, const void * down);
 };
 
 GGML_API struct ggml_moe_cache_api ggml_moe_cache;

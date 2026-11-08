@@ -6397,6 +6397,28 @@ static int moe_cache_assigned(void * opaque, const void * host_base, void * back
     return device && device->logical == tied->second ? 1 : 0;
 }
 
+static int moe_cache_hosts(void * opaque, const void * gate, const void * up, const void * down) {
+    moe_cache_session * session = (moe_cache_session *)opaque;
+    if (!session || !gate || !up || !down) {
+        return 1;
+    }
+    std::lock_guard<std::mutex> lock(session->mu);
+    bool refused = false;
+    for (const auto & device_ptr : session->devices) {
+        const moe_cache_device & device = *device_ptr;
+        if (!device.pools_built || device.dead.load()) {
+            continue;
+        }
+        const int pool = moe_cache_pool_of(device, gate);
+        if (pool >= 0 && moe_cache_pool_of(device, up) == pool && moe_cache_pool_of(device, down) == pool) {
+            return 1;
+        }
+        refused = refused || moe_cache_layer_of(device, gate) || moe_cache_layer_of(device, up) ||
+                  moe_cache_layer_of(device, down);
+    }
+    return refused ? 0 : 1;
+}
+
 static void moe_cache_set_lend_size(void * opaque, size_t bytes, int n_zones) {
     moe_cache_session * session = (moe_cache_session *)opaque;
     if (!session) {
@@ -11445,6 +11467,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.begin = moe_cache_begin;
     ggml_moe_cache.assign = moe_cache_assign;
     ggml_moe_cache.assigned = moe_cache_assigned;
+    ggml_moe_cache.hosts = moe_cache_hosts;
     ggml_moe_cache.prepare_queues = moe_cache_prepare_queues;
     ggml_moe_cache.hosted_max_rows = moe_hosted_max_rows;
     ggml_moe_cache.largest_lend = moe_cache_largest_lend;

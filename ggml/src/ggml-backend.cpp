@@ -1561,6 +1561,13 @@ static void ggml_backend_sched_find_hosted_moe(ggml_backend_sched_t sched, const
             (!ring_prefill && (ids->ne[0] * ids->ne[1] > max_rows || ids->ne[1] > 1024))) {
             continue;
         }
+        // a block the cache does not hold (a tensor under its floor: the IQ3_S GGUF's Q2_0 down, 450 KiB an expert
+        // under 512): ggml-cuda cannot host it, it runs on the CPU (before: an abort in ggml-cuda at the first graph)
+        if (ggml_moe_cache.hosts &&
+                !ggml_moe_cache.hosts(sched->moe_cache_session, gate->src[0]->data, up->src[0]->data, down->src[0]->data)) {
+            i += 3;
+            continue;
+        }
         if (ring_prefill && ids->ne[1] >= 128) {
             // GGML_CUDA_MOE_RING_PREFILL: a prompt's block hosted whatever its rows (ggml-cuda computes it by groups,
             // its experts through the ring), no split, no prefetch
