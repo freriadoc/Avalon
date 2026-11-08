@@ -11274,6 +11274,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t n_tokens : { 9, 64, 300 }) {
         test_cases.emplace_back(new test_qwen4_hc_norm_inject(2560, 320, n_tokens));
     }
+    // a prompt batch's hc boundary (ggml-cuda: hc_post and the next norm in one kernel), at several row widths (the
+    // norm's block sizes) and one the kernel leaves to the two ops (n_embd % 4 != 0)
+    for (int64_t n_tokens : { 64, 513 }) {
+        test_cases.emplace_back(new test_qwen4_hc_combine_norm(2560, n_tokens));
+    }
+    test_cases.emplace_back(new test_qwen4_hc_combine_norm(128, 33));
+    test_cases.emplace_back(new test_qwen4_hc_combine_norm(1024, 17));
+    test_cases.emplace_back(new test_qwen4_hc_combine_norm(4096, 12));
+    test_cases.emplace_back(new test_qwen4_hc_combine_norm(31, 17));
     for (int64_t n_tokens : { 1, 3, 8, 9 }) {
         test_cases.emplace_back(new test_qwen4_hc_combine_norm(2560, n_tokens));
         test_cases.emplace_back(new test_qwen4_hc_reduce_norm(2560, n_tokens));

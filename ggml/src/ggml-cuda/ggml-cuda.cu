@@ -5047,6 +5047,52 @@ static bool ggml_cuda_router_read(const ggml_backend_cuda_context & ctx, const g
     return false;
 }
 
+// SCALE, SIGMOID, SCALE, DSV4_HC_POST (the gated hc_combine), RMS_NORM of its result, MUL by the [n_embd, hc] norm
+// weights: the outputs are the combined streams (the next residual) and the normalized ones. xn may take the residual's
+// own memory (ggml-alloc gives the norm the buffer hc_post freed; each thread reads its residual values before it writes
+// them), nothing else it reads. GGML_CUDA_HC_POST_NORM=0 keeps the two kernels (comparisons)
+static bool ggml_cuda_hc_post_norm_fusable(const ggml_cgraph * cgraph, int i) {
+    static const bool enabled = !getenv("GGML_CUDA_HC_POST_NORM") || atoi(getenv("GGML_CUDA_HC_POST_NORM")) != 0;
+    if (!enabled) {
+        return false;
+    }
+    const ggml_tensor * post = cgraph->nodes[i + 3];
+    const ggml_tensor * rms  = cgraph->nodes[i + 4];
+    const ggml_tensor * mul  = cgraph->nodes[i + 5];
+    if (post->op != GGML_OP_DSV4_HC_POST || rms->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL ||
+            rms->src[0] != post || mul->src[0] != rms || mul->src[1] == rms) {
+        return false;
+    }
+    const ggml_op ops[6] = { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST, GGML_OP_RMS_NORM, GGML_OP_MUL };
+    const int outputs[2] = { i + 3, i + 5 };
+    if (!ggml_can_fuse_subgraph(cgraph, i, 6, ops, outputs, 2)) {
+        return false;
+    }
+    if (!ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST }, { GGML_UNARY_OP_SIGMOID })) {
+        return false;
+    }
+    if (!ggml_cuda_dsv4_hc_post_norm_supported(post, mul)) {
+        return false;
+    }
+    const auto range = [](const ggml_tensor * t) {
+        const int64_t a = (int64_t) t->data;
+        return std::make_pair(a, a + (int64_t) ggml_nbytes(t));
+    };
+    const auto overlap = [&](const ggml_tensor * a, const ggml_tensor * b) {
+        const auto ra = range(a), rb = range(b);
+        return ra.first < rb.second && rb.first < ra.second;
+    };
+    const ggml_tensor * residual = post->src[1];
+    const ggml_tensor * raw_gate = cgraph->nodes[i]->src[0];
+    if (overlap(mul, post->src[0]) || overlap(mul, raw_gate) || overlap(mul, mul->src[1]) || overlap(mul, post)) {
+        return false;
+    }
+    if (overlap(mul, residual) && (mul->data != residual->data || !ggml_is_contiguous(residual))) {
+        return false;
+    }
+    return true;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -6304,6 +6350,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_SQR }, { GGML_UNARY_OP_RELU })) {
         ggml_cuda_op_relu_sqr(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;
+    }
+
+    // hc_combine, then the next half's grouped norm of its result (qwen4exp's prompt batches; the small ones fuse the
+    // norm into their own hc kernels): the gated hc_post, RMS_NORM and the MUL by the norm weights in one kernel
+    if (node->op == GGML_OP_SCALE && i + 5 < cgraph->n_nodes && ggml_cuda_hc_post_norm_fusable(cgraph, i)) {
+        ggml_cuda_op_dsv4_hc_post_norm(*cuda_ctx, cgraph->nodes[i + 3], node, cgraph->nodes[i + 2],
+                cgraph->nodes[i + 4], cgraph->nodes[i + 5]);
+        return 5;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST }, { GGML_UNARY_OP_SIGMOID })) {

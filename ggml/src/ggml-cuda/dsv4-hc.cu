@@ -212,6 +212,78 @@ static __global__ void dsv4_hc_post_f32(
     }
 }
 
+// the gated hc_post (no comb) and the next half's rms_norm * w_norm in one pass (qwen4exp's prompt: hc_combine, then
+// build_hc_pre's grouped norm of its result). A block per (stream, token) row with the vectorized rms_norm kernel's
+// mapping (block_size threads, a float4 each) and reduction, and hc_post's arithmetic in its order: the two outputs are
+// the bits of the two kernels, and the norm does not read the combined streams back. A thread reads its float4 of the
+// residual before the block's barrier and writes its float4 of xn after it: xn may be the residual itself
+template <int block_size>
+static __global__ void dsv4_hc_post_norm_f32(
+        const float * x,
+        const float * residual,
+        const float * post,
+        const float * w_norm,
+        float * dst,
+        float * xn,
+        int n_embd4,
+        int n_tokens,
+        int64_t sx1,
+        int64_t sr1,
+        int64_t sr2,
+        int64_t sp0,
+        int64_t sp1,
+        int64_t sw1,
+        float gate_scale_in,
+        float gate_scale_out,
+        float eps) {
+    ggml_cuda_pdl_lc();
+    const int hc  = gridDim.x;
+    const int c   = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int ncols = 4*n_embd4;
+
+    extern __shared__ float s_sum[];
+
+    ggml_cuda_pdl_sync();
+
+    for (int it = blockIdx.y; it < n_tokens; it += gridDim.y) {
+        float p = post[c*sp0 + it*sp1];
+        p = gate_scale_out * (1.0f / (1.0f + expf(-(gate_scale_in * p))));
+
+        const int64_t row = (int64_t) it*hc + c;
+        float4 y = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        float tmp = 0.0f;
+        if (tid < n_embd4) {
+            const float4 xv = ((const float4 *) (x + it*sx1))[tid];
+            const float4 rv = ((const float4 *) (residual + c*sr1 + it*sr2))[tid];
+            float sum;
+            sum = xv.x * p; sum += rv.x; y.x = sum;
+            sum = xv.y * p; sum += rv.y; y.y = sum;
+            sum = xv.z * p; sum += rv.z; y.z = sum;
+            sum = xv.w * p; sum += rv.w; y.w = sum;
+            ((float4 *) (dst + row*ncols))[tid] = y;
+            tmp += y.x*y.x + y.y*y.y + y.z*y.z + y.w*y.w;
+        }
+        tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+        const float scale = rsqrtf(tmp / ncols + eps);
+
+        if (tid < n_embd4) {
+            float4 r = make_float4(scale*y.x, scale*y.y, scale*y.z, scale*y.w);
+            const float4 m = ((const float4 *) (w_norm + c*sw1))[tid];
+            r.x *= m.x;
+            r.y *= m.y;
+            r.z *= m.z;
+            r.w *= m.w;
+            ((float4 *) (xn + row*ncols))[tid] = r;
+        }
+
+        if constexpr (block_size > WARP_SIZE) {
+            // s_sum is reused by the next token's reduction
+            __syncthreads();
+        }
+    }
+}
+
 void ggml_cuda_op_dsv4_hc_comb(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * mixes = dst->src[0];
     const ggml_tensor * scale = dst->src[1];
@@ -340,4 +412,83 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             nbc0 / sizeof(float), nbc1 / sizeof(float), nbc2 / sizeof(float),
             nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float),
             gate_in, gate_out);
+}
+
+bool ggml_cuda_dsv4_hc_post_norm_supported(const ggml_tensor * post_node, const ggml_tensor * mul) {
+    const ggml_tensor * x        = post_node->src[0];
+    const ggml_tensor * residual = post_node->src[1];
+    const ggml_tensor * w_norm   = mul->src[1];
+    const int64_t n_embd = x->ne[0];
+    if (n_embd % 4 != 0 || n_embd/4 > 1024 || post_node->src[3] != nullptr) {
+        return false;
+    }
+    if (x->type != GGML_TYPE_F32 || residual->type != GGML_TYPE_F32 || w_norm->type != GGML_TYPE_F32 ||
+            post_node->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32) {
+        return false;
+    }
+    // the shapes of qwen4exp's hc tensors: block output [n_embd, nt], residual and both outputs [n_embd, hc, nt],
+    // the norm weights [n_embd, hc]; rows contiguous and 16-byte aligned (the rms_norm kernel's vectorized path)
+    const int64_t hc = residual->ne[1];
+    const int64_t nt = residual->ne[2];
+    if (x->ne[1] != nt || x->ne[2] != 1 || x->ne[3] != 1 || residual->ne[0] != n_embd || residual->ne[3] != 1 ||
+            !ggml_are_same_shape(post_node, residual) || !ggml_are_same_shape(mul, residual) ||
+            w_norm->ne[0] != n_embd || w_norm->ne[1] != hc || w_norm->ne[2] != 1 || w_norm->ne[3] != 1 || hc > 65535) {
+        return false;
+    }
+    if (x->nb[0] != sizeof(float) || residual->nb[0] != sizeof(float) || w_norm->nb[0] != sizeof(float) ||
+            !ggml_is_contiguous(post_node) || !ggml_is_contiguous(mul)) {
+        return false;
+    }
+    const auto aligned = [](const ggml_tensor * t, int dim) {
+        return ((uintptr_t) t->data % 16) == 0 && (dim < 1 || t->nb[1] % 16 == 0) && (dim < 2 || t->nb[2] % 16 == 0);
+    };
+    return aligned(x, 1) && aligned(residual, 2) && aligned(w_norm, 1) && aligned(post_node, 0) && aligned(mul, 0);
+}
+
+void ggml_cuda_op_dsv4_hc_post_norm(ggml_backend_cuda_context & ctx, ggml_tensor * post_node,
+        const ggml_tensor * gate_scale_in, const ggml_tensor * gate_scale_out, const ggml_tensor * rms_norm,
+        ggml_tensor * mul) {
+    const ggml_tensor * x        = post_node->src[0];
+    const ggml_tensor * residual = post_node->src[1];
+    const ggml_tensor * post     = gate_scale_in->src[0];
+    const ggml_tensor * w_norm   = mul->src[1];
+
+    float eps;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+
+    const int64_t n_embd4  = x->ne[0] / 4;
+    const int64_t hc       = residual->ne[1];
+    const int64_t n_tokens = residual->ne[2];
+
+    const dim3 grid_dims((unsigned) hc, (unsigned) std::min<int64_t>(n_tokens, UINT16_MAX), 1);
+    const float gate_in  = ggml_get_op_params_f32(gate_scale_in,  0);
+    const float gate_out = ggml_get_op_params_f32(gate_scale_out, 0);
+
+#define HC_POST_NORM_LAUNCH(BLOCK_SIZE) \
+    do { \
+        const ggml_cuda_kernel_launch_params launch_params(grid_dims, dim3(BLOCK_SIZE, 1, 1), \
+                (BLOCK_SIZE) > WARP_SIZE ? 32 * sizeof(float) : 0, ctx.stream()); \
+        ggml_cuda_kernel_launch(dsv4_hc_post_norm_f32<BLOCK_SIZE>, launch_params, \
+            (const float *) x->data, (const float *) residual->data, (const float *) post->data, \
+            (const float *) w_norm->data, (float *) post_node->data, (float *) mul->data, \
+            (int) n_embd4, (int) n_tokens, \
+            (int64_t) (x->nb[1] / sizeof(float)), (int64_t) (residual->nb[1] / sizeof(float)), \
+            (int64_t) (residual->nb[2] / sizeof(float)), \
+            (int64_t) (post->nb[0] / sizeof(float)), (int64_t) (post->nb[1] / sizeof(float)), \
+            (int64_t) (w_norm->nb[1] / sizeof(float)), gate_in, gate_out, eps); \
+    } while (0)
+
+    // the rms_norm dispatcher's block sizes for a row of n_embd4 float4 (rms_norm_f32_dispatch)
+    if (n_embd4 <= 32) {
+        HC_POST_NORM_LAUNCH(32);
+    } else if (n_embd4 <= 128) {
+        HC_POST_NORM_LAUNCH(128);
+    } else if (n_embd4 <= 256) {
+        HC_POST_NORM_LAUNCH(256);
+    } else if (n_embd4 <= 512) {
+        HC_POST_NORM_LAUNCH(512);
+    } else {
+        HC_POST_NORM_LAUNCH(1024);
+    }
+#undef HC_POST_NORM_LAUNCH
 }
