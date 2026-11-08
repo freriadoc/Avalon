@@ -372,6 +372,28 @@ void ggml_cuda_mul_mat_q(
             }
             CUDA_CHECK(cudaGetLastError());
         }
+        // GGML_CUDA_F16_IMAGE_CHECK=1 (diagnostic, synchronizes: with GGML_CUDA_DISABLE_GRAPHS=1): a quantized src1 found
+        // in the scratch (left by the group's previous product or written by the producer, ggml_cuda_f16_image_target)
+        // compared with a quantization made now
+        static const bool img_check = getenv("GGML_CUDA_F16_IMAGE_CHECK") != nullptr;
+        if (img_check && scratch_reuse && !use_native_fp4) {
+            const size_t n = nbytes_src1_q8_1 - mmq_src1_tail;
+            ggml_cuda_pool_alloc<char> ref(ctx.pool(), nbytes_src1_q8_1);
+            quantize_mmq_q8_1_cuda(src1_d, nullptr, ref.get(), src0->type, ne10, src1->nb[1] / ts_src1, src1->nb[2] / ts_src1,
+                                   src1->nb[3] / ts_src1, ne10_padded, ne11, ne12, ne13, stream);
+            std::vector<uint8_t> a(n), b(n);
+            CUDA_CHECK(cudaMemcpyAsync(a.data(), src1_q8_1, n, cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaMemcpyAsync(b.data(), ref.get(), n, cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            int64_t bad = 0;
+            for (size_t k = 0; k < n; k++) {
+                bad += a[k] != b[k];
+            }
+            static int64_t n_checked = 0, n_bad = 0;
+            n_checked++; n_bad += bad != 0;
+            fprintf(stderr, "Q8_IMAGE_CHECK %s (%s): %lld / %lld bytes differ; products %lld, with differences %lld\n", dst->name,
+                    src1->name, (long long) bad, (long long) n, (long long) n_checked, (long long) n_bad);
+        }
 
         // Stride depends on quantization format
         const int64_t s12 = use_native_fp4 ?

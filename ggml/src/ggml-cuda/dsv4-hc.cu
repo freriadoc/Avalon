@@ -144,7 +144,7 @@ static __global__ void dsv4_hc_pre_f32(
         dst[i0*sd0 + it*sd1] = scale * sum;
         if (img.p) {
             // the image of a contiguous dst (ggml_cuda_f16_image_target)
-            img.store((int64_t) it*n_embd + i0, scale * sum);
+            img.store1((int64_t) it*n_embd + i0, scale * sum);   // q8_1: whole warps (n_embd % 32 == 0)
         }
     }
 }

@@ -196,10 +196,7 @@ static __global__ void rms_norm_f32(const float * x,
                         }
                         dst4[i] = r;
                         if (img.p) {
-                            img.store(img_off + 4*i + 0, r.x);
-                            img.store(img_off + 4*i + 1, r.y);
-                            img.store(img_off + 4*i + 2, r.z);
-                            img.store(img_off + 4*i + 3, r.w);
+                            img.store4(img_off + 4*i, r);   // q8_1: whole warps (rms_norm_f32_dispatch)
                         }
                     }
                 }
@@ -442,6 +439,8 @@ static void rms_norm_f32_dispatch(
     }
 
     const int n4 = ncols / 4;
+    // a q8_1 image is written by whole warps, 8 lanes per block of 32 values: the float4 path, rows of 128 values
+    GGML_ASSERT(img.p == nullptr || img.kind != GGML_CUDA_IMG_Q8_1_D4 || (vec && ncols % 128 == 0 && n4 <= 4096));
     if (vec) {
         if (n4 <= 32) {
             RMS_NORM_LAUNCH(32,   1, true);
@@ -751,10 +750,7 @@ static __global__ void __launch_bounds__(block_size) rms_norm_mul_inject_f32(
             const int64_t off = (t*nrows + c)*ncols + 4*tid;
             *((float4 *) (dst + off)) = r;
             if (img.p) {
-                img.store(off + 0, r.x);
-                img.store(off + 1, r.y);
-                img.store(off + 2, r.z);
-                img.store(off + 3, r.w);
+                img.store4(off, r);   // q8_1: whole warps (ggml_cuda_rms_norm_mul_inject_supported: ncols % 128 == 0)
             }
             // the value's place in the token's vector, the product's K
             const int k  = c*ncols + 4*tid;

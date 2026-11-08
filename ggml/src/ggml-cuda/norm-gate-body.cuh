@@ -45,7 +45,7 @@ static __device__ __forceinline__ void rms_norm_mul_sigmoid_gate_body(const rms_
         const float v = scale * x[col] * w[col] * g;
         dst[col] = v;
         if (a.img.p) {
-            a.img.store(dst_off + col, v);
+            a.img.store1(dst_off + col, v);   // q8_1: whole warps (ncols % 128 == 0, ggml_cuda_f16_image_target)
         }
         if (dst_q8_1) {
             // the q8_1 block of the 32 values of this warp, as quantize_q8_1 writes it (lane = index in the block;

@@ -2493,43 +2493,59 @@ static ggml_cuda_mul_mat_path ggml_cuda_mul_mat_get_path(const ggml_tensor * src
     return GGML_CUDA_MM_CUBLAS;
 }
 
-// The F16 (or BF16) image of an activation written by the kernel that produces it, in the scratch of the cuBLAS products
-// that read it (at offset 0, where ggml_cuda_mul_mat_cublas_impl converts src1): the conversion (a read of the F32
-// activation and a write of its image) is skipped, the producer writes the image along with its result. The prompt's
-// products on NVIDIA (dense Q8_0 by cuBLAS): the hyper-connection norm (10240 values per token, read by the down and
-// inject products; 4090, 131k: 646 us per norm, 0.85 s of conversions), the streams' mix (DSV4_HC_PRE, read by the
-// q/k/v products or the BF16 router), the gated norm of the GDN output. Here the products whose src1 a node can image:
-// the cuBLAS path computing in F16 or BF16, src1 contiguous and of the producer's size. GGML_CUDA_F16_IMAGE=0: the
-// products convert it themselves (to compare).
+// The image of an activation written by the kernel that produces it, in the scratch of the products that read it: the
+// F16 (or BF16) conversion that cuBLAS reads, or the q8_1 quantization that MMQ reads, both at offset 0 of the scratch
+// (ggml_cuda_mul_mat_cublas_impl converts src1 there, ggml_cuda_mul_mat_q quantizes it there). The conversion (a read
+// of the F32 activation and a write of its image) is skipped, the producer writes the image along with its result: one
+// copy per activation, made once, shared by the products of the group. The prompt's products: the hyper-connection
+// norm (10240 values per token, read by the down product; 4090, 131k: 646 us per norm, 0.85 s of conversions), the
+// streams' mix (DSV4_HC_PRE, read by q/k/v and the like, or the BF16 router), the gated norm of the GDN output. Here
+// the products whose src1 a node can image: the cuBLAS path computing in F16 or BF16, or MMQ with Q8_0 weights (the
+// D4 layout), src1 2D, contiguous and of the producer's size. q8_ok: the producer writes whole blocks of 32 by whole
+// warps (each caller's condition). GGML_CUDA_F16_IMAGE=0: the products convert it themselves (to compare).
 static bool ggml_cuda_f16_image_enabled() {
     static const bool on = !getenv("GGML_CUDA_F16_IMAGE") || atoi(getenv("GGML_CUDA_F16_IMAGE")) != 0;
     return on;
 }
 
-static bool ggml_cuda_f16_image_product(const ggml_tensor * mm, const ggml_tensor * out, int device) {
+// the image a product of out can read (ggml_cuda_img_kind), -1: none
+static int ggml_cuda_f16_image_kind(const ggml_tensor * mm, const ggml_tensor * out, int device) {
     if (mm->op != GGML_OP_MUL_MAT || out->type != GGML_TYPE_F32 || !ggml_is_contiguous(out)) {
-        return false;
+        return -1;
     }
     const ggml_tensor * src0 = mm->src[0];
     const ggml_tensor * src1 = mm->src[1];
     const ggml_tensor * root = src1->view_src ? src1->view_src : src1;
     if (root != out || src1->view_offs != 0 || src1->type != GGML_TYPE_F32 || !ggml_is_contiguously_allocated(src1) ||
             ggml_nelements(src1) != ggml_nelements(out)) {
-        return false;
+        return -1;
     }
     const int cc = ggml_cuda_info().devices[device].cc;
-    if (ggml_cuda_mul_mat_get_path(src0, src1, mm, device) != GGML_CUDA_MM_CUBLAS) {
-        return false;
+    switch (ggml_cuda_mul_mat_get_path(src0, src1, mm, device)) {
+        case GGML_CUDA_MM_CUBLAS: {
+            const ggml_type t = ggml_cuda_cublas_compute_type(src0, src1, mm, cc);
+            return t == GGML_TYPE_F16 ? GGML_CUDA_IMG_F16 : t == GGML_TYPE_BF16 ? GGML_CUDA_IMG_BF16 : -1;
+        }
+        case GGML_CUDA_MM_MMQ: {
+            int64_t key[GGML_CUDA_MMQ_SCRATCH_KEY];
+            const bool ok = mmq_get_q8_1_ds_layout(src0->type) == MMQ_Q8_1_DS_LAYOUT_D4 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+                src1->ne[0] % MATRIX_ROW_PADDING == 0 && ggml_cuda_mmq_scratch_size(mm, cc, key) > 0;
+            return ok ? GGML_CUDA_IMG_Q8_1_D4 : -1;
+        }
+        default:
+            return -1;
     }
-    const ggml_type t = ggml_cuda_cublas_compute_type(src0, src1, mm, cc);
-    return t == GGML_TYPE_F16 || t == GGML_TYPE_BF16;
 }
 
-// at the producer node i (writing out): where to write the image, nullptr if nowhere. The scratch is the producer's own
+static bool ggml_cuda_f16_image_product(const ggml_tensor * mm, const ggml_tensor * out, int device) {
+    return ggml_cuda_f16_image_kind(mm, out, device) >= 0;
+}
+
+// at the producer node i (writing out): where to write the image, none if nowhere. The scratch is the producer's own
 // source (ggml_cuda_add_mmq_scratch gave it the products' scratch), live from it to the last product: nothing in between
 // writes there. *mm_out: the first product of the group, whose key ggml_cuda_f16_image_written records
 static ggml_cuda_img ggml_cuda_f16_image_target(const ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i,
-        const ggml_tensor * out, const ggml_tensor ** mm_out) {
+        const ggml_tensor * out, const ggml_tensor ** mm_out, const bool q8_ok) {
     const ggml_tensor * scratch_t = cgraph->nodes[i]->src[GGML_SCHED_SCRATCH_SRC];
     if (!ggml_cuda_f16_image_enabled() || scratch_t == nullptr || scratch_t->data == nullptr) {
         return {};
@@ -2539,24 +2555,32 @@ static ggml_cuda_img ggml_cuda_f16_image_target(const ggml_backend_cuda_context 
         if (mm->op != GGML_OP_MUL_MAT || mm->src[GGML_SCHED_SCRATCH_SRC] != scratch_t) {
             continue;
         }
-        if (!ggml_cuda_f16_image_product(mm, out, ctx.device) ||
-                ggml_nbytes(scratch_t) < (size_t) ggml_nelements(out) * sizeof(half)) {
+        const int kind = ggml_cuda_f16_image_kind(mm, out, ctx.device);
+        const size_t need = kind == GGML_CUDA_IMG_Q8_1_D4 ? (size_t) ggml_nelements(out) / 128 * 144 :
+                                                            (size_t) ggml_nelements(out) * sizeof(half);
+        if (kind < 0 || (kind == GGML_CUDA_IMG_Q8_1_D4 && !q8_ok) || ggml_nbytes(scratch_t) < need) {
             return {};
         }
         *mm_out = mm;
         ggml_cuda_img img;
         img.p    = scratch_t->data;
-        img.bf16 = ggml_cuda_cublas_compute_type(mm->src[0], mm->src[1], mm, ggml_cuda_info().devices[ctx.device].cc) == GGML_TYPE_BF16;
+        img.kind = kind;
+        img.ne10 = mm->src[1]->ne[0];
+        img.ne11 = mm->src[1]->ne[1];
         return img;
     }
     return {};
 }
 
 // after the producer's launch: the products of mm's group find their src1 converted (their reuse test)
-static void ggml_cuda_f16_image_written(ggml_backend_cuda_context & ctx, const ggml_tensor * mm) {
+static void ggml_cuda_f16_image_written(ggml_backend_cuda_context & ctx, const ggml_tensor * mm, const ggml_cuda_img & img) {
     int64_t key[GGML_CUDA_MMQ_SCRATCH_KEY];
-    const ggml_type t = ggml_cuda_cublas_compute_type(mm->src[0], mm->src[1], mm, ggml_cuda_info().devices[ctx.device].cc);
-    ggml_cuda_cublas_src1_key(mm->src[1], mm, t, key);
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (img.kind == GGML_CUDA_IMG_Q8_1_D4) {
+        ggml_cuda_mmq_scratch_size(mm, cc, key);
+    } else {
+        ggml_cuda_cublas_src1_key(mm->src[1], mm, ggml_cuda_cublas_compute_type(mm->src[0], mm->src[1], mm, cc), key);
+    }
     ctx.mmq_scratch_last = mm->src[GGML_SCHED_SCRATCH_SRC];
     memcpy(ctx.mmq_scratch_key, key, sizeof(key));
 }
@@ -6110,10 +6134,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 // the q8_1 of the output too when the next product reads it (whole warps per q8_1 block)
                 void * q8_1 = x->ne[0] % QK8_1 == 0 ? ggml_cuda_q8_1_produce(*cuda_ctx, cgraph, out_idx) : nullptr;
                 const ggml_tensor * img_mm = nullptr;
-                const ggml_cuda_img img = ggml_cuda_f16_image_target(*cuda_ctx, cgraph, i, out, &img_mm);
+                // q8_1: whole warps when every lane takes a value of each row (blocks of 128 threads)
+                const ggml_cuda_img img = ggml_cuda_f16_image_target(*cuda_ctx, cgraph, i, out, &img_mm, x->ne[0] % 128 == 0);
                 ggml_cuda_op_rms_norm_mul_sigmoid_gate(*cuda_ctx, node, w, gate, out, q8_1, img);
                 if (img.p) {
-                    ggml_cuda_f16_image_written(*cuda_ctx, img_mm);
+                    ggml_cuda_f16_image_written(*cuda_ctx, img_mm, img);
                 }
                 return count - 1;
             }
@@ -6228,10 +6253,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             if (ggml_can_fuse_subgraph_ext(cgraph, nodes, 3, ops, outputs, 2) && !overlaps(mm, node->src[0]) &&
                     !overlaps(mm, mul) && !overlaps(mul, node->src[0])) {
                 const ggml_tensor * img_mm = nullptr;
-                const ggml_cuda_img img = ggml_cuda_f16_image_target(*cuda_ctx, cgraph, i, mul, &img_mm);
+                const ggml_cuda_img img = ggml_cuda_f16_image_target(*cuda_ctx, cgraph, i, mul, &img_mm, node->src[0]->ne[0] % 128 == 0);
                 ggml_cuda_op_rms_norm_mul_inject(*cuda_ctx, node, mul, mm, img);
                 if (img.p) {
-                    ggml_cuda_f16_image_written(*cuda_ctx, img_mm);
+                    ggml_cuda_f16_image_written(*cuda_ctx, img_mm, img);
                 }
                 return k - i;
             }
@@ -6240,10 +6265,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
         const ggml_tensor * img_mm = nullptr;
-        const ggml_cuda_img img = ggml_cuda_f16_image_target(*cuda_ctx, cgraph, i, cgraph->nodes[i + 1], &img_mm);
+        // q8_1: rms_norm_f32's float4 path, rows of 128 values (its dispatch checks it)
+        const ggml_tensor * nx  = node->src[0];
+        const ggml_tensor * nm  = cgraph->nodes[i + 1];
+        const ggml_tensor * nw  = nm->src[0] == node ? nm->src[1] : nm->src[0];
+        const bool          nq8 = nx->ne[0] % 128 == 0 && nx->ne[0] <= 16384 && ggml_cuda_is_aligned(nx, 16) &&
+            ggml_cuda_is_aligned(nw, 16) && ggml_cuda_is_aligned(nm, 16) && nw->ne[0] == nx->ne[0];
+        const ggml_cuda_img img = ggml_cuda_f16_image_target(*cuda_ctx, cgraph, i, nm, &img_mm, nq8);
         ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1], img);
         if (img.p) {
-            ggml_cuda_f16_image_written(*cuda_ctx, img_mm);
+            ggml_cuda_f16_image_written(*cuda_ctx, img_mm, img);
         }
         return 1;
     }
@@ -6970,10 +7001,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 bool imaged = false;
                 if (node->op == GGML_OP_DSV4_HC_PRE && node->src[GGML_SCHED_SCRATCH_SRC] != nullptr) {
                     const ggml_tensor * img_mm = nullptr;
-                    const ggml_cuda_img img = ggml_cuda_f16_image_target(*cuda_ctx, cgraph, i, node, &img_mm);
+                    const ggml_cuda_img img = ggml_cuda_f16_image_target(*cuda_ctx, cgraph, i, node, &img_mm, node->ne[0] % 32 == 0);
                     if (img.p) {
                         ggml_cuda_op_dsv4_hc_pre(*cuda_ctx, node, img);
-                        ggml_cuda_f16_image_written(*cuda_ctx, img_mm);
+                        ggml_cuda_f16_image_written(*cuda_ctx, img_mm, img);
                         imaged = true;
                     }
                 }
