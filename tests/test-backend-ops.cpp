@@ -13866,7 +13866,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // a prompt batch of Qwen3.8's shape after a deferred window: the prefix replayed, then the chunked kernels
     for (int n_prefix : { 0, 3 }) {
         for (bool gather : { false, true }) {
-            for (int64_t n_tok : { 129, 2048 }) {
+            for (int64_t n_tok : { 129, 2048, 2085 }) {
                 test_cases.emplace_back(new test_gated_delta_net_replay(16, 128, 3, n_tok, n_prefix, n_prefix % 2, false, false, gather));
             }
         }
@@ -13897,7 +13897,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 100, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 200, 1));
     // Qwen3.8's shape (16 key heads, 48 value heads, S 128): a prompt batch of one sequence takes the chunked kernels on RDNA3
-    for (int64_t n : { 129, 257, 513, 2048 }) {
+    // (2049, 4500: GGML_CUDA_GDN_TC2's super-blocks of 2048 tokens, the last one partial)
+    for (int64_t n : { 129, 257, 513, 2048, 2049, 4500 }) {
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, n, 1, 3));
     }
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 127, 2));
@@ -14511,6 +14512,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 256, 1)); // PP-256
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 512, 1)); // PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1024, 1)); // PP-1024
+    // Qwen3.8's shape, a prompt batch of 2048 and of 9536 tokens (the chunked kernels on RDNA3 and CUDA)
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 2048, 1, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 9536, 1, 3));
     // Small model configs (fewer heads = less GPU occupancy for autoregressive)
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 64, 1));   // 4h PP-64
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 256, 1));  // 4h PP-256

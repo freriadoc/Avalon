@@ -4,6 +4,7 @@
 #include <mma.h>
 #endif
 
+#include <algorithm>
 #include <cstdlib>
 
 // The gated delta rule of a prompt batch in chunks of 16 tokens, on the RDNA3 matrix cores: Strata's gfx11 kernels
@@ -568,9 +569,695 @@ __global__ void __launch_bounds__(GW_NW * 32) gdn_tc_scan_cuda(const ggml_cuda_g
 }
 #endif // !GGML_USE_HIP && !GGML_USE_MUSA
 
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// ---- GGML_CUDA_GDN_TC2=NP (sm_80 and later): the chunked GDN of a prompt batch in chunks of 32 tokens on mma.sync, the
+// state in registers. The structure is Strata's (src/prefill/gdn_tc.cuh, MIT, Niko1221 and the Strata contributors):
+// every product transposed so that a warp's slice of the state (16 value columns x 128 rows, S^T) is the mma A operand
+// and never leaves its registers; the prep writes the scan's operands as FP16 images (k, q x 2^8, T x 2^et, P x 2^8)
+// and the token scalars, which the scan stages by cp.async, double-buffered; super-blocks of 2048 tokens bound the
+// scratch; a head split in value tiles (NTL) when the card has the SMs for them. Ours: the operand precision is a
+// parameter (NP 1: every product on one FP16 pass, as our RDNA3 kernels and the wmma kernel above; 3: Strata's three
+// passes hi.hi + hi.lo + lo.hi, FP32-level; 2: three for the state's products, one for the output's), only the images
+// the precision reads are written and staged (one pass: half the scratch and the staging, and v, T and P
+// double-buffered too, one barrier a chunk), the q / k / v / gate / beta read by strides, our transposed state read in
+// the recurrent cache, the tiles chosen from the SM count for any card.
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+#define GDN_TC2_DEVICE 1
+#endif
+
+constexpr int G2_CH = 32;              // tokens per chunk
+constexpr int G2_SB = 2048;            // tokens per super-block (one prep and one scan launch)
+constexpr int G2_NB = G2_SB / G2_CH;   // chunks per super-block
+constexpr int G2_KP = GW_S + 8;        // FP16 k / q rows in shared memory: 272 B, the 8 rows of an ldmatrix on 8 16-B lanes
+constexpr int G2_PP = G2_CH + 8;       // FP16 T / P rows: 80 B
+constexpr int G2_GP = G2_CH + 1;       // FP32 Gram rows of the prep
+constexpr int G2_CW = GW_S / 16;       // warps of a whole head: 16 value columns each
+
+// the images of a (chunk, key head) in the order k hi, q hi, [k lo], [q lo]; of a (chunk, value head) T hi, P hi, [T lo],
+// [P lo]: the low halves only for the products on three passes (NPS: the state's products, k.S, Y.T and the update;
+// NPO: the output's, q.S and D.P)
+static __host__ __device__ constexpr int g2_nimg(int nps, int npo) { return 2 + (nps == 3) + (npo == 3); }
+static __host__ __device__ constexpr int g2_klo(int nps)           { return nps == 3 ? 2 : 0; }
+static __host__ __device__ constexpr int g2_qlo(int nps, int npo)  { return npo == 3 ? (nps == 3 ? 3 : 2) : 1; }
+
+struct g2_scratch {
+    float4   * sc;   // [NB][HV][CH] (beta, exp(gamma), exp(gL - gamma), gamma)
+    uint16_t * kq;   // [NB][HK][nimg][CH][S]
+    uint16_t * tp;   // [NB][HV][nimg][CH][CH]
+    float    * te;   // [NB][HV] 2^-et
+};
+static size_t g2_scratch_bytes(int nimg) {
+    return (size_t) G2_NB * GW_HV * G2_CH * sizeof(float4) + (size_t) G2_NB * GW_HK * nimg * G2_CH * GW_S * 2 +
+           (size_t) G2_NB * GW_HV * nimg * G2_CH * G2_CH * 2 + (size_t) G2_NB * GW_HV * sizeof(float);
+}
+static g2_scratch g2_carve(void * p, int nimg) {
+    g2_scratch r;
+    unsigned char * b = (unsigned char *) p;
+    r.sc = (float4 *) b;   b += (size_t) G2_NB * GW_HV * G2_CH * sizeof(float4);
+    r.kq = (uint16_t *) b; b += (size_t) G2_NB * GW_HK * nimg * G2_CH * GW_S * 2;
+    r.tp = (uint16_t *) b; b += (size_t) G2_NB * GW_HV * nimg * G2_CH * G2_CH * 2;
+    r.te = (float *) b;
+    return r;
+}
+
+static __device__ __forceinline__ void g2_cp16(void * smem, const void * gmem) {
+#ifdef GDN_TC2_DEVICE
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"((unsigned) __cvta_generic_to_shared(smem)), "l"(gmem));
+#else
+    GGML_UNUSED_VARS(smem, gmem);
+#endif
+}
+static __device__ __forceinline__ void g2_cp4(void * smem, const void * gmem) {
+#ifdef GDN_TC2_DEVICE
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"((unsigned) __cvta_generic_to_shared(smem)), "l"(gmem));
+#else
+    GGML_UNUSED_VARS(smem, gmem);
+#endif
+}
+static __device__ __forceinline__ void g2_cp_commit() {
+#ifdef GDN_TC2_DEVICE
+    asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
+static __device__ __forceinline__ void g2_cp_wait_all() {
+#ifdef GDN_TC2_DEVICE
+    asm volatile("cp.async.wait_all;\n" ::);
+#endif
+}
+// the warp's largest of non-negative floats (their bits order as unsigned integers), under the full mask
+static __device__ __forceinline__ float g2_warp_max(float v) {
+#ifdef GDN_TC2_DEVICE
+    return __uint_as_float(__reduce_max_sync(0xffffffffu, __float_as_uint(v)));
+#else
+    return v;
+#endif
+}
+static __device__ __forceinline__ float g2_pow2(int e) { return __int_as_float((e + 127) << 23); }   // 2^e, |e| < 127
+// the power of two that puts m = max |x| in [2^14, 2^15): FP16 hi never overflows and the low part of every entry within
+// 2^-17 of the max stays normal; clamped far from FP32's range
+static __device__ __forceinline__ int g2_scale_exp(float m) {
+    if (m == 0.0f) {
+        return 0;
+    }
+    const int e = 14 - ((__float_as_int(m) >> 23) - 127);
+    return e < -40 ? -40 : (e > 40 ? 40 : e);
+}
+// m16n8k16 fragments (PTX ISA "Matrix Fragments", lane = 4 gid + tig): A a0 = (row gid, cols 2tig, 2tig+1), a1 = (gid+8, ..),
+// a2 = (gid, 2tig+8..), a3 = (gid+8, 2tig+8..); B b0 = (k 2tig, 2tig+1; n gid), b1 = (k 2tig+8..; n gid); C c0 = (gid, 2tig),
+// c1 = (gid, 2tig+1), c2 = (gid+8, 2tig), c3 = (gid+8, 2tig+1): two adjacent C tiles are the next product's A fragment
+static __device__ __forceinline__ void g2_ldsm_x4(uint32_t (&r)[4], const void * smem) {
+#ifdef GDN_TC2_DEVICE
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"((unsigned) __cvta_generic_to_shared(smem)));
+#else
+    r[0] = r[1] = r[2] = r[3] = 0u; GGML_UNUSED(smem);
+#endif
+}
+static __device__ __forceinline__ void g2_ldsm_x4_trans(uint32_t (&r)[4], const void * smem) {
+#ifdef GDN_TC2_DEVICE
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"((unsigned) __cvta_generic_to_shared(smem)));
+#else
+    r[0] = r[1] = r[2] = r[3] = 0u; GGML_UNUSED(smem);
+#endif
+}
+static __device__ __forceinline__ void g2_mma(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+#ifdef GDN_TC2_DEVICE
+    asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#else
+    GGML_UNUSED_VARS(c, a, b0, b1);
+#endif
+}
+// a product on NP passes: 3 = lo.hi, hi.lo, hi.hi (small terms first); 1 = hi.hi (the B lo image is not read)
+template <int NP>
+static __device__ __forceinline__ void g2_mmaN(float (&c)[4], const uint32_t (&ah)[4], const uint32_t (&al)[4], uint32_t bh0,
+                                               uint32_t bh1, uint32_t bl0, uint32_t bl1) {
+    if constexpr (NP == 3) {
+        g2_mma(c, al, bh0, bh1);
+        g2_mma(c, ah, bl0, bl1);
+    }
+    g2_mma(c, ah, bh0, bh1);
+}
+// x0, x1 -> packed FP16 hi (x0 in the low half) and lo = f16(x - hi) (x - hi exact in FP32)
+static __device__ __forceinline__ void g2_split(float x0, float x1, uint32_t & hi, uint32_t & lo) {
+    union { __half2 h; uint32_t u; } cv;
+    cv.h = __floats2half2_rn(x0, x1);
+    hi = cv.u;
+    const float2 r = __half22float2(cv.h);
+    cv.h = __floats2half2_rn(x0 - r.x, x1 - r.y);
+    lo = cv.u;
+}
+static __device__ __forceinline__ void g2_store4(uint16_t * hi, uint16_t * lo, float4 v, float scale) {
+    uint32_t h0, l0, h1, l1;
+    g2_split(v.x * scale, v.y * scale, h0, l0);
+    g2_split(v.z * scale, v.w * scale, h1, l1);
+    *reinterpret_cast<uint2 *>(hi) = make_uint2(h0, h1);
+    if (lo) {
+        *reinterpret_cast<uint2 *>(lo) = make_uint2(l0, l1);
+    }
+}
+// a float4 of shared memory the compiler does not keep in registers (the token scalars, read in three phases)
+static __device__ __forceinline__ float4 g2_lds128(const float4 * p) {
+    float4 v;
+#ifdef GDN_TC2_DEVICE
+    asm volatile("ld.shared.v4.f32 {%0,%1,%2,%3}, [%4];" : "=f"(v.x), "=f"(v.y), "=f"(v.z), "=f"(v.w)
+                 : "r"((unsigned) __cvta_generic_to_shared(p)));
+#else
+    v = *p;
+#endif
+    return v;
+}
+
+// X^T = S0^T K^T (NPK passes) and QS^T = S0^T Q^T (NPQ): A = the state x sA split per k16-step, B = the k / q images
+// ([CH][KP], rows = tokens) by ldmatrix. Out x 2^(8 + es).
+template <int NPK, int NPQ>
+static __device__ __forceinline__ void g2_prod_state(const float (&s)[16][4], float sA, const uint16_t * kh, const uint16_t * kl,
+        const uint16_t * qh, const uint16_t * ql, float (&xt)[4][4], float (&qs)[4][4]) {
+    const int lane = threadIdx.x & 31;
+    const int off = (8 * (lane >> 4) + (lane & 7)) * G2_KP + 8 * ((lane >> 3) & 1);
+#pragma unroll
+    for (int kk = 0; kk < GW_S / 16; ++kk) {
+        uint32_t ah[4], al[4];
+        g2_split(s[2 * kk][0] * sA,     s[2 * kk][1] * sA,     ah[0], al[0]);
+        g2_split(s[2 * kk][2] * sA,     s[2 * kk][3] * sA,     ah[1], al[1]);
+        g2_split(s[2 * kk + 1][0] * sA, s[2 * kk + 1][1] * sA, ah[2], al[2]);
+        g2_split(s[2 * kk + 1][2] * sA, s[2 * kk + 1][3] * sA, ah[3], al[3]);
+#pragma unroll
+        for (int hf = 0; hf < 2; ++hf) {
+            const int o = off + 16 * hf * G2_KP + 16 * kk;
+            uint32_t bh[4], bl[4] = {0u, 0u, 0u, 0u};
+            g2_ldsm_x4(bh, kh + o);
+            if constexpr (NPK == 3) {
+                g2_ldsm_x4(bl, kl + o);
+            }
+            g2_mmaN<NPK>(xt[2 * hf],     ah, al, bh[0], bh[1], bl[0], bl[1]);
+            g2_mmaN<NPK>(xt[2 * hf + 1], ah, al, bh[2], bh[3], bl[2], bl[3]);
+            g2_ldsm_x4(bh, qh + o);
+            if constexpr (NPQ == 3) {
+                g2_ldsm_x4(bl, ql + o);
+            }
+            g2_mmaN<NPQ>(qs[2 * hf],     ah, al, bh[0], bh[1], bl[0], bl[1]);
+            g2_mmaN<NPQ>(qs[2 * hf + 1], ah, al, bh[2], bh[3], bl[2], bl[3]);
+        }
+    }
+}
+// out^T += (sD X^T) B^T for a lower-triangular B (T or P images, [CH][PP], rows = tokens): tokens t < 16 (n-tiles 0, 1)
+// see no i >= 16 (k-step 1), skipped
+template <int NP>
+static __device__ __forceinline__ void g2_prod_tri(const float (&x)[4][4], float sD, const uint16_t * bhp, const uint16_t * blp,
+        float (&ot)[4][4]) {
+    const int lane = threadIdx.x & 31;
+    const int off = (8 * (lane >> 4) + (lane & 7)) * G2_PP + 8 * ((lane >> 3) & 1);
+#pragma unroll
+    for (int ks = 0; ks < G2_CH / 16; ++ks) {
+        uint32_t ah[4], al[4];
+        g2_split(x[2 * ks][0] * sD,     x[2 * ks][1] * sD,     ah[0], al[0]);
+        g2_split(x[2 * ks][2] * sD,     x[2 * ks][3] * sD,     ah[1], al[1]);
+        g2_split(x[2 * ks + 1][0] * sD, x[2 * ks + 1][1] * sD, ah[2], al[2]);
+        g2_split(x[2 * ks + 1][2] * sD, x[2 * ks + 1][3] * sD, ah[3], al[3]);
+#pragma unroll
+        for (int hf = 0; hf < 2; ++hf) {
+            if (ks == 1 && hf == 0) {
+                continue;
+            }
+            const int o = off + 16 * hf * G2_PP + 16 * ks;
+            uint32_t bh[4], bl[4] = {0u, 0u, 0u, 0u};
+            g2_ldsm_x4(bh, bhp + o);
+            if constexpr (NP == 3) {
+                g2_ldsm_x4(bl, blp + o);
+            }
+            g2_mmaN<NP>(ot[2 * hf],     ah, al, bh[0], bh[1], bl[0], bl[1]);
+            g2_mmaN<NP>(ot[2 * hf + 1], ah, al, bh[2], bh[3], bl[2], bl[3]);
+        }
+    }
+}
+// S^T += Dd^T (2^8 K): B = the k images read the other way by ldmatrix.trans
+template <int NP>
+static __device__ __forceinline__ void g2_update_state(float (&s)[16][4], const float (&dd)[4][4], const uint16_t * kh,
+        const uint16_t * kl) {
+    const int lane = threadIdx.x & 31;
+    const int off = (8 * ((lane >> 3) & 1) + (lane & 7)) * G2_KP + 8 * (lane >> 4);
+#pragma unroll
+    for (int ks = 0; ks < G2_CH / 16; ++ks) {
+        uint32_t ah[4], al[4];
+        g2_split(dd[2 * ks][0],     dd[2 * ks][1],     ah[0], al[0]);
+        g2_split(dd[2 * ks][2],     dd[2 * ks][3],     ah[1], al[1]);
+        g2_split(dd[2 * ks + 1][0], dd[2 * ks + 1][1], ah[2], al[2]);
+        g2_split(dd[2 * ks + 1][2], dd[2 * ks + 1][3], ah[3], al[3]);
+#pragma unroll
+        for (int hf = 0; hf < GW_S / 16; ++hf) {
+            const int o = off + 16 * ks * G2_KP + 16 * hf;
+            uint32_t bh[4], bl[4] = {0u, 0u, 0u, 0u};
+            g2_ldsm_x4_trans(bh, kh + o);
+            if constexpr (NP == 3) {
+                g2_ldsm_x4_trans(bl, kl + o);
+            }
+            g2_mmaN<NP>(s[2 * hf],     ah, al, bh[0], bh[1], bl[0], bl[1]);
+            g2_mmaN<NP>(s[2 * hf + 1], ah, al, bh[2], bh[3], bl[2], bl[3]);
+        }
+    }
+}
+
+// The prep, a block per (chunk of the super-block, key head), 256 threads: the k and q images (to shared memory, hi and
+// lo, and to the scratch, the ones the scan reads), the Gram products k_t.k_i and q_t.k_i on three FP16 passes
+// (FP32-level whatever NP: T = (I + A)^-1 amplifies their error), then warps 0..2 (value heads qh + j HK) A, T by forward
+// substitution (a lane per column) and T's images x 2^et, warps 3..5 P x 2^8 and the token scalars.
+constexpr size_t G2_PREP_SMEM = (size_t) 4 * G2_CH * G2_KP * 2 + 2 * G2_CH * G2_GP * 4;
+static_assert(GW_VPK * G2_CH * G2_GP * 4 <= 4 * G2_CH * G2_KP * 2, "A fits where the images were");
+
+template <int NPS, int NPO>
+__global__ void __launch_bounds__(256) gdn_tc2_prep(const ggml_cuda_gdn_wmma_args a, const g2_scratch sp, const int64_t t0) {
+#ifdef GDN_TC2_DEVICE
+    constexpr int NIMG = g2_nimg(NPS, NPO);
+    extern __shared__ __align__(16) float g2_psm[];
+    uint16_t * im  = reinterpret_cast<uint16_t *>(g2_psm);   // [4][CH][KP] k hi, k lo, q hi, q lo (x 2^8)
+    float    * skk = g2_psm + 4 * G2_CH * G2_KP / 2;          // [CH][GP] k_t.k_i
+    float    * sqk = skk + G2_CH * G2_GP;                     // [CH][GP] q_t.k_i
+    float    * sa  = g2_psm;                                  // [VPK][CH][GP] A (over the images, read by then)
+    const int qh = blockIdx.y, ch = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int64_t tb = t0 + (int64_t) ch * G2_CH;
+    const int n = (int) min((int64_t) G2_CH, a.T - tb);
+    const int j = warp % GW_VPK, vh = qh + j * GW_HK, i = lane;
+    const bool pv = warp < 2 * GW_VPK && i < n;   // past the end: gate 0, beta 0
+    const float b = pv ? a.beta[(tb + i) * a.sb2 + vh * a.sb1] : 0.0f;
+    float gam     = pv ? a.g   [(tb + i) * a.sb2 + vh * a.sb1] : 0.0f;
+    {
+        constexpr int NR = G2_CH * GW_S / 4 / 256;   // float4 a thread, each of k and q
+        float4 kv[NR], qv[NR];
+#pragma unroll
+        for (int m = 0; m < NR; ++m) {
+            const int p = tid + 256 * m, t = p / (GW_S / 4), r = (p % (GW_S / 4)) * 4;
+            const float4 z4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            kv[m] = t < n ? *reinterpret_cast<const float4 *>(a.k + (tb + t) * a.sq2 + qh * a.sq1 + r) : z4;
+            qv[m] = t < n ? *reinterpret_cast<const float4 *>(a.q + (tb + t) * a.sq2 + qh * a.sq1 + r) : z4;
+        }
+        uint16_t * img = sp.kq + ((size_t) ch * GW_HK + qh) * NIMG * G2_CH * GW_S;
+#pragma unroll
+        for (int m = 0; m < NR; ++m) {
+            const int p = tid + 256 * m, t = p / (GW_S / 4), r = (p % (GW_S / 4)) * 4;
+            const int o = t * G2_KP + r, og = t * GW_S + r;
+            g2_store4(im + o, im + G2_CH * G2_KP + o, kv[m], 256.0f);
+            g2_store4(im + 2 * G2_CH * G2_KP + o, im + 3 * G2_CH * G2_KP + o, qv[m], 256.0f);
+            g2_store4(img + og, NPS == 3 ? img + g2_klo(NPS) * G2_CH * GW_S + og : nullptr, kv[m], 256.0f);
+            g2_store4(img + G2_CH * GW_S + og, NPO == 3 ? img + g2_qlo(NPS, NPO) * G2_CH * GW_S + og : nullptr, qv[m], 256.0f);
+        }
+    }
+    __syncthreads();
+    {   // warp w: product w >> 2 (k.k, q.k), rows 16 ((w >> 1) & 1).., columns 16 (w & 1)..; out x 2^16
+        const int pr = warp >> 2, mt = (warp >> 1) & 1, np = warp & 1;
+        const uint16_t * ah_ = im + 2 * pr * G2_CH * G2_KP + (16 * mt + (lane & 7) + 8 * ((lane >> 3) & 1)) * G2_KP + 8 * (lane >> 4);
+        const uint16_t * bh_ = im + (16 * np + 8 * (lane >> 4) + (lane & 7)) * G2_KP + 8 * ((lane >> 3) & 1);
+        float c[2][4] = {};
+#pragma unroll
+        for (int kk = 0; kk < GW_S / 16; ++kk) {
+            uint32_t ah[4], al[4], bh[4], bl[4];
+            g2_ldsm_x4(ah, ah_ + 16 * kk);
+            g2_ldsm_x4(al, ah_ + G2_CH * G2_KP + 16 * kk);
+            g2_ldsm_x4(bh, bh_ + 16 * kk);
+            g2_ldsm_x4(bl, bh_ + G2_CH * G2_KP + 16 * kk);
+            g2_mmaN<3>(c[0], ah, al, bh[0], bh[1], bl[0], bl[1]);
+            g2_mmaN<3>(c[1], ah, al, bh[2], bh[3], bl[2], bl[3]);
+        }
+        float * g = pr ? sqk : skk;
+        const int gid = lane >> 2, tig = lane & 3;
+#pragma unroll
+        for (int jj = 0; jj < 2; ++jj) {
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const int t = 16 * mt + gid + 8 * (q >> 1), ii = 16 * np + 8 * jj + 2 * tig + (q & 1);
+                g[t * G2_GP + ii] = ii <= t ? c[jj][q] * g2_pow2(-16) : 0.0f;
+            }
+        }
+    }
+    __syncthreads();
+    if (warp >= 2 * GW_VPK) {
+        return;
+    }
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        const float u = __shfl_up_sync(0xffffffffu, gam, o);
+        if (lane >= o) {
+            gam += u;
+        }
+    }
+    uint16_t * tpb = sp.tp + ((size_t) ch * GW_HV + vh) * NIMG * G2_CH * G2_CH;
+    if (warp >= GW_VPK) {   // P = exp(gamma_t - gamma_i) q_t.k_i (i <= t) x 2^8; the scalars
+        uint16_t * Ph = tpb + G2_CH * G2_CH;
+        uint16_t * Pl = tpb + g2_qlo(NPS, NPO) * G2_CH * G2_CH;
+#pragma unroll
+        for (int t = 0; t < G2_CH; ++t) {
+            const float gt = __shfl_sync(0xffffffffu, gam, t);
+            const float p = (i <= t ? expf(gt - gam) * sqk[t * G2_GP + i] : 0.0f) * 256.0f;
+            const __half hi = __float2half_rn(p);
+            Ph[t * G2_CH + i] = __half_as_ushort(hi);
+            if constexpr (NPO == 3) {
+                Pl[t * G2_CH + i] = __half_as_ushort(__float2half_rn(p - __half2float(hi)));
+            }
+        }
+        const float gL = __shfl_sync(0xffffffffu, gam, G2_CH - 1);
+        sp.sc[((size_t) ch * GW_HV + vh) * G2_CH + i] = make_float4(b, expf(gam), expf(gL - gam), gam);
+        return;
+    }
+    float * A = sa + j * G2_CH * G2_GP;
+#pragma unroll
+    for (int t = 0; t < G2_CH; ++t) {
+        const float gt = __shfl_sync(0xffffffffu, gam, t), bt = __shfl_sync(0xffffffffu, b, t);
+        A[t * G2_GP + i] = i < t ? bt * expf(gt - gam) * skk[t * G2_GP + i] : (i == t ? 1.0f : 0.0f);
+    }
+    __syncwarp();
+    // T = (I + A)^-1 row by row, lane i keeping column i in registers (A's row t a broadcast load a term)
+    float tv[G2_CH];
+    tv[0] = i == 0 ? 1.0f : 0.0f;
+#pragma unroll
+    for (int t = 1; t < G2_CH; ++t) {
+        float v = 0.0f;
+#pragma unroll
+        for (int k = 0; k < t; ++k) {
+            v = fmaf(-A[t * G2_GP + k], tv[k], v);
+        }
+        tv[t] = i < t ? v : (i == t ? 1.0f : 0.0f);
+    }
+    float mt4[4] = {};
+#pragma unroll
+    for (int t = 0; t < G2_CH; ++t) {
+        mt4[t & 3] = fmaxf(mt4[t & 3], fabsf(tv[t]));
+    }
+    const int et = g2_scale_exp(g2_warp_max(fmaxf(fmaxf(mt4[0], mt4[1]), fmaxf(mt4[2], mt4[3]))));
+    const float sT = g2_pow2(et);
+    uint16_t * Th = tpb;
+    uint16_t * Tl = tpb + g2_klo(NPS) * G2_CH * G2_CH;
+#pragma unroll
+    for (int t = 0; t < G2_CH; ++t) {
+        const float x = tv[t] * sT;
+        const __half hi = __float2half_rn(x);
+        Th[t * G2_CH + i] = __half_as_ushort(hi);
+        if constexpr (NPS == 3) {
+            Tl[t * G2_CH + i] = __half_as_ushort(__float2half_rn(x - __half2float(hi)));
+        }
+    }
+    if (i == 0) {
+        sp.te[(size_t) ch * GW_HV + vh] = g2_pow2(-et);
+    }
+#else
+    GGML_UNUSED_VARS(a, sp, t0);
+    __trap();
+#endif // GDN_TC2_DEVICE
+}
+
+// the scan's shared memory: k / q images [2][NIMG][CH][KP], v [NV][CH][VC + 4], T / P images [NV][NIMG][CH][PP], the
+// scalars [2][CH], T's scale [2]; with three passes (NPS or NPO 3) v, T and P have one buffer (SPLIT), restaged after the
+// chunk's last read of them, so that the plan fits the 99 KB of the sm_86 / sm_89 cards
+template <int NPS, int NPO, int NTL>
+struct g2_plan {
+    static constexpr bool   SPLIT = NPS == 3 || NPO == 3;
+    static constexpr int    NIMG  = g2_nimg(NPS, NPO);
+    static constexpr int    NV    = SPLIT ? 1 : 2;
+    static constexpr int    VC    = GW_S / NTL;    // value columns of a tile
+    static constexpr int    VP    = VC + 4;        // lane (gid, tig) reads word 2 tig VP + gid: 32 distinct banks
+    static constexpr int    NT    = (G2_CW / NTL) * 32;
+    static constexpr size_t KQ    = (size_t) 2 * NIMG * G2_CH * G2_KP * 2;
+    static constexpr size_t SV    = (size_t) NV * G2_CH * VP * 4;
+    static constexpr size_t TP    = (size_t) NV * NIMG * G2_CH * G2_PP * 2;
+    static constexpr size_t SMEM  = KQ + SV + TP + 2 * G2_CH * 16 + 16;
+};
+
+// The scan, a block per (value head, tile of VC value columns), a warp per 16 columns, the state slice in registers as
+// 16 S^T accumulator tiles a lane; per chunk: (a) X^T = S0^T K^T, QS^T = S0^T Q^T; (b) Y^T = beta (V^T - e X^T);
+// (c) D^T = Y^T T^T; (d) o^T = e QS^T + D^T P^T (written out); (e) S^T = eL S0^T + (f D^T) K. Every operand is scaled to
+// [2^14, 2^15) by a power of two (exact), so its FP16 images stay in range (and the low halves normal).
+template <int NPS, int NPO, int NTL>
+__global__ void __launch_bounds__(g2_plan<NPS, NPO, NTL>::NT, 1) gdn_tc2_scan(const ggml_cuda_gdn_wmma_args a, const g2_scratch sp,
+        const int64_t t0, const int nch, const bool first) {
+#ifdef GDN_TC2_DEVICE
+    using P = g2_plan<NPS, NPO, NTL>;
+    constexpr int NIMG = P::NIMG, NT = P::NT, VC = P::VC, VP = P::VP;
+    extern __shared__ __align__(16) unsigned char g2_ssm[];
+    uint16_t * skq = reinterpret_cast<uint16_t *>(g2_ssm);
+    float    * sv  = reinterpret_cast<float *>(g2_ssm + P::KQ);
+    uint16_t * stp = reinterpret_cast<uint16_t *>(g2_ssm + P::KQ + P::SV);
+    float4   * ssc = reinterpret_cast<float4 *>(g2_ssm + P::KQ + P::SV + P::TP);
+    float    * ste = reinterpret_cast<float *>(ssc + 2 * G2_CH);
+    const int vh = blockIdx.x / NTL, qhd = vh % GW_HK, cb = (blockIdx.x % NTL) * VC;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, gid = lane >> 2, tig = lane & 3;
+    const int64_t T = a.T;
+    auto stage = [&](int ch, int b, int parts) {
+        const int64_t c_t0 = t0 + (int64_t) ch * G2_CH;
+        const int n = (int) min((int64_t) G2_CH, T - c_t0);
+        const int bv = P::SPLIT ? 0 : b;
+        if (parts & 1) {
+            const uint16_t * img = sp.kq + ((size_t) ch * GW_HK + qhd) * NIMG * G2_CH * GW_S;
+            for (int pc = tid; pc < NIMG * G2_CH * GW_S / 8; pc += NT) {
+                const int m = pc / (G2_CH * GW_S / 8), t = (pc % (G2_CH * GW_S / 8)) / (GW_S / 8), r = (pc % (GW_S / 8)) * 8;
+                g2_cp16(skq + ((b * NIMG + m) * G2_CH + t) * G2_KP + r, img + (m * G2_CH + t) * GW_S + r);
+            }
+            if (tid < G2_CH) {
+                g2_cp16(ssc + b * G2_CH + tid, sp.sc + ((size_t) ch * GW_HV + vh) * G2_CH + tid);
+            }
+            if (tid == 0) {
+                g2_cp4(ste + b, sp.te + (size_t) ch * GW_HV + vh);
+            }
+        }
+        if (parts & 2) {
+            for (int p = tid; p < G2_CH * VC / 4; p += NT) {
+                const int t = p / (VC / 4), r = (p % (VC / 4)) * 4;
+                float * dst = sv + (bv * G2_CH + t) * VP + r;
+                if (t < n) {
+                    g2_cp16(dst, a.v + (c_t0 + t) * a.sv2 + vh * a.sv1 + cb + r);
+                } else {
+                    *reinterpret_cast<float4 *>(dst) = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                }
+            }
+            const uint16_t * tpg = sp.tp + ((size_t) ch * GW_HV + vh) * NIMG * G2_CH * G2_CH;
+            for (int pc = tid; pc < NIMG * G2_CH * G2_CH / 8; pc += NT) {
+                const int m = pc / (G2_CH * G2_CH / 8), t = (pc % (G2_CH * G2_CH / 8)) / (G2_CH / 8), i = (pc % (G2_CH / 8)) * 8;
+                g2_cp16(stp + ((bv * NIMG + m) * G2_CH + t) * G2_PP + i, tpg + (m * G2_CH + t) * G2_CH + i);
+            }
+        }
+        g2_cp_commit();
+    };
+    const int c0 = 16 * warp;   // the warp's columns c0 + gid and c0 + gid + 8 of the tile
+    const int ca = cb + c0;     // in the head
+    // our state is transposed, M[col][i] = S[i][col]: s[j][0..1] = S[8j + 2tig .. +1][ca + gid], s[j][2..3] the column + 8
+    const float * s_in = first ? a.state + (a.state_ids ? (int64_t) a.state_ids[0] * a.state_row_stride : 0) : a.state_out;
+    s_in += (int64_t) vh * GW_S * GW_S;
+    float s[16][4];
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+        const float2 u0 = *reinterpret_cast<const float2 *>(s_in + (int64_t) (ca + gid)     * GW_S + 8 * j + 2 * tig);
+        const float2 u1 = *reinterpret_cast<const float2 *>(s_in + (int64_t) (ca + gid + 8) * GW_S + 8 * j + 2 * tig);
+        s[j][0] = u0.x; s[j][1] = u0.y; s[j][2] = u1.x; s[j][3] = u1.y;
+    }
+    stage(0, 0, 3);
+    const float out_scale = rsqrtf((float) GW_S);
+    for (int ch = 0; ch < nch; ++ch) {
+        const int b = ch & 1, bv = P::SPLIT ? 0 : b;
+        const int64_t c_t0 = t0 + (int64_t) ch * G2_CH;
+        const int n = (int) min((int64_t) G2_CH, T - c_t0);
+        g2_cp_wait_all();
+        __syncthreads();   // chunk ch's buffers complete; every read of the other ones done
+        if (ch + 1 < nch) {
+            stage(ch + 1, b ^ 1, P::SPLIT ? 1 : 3);
+        }
+        const uint16_t * bk  = skq + b * NIMG * G2_CH * G2_KP;
+        const uint16_t * bkh = bk;
+        const uint16_t * bqh = bk + G2_CH * G2_KP;
+        const uint16_t * bkl = bk + g2_klo(NPS) * G2_CH * G2_KP;
+        const uint16_t * bql = bk + g2_qlo(NPS, NPO) * G2_CH * G2_KP;
+        const uint16_t * bt  = stp + bv * NIMG * G2_CH * G2_PP;
+        const uint16_t * bth = bt;
+        const uint16_t * bph = bt + G2_CH * G2_PP;
+        const uint16_t * btl = bt + g2_klo(NPS) * G2_CH * G2_PP;
+        const uint16_t * bpl = bt + g2_qlo(NPS, NPO) * G2_CH * G2_PP;
+        const float    * bsv = sv + bv * G2_CH * VP;
+        const float4   * bsc = ssc + b * G2_CH;
+        // (a) the state x 2^es (its largest entry in [2^14, 2^15)), eight max chains
+        float m8[8] = {};
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                m8[(2 * j + (q >> 1)) & 7] = fmaxf(m8[(2 * j + (q >> 1)) & 7], fabsf(s[j][q]));
+            }
+        }
+        const float m = fmaxf(fmaxf(fmaxf(m8[0], m8[1]), fmaxf(m8[2], m8[3])), fmaxf(fmaxf(m8[4], m8[5]), fmaxf(m8[6], m8[7])));
+        const int es = g2_scale_exp(g2_warp_max(m));
+        float xt[4][4] = {}, qs[4][4] = {};
+        g2_prod_state<NPS, NPO>(s, g2_pow2(es), bkh, bkl, bqh, bql, xt, qs);
+        // (b) Y^T = beta_i (V^T - e'_i X^T), e'_i = exp(gamma_i) 2^-(8 + es); lane: tokens 8nt + 2tig (+1), columns c0 + gid (+8)
+        const float eS = g2_pow2(-(8 + es));
+        float yt[4][4];
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+            const float4 s0 = g2_lds128(bsc + 8 * nt + 2 * tig), s1 = g2_lds128(bsc + 8 * nt + 2 * tig + 1);
+            const float * v = bsv + (8 * nt + 2 * tig) * VP + c0 + gid;
+            const float e0 = s0.y * eS, e1 = s1.y * eS;
+            yt[nt][0] = s0.x * fmaf(-e0, xt[nt][0], v[0]);
+            yt[nt][1] = s1.x * fmaf(-e1, xt[nt][1], v[VP]);
+            yt[nt][2] = s0.x * fmaf(-e0, xt[nt][2], v[8]);
+            yt[nt][3] = s1.x * fmaf(-e1, xt[nt][3], v[VP + 8]);
+        }
+        // (c) D^T = Y^T T^T: Y^T x 2^ey, T's images x 2^et; out x 2^(ey + et)
+        float my4[4] = {};
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                my4[q] = fmaxf(my4[q], fabsf(yt[nt][q]));
+            }
+        }
+        const int ey = g2_scale_exp(g2_warp_max(fmaxf(fmaxf(my4[0], my4[1]), fmaxf(my4[2], my4[3]))));
+        float dt[4][4] = {};
+        g2_prod_tri<NPS>(yt, g2_pow2(ey), bth, btl, dt);
+        const float sYT = g2_pow2(-ey) * ste[b];
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                dt[nt][q] *= sYT;
+            }
+        }
+        // (d) o^T = e_t QS^T + D^T P^T: the accumulator starts as 2^(ed + 8) e_t QS^T, D^T in x 2^ed, P x 2^8
+        float md4[4] = {};
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                md4[q] = fmaxf(md4[q], fabsf(dt[nt][q]));
+            }
+        }
+        const int ed = g2_scale_exp(g2_warp_max(fmaxf(fmaxf(md4[0], md4[1]), fmaxf(md4[2], md4[3]))));
+        const float sD = g2_pow2(ed), sO = g2_pow2(ed + 8), sOi = g2_pow2(-(ed + 8)), eO = g2_pow2(ed - es);
+        float ot[4][4];
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+            const float e0 = g2_lds128(bsc + 8 * nt + 2 * tig).y * eO, e1 = g2_lds128(bsc + 8 * nt + 2 * tig + 1).y * eO;
+            ot[nt][0] = qs[nt][0] * e0; ot[nt][1] = qs[nt][1] * e1; ot[nt][2] = qs[nt][2] * e0; ot[nt][3] = qs[nt][3] * e1;
+        }
+        g2_prod_tri<NPO>(dt, sD, bph, bpl, ot);
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const int t = 8 * nt + 2 * tig + (q & 1);
+                if (t < n) {
+                    a.dst[((c_t0 + t) * GW_HV + vh) * GW_S + ca + gid + 8 * (q >> 1)] = (ot[nt][q] * sOi) * out_scale;
+                }
+            }
+        }
+        if constexpr (P::SPLIT) {   // v, T and P of this chunk are dead: the next chunk's land during (e)
+            __syncthreads();
+            if (ch + 1 < nch) {
+                stage(ch + 1, 0, 2);
+            }
+        }
+        // (e) S^T = eL S0^T + Dd^T K: the accumulator x eL 2^(ed + 8) before, Dd^T = f_i D^T x 2^ed, K x 2^8, x 2^-(ed + 8) after
+        const float sPre = g2_lds128(bsc + G2_CH - 1).y * sO;
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                s[j][q] *= sPre;
+            }
+        }
+        float dd[4][4];
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+            const float f0 = g2_lds128(bsc + 8 * nt + 2 * tig).z * sD, f1 = g2_lds128(bsc + 8 * nt + 2 * tig + 1).z * sD;
+            dd[nt][0] = dt[nt][0] * f0; dd[nt][1] = dt[nt][1] * f1; dd[nt][2] = dt[nt][2] * f0; dd[nt][3] = dt[nt][3] * f1;
+        }
+        g2_update_state<NPS>(s, dd, bkh, bkl);
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                s[j][q] *= sOi;
+            }
+        }
+    }
+    float * s_out = a.state_out + (int64_t) vh * GW_S * GW_S;
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+        *reinterpret_cast<float2 *>(s_out + (int64_t) (ca + gid)     * GW_S + 8 * j + 2 * tig) = make_float2(s[j][0], s[j][1]);
+        *reinterpret_cast<float2 *>(s_out + (int64_t) (ca + gid + 8) * GW_S + 8 * j + 2 * tig) = make_float2(s[j][2], s[j][3]);
+    }
+#else
+    GGML_UNUSED_VARS(a, sp, t0, nch, first);
+    __trap();
+#endif // GDN_TC2_DEVICE
+}
+
+// GGML_CUDA_GDN_TC2: 0 / unset off, 1 / 2 / 3 the passes (see above); GGML_CUDA_GDN_TC2_TILES=1|2 forces the tiles
+static int g2_np() {
+    static const int np = [] {
+        const char * e = getenv("GGML_CUDA_GDN_TC2");
+        const int v = e ? atoi(e) : 0;
+        return v == 1 || v == 2 || v == 3 ? v : 0;
+    }();
+    return np;
+}
+static int g2_nps(int np) { return np == 1 ? 1 : 3; }
+static int g2_npo(int np) { return np == 3 ? 3 : 1; }
+
+template <int NPS, int NPO, int NTL>
+static void g2_run(const ggml_cuda_gdn_wmma_args & a, cudaStream_t stream) {
+    using P = g2_plan<NPS, NPO, NTL>;
+    static bool attr[GGML_CUDA_MAX_DEVICES] = {};
+    const int dev = ggml_cuda_get_device();
+    if (!attr[dev]) {
+        CUDA_CHECK(cudaFuncSetAttribute(gdn_tc2_scan<NPS, NPO, NTL>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) P::SMEM));
+        attr[dev] = true;
+    }
+    const g2_scratch sp = g2_carve(a.scratch, P::NIMG);
+    for (int64_t t0 = 0; t0 < a.T; t0 += G2_SB) {
+        const int nch = (int) ((std::min<int64_t>(G2_SB, a.T - t0) + G2_CH - 1) / G2_CH);
+        gdn_tc2_prep<NPS, NPO><<<dim3((unsigned) nch, GW_HK), 256, G2_PREP_SMEM, stream>>>(a, sp, t0);
+        gdn_tc2_scan<NPS, NPO, NTL><<<GW_HV * NTL, P::NT, P::SMEM, stream>>>(a, sp, t0, nch, t0 == 0);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+#endif // !GGML_USE_HIP && !GGML_USE_MUSA
+
 } // namespace
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// the value tiles of a head for the TC2 scan: two when the card holds the 2 x 48 blocks in one wave
+static int g2_tiles() {
+    static const int forced = getenv("GGML_CUDA_GDN_TC2_TILES") ? atoi(getenv("GGML_CUDA_GDN_TC2_TILES")) : 0;
+    if (forced > 0) {
+        return forced >= 2 ? 2 : 1;
+    }
+    return ggml_cuda_info().devices[ggml_cuda_get_device()].nsm >= 2 * GW_HV ? 2 : 1;
+}
+static size_t g2_smem(int np, int tiles) {
+    switch (np * 10 + tiles) {
+        case 11: return g2_plan<1, 1, 1>::SMEM;
+        case 12: return g2_plan<1, 1, 2>::SMEM;
+        case 21: return g2_plan<3, 1, 1>::SMEM;
+        case 22: return g2_plan<3, 1, 2>::SMEM;
+        case 31: return g2_plan<3, 3, 1>::SMEM;
+        default: return g2_plan<3, 3, 2>::SMEM;
+    }
+}
+// GGML_CUDA_GDN_TC2 asked, an sm_80 card with the shared memory of the plan
+static bool g2_active() {
+    const int np = g2_np();
+    if (np == 0) {
+        return false;
+    }
+    const auto & info = ggml_cuda_info().devices[ggml_cuda_get_device()];
+    return GGML_CUDA_CC_IS_NVIDIA(info.cc) && info.cc >= GGML_CUDA_CC_AMPERE && info.smpbo >= g2_smem(np, g2_tiles());
+}
+#endif // !GGML_USE_HIP && !GGML_USE_MUSA
+
 size_t ggml_cuda_gdn_wmma_scratch_size(int64_t T) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (g2_active()) {   // one super-block's, whatever T
+        return g2_scratch_bytes(g2_nimg(g2_nps(g2_np()), g2_npo(g2_np())));
+    }
+#endif
     return (size_t) ((T + GW_CK - 1) / GW_CK) * GW_HV * (2 * GW_CK * GW_CK) * sizeof(uint16_t);
 }
 
@@ -616,6 +1303,16 @@ void ggml_cuda_gdn_wmma_launch(const ggml_cuda_gdn_wmma_args & a, cudaStream_t s
     gdn_wmma_scan<<<GW_HV, GW_NW * 32, 0, stream>>>(a, (const unsigned *) a.scratch);
     CUDA_CHECK(cudaGetLastError());
 #elif !defined(GGML_USE_MUSA)
+    if (g2_active()) {
+        switch (g2_np() * 10 + g2_tiles()) {
+            case 11: g2_run<1, 1, 1>(a, stream); return;
+            case 12: g2_run<1, 1, 2>(a, stream); return;
+            case 21: g2_run<3, 1, 1>(a, stream); return;
+            case 22: g2_run<3, 1, 2>(a, stream); return;
+            case 31: g2_run<3, 3, 1>(a, stream); return;
+            default: g2_run<3, 3, 2>(a, stream); return;
+        }
+    }
     const int64_t nch = (a.T + GW_CK - 1) / GW_CK;
     gdn_tc_prep_cuda<<<dim3(GW_HK, (unsigned) nch), GW_CK * GW_CK, 0, stream>>>(a, (__half *) a.scratch);
     gdn_tc_scan_cuda<<<GW_HV, GW_NW * 32, 0, stream>>>(a, (const __half *) a.scratch);
