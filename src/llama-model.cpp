@@ -2067,17 +2067,28 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // reads as the same bytes of page cache would. Else the rows stay mapped and prefetched as before
     if (per_layer_tok_embd && ml.lazy.has(per_layer_tok_embd) && per_layer_tok_embd->data) {
         const size_t ple = ggml_nbytes(per_layer_tok_embd);
-        size_t host = 0;
+        // the other weights' bytes in host memory, their ranges merged: a packed layer's gate, up and down are views
+        // of one region, each spanning nearly all of it (summed, 146 272 MiB for 49 743 MiB of experts)
+        std::vector<std::pair<uintptr_t, uintptr_t>> ranges;
         for (const auto & [name, t] : tensors_by_name) {
-            if (t != per_layer_tok_embd && t->buffer && ggml_backend_buffer_is_host(t->buffer)) {
-                host += ggml_nbytes(t);
+            if (t != per_layer_tok_embd && t->data && t->buffer && ggml_backend_buffer_is_host(t->buffer)) {
+                ranges.push_back({(uintptr_t) t->data, (uintptr_t) t->data + ggml_nbytes(t)});
             }
+        }
+        std::sort(ranges.begin(), ranges.end());
+        size_t host = 0;
+        uintptr_t covered = 0;
+        for (const auto & r : ranges) {
+            const uintptr_t b = std::max(r.first, covered);
+            host += r.second > b ? r.second - b : 0;
+            covered = std::max(covered, r.second);
         }
         const char * margin_env = getenv("GGML_CUDA_MOE_ARENA_MARGIN_MB");
         const size_t margin = (margin_env ? (size_t) atoll(margin_env) : 4096) << 20;
         const size_t room = llama_host_room_bytes();
         const bool fits = room != SIZE_MAX && host + ple + 2 * margin <= room;
         const char * env = getenv("LLAMA_PLE_RAM");
+        env = env && *env ? env : nullptr;   // set but empty: the default
         const bool on = env ? atoi(env) != 0 : fits;
         const double mib = 1024.0 * 1024.0;
         LLAMA_LOG_INFO("%s: PLE table in RAM: %s (%s; table %.0f MiB, other host weights %.0f MiB, margin 2 x %.0f MiB, "
