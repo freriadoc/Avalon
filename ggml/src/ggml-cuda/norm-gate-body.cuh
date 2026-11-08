@@ -13,6 +13,7 @@ struct rms_norm_gate_args {
     float eps;
     block_q8_1 * dst_q8_1;
     int nrows, nchannels, nsamples;   // the grid
+    bool dst_unused;   // with the image: dst unwritten (its product reads only the image)
 };
 
 // has_img: also the image of dst for the cuBLAS products after it (a prompt batch only; out of the arguments and of the
@@ -44,9 +45,13 @@ static __device__ __forceinline__ void rms_norm_mul_sigmoid_gate_body(const rms_
     for (int col = tid; col < ncols; col += block_size) {
         const float g = 1.0f / (1.0f + expf(-gate[col]));
         const float v = scale * x[col] * w[col] * g;
-        dst[col] = v;
         if constexpr (has_img) {
+            if (!a.dst_unused) {
+                dst[col] = v;
+            }
             img.store1(dst_off + col, v);   // q8_1: whole warps (ncols % 128 == 0, ggml_cuda_f16_image_target)
+        } else {
+            dst[col] = v;
         }
         if (dst_q8_1) {
             // the q8_1 block of the 32 values of this warp, as quantize_q8_1 writes it (lane = index in the block;

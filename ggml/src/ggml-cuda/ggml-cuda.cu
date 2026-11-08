@@ -4016,6 +4016,44 @@ static const ggml_tensor * ggml_cuda_view_root(const ggml_tensor * t) {
 // true when no node after `from` reads the first n_ch_lo channels of conv_out ([n_ch, n_t, n_s], a row per token): every
 // later reader of it is a view whose bytes in a row start at or past them (the gated delta net's v view); a reader
 // of conv_out itself, or a view across rows in another way, says no
+// whether the product mm reading the F16 / BF16 image of out (ggml_cuda_f16_image_target) is out's only reader in the rest of
+// the graph and finds the image still there: every later node that reads out or a view of it is mm or a view, and only
+// views and no-ops run between them (no other product could take the scratch's reuse key first). Graphs of other splits
+// cannot read it: same rule as ggml_cuda_conv_low_channels_unread
+static bool ggml_cuda_only_image_reader(const ggml_cgraph * cgraph, int from, const ggml_tensor * out, const ggml_tensor * mm) {
+    if (out->flags & GGML_TENSOR_FLAG_OUTPUT) {
+        return false;
+    }
+    bool seen_mm = false;
+    for (int j = from + 1; j < cgraph->n_nodes; j++) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        const bool view = ggml_cuda_is_view_or_noop(n);
+        if (n == mm) {
+            seen_mm = true;
+            continue;
+        }
+        if (!seen_mm && !view) {
+            return false;   // a computing node between the producer and its product
+        }
+        if (view) {
+            continue;
+        }
+        for (int k = 0; k < GGML_MAX_SRC; k++) {
+            const ggml_tensor * t = n->src[k];
+            if (t == nullptr) {
+                continue;
+            }
+            while (t->view_src) {
+                t = t->view_src;
+            }
+            if (t == out) {
+                return false;
+            }
+        }
+    }
+    return seen_mm;
+}
+
 static bool ggml_cuda_conv_low_channels_unread(const ggml_cgraph * cgraph, int from, const ggml_tensor * conv_out,
         int64_t n_ch_lo) {
     const int64_t rowb = conv_out->nb[1];
@@ -6411,7 +6449,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 const ggml_tensor * img_mm = nullptr;
                 // q8_1: whole warps when every lane takes a value of each row (blocks of 128 threads)
                 const ggml_cuda_img img = ggml_cuda_f16_image_target(*cuda_ctx, cgraph, i, out, &img_mm, x->ne[0] % 128 == 0);
-                ggml_cuda_op_rms_norm_mul_sigmoid_gate(*cuda_ctx, node, w, gate, out, q8_1, img);
+                // GGML_CUDA_NORM_GATE_SKIP_DST=1: out's FP32 values unwritten when the image's product is its only reader
+                // (ggml_cuda_only_image_reader); never under GGML_CUDA_F16_IMAGE_CHECK, which compares the image with them
+                static const bool skip_on = getenv("GGML_CUDA_NORM_GATE_SKIP_DST") && atoi(getenv("GGML_CUDA_NORM_GATE_SKIP_DST")) != 0 &&
+                                            !getenv("GGML_CUDA_F16_IMAGE_CHECK");
+                const bool dst_unused = skip_on && img.p && q8_1 == nullptr && ggml_cuda_only_image_reader(cgraph, out_idx, out, img_mm);
+                static bool skip_said = false;
+                if (dst_unused && !skip_said) {
+                    skip_said = true;
+                    GGML_LOG_INFO("%s: a prompt batch's gated norm writes only the image of %s for %s\n", __func__, out->name, img_mm->name);
+                }
+                ggml_cuda_op_rms_norm_mul_sigmoid_gate(*cuda_ctx, node, w, gate, out, q8_1, img, dst_unused);
                 if (img.p) {
                     ggml_cuda_f16_image_written(*cuda_ctx, img_mm, img);
                 }

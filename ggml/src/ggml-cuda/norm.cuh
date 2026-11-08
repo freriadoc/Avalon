@@ -32,4 +32,4 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 // rms_norm(x) * w * sigmoid(gate) in one kernel (gated norm)
 void ggml_cuda_op_rms_norm_mul_sigmoid_gate(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm,
         const ggml_tensor * w, const ggml_tensor * gate, ggml_tensor * dst,
-        void * dst_q8_1 = nullptr, ggml_cuda_img img = ggml_cuda_img());
+        void * dst_q8_1 = nullptr, ggml_cuda_img img = ggml_cuda_img(), bool dst_unused = false);

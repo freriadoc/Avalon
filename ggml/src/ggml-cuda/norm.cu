@@ -1004,7 +1004,7 @@ static __global__ void rms_norm_mul_sigmoid_gate_f32(const rms_norm_gate_args a,
 }
 
 void ggml_cuda_op_rms_norm_mul_sigmoid_gate(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm,
-        const ggml_tensor * w, const ggml_tensor * gate, ggml_tensor * dst, void * dst_q8_1, ggml_cuda_img img) {
+        const ggml_tensor * w, const ggml_tensor * gate, ggml_tensor * dst, void * dst_q8_1, ggml_cuda_img img, bool dst_unused) {
     const ggml_tensor * x = rms_norm->src[0];
     float eps = 0.0f;
     memcpy(&eps, rms_norm->op_params, sizeof(float));
@@ -1018,6 +1018,7 @@ void ggml_cuda_op_rms_norm_mul_sigmoid_gate(ggml_backend_cuda_context & ctx, con
     a.ncols = (int) ncols; a.sx1 = sx1; a.sx2 = sx2; a.sx3 = sx3; a.sg1 = sg1; a.sg2 = sg2; a.sg3 = sg3; a.eps = eps;
     a.dst_q8_1 = (block_q8_1 *) dst_q8_1;
     a.nrows = (int) x->ne[1]; a.nchannels = (int) x->ne[2]; a.nsamples = (int) x->ne[3];
+    a.dst_unused = img.p && dst_unused;
     if (img.p) {
         ggml_cuda_mk_direct(ctx.mk, ctx.stream());   // the image's variant is not recorded: the pending tasks first
         rms_norm_mul_sigmoid_gate_f32<block_size, true><<<blocks_num, block_size, 32 * sizeof(float), ctx.stream()>>>(a, img);
