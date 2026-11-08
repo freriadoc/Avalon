@@ -7601,6 +7601,29 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         ggml_cuda_add_mmq_scratch(cuda_ctx, cgraph, params);
     }
 
+    // a prompt's MoE block computed by groups (GGML_CUDA_MOE_RING_PREFILL, GGML_CUDA_MOE_GROUPED): gate's scratch (the
+    // ids and the activation quantized once for gate and up, ~270 MiB at 9 536 tokens), gate and up are read by every
+    // group until the last down product. The allocator sees them dead once the swiglu has read them: they live until
+    // the down now (else the block took pool memory, which ggml-cuda's pool keeps, out of the cache)
+    static const bool moe_by_groups = (getenv("GGML_CUDA_MOE_RING_PREFILL") && atoi(getenv("GGML_CUDA_MOE_RING_PREFILL")) > 0) ||
+                                      (getenv("GGML_CUDA_MOE_GROUPED") && atoi(getenv("GGML_CUDA_MOE_GROUPED")) > 0);
+    if (moe_by_groups) {
+        for (int i = 0; i + 3 < cgraph->n_nodes; i++) {
+            ggml_tensor * gate = cgraph->nodes[i], * up = cgraph->nodes[i + 1], * glu = cgraph->nodes[i + 2], * down = cgraph->nodes[i + 3];
+            if (gate->op != GGML_OP_MUL_MAT_ID || up->op != GGML_OP_MUL_MAT_ID || glu->op != GGML_OP_GLU ||
+                    down->op != GGML_OP_MUL_MAT_ID || glu->src[0] != gate || glu->src[1] != up || down->src[1] != glu ||
+                    !gate->src[2] || gate->src[2]->ne[1] < 128) {
+                continue;
+            }
+            for (ggml_tensor * t : { gate->src[GGML_SCHED_SCRATCH_SRC], up->src[GGML_SCHED_SCRATCH_SRC], gate, up }) {
+                if (t) {
+                    params->add_alloc_dep(params->user_data, t, down);
+                }
+            }
+            i += 3;
+        }
+    }
+
 #ifdef USE_CUDA_GRAPH
     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
     const bool use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
