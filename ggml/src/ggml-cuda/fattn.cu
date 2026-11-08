@@ -854,7 +854,8 @@ size_t ggml_cuda_flash_attn_ext_scratch_size(ggml_backend_cuda_context & ctx, gg
 static void ggml_cuda_qsa_tile_stats(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
     static const bool on = getenv("GGML_CUDA_QSA_TILE_STATS") && atoi(getenv("GGML_CUDA_QSA_TILE_STATS")) != 0;
     const ggml_tensor * mask = dst->src[3];
-    if (!on || !mask || mask->op != GGML_OP_QSA_SELECT || ggml_get_op_params_i32(mask, 1) != GGML_QSA_SELECT_TILE_MASK) {
+    // not for a size query (ggml_cuda_flash_attn_ext_scratch_size): the tensors have no memory yet
+    if (!on || g_fattn_scratch_query || !mask || mask->op != GGML_OP_QSA_SELECT || ggml_get_op_params_i32(mask, 1) != GGML_QSA_SELECT_TILE_MASK) {
         return;
     }
     cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;

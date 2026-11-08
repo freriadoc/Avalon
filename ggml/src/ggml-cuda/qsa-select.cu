@@ -4,6 +4,9 @@
 #include "top-k.cuh"
 #include "ggml-backend-impl.h"
 
+#include <string>
+#include <vector>
+
 // see ggml_qsa_select: a thread per (slot, query) (the body: qsa-select-body.cuh)
 template <int mode, bool by_pos>
 static __global__ void k_qsa_select(const qsa_select_args a) {
@@ -198,6 +201,64 @@ static __global__ void k_qsa_tile_mask(const int32_t * __restrict__ sel, const f
     }
 }
 
+// GGML_CUDA_QSA_TILE_STATS=2 (diagnostic, synchronizes: run with GGML_CUDA_DISABLE_GRAPHS=1): the union of the
+// selections (the cells the tile lists take) of groups of g consecutive queries, in selections of one query
+static void qsa_tile_union_stats(ggml_backend_cuda_context & ctx, const ggml_tensor * sel, const ggml_tensor * top_score,
+        int64_t n_kv, int32_t kpool) {
+    static const int on = getenv("GGML_CUDA_QSA_TILE_STATS") ? atoi(getenv("GGML_CUDA_QSA_TILE_STATS")) : 0;
+    if (on < 2 || !sel->data) {
+        return;
+    }
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &capture));
+    if (capture != cudaStreamCaptureStatusNone) {
+        return;
+    }
+    const int64_t n_s = sel->ne[0], n_q = sel->ne[1], n_top = top_score->ne[0];
+    const int64_t s_sel = sel->nb[1] / sizeof(int32_t), s_score = top_score->nb[1] / sizeof(float);
+    std::vector<int32_t> h(s_sel*n_q);
+    std::vector<float>   sc(s_score*n_q);
+    CUDA_CHECK(cudaMemcpyAsync(h.data(),  sel->data,       h.size()*sizeof(int32_t), cudaMemcpyDeviceToHost, ctx.stream()));
+    CUDA_CHECK(cudaMemcpyAsync(sc.data(), top_score->data, sc.size()*sizeof(float),  cudaMemcpyDeviceToHost, ctx.stream()));
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+    const auto live = [&](int64_t q, int64_t j) {
+        const int32_t c = h[q*s_sel + j];
+        return c >= 0 && c < n_kv && (j >= n_top*kpool || sc[q*s_score + j/kpool] != -INFINITY);
+    };
+    double one = 0;
+    for (int64_t q = 0; q < n_q; ++q) {
+        for (int64_t j = 0; j < n_s; ++j) {
+            one += live(q, j);
+        }
+    }
+    one /= std::max<int64_t>(n_q, 1);
+    std::vector<int32_t> seen(n_kv, -1);
+    std::string line;
+    for (int g : {2, 4, 8, 16, 32, 64}) {
+        double u = 0;
+        int64_t n_g = 0;
+        std::fill(seen.begin(), seen.end(), -1);
+        for (int64_t q0 = 0; q0 + g <= n_q; q0 += g, ++n_g) {
+            for (int64_t q = q0; q < q0 + g; ++q) {
+                for (int64_t j = 0; j < n_s; ++j) {
+                    if (live(q, j)) {
+                        const int32_t c = h[q*s_sel + j];
+                        if (seen[c] != (int32_t) q0) {
+                            seen[c] = (int32_t) q0;
+                            u += 1;
+                        }
+                    }
+                }
+            }
+        }
+        char buf[64];
+        snprintf(buf, sizeof(buf), " %d:%.2f", g, n_g ? u / n_g / one : 0.0);
+        line += buf;
+    }
+    fprintf(stderr, "qsa unions: %lld queries, %lld cells, %.0f cells a query; union of g consecutive queries in selections:%s\n",
+        (long long) n_q, (long long) n_kv, one, line.c_str());
+}
+
 static void qsa_select_tiles(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int32_t mode   = ggml_get_op_params_i32(dst, 1);
     const int32_t kpool  = ggml_get_op_params_i32(dst, 0);
@@ -227,6 +288,7 @@ static void qsa_select_tiles(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         const auto kernel = by_pos ? k_qsa_tile_rows<true> : k_qsa_tile_rows<false>;
         kernel<<<(unsigned) n_tiles, qsa_tiles_threads, smem, stream>>>((const int32_t *) sel->data, (const float *) top_score->data,
             (int32_t *) dst->data, sel->ne[0], top_score->ne[0], n_kv, kpool, s_sel, s_score, n_t, ncols, n_list, n_tiles);
+        qsa_tile_union_stats(ctx, sel, top_score, n_kv, kpool);
     } else {
         const dim3 grid((unsigned) n_tiles, (unsigned) ncols, 1);
         const auto kernel = by_pos ? k_qsa_tile_mask<true> : k_qsa_tile_mask<false>;

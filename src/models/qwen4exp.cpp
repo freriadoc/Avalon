@@ -1348,7 +1348,10 @@ llama_model_qwen4exp::graph::qsa_sel llama_model_qwen4exp::graph::build_qsa_sel(
     // selections joined, then one mask by tiles of 16 queries for one flash attention (ggml-cuda's sparse kernel reads
     // it with its lists, no dense mask); LLAMA_QSA_TILES=0 keeps the dense slices
     static const bool qsa_tiles = [] { const char * e = getenv("LLAMA_QSA_TILES"); return !e || atoi(e) != 0; }();
-    if (qsa_tiles && n_slice < n_tokens && pos_mode && cparams.flash_attn && n_tokens > 8) {
+    // LLAMA_QSA_TILES_ALL=1: the tile mask also for a batch that fits one slice (the first batches of a prompt, n_kv
+    // up to ~28k cells at 9536 tokens), which otherwise runs the dense masked flash attention over every cell
+    static const bool qsa_tiles_all = [] { const char * e = getenv("LLAMA_QSA_TILES_ALL"); return e && atoi(e) != 0; }();
+    if (qsa_tiles && (n_slice < n_tokens || qsa_tiles_all) && pos_mode && cparams.flash_attn && n_tokens > 8) {
         ggml_tensor * sel_all   = nullptr;
         ggml_tensor * score_all = nullptr;
         for (int64_t t0 = 0; t0 < n_tokens; t0 += n_slice) {
