@@ -167,6 +167,31 @@ static __global__ void k_get_rows_float(
     }
 }
 
+// rows of a few elements (QSA's selection: the score of each chosen block, 1 float; the cells of a block, 4 ints): a
+// thread per element over the whole output instead of a block per row, which left 255 of its 256 threads idle (2.4 M
+// blocks of one float, ~2 ms, at a 9536-token ubatch over 131k cells)
+template<typename src0_t, typename dst_t>
+static __global__ void k_get_rows_float_small(
+        const src0_t * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
+        const uint3 ne00_fdv, const uint3 ne10_fdv, const uint3 ne11_fdv, const uint32_t n,
+        const size_t s1, const size_t s2, const size_t s3,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12) {
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+    const uint32_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+    if (idx >= n) {
+        return;
+    }
+    const uint2 a = fast_div_modulo(idx, ne00_fdv);   // a.x: row of the output, a.y: i00
+    const uint2 b = fast_div_modulo(a.x, ne10_fdv);   // b.y: i10
+    const uint2 c = fast_div_modulo(b.x, ne11_fdv);   // c.y: i11, c.x: i12
+    const int i00 = a.y, i10 = b.y, i11 = c.y, i12 = c.x;
+    const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
+    const src0_t * src0_row = (const src0_t *) ((const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03);
+    dst[i10*s1 + i11*s2 + i12*s3 + i00] = ggml_cuda_cast<dst_t>(src0_row[i00]);
+}
+
 template<typename dst_t>
 static __global__ void k_get_rows_float_vec(
         const dst_t * src0_ptr, const int32_t * src1_ptr, dst_t * dst_ptr,
@@ -319,6 +344,20 @@ static void get_rows_cuda_float(
     GGML_ASSERT(ne12 > 0);
     GGML_ASSERT(ne11 <= std::numeric_limits<uint32_t>::max() / ne12);
     const uint3 ne12_fdv = init_fastdiv_values(ne12);
+
+    // rows of a few elements: a thread per element (k_get_rows_float_small)
+    const int64_t n_small = ne00 * ne10 * ne11 * ne12;
+    if (ne00 <= 32 && n_small < (int64_t) std::numeric_limits<uint32_t>::max() - CUDA_GET_ROWS_BLOCK_SIZE) {
+        const int64_t nblk = (n_small + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE;
+        const ggml_cuda_kernel_launch_params launch_params =
+            ggml_cuda_kernel_launch_params{dim3((unsigned) nblk, 1, 1), block_dims, 0, stream};
+        ggml_cuda_kernel_launch(k_get_rows_float_small<src0_t, dst_t>, launch_params,
+            src0_d, src1_d, dst_d,
+            init_fastdiv_values((uint32_t) ne00), init_fastdiv_values((uint32_t) ne10), init_fastdiv_values((uint32_t) ne11),
+            (uint32_t) n_small,
+            s1, s2, s3, nb01, nb02, nb03, s10, s11, s12);
+        return;
+    }
 
     if constexpr (std::is_same<src0_t, dst_t>::value) {
         constexpr int VEC = 16 / sizeof(dst_t);
