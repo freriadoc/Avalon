@@ -4,6 +4,7 @@
 #include "gdn-body.cuh"
 #include "mk.cuh"
 #include "gdn-wmma.cuh"
+#include "gdn-sm80-chunked.cuh"
 #include "ggml-backend-impl.h"
 
 template <int S_v, bool KDA, bool keep_rs_t, int cols_per_warp = gdn_cols_per_warp, bool replay = false>
@@ -158,6 +159,19 @@ static void ggml_cuda_op_gated_delta_net_impl(
         state_slot_stride = cache->slot_stride;
     }
 
+    ggml_cuda_gdn_sm80_chunked_args ca = { q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+        H, neqk1, n_tokens, n_seqs, rq3, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, scale,
+        S_v == 128 && !kda && !keep_rs && n_tokens >= 128 };
+    const bool use_chunked = (!dst->src[6] || n_tokens > dst->src[6]->ne[1] / 2) &&
+        ggml_cuda_gdn_sm80_chunked_usable(ctx.device, ca);
+    ggml_cuda_pool_alloc<char> chunked_pool(ctx.pool());
+    void * chunked_scratch = nullptr;
+    if (use_chunked) {
+        const ggml_tensor * scratch_t = dst->src[GGML_SCHED_SCRATCH_SRC];
+        const size_t need = ggml_cuda_gdn_sm80_chunked_scratch_size(n_tokens);
+        chunked_scratch = scratch_t && ggml_nbytes(scratch_t) >= need ? scratch_t->data : (void *) chunked_pool.alloc(need);
+    }
+
     gdn_replay_args rp = { nullptr, nullptr, 0, 0, neqk1 };
     if (const ggml_tensor * stash = dst->src[6]) {
         GGML_ASSERT(!keep_rs && n_seqs == 1);
@@ -167,6 +181,15 @@ static void ggml_cuda_op_gated_delta_net_impl(
         rp.w     = stash->ne[1] / 2;
         // the replayed k rows are read by key head with the q/k head size
         GGML_ASSERT(src_k->ne[0] == S_v);
+        if (use_chunked) {
+            // Commit the accepted prefix before consuming a longer prompt batch.
+            launch_gated_delta_net<false, false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+                S_v, H, 0, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, state_ids, state_row_stride, rp, stream);
+            ca.state = state_d;
+            ggml_cuda_gdn_sm80_chunked_launch(ca, chunked_scratch, stream);
+            return;
+        }
         if (kda) {
             launch_gated_delta_net<true, false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
@@ -176,6 +199,18 @@ static void ggml_cuda_op_gated_delta_net_impl(
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, state_ids, state_row_stride, rp, stream);
         }
+        return;
+    }
+
+    if (use_chunked) {
+        if (state_ids != nullptr) {
+            // Materialize gathered state before the scan on the same stream.
+            launch_gated_delta_net<false, false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+                S_v, H, 0, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, state_ids, state_row_stride, rp, stream);
+            ca.state = state_d;
+        }
+        ggml_cuda_gdn_sm80_chunked_launch(ca, chunked_scratch, stream);
         return;
     }
 
@@ -220,7 +255,7 @@ bool ggml_cuda_gdn_mk_recordable(const ggml_tensor * dst) {
     const ggml_tensor * v = dst->src[2];
     const ggml_tensor * g = dst->src[3];
     const int64_t S_v = v->ne[0], H = v->ne[1], n_tokens = v->ne[2], n_seqs = v->ne[3];
-    if (ggml_cuda_gdn_wmma_usable(dst)) {
+    if (ggml_cuda_gdn_sm80_chunked_scratch_size_for(dst, ggml_cuda_get_device()) > 0 || ggml_cuda_gdn_wmma_usable(dst)) {
         return false; // the chunked kernels run alone
     }
     if (S_v != 128 || g->ne[0] == S_v || ggml_get_op_params_i32(dst, 0) > 1 || dst->src[6] != nullptr || n_tokens == 1 ||
