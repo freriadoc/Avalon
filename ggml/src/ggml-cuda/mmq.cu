@@ -18,6 +18,25 @@ static __global__ void k_mmq_tile_prefix(const int32_t * __restrict__ bounds, co
 void ggml_cuda_mmq_tile_prefix(const int32_t * expert_bounds, int n_experts, int J, int32_t * prefix, cudaStream_t stream) {
     k_mmq_tile_prefix<<<1, 32, 0, stream>>>(expert_bounds, n_experts, J, prefix);
 }
+
+// the prefixes of every group of G experts at once (block g: group g; prefix + (2*g + k)*(G + 1) for J[k], k = 0, 1),
+// each relative to its group as k_mmq_tile_prefix's of bounds + g*G: the grouped MoE block's launches in one
+static __global__ void k_mmq_tile_prefix_groups(const int32_t * __restrict__ bounds, const int G, const int J0, const int J1,
+        int32_t * __restrict__ prefix) {
+    const int g = blockIdx.x, k = threadIdx.x;
+    if (k > 1) {
+        return;
+    }
+    const int J = k == 0 ? J0 : J1;
+    const int32_t * b = bounds + (int64_t) g*G;
+    int32_t * p = prefix + (int64_t) (2*g + k)*(G + 1);
+    int t = 0;
+    for (int e = 0; e < G; ++e) {
+        p[e] = t;
+        t += (b[e + 1] - b[e] + J - 1) / J;
+    }
+    p[G] = t;
+}
 #include "quantize.cuh"
 #include "mmid.cuh"
 #include "unary.cuh"
@@ -716,7 +735,13 @@ struct moe_grouped_hooks {
     std::function<void(int64_t)> * before = nullptr, * after = nullptr;   // around each group (empty ones too)
     std::function<void()> * synced = nullptr;      // once the stream is synchronized (the rows read back)
     std::vector<int32_t> * bounds = nullptr;       // the rows' bounds by expert, read back (n_expert + 1)
+    cudaStream_t * group_stream = nullptr;         // set to the group's stream before before() and after()
 };
+
+int ggml_cuda_moe_grouped_streams() {
+    static const int n = getenv("GGML_CUDA_MOE_GROUPED_STREAMS") && atoi(getenv("GGML_CUDA_MOE_GROUPED_STREAMS")) == 2 ? 2 : 1;
+    return n;
+}
 
 static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i,
         const ggml_tensor * wg_dev, const ggml_tensor * wu_dev, const ggml_tensor * wd_dev, const std::vector<uint64_t> * xe_host,
@@ -728,10 +753,10 @@ int ggml_cuda_moe_block_grouped(ggml_backend_cuda_context & ctx, const ggml_cgra
 
 int ggml_cuda_moe_block_grouped_xe(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i, int G,
         const std::vector<uint64_t> * xe, std::function<void(int64_t)> * before, std::function<void(int64_t)> * after,
-        std::function<void()> * synced, std::vector<int32_t> * bounds) {
+        std::function<void()> * synced, std::vector<int32_t> * bounds, cudaStream_t * group_stream) {
     const ggml_tensor * gate = cgraph->nodes[i], * up = cgraph->nodes[i + 1], * down = cgraph->nodes[i + 3];
     moe_grouped_hooks h;
-    h.G = G; h.before = before; h.after = after; h.synced = synced; h.bounds = bounds;
+    h.G = G; h.before = before; h.after = after; h.synced = synced; h.bounds = bounds; h.group_stream = group_stream;
     return moe_block_grouped_impl(ctx, cgraph, i, gate->src[0], up->src[0], down->src[0], xe, &h);
 }
 
@@ -907,7 +932,7 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
     const ptr_c   q8_d     { sd ? sd + ld.src1_q8_1 : q8_d_p.alloc(q8_d_bytes) };
     // the pool frees in reverse order of its allocations (VMM pool: asserted): allocated after the ones above, which
     // their declarations precede
-    ggml_cuda_pool_alloc<int32_t> prefix(ctx.pool(), G + 1);
+    ggml_cuda_pool_alloc<int32_t> prefix(ctx.pool(), 2*(n_expert / G)*(G + 1));   // GGML_CUDA_MOE_GROUPED_PREFIX: all groups'
 
     // the rows by expert (the inverse map for the broadcast activation), the activation quantized once for gate and up
     ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(), n_expert, n_tok,
@@ -937,8 +962,43 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
         (*hooks->synced)();
     }
 
+    // GGML_CUDA_MOE_GROUPED_PREFIX=1: every group's tile prefixes in one launch (instead of one before each product) and each
+    // launch's grid of its exact tiles (from the bounds read back), not a bound of them: the same tiles, the same sums
+    // GGML_CUDA_MOE_GROUPED_STREAMS=2: the groups alternate between this stream and a second one, so that a group's
+    // launches fill the last waves of the other's and its small kernels (swiglu, the down's quantization) overlap them;
+    // the groups write disjoint rows (their own compact rows and outputs), every prefix of the layer is computed first
+    const bool two = ggml_cuda_moe_grouped_streams() == 2;
+    static const bool prefix_env = getenv("GGML_CUDA_MOE_GROUPED_PREFIX") && atoi(getenv("GGML_CUDA_MOE_GROUPED_PREFIX")) != 0;
+    const bool prefix_once = prefix_env || two;
+    // GGML_CUDA_MOE_FUSE_GU=1: gate and up in one launch (twice the row tiles; the upper ones read up's experts and
+    // write up's output): the same tiles and sums as their two launches, half the launches and their last waves'
+    // idle SMs (one 254-register block per SM on an RTX 4090: ~17 % of gate/up's time by groups of 32, 9.5 % fused)
+    static const bool fuse_gu = getenv("GGML_CUDA_MOE_FUSE_GU") && atoi(getenv("GGML_CUDA_MOE_FUSE_GU")) != 0;
+    const bool pair_ok = fuse_gu && wg->nb[1] == wu->nb[1] && wg->nb[2] == wu->nb[2] && gate->nb[1] == up->nb[1] &&
+        gate->nb[2] == up->nb[2] && ((const char *) up->data - (const char *) gate->data) % sizeof(float) == 0;
+    if (prefix_once) {
+        k_mmq_tile_prefix_groups<<<(unsigned) (n_expert / G), 32, 0, stream>>>(bounds.get(), G, J_gu, J_d, prefix.get());
+    }
+    static cudaEvent_t ev_fork[GGML_CUDA_MAX_DEVICES] = {}, ev_join[GGML_CUDA_MAX_DEVICES] = {};
+    cudaStream_t gs[2] = { stream, stream };
+    if (two) {
+        if (!ev_fork[ctx.device]) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&ev_fork[ctx.device], cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&ev_join[ctx.device], cudaEventDisableTiming));
+        }
+        gs[1] = ctx.stream(ctx.device, GGML_CUDA_MAX_STREAMS - 1);
+        CUDA_CHECK(cudaEventRecord(ev_fork[ctx.device], stream));
+        CUDA_CHECK(cudaStreamWaitEvent(gs[1], ev_fork[ctx.device], 0));
+    }
+    auto exact_tiles = [&](int64_t g0, int J) {
+        int64_t t = 0;
+        for (int64_t e = g0; e < g0 + G; e++) {
+            t += (hb[e + 1] - hb[e] + J - 1) / J;
+        }
+        return t;
+    };
     auto launch = [&](const ggml_tensor * w, ggml_tensor * dst, const char * q8, int64_t ne10p, int64_t ne11, int J, bool fallback,
-                      int64_t g0, int r0, int r1, int role) {
+                      int64_t g0, int r0, int r1, int role, cudaStream_t ls) {
         const size_t ts = ggml_type_size(w->type);
         mmq_args a = {
             (const char *) w->data + g0*w->nb[2], w->type, (const int *) q8, ids_dst.get(), bounds.get() + g0, (float *) dst->data,
@@ -952,14 +1012,31 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
         }
         // the grid of the group's own rows (the compact grid bound for them)
         a.ncols_dst = r1 - r0;
-        ggml_cuda_mmq_tile_prefix(bounds.get() + g0, G, J, prefix.get(), stream);
-        a.tile_prefix = prefix.get();
+        if (prefix_once) {
+            a.tile_prefix = prefix.get() + (2*(g0/G) + (role == 2 ? 1 : 0))*(G + 1);
+            a.ntiles_x = exact_tiles(g0, J);
+        } else {
+            ggml_cuda_mmq_tile_prefix(bounds.get() + g0, G, J, prefix.get(), ls);
+            a.tile_prefix = prefix.get();
+        }
+        if (role == 0 && pair_ok) {   // gate with up (role 1) in the same launch
+            a.pair = true;
+            a.x2_off = (const char *) wu->data - (const char *) wg->data;
+            a.dst2_off = ((const char *) up->data - (const char *) gate->data) / (int64_t) sizeof(float);
+            if (xe_host) {
+                a.x_experts2 = xe_dev.get() + n_expert + g0;
+            }
+        }
         GGML_UNUSED(fallback);
-        ggml_cuda_mul_mat_q_switch_type(ctx, a, stream, GGML_PREC_Q8);
+        ggml_cuda_mul_mat_q_switch_type(ctx, a, ls, GGML_PREC_Q8);
     };
     bool first_launch = true;
     for (int64_t g0 = 0; g0 < n_expert; g0 += G) {
         const int r0 = hb[g0], r1 = hb[g0 + G];
+        cudaStream_t sg = gs[(g0 / G) & 1];
+        if (hooks && hooks->group_stream) {
+            *hooks->group_stream = sg;
+        }
         if (timing && first_launch && r1 > r0) {
             // the stream idles from the synchronization to the first group's launch
             t_gap += ggml_time_us() - t_sync1;
@@ -974,19 +1051,28 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
             }
             continue;
         }
-        launch(wg, gate, q8_gu.get(), ne10p_gu, 1, J_gu, fb_gu, g0, r0, r1, 0);
-        launch(wu, up,   q8_gu.get(), ne10p_gu, 1, J_gu, fb_gu, g0, r0, r1, 1);
+        launch(wg, gate, q8_gu.get(), ne10p_gu, 1, J_gu, fb_gu, g0, r0, r1, 0, sg);
+        if (!pair_ok) {
+            launch(wu, up,   q8_gu.get(), ne10p_gu, 1, J_gu, fb_gu, g0, r0, r1, 1, sg);
+        }
         {
             const dim3 grid((unsigned) std::min<int64_t>((n_ff + 255)/256, 8), (unsigned) (r1 - r0));
-            k_moe_grouped_swiglu<<<grid, 256, 0, stream>>>((const float *) gate->data, (const float *) up->data, (float *) glu->data,
+            k_moe_grouped_swiglu<<<grid, 256, 0, sg>>>((const float *) gate->data, (const float *) up->data, (float *) glu->data,
                 ids_dst.get(), r0, n_ff, gate->nb[1]/sizeof(float), up->nb[1]/sizeof(float), glu->nb[1]/sizeof(float));
         }
         quantize_mmq_q8_1_rows_cuda((const float *) glu->data, ids_dst.get(), q8_d.get(), wd->type, n_ff,
-            glu->nb[1]/sizeof(float), ne10p_d, r0, r1 - r0, (int) rows, stream);
-        launch(wd, down, q8_d.get(), ne10p_d, n_used, J_d, fb_d, g0, r0, r1, 2);
+            glu->nb[1]/sizeof(float), ne10p_d, r0, r1 - r0, (int) rows, sg);
+        launch(wd, down, q8_d.get(), ne10p_d, n_used, J_d, fb_d, g0, r0, r1, 2, sg);
         if (hooks && hooks->after) {
             (*hooks->after)(g0 / G);
         }
+    }
+    if (two) {   // the second stream's groups joined into the block's stream
+        CUDA_CHECK(cudaEventRecord(ev_join[ctx.device], gs[1]));
+        CUDA_CHECK(cudaStreamWaitEvent(stream, ev_join[ctx.device], 0));
+    }
+    if (hooks && hooks->group_stream) {
+        *hooks->group_stream = stream;
     }
     CUDA_CHECK(cudaGetLastError());
     if (timing) {

@@ -11001,8 +11001,11 @@ int ggml_cuda_moe_ring_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cgra
         }
         span = std::max(span, role_off[k] + w[k]->nb[1]*w[k]->ne[1]);
     }
-    const int G = 32;
-    if (n_expert % G != 0 || !r.ring.fits(G)) {
+    // GGML_CUDA_MOE_RING_GROUP=G: the experts of a group (32 by default): a larger group, fewer launches and fewer idle
+    // SMs in each launch's last wave, against a ring that must hold a group and later reads of a group's first copies
+    static const int G = getenv("GGML_CUDA_MOE_RING_GROUP") && atoi(getenv("GGML_CUDA_MOE_RING_GROUP")) > 0 ?
+                         atoi(getenv("GGML_CUDA_MOE_RING_GROUP")) : 32;
+    if (n_expert % G != 0 || G >= n_expert || !r.ring.fits(G)) {
         return 0;
     }
     // the experts the cache holds (a whole expert: every role), pinned until the next block's synchronization
@@ -11093,6 +11096,8 @@ int ggml_cuda_moe_ring_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cgra
         GGML_LOG_INFO("ring validate %s: %d in the slab, %d in the ring, %d elsewhere; stride %zu entry %zu offsets %zu %zu %zu\n", w[0]->name,
                 in_slab, in_ring, bad, stride, r.entry, role_off[0], role_off[1], role_off[2]);
     }
+    const bool two_streams = ggml_cuda_moe_grouped_streams() == 2;
+    cudaStream_t gstream = cs;          // the group's stream (set by the grouped block before each hook)
     int64_t recorded = seq0;            // groups below have their done event recorded
     int64_t next_group_to_close = 0;    // groups below have every copy issued (and their copied event)
     // the copies in order, group by group, as far as their waits are recorded: those that wait for nothing of this
@@ -11112,6 +11117,11 @@ int ggml_cuda_moe_ring_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cgra
                 // later one covers the earlier (ROCm 7.2.4: a wait before every copy cost the copy stream 3.7 %, ringsim)
                 if (p.wait > r.waited) {
                     CUDA_CHECK(cudaStreamWaitEvent(r.copy, r.done[p.wait % moe_ring_state::P], 0));
+                    // two streams (GGML_CUDA_MOE_GROUPED_STREAMS=2): a done event covers its stream's groups only, the
+                    // previous group's (the other stream) too then
+                    if (two_streams && p.wait - 1 > r.waited) {
+                        CUDA_CHECK(cudaStreamWaitEvent(r.copy, r.done[(p.wait - 1) % moe_ring_state::P], 0));
+                    }
                     r.waited = p.wait;
                 }
                 char * dst = r.base + (size_t) p.entry * r.entry;
@@ -11137,11 +11147,11 @@ int ggml_cuda_moe_ring_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cgra
         advance();
         GGML_ASSERT(next_group_to_close > g && "a group's copies wait for itself");
         if (!by_group[g].empty()) {
-            CUDA_CHECK(cudaStreamWaitEvent(cs, r.copied[(seq0 + g) % moe_ring_state::P], 0));
+            CUDA_CHECK(cudaStreamWaitEvent(gstream, r.copied[(seq0 + g) % moe_ring_state::P], 0));
         }
     };
     std::function<void(int64_t)> after = [&](int64_t g) {
-        CUDA_CHECK(cudaEventRecord(r.done[(seq0 + g) % moe_ring_state::P], cs));
+        CUDA_CHECK(cudaEventRecord(r.done[(seq0 + g) % moe_ring_state::P], gstream));
         recorded = seq0 + g + 1;
         advance();
     };
@@ -11156,8 +11166,14 @@ int ggml_cuda_moe_ring_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cgra
     for (int64_t e = 0; e < n_expert; e++) {
         held[e] = !(xe[0][e] >= (uint64_t) (uintptr_t) r.base && xe[0][e] < (uint64_t) (uintptr_t) (r.base + r.bytes));
     }
-    const int covered = ggml_cuda_moe_block_grouped_xe(ctx, cgraph, i, G, xe, &before, &after, &synced, dump_path ? &hb : nullptr);
+    const int covered = ggml_cuda_moe_block_grouped_xe(ctx, cgraph, i, G, xe, &before, &after, &synced, dump_path ? &hb : nullptr,
+        &gstream);
     GGML_ASSERT(covered > 0 && "a ring prompt MoE block the grouped path does not take");
+    if (two_streams && n_groups > 0) {
+        // the block's last done event again on its stream, after the join: it covers both streams (moe_ring_drain, the
+        // next block's first waits); the copies that already wait for the first record keep it
+        CUDA_CHECK(cudaEventRecord(r.done[(seq0 + n_groups - 1) % moe_ring_state::P], cs));
+    }
     if (dump_path && (int64_t) hb.size() == n_expert + 1) {
         static FILE * f = fopen(dump_path, "ab");
         if (f) {
