@@ -200,7 +200,7 @@ bool ggml_cuda_flash_attn_ext_mma_f16_kv_quant_sparse(const int cc, const ggml_t
         K->ne[1] >= 65536 &&
         gqa_ratio % 4 == 0 && gqa_ratio % 8 != 0 && Q->ne[1] > 8 && Q->ne[3] == 1 &&
         K->ne[1] % FATTN_KQ_STRIDE == 0 &&
-        (tiles ? mask->ne[1] == 16 : mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1);
+        (tiles ? (mask->ne[1] == 16 || mask->ne[1] == 8) : mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1);
 #endif // defined(GGML_USE_MUSA)
 }
 
@@ -276,6 +276,11 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     // a tile mask of ggml_qsa_select_tiles: only (256, 256, 16, 4) reads it (ggml_cuda_get_best_fattn_kernel checked
     // the ratio), not the 8 that NVIDIA's rule below picks for a ratio of 12
     if (mask && mask->op == GGML_OP_QSA_SELECT && ggml_get_op_params_i32(mask, 1) == GGML_QSA_SELECT_TILE_MASK) {
+        // tiles of 8 queries (LLAMA_QSA_TILE_COLS=8): (256, 256, 8, 4)
+        if (mask->ne[1] == 8) {
+            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8, 4>(ctx, dst);
+            return;
+        }
         ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 4>(ctx, dst);
         return;
     }
@@ -700,7 +705,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         float logit_softcap = 0.0f;
         memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
         const bool ok = (rdna || nv) && gqa_opt_applies && logit_softcap == 0.0f && K->ne[0] == 256 && V->ne[0] == 256 &&
-            gqa_ratio % 4 == 0 && gqa_ratio % 8 != 0 && Q->ne[1] > 8 && Q->ne[3] == 1 && mask->ne[1] == 16;
+            gqa_ratio % 4 == 0 && gqa_ratio % 8 != 0 && Q->ne[1] > 8 && Q->ne[3] == 1 && (mask->ne[1] == 16 || mask->ne[1] == 8);
         return ok ? BEST_FATTN_KERNEL_MMA_F16 : BEST_FATTN_KERNEL_NONE;
     }
 

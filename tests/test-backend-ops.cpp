@@ -13582,6 +13582,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_qsa_select_tiles(40960, 512, 4, 333, 16, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, true));
     test_cases.emplace_back(new test_qsa_select_tiles(40960, 512, 4, 333, 16, true, true, GGML_TYPE_F16, GGML_TYPE_F16, 2, true));
     test_cases.emplace_back(new test_qsa_select_tiles(49152, 512, 4, 8192, 16, true, false));
+    // tiles of 8 queries (LLAMA_QSA_TILE_COLS=8): f16 K/V, q8_0 / q4_0 gathered and copied, a partial last tile
+    test_cases.emplace_back(new test_qsa_select_tiles(40960, 512, 4, 333, 8, true, true, GGML_TYPE_F16, GGML_TYPE_F16, 2));
+    test_cases.emplace_back(new test_qsa_select_tiles(40960, 512, 4, 333, 8, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, true));
+    test_cases.emplace_back(new test_qsa_select_tiles(150016, 512, 4, 333, 8, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, true));
+    test_cases.emplace_back(new test_qsa_select_tiles(262144, 2048, 4, 2048, 8, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, true, 8.0f));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {12, 1}, 65536, 200, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 2048));
 
     // sparse mask + quantized cache

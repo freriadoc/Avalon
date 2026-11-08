@@ -1107,6 +1107,13 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
     return (llm_graph_input_kpool *) res->add_input(std::move(inp));
 }
 
+// the queries per tile of the QSA tile mask: 16, or 8 (LLAMA_QSA_TILE_COLS=8: a smaller union per tile, its K/V read
+// by twice the tiles)
+static int32_t qsa_tile_cols() {
+    static const int32_t n = [] { const char * e = getenv("LLAMA_QSA_TILE_COLS"); return e && atoi(e) == 8 ? 8 : 16; }();
+    return n;
+}
+
 // the blocks this ubatch completes or regroups, re-pooled into the cache
 void llama_model_qwen4exp::graph::add_new_pool_inputs(llm_graph_input_kpool * inp, const llama_memory_hybrid_idx_context * mctx_hyb,
                                                       uint32_t kpool) {
@@ -1367,7 +1374,7 @@ llama_model_qwen4exp::graph::qsa_sel llama_model_qwen4exp::graph::build_qsa_sel(
                 ggml_build_forward_expand(gf, score_s);
             }
             ggml_tensor * tok_pos = ggml_view_1d(ctx0, inp_kpool->tok_pos, n, t0*sizeof(int32_t));
-            ggml_tensor * tiles = ggml_qsa_select_tiles(ctx0, sel_s, score_s, inp_kpool->cell_pos, tok_pos, (int32_t) kpool, 16);
+            ggml_tensor * tiles = ggml_qsa_select_tiles(ctx0, sel_s, score_s, inp_kpool->cell_pos, tok_pos, (int32_t) kpool, qsa_tile_cols());
             cb(tiles, "indexer_sel_tiles", il);
             return tiles;
         };
@@ -1387,7 +1394,7 @@ llama_model_qwen4exp::graph::qsa_sel llama_model_qwen4exp::graph::build_qsa_sel(
             ggml_build_forward_expand(gf, sel_all);
             ggml_build_forward_expand(gf, score_all);
         }
-        res_d.tiles = ggml_qsa_select_tiles(ctx0, sel_all, score_all, inp_kpool->cell_pos, inp_kpool->tok_pos, (int32_t) kpool, 16);
+        res_d.tiles = ggml_qsa_select_tiles(ctx0, sel_all, score_all, inp_kpool->cell_pos, inp_kpool->tok_pos, (int32_t) kpool, qsa_tile_cols());
         cb(res_d.tiles, "indexer_sel_tiles", il);
         return res_d;
     }
