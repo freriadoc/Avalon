@@ -1981,6 +1981,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
             const auto convert_func = traits::convert_nc(src1->type);
             GGML_ASSERT(convert_func != nullptr);
             if (!src1_reuse) {
+                ggml_cuda_f16_image_lost(dst, src1);
                 convert_func(src1->data, src1_conv, ne10, ne11, ne12, ne13, s11, s12, s13, main_stream);
             }
             s11 = ne10;
@@ -2517,6 +2518,15 @@ static bool ggml_cuda_f16_image_enabled() {
 // The producer is src1's root or a node at most two sources above it (the RMS_NORM under a MUL by the weights, under
 // a MUL by a sigmoid), the node that holds the scratch as its own source.
 void ggml_cuda_f16_image_lost(const ggml_tensor * dst, const ggml_tensor * src1) {
+    // GGML_CUDA_F16_IMAGE_TRACE=1 (diagnostic): every conversion / quantization of a product's src1, with its size and
+    // whether a scratch (a group) was there, to find the activations no producer images
+    static const bool trace = getenv("GGML_CUDA_F16_IMAGE_TRACE") != nullptr;
+    if (trace) {
+        const ggml_tensor * root = src1->view_src ? src1->view_src : src1;
+        GGML_LOG_INFO("F16_CONVERT %s <- %s (%s, producer %s) %lld x %lld, scratch %d\n", dst->name, src1->name, root->name,
+                ggml_op_desc(root), (long long) src1->ne[0], (long long) ggml_nrows(src1),
+                dst->src[GGML_SCHED_SCRATCH_SRC] != nullptr);
+    }
     const ggml_tensor * scratch_t = dst->src[GGML_SCHED_SCRATCH_SRC];
     if (!ggml_cuda_f16_image_enabled() || scratch_t == nullptr) {
         return;
