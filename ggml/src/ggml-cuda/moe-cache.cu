@@ -10822,6 +10822,7 @@ static void moe_split_cards_create(moe_cache_session & session, moe_hosted_state
 struct moe_ring_state {
     char * base = nullptr;
     size_t bytes = 0;
+    const void * owner = nullptr;    // the backend context of the scheduler that lent the zones
     size_t entry = 0;
     moe_vram_ring<moe_cache_key, moe_cache_key_hash> ring;
     cudaStream_t copy = nullptr;
@@ -10888,9 +10889,11 @@ static void moe_cache_ring_zone(void * opaque, void * backend, void * base, size
         }
         r.base = nullptr;
         r.bytes = 0;
+        r.owner = nullptr;
         r.ring.give_back();
         return;
     }
+    r.owner = backend ? ((ggml_backend_t) backend)->context : nullptr;
     if (r.base == base && r.bytes == bytes) {
         return;
     }
@@ -10909,6 +10912,26 @@ static void moe_cache_ring_zone(void * opaque, void * backend, void * base, size
     MOE_CACHE_LOG("[moe-cache] CUDA%d prefill ring: %zu entries of %zu KiB in %zu MiB\n", device->physical, n, r.entry >> 10, bytes >> 20);
 }
 
+bool ggml_cuda_moe_ring_takes(ggml_backend_cuda_context & ctx, const ggml_tensor * node) {
+    static const bool ring_prefill = getenv("GGML_CUDA_MOE_RING_PREFILL") && atoi(getenv("GGML_CUDA_MOE_RING_PREFILL")) > 0;
+    if (!ring_prefill || node->op != GGML_OP_MUL_MAT_ID || !node->src[2] || node->src[2]->ne[1] < 128 || !node->src[0]->buffer ||
+            !ggml_backend_buffer_is_host(node->src[0]->buffer)) {
+        return false;
+    }
+    if (node->src[2]->ne[0] * node->src[2]->ne[1] > moe_hosted_max_rows() || node->src[2]->ne[1] > moe_hosted_tokens_max) {
+        return true;
+    }
+    if (g_session_stack.empty() || !g_session_stack.back().active) {
+        return false;
+    }
+    for (auto & d : g_session_stack.back().active->devices) {
+        if (d->logical == ctx.device && d->ring && d->ring->base && d->ring->owner == (const void *) &ctx) {
+            return true;
+        }
+    }
+    return false;
+}
+
 int ggml_cuda_moe_ring_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
     if (i + 3 >= cgraph->n_nodes || g_session_stack.empty() || !g_session_stack.back().active) {
         return 0;
@@ -10924,7 +10947,7 @@ int ggml_cuda_moe_ring_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cgra
             device = d.get();
         }
     }
-    if (!device || !device->ring || !device->ring->base) {
+    if (!device || !device->ring || !device->ring->base || device->ring->owner != (const void *) &ctx) {
         return 0;
     }
     moe_ring_state & r = *device->ring;

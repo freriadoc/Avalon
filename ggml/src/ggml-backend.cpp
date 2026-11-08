@@ -1502,6 +1502,9 @@ static bool ggml_backend_sched_is_hosted_moe(ggml_backend_sched_t sched, const s
 }
 
 static int ggml_backend_sched_ring_backend(ggml_backend_sched_t sched, int split_id) {
+    if (sched->moe_cache_guest || !sched->prefetch_experts) {
+        return -1;
+    }
     const ggml_backend_sched_split * split = &sched->splits[split_id];
     for (int j = 0; j < split->graph.n_nodes; j++) {
         const ggml_tensor * n = split->graph.nodes[j];
@@ -1519,7 +1522,10 @@ static int ggml_backend_sched_ring_backend(ggml_backend_sched_t sched, int split
 // others (ggml_cuda_moe_hosted_block); no weight is copied. GGML_MOE_HOSTED_MAX_ROWS=N: a fixed limit instead.
 static void ggml_backend_sched_find_hosted_moe(ggml_backend_sched_t sched, const struct ggml_cgraph * graph) {
     static const bool enabled = !getenv("GGML_MOE_GPU") || atoi(getenv("GGML_MOE_GPU")) != 0;
-    static const bool ring_prefill = getenv("GGML_CUDA_MOE_RING_PREFILL") && atoi(getenv("GGML_CUDA_MOE_RING_PREFILL")) > 0;
+    // GGML_CUDA_MOE_RING_PREFILL: the prompt's blocks of the scheduler that owns the session (a guest, the MTP draft,
+    // borrows no zone for a ring: its blocks keep the hosted path's limits)
+    static const bool ring_env = getenv("GGML_CUDA_MOE_RING_PREFILL") && atoi(getenv("GGML_CUDA_MOE_RING_PREFILL")) > 0;
+    const bool ring_prefill = ring_env && !sched->moe_cache_guest && sched->prefetch_experts;
     // the routed rows of a hosted block: the backend's (ggml-cuda's moe_hosted_max_rows, GGML_MOE_HOSTED_MAX_ROWS)
     static const bool fixed_rows = getenv("GGML_MOE_HOSTED_MAX_ROWS") != nullptr;
     const int64_t max_rows = ggml_moe_cache.hosted_max_rows ? ggml_moe_cache.hosted_max_rows() : 64;

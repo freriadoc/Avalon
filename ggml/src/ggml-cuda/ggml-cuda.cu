@@ -3390,7 +3390,7 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 }
 
 #ifdef USE_CUDA_GRAPH
-static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+static bool ggml_cuda_graph_check_compability(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph) {
 
     bool use_cuda_graph = true;
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
@@ -3405,10 +3405,10 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
         if (node->op == GGML_OP_MUL_MAT_ID) {
-            // GGML_CUDA_MOE_GROUPED: a prompt's MoE block by groups reads its experts' rows back to the host
-            static const bool moe_grouped = (getenv("GGML_CUDA_MOE_GROUPED") && atoi(getenv("GGML_CUDA_MOE_GROUPED")) > 0) ||
-                                            (getenv("GGML_CUDA_MOE_RING_PREFILL") && atoi(getenv("GGML_CUDA_MOE_RING_PREFILL")) > 0);
-            if (moe_grouped && node->src[2] && node->src[2]->ne[1] >= 128) {
+            // a prompt's MoE block by groups reads its experts' rows back to the host (GGML_CUDA_MOE_GROUPED, and
+            // the blocks the prefill ring takes: GGML_CUDA_MOE_RING_PREFILL)
+            static const bool moe_grouped = getenv("GGML_CUDA_MOE_GROUPED") && atoi(getenv("GGML_CUDA_MOE_GROUPED")) > 0;
+            if ((moe_grouped && node->src[2] && node->src[2]->ne[1] >= 128) || ggml_cuda_moe_ring_takes(ctx, node)) {
                 use_cuda_graph = false;
             }
             if (ggml_cuda_mul_mat_id_needs_sync(node, cc)) {
@@ -6743,10 +6743,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 // GGML_CUDA_MOE_RING_PREFILL: a prompt's MoE block of host weights by groups of experts (the scheduler
-                // hosts every MoE block of a prompt in that mode)
-                static const bool ring_prefill = getenv("GGML_CUDA_MOE_RING_PREFILL") && atoi(getenv("GGML_CUDA_MOE_RING_PREFILL")) > 0;
-                if (ring_prefill && node->op == GGML_OP_MUL_MAT_ID && node->src[0]->buffer &&
-                        !ggml_backend_buft_is_cuda(node->src[0]->buffer->buft) && node->src[2] && node->src[2]->ne[1] >= 128) {
+                // hosts every MoE block of a prompt in that mode); a context without the ring (the MTP draft) keeps its
+                // hosted blocks
+                if (ggml_cuda_moe_ring_takes(*cuda_ctx, node)) {
                     if (i == cuda_ctx->router_next && cuda_ctx->router_pending) {
                         ggml_cuda_router_flush(*cuda_ctx);   // the block reads the routing
                     }
@@ -6948,7 +6947,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         // a graph llama.cpp reused (same uid as the one captured) was found compatible then: its ~7000 nodes are not
         // walked again (~150 us of host time per verification step on an EPYC 7542, the GPU idle meanwhile)
         const bool same_graph = cgraph->uid != 0 && cgraph->uid == graph->uid;
-        const bool graph_compatible = same_graph || ggml_cuda_graph_check_compability(cgraph);
+        const bool graph_compatible = same_graph || ggml_cuda_graph_check_compability(*cuda_ctx, cgraph);
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 

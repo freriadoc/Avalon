@@ -28,6 +28,10 @@ struct ggml_cgraph;
 int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, struct ggml_cgraph * cgraph, int i);
 // GGML_CUDA_MOE_RING_PREFILL: a prompt's MoE block by groups, its absent experts through the prefill's ring; 0: not taken
 int ggml_cuda_moe_ring_block(ggml_backend_cuda_context & ctx, struct ggml_cgraph * cgraph, int i);
+// GGML_CUDA_MOE_RING_PREFILL: whether the MUL_MAT_ID `node` (host weights) is computed by groups, through the ring of the
+// context that borrowed it (or, without a ring, its layer copied whole: more rows than a hosted block takes); else it is
+// a hosted block (a context sharing the session, the MTP draft, has no ring: its prompt blocks stay hosted)
+bool ggml_cuda_moe_ring_takes(ggml_backend_cuda_context & ctx, const struct ggml_tensor * node);
 
 // rows a graph waits for, written by the host after the launch (see moe-cache.cu): the mapped buffer (nullptr if too large),
 // the task that writes it (run by the first wait for the GPU), the node that waits for it (true: the node was launched)
