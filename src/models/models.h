@@ -2631,7 +2631,21 @@ struct llama_model_qwen4exp : public llama_model_base {
             // or, for the flash attention of all the queries at once, the mask by tiles of 16 queries
             // (ggml_qsa_select_tiles: each tile's list of chosen cells, each query's mask at the list's positions)
             ggml_tensor * tiles = nullptr;
+            // or the tile mask of the queries [t0, t0 + n) only, for an attention by slices of n_att_slice queries
+            // (LLAMA_QSA_ATT_SLICE): neither the mask nor the query side is ever alive for the whole batch
+            std::function<ggml_tensor * (int64_t t0, int64_t n)> tiles_slice;
+            int64_t n_att_slice = 0;
         };
+
+        // a QSA layer of a prompt batch by slices of queries (qsa_sel::tiles_slice)
+        ggml_tensor * build_layer_attn_qsa_sliced(
+        llm_graph_input_attn_kv * inp,
+                    ggml_tensor * cur,
+                    ggml_tensor * inp_pos,
+                            int * sections,
+                const qsa_sel   & sel,
+                        int64_t   n_sel,
+                            int   il);
 
         // self-attention over the cells the QSA selection keeps
         ggml_tensor * build_attn_qsa(

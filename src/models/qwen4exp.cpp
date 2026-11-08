@@ -1351,6 +1351,31 @@ llama_model_qwen4exp::graph::qsa_sel llama_model_qwen4exp::graph::build_qsa_sel(
     // LLAMA_QSA_TILES_ALL=1: the tile mask also for a batch that fits one slice (the first batches of a prompt, n_kv
     // up to ~28k cells at 9536 tokens), which otherwise runs the dense masked flash attention over every cell
     static const bool qsa_tiles_all = [] { const char * e = getenv("LLAMA_QSA_TILES_ALL"); return e && atoi(e) != 0; }();
+    // LLAMA_QSA_ATT_SLICE=S (queries, a multiple of 16; 0, the default: off): the attention by slices of S queries, each
+    // with the tile mask of its own queries (their selections by the indexer's slices inside it); build_layer_attn then
+    // runs the query projection, the attention, its gate and the output projection slice by slice
+    static const int64_t att_slice = [] { const char * e = getenv("LLAMA_QSA_ATT_SLICE"); return e ? (int64_t) atoll(e) & ~(int64_t) 15 : (int64_t) 0; }();
+    if (qsa_tiles && att_slice > 0 && att_slice < n_tokens && pos_mode && cparams.flash_attn) {
+        res_d.tiles_slice = [=, this](int64_t t0, int64_t n) {
+            ggml_tensor * sel_s   = nullptr;
+            ggml_tensor * score_s = nullptr;
+            for (int64_t u0 = t0; u0 < t0 + n; u0 += n_slice) {
+                const slice_sel ss = select(u0, std::min(n_slice, t0 + n - u0));
+                sel_s   = sel_s   ? ggml_concat(ctx0, sel_s,   ss.sel_idx,   1) : ss.sel_idx;
+                score_s = score_s ? ggml_concat(ctx0, score_s, ss.top_score, 1) : ss.top_score;
+                ggml_build_forward_expand(gf, sel_s);
+                ggml_build_forward_expand(gf, score_s);
+            }
+            ggml_tensor * tok_pos = ggml_view_1d(ctx0, inp_kpool->tok_pos, n, t0*sizeof(int32_t));
+            ggml_tensor * tiles = ggml_qsa_select_tiles(ctx0, sel_s, score_s, inp_kpool->cell_pos, tok_pos, (int32_t) kpool, 16);
+            cb(tiles, "indexer_sel_tiles", il);
+            return tiles;
+        };
+        // slices of equal size (multiples of 16, the tiles): 9536 queries by 4096 -> 3 x 3184 rather than 4096, 4096, 1344
+        const int64_t n_sl = (n_tokens + att_slice - 1) / att_slice;
+        res_d.n_att_slice = GGML_PAD((n_tokens + n_sl - 1) / n_sl, 16);
+        return res_d;
+    }
     if (qsa_tiles && (n_slice < n_tokens || qsa_tiles_all) && pos_mode && cparams.flash_attn && n_tokens > 8) {
         ggml_tensor * sel_all   = nullptr;
         ggml_tensor * score_all = nullptr;
@@ -1564,6 +1589,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
         return nullptr;
     }
 
+    if (qsa && sel.tiles_slice) {
+        return build_layer_attn_qsa_sliced(inp, cur, inp_pos, sections, sel, inp_kpool->n_sel, il);
+    }
+
     // Qwen3Next uses a single Q projection that outputs query + gate
     ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
     cb(Qcur_full, "Qcur_full", il);
@@ -1638,6 +1667,121 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     cb(cur, "attn_output", il);
 
     return cur;
+}
+
+// The QSA layer of a prompt batch by slices of queries (qsa_sel::tiles_slice, LLAMA_QSA_ATT_SLICE): K and V of the whole
+// batch into the cache first, then for each slice of queries its part of the query projection, its norm and rope, its
+// tile mask, the flash attention, the gate and the output projection; the slices' outputs joined at the end (by pairs).
+// The same arithmetic as build_layer_attn + build_attn_qsa per query: only what is alive at once changes (the query
+// projection [12288, n], the tile mask [n_list, 16, n/16] and the attention's output are those of one slice).
+ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_qsa_sliced(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor *             cur,
+        ggml_tensor *             inp_pos,
+        int *                     sections,
+        const qsa_sel &           sel,
+        int64_t                   n_sel,
+        int                       il) {
+    const int64_t n_embd_head = hparams.n_embd_head_v();
+    const auto *  mctx_cur    = inp->mctx;
+
+    ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
+    cb(Kcur, "Kcur", il);
+    ggml_build_forward_expand(gf, Kcur);
+    ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
+    cb(Vcur, "Vcur", il);
+    ggml_build_forward_expand(gf, Vcur);
+    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+    Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
+    cb(Kcur, "Kcur_normed", il);
+    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+    Kcur = ggml_rope_multi(ctx0, Kcur, inp_pos, nullptr,
+            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+            ext_factor, attn_factor, beta_fast, beta_slow);
+    cb(Kcur, "Kcur", il);
+    cb(Vcur, "Vcur", il);
+    if (inp->self_k_rot) {
+        Kcur = llama_mul_mat_hadamard(ctx0, Kcur, mctx_cur->layer_rot(inp->self_k_rot, il));
+    }
+    if (inp->self_v_rot) {
+        Vcur = llama_mul_mat_hadamard(ctx0, Vcur, mctx_cur->layer_rot(inp->self_v_rot, il));
+    }
+    // as build_attn_qsa: v and k each right before its store, every store before the first attention reads the cache
+    ggml_build_forward_expand(gf, Vcur);
+    ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, Vcur, inp->get_v_idxs(), il));
+    ggml_build_forward_expand(gf, Kcur);
+    ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, Kcur, inp->get_k_idxs(), il));
+
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+    const bool kv_direct = k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q4_0;
+    if (ggml_is_quantized(k->type) && !kv_direct) {
+        k = ggml_cast(ctx0, k, GGML_TYPE_F16);
+    }
+    if (ggml_is_quantized(v->type) && !kv_direct) {
+        v = ggml_cast(ctx0, v, GGML_TYPE_F16);
+    }
+
+    const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
+    // the positions of a slice: each of the n_pos sections of inp_pos ([n_tokens] each) cut to the slice
+    const int64_t n_pos = inp_pos->ne[0] / n_tokens;
+    const auto pos_of = [&](int64_t t0, int64_t n) {
+        ggml_tensor * p = ggml_view_2d(ctx0, inp_pos, n, n_pos, n_tokens*ggml_element_size(inp_pos), t0*ggml_element_size(inp_pos));
+        return ggml_reshape_1d(ctx0, ggml_cont(ctx0, p), n*n_pos);
+    };
+
+    std::vector<ggml_tensor *> outs;
+    for (int64_t t0 = 0; t0 < n_tokens; t0 += sel.n_att_slice) {
+        const int64_t n   = std::min(sel.n_att_slice, n_tokens - t0);
+        ggml_tensor * cur_s = ggml_view_2d(ctx0, cur, cur->ne[0], n, cur->nb[1], t0*cur->nb[1]);
+        ggml_tensor * Qf = build_lora_mm(model.layers[il].wq, cur_s, model.layers[il].wq_s); // [n_embd_head * 2 * n_head, n]
+        cb(Qf, "Qcur_full", il);
+        ggml_tensor * Q = ggml_view_3d(ctx0, Qf, n_embd_head, n_head, n,
+            ggml_element_size(Qf) * n_embd_head * 2, ggml_element_size(Qf) * n_embd_head * 2 * n_head, 0);
+        Q = build_norm(Q, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
+        cb(Q, "Qcur_normed", il);
+        ggml_tensor * gate = ggml_view_3d(ctx0, Qf, n_embd_head, n_head, n,
+            ggml_element_size(Qf) * n_embd_head * 2, ggml_element_size(Qf) * n_embd_head * 2 * n_head,
+            ggml_element_size(Qf) * n_embd_head);
+        gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n);
+        cb(gate, "gate_reshaped", il);
+        Q = ggml_rope_multi(ctx0, Q, pos_of(t0, n), nullptr,
+                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow);
+        cb(Q, "Qcur", il);
+        if (inp->self_k_rot) {
+            Q = llama_mul_mat_hadamard(ctx0, Q, mctx_cur->layer_rot(inp->self_k_rot, il));
+        }
+        ggml_build_forward_expand(gf, Q);
+        ggml_tensor * tiles = sel.tiles_slice(t0, n);
+        ggml_tensor * o = build_attn_mha(Q, k, v, nullptr, tiles, nullptr, nullptr, n_sel, kq_scale, il);
+        cb(o, "kqv_out", il);
+        if (inp->self_v_rot) {
+            o = llama_mul_mat_hadamard(ctx0, o, mctx_cur->layer_rot(inp->self_v_rot, il));
+        }
+        cb(o, "attn_pregate", il);
+        ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, gate);
+        cb(gate_sigmoid, "gate_sigmoid", il);
+        o = ggml_mul(ctx0, o, gate_sigmoid);
+        cb(o, "attn_gated", il);
+        o = build_lora_mm(model.layers[il].wo, o, model.layers[il].wo_s);
+        cb(o, "attn_output", il);
+        // queued now: the next slice reuses this one's memory
+        ggml_build_forward_expand(gf, o);
+        outs.push_back(o);
+    }
+    // joined by pairs: each output copied log2(slices) times instead of up to slices times
+    while (outs.size() > 1) {
+        std::vector<ggml_tensor *> next;
+        for (size_t i = 0; i + 1 < outs.size(); i += 2) {
+            next.push_back(ggml_concat(ctx0, outs[i], outs[i + 1], 1));
+        }
+        if (outs.size() % 2) {
+            next.push_back(outs.back());
+        }
+        outs.swap(next);
+    }
+    return outs[0];
 }
 
 ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
