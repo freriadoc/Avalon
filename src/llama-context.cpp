@@ -1798,13 +1798,14 @@ bool llama_context::set_mtp_h_from(llama_context & tgt, const float * row_first)
     return true;
 }
 
-// LLAMA_MTP_ROWS_CB_SINGLE=1: one device too, the MTP draft takes the nextn rows of a batch of several ubatches ubatch by
-// ubatch on the device (nextn_cb), as the pipeline stages do, instead of their round trip through the host output buffer
-// (the target's 390 MB per 9536-token ubatch down, the draft's whole batch back up after the batch)
-// LLAMA_MTP_ROWS_ASYNC=1 implies it (the draft then reads a staging copy of the rows, without the target waiting for it)
+// one device too, the MTP draft takes the nextn rows of a batch of several ubatches ubatch by ubatch on the device
+// (nextn_cb), as the pipeline stages do, instead of their round trip through the host output buffer (the target's 390 MB
+// per 9536-token ubatch down, the draft's whole batch back up after the batch); LLAMA_MTP_ROWS_CB_SINGLE=0 restores the
+// round trip. LLAMA_MTP_ROWS_ASYNC=1 implies it (the draft then reads a staging copy of the rows, without the target
+// waiting for it)
 static bool llama_mtp_rows_cb_single() {
-    static const bool on = (getenv("LLAMA_MTP_ROWS_CB_SINGLE") && atoi(getenv("LLAMA_MTP_ROWS_CB_SINGLE")) != 0) ||
-                           (getenv("LLAMA_MTP_ROWS_ASYNC")     && atoi(getenv("LLAMA_MTP_ROWS_ASYNC"))     != 0);
+    static const bool on = !(getenv("LLAMA_MTP_ROWS_CB_SINGLE") && atoi(getenv("LLAMA_MTP_ROWS_CB_SINGLE")) == 0) ||
+                           (getenv("LLAMA_MTP_ROWS_ASYNC")      && atoi(getenv("LLAMA_MTP_ROWS_ASYNC"))     != 0);
     return on;
 }
 
