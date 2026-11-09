@@ -235,7 +235,8 @@ static __global__ void dsv4_hc_post_norm_f32(
         int64_t sw1,
         float gate_scale_in,
         float gate_scale_out,
-        float eps) {
+        float eps,
+        const ggml_cuda_img img) {
     ggml_cuda_pdl_lc();
     const int hc  = gridDim.x;
     const int c   = blockIdx.x;
@@ -275,6 +276,9 @@ static __global__ void dsv4_hc_post_norm_f32(
             r.z *= m.z;
             r.w *= m.w;
             ((float4 *) (xn + row*ncols))[tid] = r;
+            if (img.p) {
+                img.store4(row*ncols + 4*tid, r);   // q8_1: whole warps (ncols % 128 == 0, the caller's check)
+            }
         }
 
         if constexpr (block_size > WARP_SIZE) {
@@ -447,7 +451,7 @@ bool ggml_cuda_dsv4_hc_post_norm_supported(const ggml_tensor * post_node, const 
 
 void ggml_cuda_op_dsv4_hc_post_norm(ggml_backend_cuda_context & ctx, ggml_tensor * post_node,
         const ggml_tensor * gate_scale_in, const ggml_tensor * gate_scale_out, const ggml_tensor * rms_norm,
-        ggml_tensor * mul) {
+        ggml_tensor * mul, const ggml_cuda_img img) {
     const ggml_tensor * x        = post_node->src[0];
     const ggml_tensor * residual = post_node->src[1];
     const ggml_tensor * post     = gate_scale_in->src[0];
@@ -475,7 +479,7 @@ void ggml_cuda_op_dsv4_hc_post_norm(ggml_backend_cuda_context & ctx, ggml_tensor
             (int64_t) (x->nb[1] / sizeof(float)), (int64_t) (residual->nb[1] / sizeof(float)), \
             (int64_t) (residual->nb[2] / sizeof(float)), \
             (int64_t) (post->nb[0] / sizeof(float)), (int64_t) (post->nb[1] / sizeof(float)), \
-            (int64_t) (w_norm->nb[1] / sizeof(float)), gate_in, gate_out, eps); \
+            (int64_t) (w_norm->nb[1] / sizeof(float)), gate_in, gate_out, eps, img); \
     } while (0)
 
     // the rms_norm dispatcher's block sizes for a row of n_embd4 float4 (rms_norm_f32_dispatch)

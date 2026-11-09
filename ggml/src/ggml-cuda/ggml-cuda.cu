@@ -6478,9 +6478,56 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     // hc_combine, then the next half's grouped norm of its result (qwen4exp's prompt batches; the small ones fuse the
     // norm into their own hc kernels): the gated hc_post, RMS_NORM and the MUL by the norm weights in one kernel
+    // With the next half's inject product right after (MUL_MAT [n_embd*hc] -> 4 by Q8_0 weights, views in between) the
+    // kernel of RMS_NORM + MUL + MUL_MAT (ggml_cuda_op_rms_norm_mul_inject) computes the hc_post too; both write the
+    // normalized streams' image for the products after them (ggml_cuda_f16_image_target, the scratch of the RMS_NORM node)
     if (node->op == GGML_OP_SCALE && i + 5 < cgraph->n_nodes && ggml_cuda_hc_post_norm_fusable(cgraph, i)) {
-        ggml_cuda_op_dsv4_hc_post_norm(*cuda_ctx, cgraph->nodes[i + 3], node, cgraph->nodes[i + 2],
-                cgraph->nodes[i + 4], cgraph->nodes[i + 5]);
+        ggml_tensor * post = cgraph->nodes[i + 3];
+        ggml_tensor * rms  = cgraph->nodes[i + 4];
+        ggml_tensor * mul  = cgraph->nodes[i + 5];
+        const bool    q8   = rms->src[0]->ne[0] % 128 == 0;
+        int k = i + 6;
+        while (k < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[k])) {
+            k++;
+        }
+        ggml_tensor * mm = k < cgraph->n_nodes ? cgraph->nodes[k] : nullptr;
+        static const bool norm_inject = !getenv("GGML_CUDA_NORM_INJECT") || atoi(getenv("GGML_CUDA_NORM_INJECT")) != 0;
+        if (norm_inject && mm && mm->op == GGML_OP_MUL_MAT && mm->ne[1] > 8 && mm->src[0]->ne[1] == 4 &&
+                ggml_get_op_params_i32(mm, 3) == GGML_PREC_DEFAULT && ggml_cuda_rms_norm_mul_inject_supported(rms, mul, mm)) {
+            const ggml_tensor * residual = post->src[1];
+            const ggml_tensor * bo       = post->src[0];
+            const ggml_tensor * raw      = node->src[0];
+            const auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+                const char * a0 = (const char *) a->data, * a1 = a0 + ggml_nbytes(a);
+                const char * b0 = (const char *) b->data, * b1 = b0 + ggml_nbytes(b);
+                return a0 < b1 && b0 < a1;
+            };
+            const int nodes[7] = { i, i + 1, i + 2, i + 3, i + 4, i + 5, k };
+            const enum ggml_op ops[7] = { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST, GGML_OP_RMS_NORM,
+                                          GGML_OP_MUL, GGML_OP_MUL_MAT };
+            const int outputs[3] = { i + 3, i + 5, k };
+            // the inject's 4 values per token may not take the block output's memory (freed by hc_post, often given to
+            // them by ggml-alloc: 37 of 186 boundaries at 19k): a block writes them while others still read bo, so the
+            // product runs apart then, from the image (the values of a product in F16 instead of F32, as before e917e6e53)
+            if (residual->type == GGML_TYPE_F32 && residual->nb[0] == sizeof(float) && ggml_cuda_is_aligned(residual, 16) &&
+                    residual->nb[1] % 16 == 0 && residual->nb[2] % 16 == 0 && ggml_are_same_shape(residual, post) &&
+                    ggml_can_fuse_subgraph_ext(cgraph, nodes, 7, ops, outputs, 3) &&
+                    !overlaps(mm, residual) && !overlaps(mm, bo) && !overlaps(mm, raw) && !overlaps(mm, mul) && !overlaps(mm, post)) {
+                const ggml_tensor * img_mm = nullptr;
+                const ggml_cuda_img img = ggml_cuda_f16_image_target(*cuda_ctx, cgraph, i + 4, mul, &img_mm, q8);
+                ggml_cuda_op_rms_norm_mul_inject(*cuda_ctx, rms, mul, mm, img, node, cgraph->nodes[i + 2]);
+                if (img.p) {
+                    ggml_cuda_f16_image_written(*cuda_ctx, img_mm, img);
+                }
+                return k - i;
+            }
+        }
+        const ggml_tensor * img_mm = nullptr;
+        const ggml_cuda_img img = ggml_cuda_f16_image_target(*cuda_ctx, cgraph, i + 4, mul, &img_mm, q8);
+        ggml_cuda_op_dsv4_hc_post_norm(*cuda_ctx, post, node, cgraph->nodes[i + 2], rms, mul, img);
+        if (img.p) {
+            ggml_cuda_f16_image_written(*cuda_ctx, img_mm, img);
+        }
         return 5;
     }
 

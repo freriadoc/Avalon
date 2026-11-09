@@ -14,4 +14,4 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 bool ggml_cuda_dsv4_hc_post_norm_supported(const ggml_tensor * post_node, const ggml_tensor * mul);
 void ggml_cuda_op_dsv4_hc_post_norm(ggml_backend_cuda_context & ctx, ggml_tensor * post_node,
         const ggml_tensor * gate_scale_in, const ggml_tensor * gate_scale_out, const ggml_tensor * rms_norm,
-        ggml_tensor * mul);
+        ggml_tensor * mul, const ggml_cuda_img img = ggml_cuda_img());
