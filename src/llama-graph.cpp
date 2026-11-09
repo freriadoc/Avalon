@@ -69,7 +69,7 @@ static bool can_reuse_kq_mask(
 // impl
 
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
-    if (ubatch->token) {
+    if (ubatch->token && path_tok) {
         const int64_t n_tokens = ubatch->n_tokens;
 
         ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
@@ -128,6 +128,10 @@ static int64_t llm_graph_n_tok_rows(const llama_ubatch & ubatch) {
 
 bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
     bool res = true;
+
+    res &= path_tok   == (params.ubatch.token && !params.ubatch.is_mixed());
+    res &= path_embd  == (params.ubatch.embd  && !params.ubatch.is_mixed());
+    res &= path_mixed == params.ubatch.is_mixed();
 
     res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
     res &= (!params.ubatch.embd)  || (embd   &&   embd->ne[1] == params.ubatch.n_tokens);
@@ -2617,6 +2621,13 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
 
     const int64_t n_tok_rows = has_mixed ? llm_graph_n_tok_rows(ubatch) : 0;
 
+    // only the paths the batch's contents take are built: their host inputs ([n_embd, n_tokens] f32 each, 93 MiB at 9536
+    // tokens) would sit in the host compute buffer of every graph, a prompt's included
+    inp->path_mixed = has_mixed && ubatch.is_mixed();
+    inp->path_tok   = ubatch.token && !ubatch.is_mixed();
+    inp->path_embd  = ubatch.embd  && !ubatch.is_mixed();
+    GGML_ASSERT(inp->path_tok || inp->path_embd || inp->path_mixed);
+
     // we have 3 standard paths to produce the input embeddings for the first layer:
     // - embd0: extract from the token embeddings weight (`tok_embd`) using the input token ids
     // - embd1: pass raw embeddings, skipping the `tok_embd`
@@ -2632,11 +2643,13 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
         ggml_set_input(inp->tokens);
         res->t_inp_tokens = inp->tokens;
 
-        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, ubatch.n_tokens);
-        cb(inp->embd, "inp_embd", -1);
-        ggml_set_input(inp->embd);
+        if (inp->path_embd) {
+            inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, ubatch.n_tokens);
+            cb(inp->embd, "inp_embd", -1);
+            ggml_set_input(inp->embd);
+        }
 
-        if (has_mixed) {
+        if (inp->path_mixed) {
             inp->mixed_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tok_rows);
             cb(inp->mixed_tokens, "inp_mixed_tokens", -1);
             ggml_set_input(inp->mixed_tokens);
@@ -2646,7 +2659,7 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
     // the embeddings placeholders for the 3 paths
     // we use ggml_build_forward_order to make the GET_ROWS ops stick at the beginning of the compute graph
     // this way the embeddings remain in the host buffer, and the GET_ROWS run before any other computations
-    {
+    if (inp->path_tok) {
         if (llama_embd_raw_rows(tok_embd)) {
             // the rows gathered in their type on the host, dequantized by the GPU that reads them: a quarter of the bytes
             // copied and kept for Q8_0 (llama_embd_raw_rows)
@@ -2657,10 +2670,11 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
             embd0 = ggml_get_rows(ctx0, tok_embd, inp->tokens);
             ggml_build_forward_order(gf, embd0);
         }
-
+    }
+    {
         embd1 = inp->embd;
 
-        if (has_mixed) {
+        if (inp->path_mixed) {
             embd2 = ggml_get_rows(ctx0, tok_embd, inp->mixed_tokens);
             ggml_build_forward_order(gf, embd2);
         }
@@ -2700,15 +2714,14 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
     std::array<ggml_tensor *, 3> inps = {};
 
     // token embeddings path (ubatch.token != nullptr)
-    inps[0] = build_tok(embd0, inp->tokens);
+    if (inp->path_tok) {
+        inps[0] = build_tok(embd0, inp->tokens);
+    }
 
     // vector embeddings path (ubatch.embd != nullptr)
     inps[1] = embd1;
 
-    assert(ggml_are_same_shape (inps[0], inps[1]));
-    assert(ggml_are_same_stride(inps[0], inps[1]));
-
-    if (has_mixed) {
+    if (inp->path_mixed) {
         inp->mixed_slots = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_tok_rows);
         cb(inp->mixed_slots, "inp_mixed_slots", -1);
         ggml_set_input(inp->mixed_slots);
@@ -2721,13 +2734,10 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
         ggml_tensor * embd_mixed = build_tok(embd2, inp->mixed_tokens);
         inps[2] = ggml_set_rows(ctx0, ggml_dup(ctx0, inp->mixed_embd), embd_mixed, inp->mixed_slots);
 
-        assert(ggml_are_same_shape (inps[0], inps[2]));
-        assert(ggml_are_same_stride(inps[0], inps[2]));
     }
 
-    const int idx = ubatch.is_mixed() ? 2 : ubatch.token ? 0 : 1;
-
-    ggml_tensor * cur = ggml_build_forward_select(gf, inps.data(), has_mixed ? 3 : 2, idx);
+    // the one path built
+    ggml_tensor * cur = inp->path_mixed ? inps[2] : inp->path_tok ? inps[0] : inps[1];
 
     if (n_embd_inp != n_embd) {
         cur = ggml_view_2d(ctx0, cur, n_embd, n_tokens, cur->nb[1], 0);

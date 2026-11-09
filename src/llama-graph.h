@@ -149,6 +149,11 @@ public:
 
     float scale_tok = 1.0f;
 
+    // the paths built for the batch's contents (token rows, raw embeddings, mixed): a graph is reused for the same ones
+    bool path_tok   = false;
+    bool path_embd  = false;
+    bool path_mixed = false;
+
     const int64_t n_embd = 0;
 };
 
