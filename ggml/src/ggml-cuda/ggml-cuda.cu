@@ -2632,6 +2632,42 @@ static ggml_cuda_img ggml_cuda_f16_image_target(const ggml_backend_cuda_context 
     return {};
 }
 
+// an image written by a kernel fused from node first to node last, at first's launch, into the scratch of one of the later
+// nodes: ggml-alloc makes that scratch live from its own node only, so it may still hold a tensor the fused nodes read or
+// write (the block output and the residual, which die at hc_post, given to the RMS_NORM's scratch): no image then, the
+// products convert their src1 themselves
+static ggml_cuda_img ggml_cuda_f16_image_if_free(const ggml_cgraph * cgraph, int first, int last, const ggml_cuda_img & img,
+        const ggml_tensor * out) {
+    if (!img.p) {
+        return img;
+    }
+    const size_t n  = img.kind == GGML_CUDA_IMG_Q8_1_D4 ? (size_t) ggml_nelements(out) / 128 * 144 :
+                                                          (size_t) ggml_nelements(out) * sizeof(half);
+    const char * a0 = (const char *) img.p, * a1 = a0 + n;
+    const auto overlaps = [&](const ggml_tensor * t) {
+        if (t == nullptr || t->data == nullptr) {
+            return false;
+        }
+        const char * b0 = (const char *) t->data, * b1 = b0 + ggml_nbytes(t);
+        return a0 < b1 && b0 < a1;
+    };
+    static const bool trace = getenv("GGML_CUDA_F16_IMAGE_TRACE") != nullptr;
+    for (int j = first; j <= last; j++) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        for (int s = -1; s < GGML_SCHED_SCRATCH_SRC; s++) {
+            const ggml_tensor * u = s < 0 ? t : t->src[s];
+            if (overlaps(u)) {
+                if (trace) {
+                    fprintf(stderr, "F16_IMAGE_TRACE %s: no image, its scratch holds %s (read or written by the fused nodes)\n",
+                            out->name, u->name);
+                }
+                return {};
+            }
+        }
+    }
+    return img;
+}
+
 // after the producer's launch: the products of mm's group find their src1 converted (their reuse test)
 static void ggml_cuda_f16_image_written(ggml_backend_cuda_context & ctx, const ggml_tensor * mm, const ggml_cuda_img & img) {
     int64_t key[GGML_CUDA_MMQ_SCRATCH_KEY];
@@ -6514,7 +6550,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     ggml_can_fuse_subgraph_ext(cgraph, nodes, 7, ops, outputs, 3) &&
                     !overlaps(mm, residual) && !overlaps(mm, bo) && !overlaps(mm, raw) && !overlaps(mm, mul) && !overlaps(mm, post)) {
                 const ggml_tensor * img_mm = nullptr;
-                const ggml_cuda_img img = ggml_cuda_f16_image_target(*cuda_ctx, cgraph, i + 4, mul, &img_mm, q8);
+                const ggml_cuda_img img = ggml_cuda_f16_image_if_free(cgraph, i, k,
+                        ggml_cuda_f16_image_target(*cuda_ctx, cgraph, i + 4, mul, &img_mm, q8), mul);
                 ggml_cuda_op_rms_norm_mul_inject(*cuda_ctx, rms, mul, mm, img, node, cgraph->nodes[i + 2]);
                 if (img.p) {
                     ggml_cuda_f16_image_written(*cuda_ctx, img_mm, img);
@@ -6523,7 +6560,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             }
         }
         const ggml_tensor * img_mm = nullptr;
-        const ggml_cuda_img img = ggml_cuda_f16_image_target(*cuda_ctx, cgraph, i + 4, mul, &img_mm, q8);
+        const ggml_cuda_img img = ggml_cuda_f16_image_if_free(cgraph, i, i + 5,
+                ggml_cuda_f16_image_target(*cuda_ctx, cgraph, i + 4, mul, &img_mm, q8), mul);
         ggml_cuda_op_dsv4_hc_post_norm(*cuda_ctx, post, node, cgraph->nodes[i + 2], rms, mul, img);
         if (img.p) {
             ggml_cuda_f16_image_written(*cuda_ctx, img_mm, img);
