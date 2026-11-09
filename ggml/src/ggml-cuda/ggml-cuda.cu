@@ -330,8 +330,13 @@ __attribute__((constructor)) static void ggml_hip_set_hw_queues() {
 // waits for the device: with a hosted MoE block waiting for the host thread to serve its mailbox, the first launch of a
 // kernel made meanwhile hung (cudaFuncGetAttributes -> cuLibraryGetModule, the first mul_mat_vec_f of the warm-up on an
 // RTX 4090). Every module loaded with the library instead; an explicit CUDA_MODULE_LOADING is kept.
+//
+// The prompt's expert ring (GGML_CUDA_MOE_RING_PREFILL, MiB of the zones the scheduler borrows) on NVIDIA by default: the
+// MoE blocks of a prompt hosted, their experts streamed through the ring and read in place from the cache, gate and up
+// grouped (every RTX 4090 measurement of the 8th and 9th of November ran with 900). An explicit value is kept, 0 turns it off.
 __attribute__((constructor)) static void ggml_cuda_set_module_loading() {
     setenv("CUDA_MODULE_LOADING", "EAGER", /*overwrite =*/ 0);
+    setenv("GGML_CUDA_MOE_RING_PREFILL", "900", /*overwrite =*/ 0);
 }
 #endif
 
