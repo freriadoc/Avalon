@@ -1024,18 +1024,19 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
         (*hooks->synced)();
     }
 
-    // GGML_CUDA_MOE_GROUPED_PREFIX=1: every group's tile prefixes in one launch (instead of one before each product) and each
-    // launch's grid of its exact tiles (from the bounds read back), not a bound of them: the same tiles, the same sums
+    // every group's tile prefixes in one launch (instead of one before each product) and each launch's grid of its exact
+    // tiles (from the bounds read back), not a bound of them: the same tiles, the same sums (GGML_CUDA_MOE_GROUPED_PREFIX=0:
+    // one prefix launch before each product)
     // GGML_CUDA_MOE_GROUPED_STREAMS=2: the groups alternate between this stream and a second one, so that a group's
     // launches fill the last waves of the other's and its small kernels (swiglu, the down's quantization) overlap them;
     // the groups write disjoint rows (their own compact rows and outputs), every prefix of the layer is computed first
     const bool two = ggml_cuda_moe_grouped_streams() == 2;
-    static const bool prefix_env = getenv("GGML_CUDA_MOE_GROUPED_PREFIX") && atoi(getenv("GGML_CUDA_MOE_GROUPED_PREFIX")) != 0;
+    static const bool prefix_env = !getenv("GGML_CUDA_MOE_GROUPED_PREFIX") || atoi(getenv("GGML_CUDA_MOE_GROUPED_PREFIX")) != 0;
     const bool prefix_once = prefix_env || two;
-    // GGML_CUDA_MOE_FUSE_GU=1: gate and up in one launch (twice the row tiles; the upper ones read up's experts and
-    // write up's output): the same tiles and sums as their two launches, half the launches and their last waves'
-    // idle SMs (one 254-register block per SM on an RTX 4090: ~17 % of gate/up's time by groups of 32, 9.5 % fused)
-    static const bool fuse_gu = getenv("GGML_CUDA_MOE_FUSE_GU") && atoi(getenv("GGML_CUDA_MOE_FUSE_GU")) != 0;
+    // gate and up in one launch (twice the row tiles; the upper ones read up's experts and write up's output): the same
+    // tiles and sums as their two launches, half the launches and their last waves' idle SMs (one 254-register block per
+    // SM on an RTX 4090: ~17 % of gate/up's time by groups of 32, 9.5 % fused); GGML_CUDA_MOE_FUSE_GU=0: two launches
+    static const bool fuse_gu = !getenv("GGML_CUDA_MOE_FUSE_GU") || atoi(getenv("GGML_CUDA_MOE_FUSE_GU")) != 0;
     const bool pair_ok = fuse_gu && wg->nb[1] == wu->nb[1] && wg->nb[2] == wu->nb[2] && gate->nb[1] == up->nb[1] &&
         gate->nb[2] == up->nb[2] && ((const char *) up->data - (const char *) gate->data) % sizeof(float) == 0;
     // ggml_mul_mat_id_sum: each group's down into a buffer of the group's rows (one per stream), then added into the
