@@ -248,28 +248,46 @@ draft-mtp --spec-draft-n-max 2 -ubd 256 -ctkd q8_0 -ctvd q8_0"`. Lemonade adds t
 `--jinja` and `--parallel 1` itself and no `-ngl`, so `--fit` keeps placing the model. Not tried yet: if you do, please
 open an issue with what worked or not.
 
-### Two or more GPUs (experimental, untested)
+### Two GPUs: the pipeline stages
 
-```bash
-GGML_MOE_CACHE_LAYER_DEVICE=1 avalon-server   # or the llama-server command above
-```
+With two GPUs visible, Avalon runs the model as a **two-stage pipeline by default**: start it as usual, no flag needed.
 
-The second GPU becomes **more expert cache**, it does not split the model: the dense weights and the KV stay on the
-first GPU (`--fit` puts them there), and the MoE layers are shared between the GPUs' expert caches in proportion to
-their free VRAM. In generation, the MoE block of a layer runs on the GPU that caches it (only tens of KB of activations
-cross per layer); the prefill and its expert prefetch stay on the first GPU. With one GPU the option changes nothing
-(measured: same speed, same text).
+- **The layers are split** between the GPUs (23 / 25 of the 48 layers by default; `-ts` moves the boundary). Each GPU
+  has its own layers, its own part of the KV cache and recurrent states, its own expert cache and its own thread.
+- **The prompt is pipelined.** The first GPU works on the next chunk of the prompt while the second finishes the
+  current one, and each GPU streams the experts of its own layers through its own PCIe link, so both links are used.
+  With two stages, a whole prompt goes through in one call (the batch is raised to the context size).
+- **Generation** runs both stages in turn; only the hidden state of the tokens crosses from one GPU to the other.
+- **MTP** works as with one GPU: the draft takes the target's rows chunk by chunk on the device.
 
-**It has never run on two GPUs**: I have only one. If you have two RDNA3 cards, please try it and open an
-issue with the server log (`-lv 4`), your GPUs and how they are connected (x16 + x4, x8 / x8...). Known gap: the
-prefill only uses the first GPU's PCIe link, so with two cards in x8 / x8 slots it is probably slower than one card in x16
-(a per-GPU prefetch would fix it). Without the option, several GPUs are untested too.
+Measured on 2 x RTX A4000 with MTP, against a plain layer split of the same model:
+
+| | plain layer split | pipeline stages |
+|---|---|---|
+| prefill, 19k prompt | 1,190 t/s | 1,669 – 1,680 t/s |
+| prefill, 60k prompt | 1,079 t/s | 1,761 t/s |
+| prefill, 120k prompt | 1,027 t/s | 1,598 t/s |
+| generation, one verification step | 35.6 – 35.9 ms | 35.05 ms |
+
+It was also tuned on 2 x RTX 5060 Ti. **It has not run on two AMD GPUs yet**: if you have two, please try it and open
+an issue with the server log (`-lv 4`), your GPUs, how they are connected (x16 / x16, x16 / x8, x8 / x8...) and your
+prompt and generation speed.
+
+Options:
+- `LLAMA_STAGES=0`: no pipeline (to compare with a plain layer split, or with one card).
+- `LLAMA_STAGES_FULL_UBATCH_FROM=N` (off by default): a prompt of N tokens or more runs each stage at the whole ubatch
+  instead of half of it, which copies fewer expert bytes per token where the PCIe link is the limit.
+- `GGML_MOE_CACHE_LAYER_DEVICE=1` with `LLAMA_STAGES=0`, experimental: the second GPU only adds **expert cache**; the
+  dense weights, the KV and the prefill stay on the first GPU.
+
+More than two GPUs is untested.
 
 ## Limits
 
 - **One model.** Avalon is tuned for Qwen3.8-Flash-Next; the GGUF files above use types and a layout stock llama.cpp
   does not have. Other models run as in llama.cpp, without the expert cache work.
-- **One GPU measured.** Two or more: see above, experimental and untested.
+- **GPUs measured.** One AMD GPU (RDNA3, RDNA4 by users) and pairs of NVIDIA GPUs with the pipeline stages (see
+  above). Two AMD GPUs and more than two GPUs: untested.
 - **Tuned on RDNA3 with ROCm 7.2.** CUDA builds and was measured on rented RTX 4090s (see
   [NVIDIA](#nvidia-cuda-one-rented-rtx-4090)); its kernels are not tuned for NVIDIA yet, and the installer is ROCm only.
   RDNA4 runs ([reported](#reported-by-users-not-verified-here) on an R9700), not measured here; the chunked prompt GDN
