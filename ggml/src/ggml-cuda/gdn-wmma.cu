@@ -1189,11 +1189,11 @@ __global__ void __launch_bounds__(g2_plan<NPS, NPO, NTL>::NT, 1) gdn_tc2_scan(co
 #endif // GDN_TC2_DEVICE
 }
 
-// GGML_CUDA_GDN_TC2: 0 / unset off, 1 / 2 / 3 the passes (see above); GGML_CUDA_GDN_TC2_TILES=1|2 forces the tiles
+// GGML_CUDA_GDN_TC2: 1 (the default) / 2 / 3 the passes (see above), 0 off; GGML_CUDA_GDN_TC2_TILES=1|2 forces the tiles
 static int g2_np() {
     static const int np = [] {
         const char * e = getenv("GGML_CUDA_GDN_TC2");
-        const int v = e ? atoi(e) : 0;
+        const int v = e ? atoi(e) : 1;
         return v == 1 || v == 2 || v == 3 ? v : 0;
     }();
     return np;
