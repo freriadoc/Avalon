@@ -590,7 +590,7 @@ static bool top_k_radix_fused_cuda(int * histograms, size_t hist_count, const fl
     return true;
 }
 
-// A row by one block (GGML_CUDA_TOPK_ROW=N: for N rows or more; 0, the default, keeps the kernels below): the four
+// A row by one block (for 64 rows or more; GGML_CUDA_TOPK_ROW=N sets the bound, 0 keeps the kernels below): the four
 // radix passes and the gather of the step kernels, in the same order with the same rule (keys above the k-th value's in
 // column order first, then the lowest columns of those equal to it at the end), so the same output. The step kernels
 // read every row from memory once per pass (9 launches over the whole [ncols, nrows] scores: 268 MiB per slice of the
@@ -714,7 +714,7 @@ static __global__ void top_k_radix_row(
 }
 
 static int top_k_row_min_rows() {
-    static const int n = [] { const char * e = getenv("GGML_CUDA_TOPK_ROW"); return e ? atoi(e) : 0; }();
+    static const int n = [] { const char * e = getenv("GGML_CUDA_TOPK_ROW"); return e ? atoi(e) : 64; }();
     return n;
 }
 
