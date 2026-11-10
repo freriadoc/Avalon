@@ -4148,14 +4148,16 @@ private:
                     // as much as a full one when the experts are uploaded for each ubatch (prefetch), and the cost of a
                     // ubatch, max(compute ~ tokens, upload), is convex in its size: 19k tokens at -ub 8192, 8192 / 2634 / 8188
                     // become 5413 / 5413 / 8188. One ubatch per server batch then
-                    // with snapshots, a single sequence's prompt batch is filled up to n_batch and llama makes the equal
-                    // ubatches between the checkpoints (llama_set_seq_snapshots)
+                    // with snapshots, llama ends a ubatch at each one inside the batch (llama_set_seq_snapshots) but only
+                    // sees one batch: the batch also stops at the next forced break, or the checkpoint one ubatch before
+                    // the end splits a full batch in two (131k at -ub 9536: 12 x 9536 + 7150 / 2386 / 7146, 15 ubatches
+                    // instead of 14; 32k: 3 x 9536 split 4206 / 5330, then 4202, prefill +16 to +42 % on the RX 7900 XT)
                     static const bool snaps_env = !getenv("LLAMA_SERVER_SNAPSHOTS") || atoi(getenv("LLAMA_SERVER_SNAPSHOTS")) != 0;
                     const bool use_snaps = snaps_env && do_checkpoint && n_swa == 0 && params_base.n_parallel == 1 && !has_mtmd &&
                         !input_tokens.has_mtmd && batch.size() == 0;
                     std::vector<snapshot_req> snaps_cur;
                     int32_t n_batch_cur = n_batch;
-                    if (!use_snaps) {
+                    {
                         const int32_t pos   = slot.prompt.n_tokens();
                         int32_t       stop  = slot.task->n_tokens();
                         if (do_checkpoint) {
@@ -4174,6 +4176,8 @@ private:
                         if (r > g) {
                             const int32_t k = (r + g - 1) / g;
                             n_batch_cur = std::min<int32_t>(n_batch, (int32_t) batch.size() + (r + k - 1) / k);
+                        } else if (use_snaps && r > 0) {
+                            n_batch_cur = std::min<int32_t>(n_batch, (int32_t) batch.size() + r);
                         }
                     }
 
