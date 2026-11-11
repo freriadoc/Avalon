@@ -200,10 +200,71 @@ static int cpu_count_math_cpus(int n_cpu) {
 
 #endif // __x86_64__ && __linux__
 
+#if defined(__linux__)
+// The CPU time the cgroup grants, in whole CPUs (0: no quota): the smallest cpu.max quota / period of the process's
+// cgroup v2 and its parents, or cpu.cfs_quota_us / cpu.cfs_period_us of cgroup v1. A container (a rented GPU, docker
+// --cpus) often sees every CPU of its host and gets a fraction of them: one thread per core then exceeds the quota,
+// and the scheduler stops all of them for the rest of each period (generation 30 % slower at 48 threads for a quota
+// of 23 CPUs, measured on a rented RTX 4090)
+static int32_t cpu_cgroup_quota() {
+    double best = 0.0;
+    auto take = [&](double quota, double period) {
+        if (quota > 0.0 && period > 0.0 && (best == 0.0 || quota / period < best)) {
+            best = quota / period;
+        }
+    };
+    std::ifstream self("/proc/self/cgroup");
+    std::string line, path;
+    while (std::getline(self, line)) {
+        if (line.rfind("0::", 0) == 0) {
+            path = line.substr(3);
+        }
+    }
+    if (!path.empty()) {
+        while (true) {
+            std::ifstream f("/sys/fs/cgroup" + (path == "/" ? std::string() : path) + "/cpu.max");
+            std::string quota;
+            double period = 0.0;
+            if (f >> quota >> period && quota != "max") {
+                take(std::atof(quota.c_str()), period);
+            }
+            if (path == "/" || path.empty()) {
+                break;
+            }
+            const size_t slash = path.rfind('/');
+            path = slash == 0 || slash == std::string::npos ? "/" : path.substr(0, slash);
+        }
+    }
+    for (const char * dir : { "/sys/fs/cgroup/cpu,cpuacct", "/sys/fs/cgroup/cpu" }) {
+        std::ifstream q(std::string(dir) + "/cpu.cfs_quota_us"), t(std::string(dir) + "/cpu.cfs_period_us");
+        double quota = 0.0, period = 0.0;
+        if (q >> quota && t >> period) {
+            take(quota, period);
+            break;
+        }
+    }
+    return best > 0.0 ? std::max<int32_t>(1, (int32_t) best) : 0;
+}
+#endif
+
+static int32_t cpu_get_num_math_host();
+
 /**
- * Returns number of CPUs on system that are useful for math.
+ * Returns number of CPUs on system that are useful for math, at most the CPU time the cgroup grants (Linux).
  */
 int32_t common_cpu_get_num_math() {
+    const int32_t n = cpu_get_num_math_host();
+#if defined(__linux__)
+    const int32_t quota = cpu_cgroup_quota();
+    if (quota > 0 && quota < n) {
+        LOG_INF("%s: %d CPUs for math, bounded by the cgroup's CPU quota to %d threads\n", __func__, n, quota);
+        return quota;
+    }
+#endif
+    return n;
+}
+
+static int32_t cpu_get_num_math_host() {
 #if defined(__x86_64__) && defined(__linux__) && !defined(__ANDROID__)
     int n_cpu = sysconf(_SC_NPROCESSORS_ONLN);
     if (n_cpu < 1) {
