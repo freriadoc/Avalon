@@ -5496,6 +5496,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     const char * b0 = (const char *) in->data,  * b1 = b0 + ggml_nbytes(in);
                     return !(a0 < b1 && b0 < a1) || (exact_ok && a0 == b0 && a1 == b1);
                 };
+                // the hyper-connection combine + norm that reads the block output computes it (qwen4exp), as the
+                // unsummed block's below: the summed row with weight 1
+                const int with_k1 = ggml_cuda_qwen4_hc_fuse_reduction_k1(*cuda_ctx, cgraph, i, add_idx + 1,
+                    [](const ggml_cgraph * g, int idx, int n, const int * outs, int n_outs) {
+                        return ggml_cuda_check_fusion_memory_ranges(g, idx, n, outs, n_outs);
+                    }, summed, nullptr, nullptr, sh, logit);
+                if (with_k1 > 0) {
+                    return with_k1;
+                }
                 if (ggml_can_fuse_subgraph_ext(cgraph, nodes3, 3, ops3, &add_idx, 1) &&
                         range_ok(summed, true) && range_ok(sh, true) && range_ok(logit, false)) {
                     ggml_cuda_op_moe_weighted_reduction(*cuda_ctx, summed, nullptr, nullptr, add, sh, logit);

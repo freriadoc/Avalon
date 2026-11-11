@@ -2499,10 +2499,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
-    // LLAMA_MOE_DOWN_SUM=1 (with the prefill ring, GGML_CUDA_MOE_RING_PREFILL): a prompt's down projection weighted and
+    // With the prefill ring (GGML_CUDA_MOE_RING_PREFILL), a prompt's down projection weighted and
     // summed in one node (ggml_mul_mat_id_sum, [n_embd, 1, n_tokens]): the [n_embd, n_expert_used, n_tokens] products,
     // the weighting and the adds stay out of the graph (the grouped block sums them group by group). From 128 tokens
     // (the grouped block's floor; below, the hosted block and its fusions keep today's nodes)
+    // LLAMA_MOE_DOWN_SUM=1 turns it on. Its quality is today's (KLD of 10 Nov., RX 7900 XT, 8 x 4096, EN / FR / code: against
+    // today's nodes 0.0241 / 0.0322 / 0.0057, below the fusions switched off, rounding only: 0.0283 / 0.0355 / 0.0064), but at
+    // -ub 9536 it gave back 272 MiB of compute buffer only and the prompt ran 1 to 15 % slower in 5 cases of 6: off for now
     static const bool down_sum = getenv("LLAMA_MOE_DOWN_SUM") && atoi(getenv("LLAMA_MOE_DOWN_SUM")) != 0;
     if (down_sum && n_tokens >= 128 && !weight_before_ffn && !down_exps_b && !down_exps_s && arch != LLM_ARCH_MISTRAL4 &&
             loras->empty() && hparams.n_expert_used(il) == (uint32_t) n_expert_used && n_expert_used > 1) {

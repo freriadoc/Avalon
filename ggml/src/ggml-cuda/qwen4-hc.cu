@@ -131,7 +131,7 @@ static constexpr int QWEN4_HC_K1_PER_THREAD = 4; // n_embd <= 4096, 4 contiguous
 struct qwen4_hc_reduction {
     const float * experts = nullptr;       // rows (token, expert) x n_embd
     const float * expert_scale = nullptr;  // per row, or nullptr
-    const float * weights = nullptr;       // per row
+    const float * weights = nullptr;       // per row, or nullptr: 1 (ggml_mul_mat_id_sum's down: one row, already weighted)
     const float * sh = nullptr;            // shared expert, token x n_embd, or nullptr
     const float * sh_logit = nullptr;      // its gate's logit, per token
     int n_used = 0;
@@ -154,14 +154,14 @@ static __device__ __forceinline__ float4 qwen4_hc_block_value(const qwen4_hc_red
     }
     const float4 sh = red.sh != nullptr ? qwen4_hc_ld4(red.sh + (size_t) t * n_embd + e) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     const float s0 = red.expert_scale != nullptr ? red.expert_scale[first_row] : 1.0f;
-    const float w0 = red.weights[first_row];
+    const float w0 = red.weights != nullptr ? red.weights[first_row] : 1.0f;
     float4 sum = make_float4((v[0].x * s0) * w0, (v[0].y * s0) * w0, (v[0].z * s0) * w0, (v[0].w * s0) * w0);
 #pragma unroll
     for (int expert = 1; expert < QWEN4_HC_RED_MAX_EXPERTS; ++expert) {
         if (expert < red.n_used) {
             const uint64_t row = first_row + expert;
             const float sc = red.expert_scale != nullptr ? red.expert_scale[row] : 1.0f;
-            const float w = red.weights[row];
+            const float w = red.weights != nullptr ? red.weights[row] : 1.0f;
             sum.x += (v[expert].x * sc) * w;
             sum.y += (v[expert].y * sc) * w;
             sum.z += (v[expert].z * sc) * w;
@@ -1063,7 +1063,7 @@ int ggml_cuda_qwen4_hc_fuse_reduction_k1(ggml_backend_cuda_context & ctx, ggml_c
     qwen4_hc_reduction red;
     red.experts = (const float *) experts->data;
     red.expert_scale = expert_scale ? (const float *) expert_scale->data : nullptr;
-    red.weights = (const float *) weights->data;
+    red.weights = weights ? (const float *) weights->data : nullptr;
     red.sh = sh ? (const float *) sh->data : nullptr;
     red.sh_logit = sh_logit ? (const float *) sh_logit->data : nullptr;
     red.n_used = (int) experts->ne[1];
