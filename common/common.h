@@ -14,6 +14,8 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <mutex>
+#include <thread>
 #include <vector>
 #include <map>
 #include <algorithm>
@@ -1297,6 +1299,27 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 // prompt utils
 //
 
+// A checkpoint's buffer taken ready instead of allocated. A fresh allocation of ~115 MiB (Qwen3.8's recurrent state)
+// takes ~50 ms to touch for the first time (29 000 page faults, as long by a memset, by the copy or prefaulted), at
+// every request, before its ~22 ms copy from the device; transparent huge pages cut it to 8 ms but stalled up to
+// 1.2 s once the RAM was full (direct compaction). So one spare buffer is kept touched ahead of time by a thread, while
+// the answer is generated: resize() gives it to the checkpoint and the thread prepares the next one. No spare of
+// that size ready (the first requests): a fresh buffer, as before. Standard C++ only (it serves Windows as Linux);
+// owned by who makes the checkpoints (the server), which joins the thread when it goes
+struct common_checkpoint_spare {
+    ~common_checkpoint_spare();
+
+    // data resized to size, from the spare when it holds enough
+    void resize(std::vector<uint8_t> & data, size_t size);
+
+private:
+    std::mutex mu;
+    std::vector<uint8_t> buf;
+    std::thread worker;
+    bool busy = false;
+    size_t largest = 0;
+};
+
 struct common_prompt_checkpoint {
     int64_t n_tokens;
 
@@ -1326,7 +1349,8 @@ struct common_prompt_checkpoint {
     void update_tgt(
             llama_context * ctx,
             llama_seq_id seq_id,
-            llama_state_seq_flags flags);
+            llama_state_seq_flags flags,
+            common_checkpoint_spare * spare = nullptr);
 
     void update_dft(
             llama_context * ctx,

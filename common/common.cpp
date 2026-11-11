@@ -32,6 +32,7 @@
 #include <string>
 #include <thread>
 #include <unordered_set>
+#include <mutex>
 #include <vector>
 
 #if defined(__APPLE__) && defined(__MACH__)
@@ -2500,17 +2501,58 @@ void common_prompt_checkpoint::update_pos(
     this->pos_max  = pos_max;
 }
 
+common_checkpoint_spare::~common_checkpoint_spare() {
+    if (worker.joinable()) {
+        worker.join();
+    }
+}
+
+void common_checkpoint_spare::resize(std::vector<uint8_t> & data, size_t size) {
+    const size_t floor_bytes = (size_t) 16 << 20;   // small states: nothing to gain
+    if (size < floor_bytes || data.capacity() >= size) {
+        data.resize(size);
+        return;
+    }
+    std::unique_lock<std::mutex> lock(mu);
+    if (!busy && buf.capacity() >= size) {
+        data.swap(buf);
+        std::vector<uint8_t>().swap(buf);
+    }
+    if (!busy) {
+        if (worker.joinable()) {
+            worker.join();
+        }
+        busy = true;
+        // the states of a context differ by ~2 MiB (113.7 to 116.0 MiB seen): the largest one seen fits them all
+        largest = std::max(largest, size);
+        const size_t n = largest + ((size_t) 1 << 20);
+        worker = std::thread([this, n] {
+            std::vector<uint8_t> fresh(n);
+            std::lock_guard<std::mutex> l(mu);
+            buf.swap(fresh);
+            busy = false;
+        });
+    }
+    lock.unlock();
+    data.resize(size);
+}
+
 void common_prompt_checkpoint::update_tgt(
         llama_context * ctx,
         llama_seq_id seq_id,
-        llama_state_seq_flags flags) {
+        llama_state_seq_flags flags,
+        common_checkpoint_spare * spare) {
     if (ctx == nullptr) {
         return;
     }
 
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
-    data_tgt.resize(ckpt_size);
+    if (spare) {
+        spare->resize(data_tgt, ckpt_size);
+    } else {
+        data_tgt.resize(ckpt_size);
+    }
 
     const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
     if (n != ckpt_size) {

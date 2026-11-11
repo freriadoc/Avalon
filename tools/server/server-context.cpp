@@ -1038,6 +1038,9 @@ private:
 
     common_speculative_ptr spec;
 
+    // the context checkpoints' next buffer, prepared ahead of the request that takes it
+    common_checkpoint_spare ckpt_spare;
+
     // context checkpoints inside a prompt batch (llama_set_seq_snapshots): the batch is no longer ended where a
     // checkpoint is due, so that its ubatches stay in one decode (they overlap in a pipeline over several GPUs); the
     // state there is captured by the decode and the checkpoint created after it. LLAMA_SERVER_SNAPSHOTS=0: the batch
@@ -2676,7 +2679,7 @@ private:
         if (data_tgt) {
             cur.data_tgt = *data_tgt;
         } else {
-            cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, &ckpt_spare);
         }
         // a checkpoint from a snapshot takes the draft's state after the whole batch: a restore removes the later
         // positions (seq_rm) after loading it
@@ -3637,7 +3640,7 @@ private:
                 if (use_ckpt_tgt) {
                     //const int64_t t_start = ggml_time_us();
 
-                    ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, &ckpt_spare);
 
                     //const int64_t t_total = ggml_time_us() - t_start;
                     //printf("checkpoint total: %f ms\n", t_total / 1000.0);
