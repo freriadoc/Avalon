@@ -1123,8 +1123,10 @@ static bool ggml_gallocr_reserve_n_impl(
         GGML_ASSERT(galloc->hash_values != NULL);
     }
 
-    // reset allocators
+    // reset allocators; a type's largest chunk read again: a borrowing type's follows the lender (the bands lend their
+    // free room in one piece, known once the cache has set its zones, after the allocator was created)
     for (int i = 0; i < galloc->n_buffers; i++) {
+        galloc->buf_tallocs[i]->max_chunk_size = MIN(ggml_backend_buft_get_max_size(galloc->bufts[i]), SIZE_MAX/2);
         ggml_dyn_tallocr_reset(galloc->buf_tallocs[i]);
     }
 
@@ -1262,16 +1264,19 @@ static bool ggml_gallocr_reserve_n_impl(
         // a buffer that grows keeps every chunk at least at its size: graphs of different shapes needing more in
         // different chunks (the verification batches of a speculative decoder) otherwise reallocated it at
         // every change of shape; it settles at the largest of them
-        // A borrowed chunk that grows at least doubles: the MTP draft's prompt batches need a little more at each
-        // batch as the context fills (+0.5 MiB per 256 tokens at 256k), one loan and one return each time; doubling
-        // bounds the reallocations to a few per prompt for at most twice the room
+        // A borrowed chunk that grows takes a margin of its size, 128 MiB at most: the MTP draft's prompt batches need a
+        // little more at each batch as the context fills (+0.5 MiB per 256 tokens at 256k), one loan and one return each
+        // time; the margin (its own size for a small buffer: doubling) bounds the reallocations to a few per prompt (2 or
+        // 3 for a 250k prompt). Doubling a prompt's buffer (GiB) lent 2.2 to 2.6 GiB more for its last ubatch, needing a
+        // few MiB more than the first (chunks of 1 GiB capped it before the bands' single chunk)
         const bool borrowed = galloc->buffers[i] && ggml_moe_cache.borrows && ggml_moe_cache.borrows(galloc->bufts[i]);
         if (realloc && !shrinking && galloc->buffers[i]) {
             for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
                 struct tallocr_chunk * chunk = galloc->buf_tallocs[i]->chunks[c];
                 const size_t cur_chunk_size = ggml_vbuffer_chunk_size(galloc->buffers[i], c);
                 if (borrowed && cur_chunk_size > 0 && chunk->max_size > cur_chunk_size) {
-                    chunk->max_size = MAX(chunk->max_size, MIN(2 * cur_chunk_size, galloc->buf_tallocs[i]->max_chunk_size));
+                    const size_t margin = MIN(cur_chunk_size, (size_t) 128 << 20);
+                    chunk->max_size = MAX(chunk->max_size, MIN(cur_chunk_size + margin, galloc->buf_tallocs[i]->max_chunk_size));
                 }
                 chunk->max_size = MAX(chunk->max_size, cur_chunk_size);
             }

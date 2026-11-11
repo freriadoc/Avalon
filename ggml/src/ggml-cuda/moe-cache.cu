@@ -533,7 +533,8 @@ struct moe_arena_readers {
 };
 
 struct moe_cache_device {
-    // the largest piece one pool lends while the prefetch holds its zones, set once with the zones (moe_cache_largest_lend)
+    // the largest piece the device lends while the prefetch holds its zones, set once with the zones (the bands: all of their
+    // free room; pools apart: one pool's, 1 GiB at most), the compute buffers' chunk (moe_cache_largest_lend)
     std::atomic<size_t> largest_lend_bytes{0};
     // BANDS: the slab of the banded pools (moe_cache_allocate_banded). Zones and loans are byte ranges of it: the
     // prefetch zones at its top (band_zones slots of band_zone_bytes from band_zone_begin), the compute buffer chunks in
@@ -5584,7 +5585,12 @@ static void moe_cache_setup_zone(moe_cache_device & device, size_t zone_bytes, i
             const int lend    = (int) ((int64_t) region0 * moe_cache_lend_percent / 100) - zone;
             best = std::max(best, (size_t) std::max(lend, 0) * pool.expert_size);
         }
-        device.largest_lend_bytes.store(best);
+        // a chunk of 1 GiB at most: the loan plan seats every chunk list it can (see moe_cache_plan_borrows), so the
+        // limit only trades fragmentation against how finely chunks spread over the pools. Measured on the qwen4exp
+        // graph (7.2 GiB in one piece): 512 MiB chunks lose 654 MiB to fragmentation, 1 GiB 292 MiB at the same most-lent
+        // pool (71 %), 2 GiB 237 MiB but 77 %. Measured, not derived: the best value moves with the graph. (The bands lend
+        // one slab: their largest lend is all of its free room, a graph's buffer in one chunk)
+        device.largest_lend_bytes.store(std::min(best, (size_t) 1 << 30));
     }
     if (equipped < n_zones) {
         MOE_CACHE_LOG("[moe-cache] CUDA%d zone: only %d of %d prefetch slots reserved%s\n",

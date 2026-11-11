@@ -1269,27 +1269,23 @@ struct ggml_backend_cuda_borrowed_buffer_type_context {
 };
 
 static size_t ggml_backend_cuda_borrowed_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
-    // the cache lends contiguous runs of one pool: ask ggml-alloc for chunks it can serve
+    // the cache lends contiguous runs: ask ggml-alloc for chunks it can serve, the largest piece the device lends now
+    // (the bands: all of the slab's free room, a graph's buffer in one chunk; pools apart: 1 GiB at most, see
+    // moe_cache_largest_lend), rounded down to 64 MiB, 256 MiB at least (a single larger tensor keeps a chunk of its
+    // own: ggml-alloc never splits a tensor). GGML_SCHED_BORROW_CHUNK_MB=N: N MiB at most. Chunks of 1 GiB at most
+    // with the bands lost up to 400 MiB to placement (tensors of 200 - 670 MiB at a 9536-token ubatch)
     static const size_t max_chunk = [] () -> size_t {
         const char * text = getenv("GGML_SCHED_BORROW_CHUNK_MB");
         const long long value = text && text[0] ? atoll(text) : 0;
-        // 1 GiB: the loan plan seats every chunk list it can (see moe_cache_plan_borrows), so
-        // the limit only trades fragmentation against how finely chunks spread over the
-        // pools. Measured on the qwen4exp graph (7.2 GiB in one piece): 512 MiB chunks lose
-        // 654 MiB to fragmentation, 1 GiB 292 MiB at the same most-lent pool (71 %), 2 GiB
-        // 237 MiB but 77 %. Measured, not derived: the best value moves with the graph.
-        return (value > 0 ? (size_t)value : 1024) << 20;
+        return value > 0 ? (size_t)value << 20 : SIZE_MAX;
     }();
-    // on a small card no pool lends that much in one piece (12 GB at 131k: the largest ~900 MiB): chunks of what
-    // the largest pool can lend now, rounded down to 64 MiB, 256 MiB at least (a single larger tensor keeps a chunk
-    // of its own: ggml-alloc never splits a tensor)
     const auto * ctx = (const ggml_backend_cuda_borrowed_buffer_type_context *) buft->context;
     const size_t lend = ggml_moe_cache.largest_lend ? ggml_moe_cache.largest_lend(ctx->session, ctx->backend) : 0;
     if (lend > 0) {
         const size_t mib64 = (size_t) 64 << 20;
         return std::min(max_chunk, std::max<size_t>((size_t) 256 << 20, lend / mib64 * mib64));
     }
-    return max_chunk;
+    return std::min(max_chunk, (size_t) 1 << 30);
 }
 
 static ggml_backend_buffer_t ggml_backend_cuda_borrowed_buffer_type_alloc_buffer(
