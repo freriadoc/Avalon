@@ -2560,6 +2560,22 @@ void common_prompt_checkpoint::update_tgt(
     }
 }
 
+bool common_prompt_checkpoint::update_tgt_captured(
+        llama_context * ctx,
+        size_t size,
+        common_checkpoint_spare * spare) {
+    if (spare) {
+        spare->resize(data_tgt, size);
+    } else {
+        data_tgt.resize(size);
+    }
+    if (llama_state_seq_capture_data(ctx, data_tgt.data(), size) != size) {
+        data_tgt.clear();
+        return false;
+    }
+    return true;
+}
+
 void common_prompt_checkpoint::update_dft(
         llama_context * ctx,
         llama_seq_id seq_id,

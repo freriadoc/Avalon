@@ -1041,6 +1041,28 @@ private:
     // the context checkpoints' next buffer, prepared ahead of the request that takes it
     common_checkpoint_spare ckpt_spare;
 
+    // a checkpoint whose state is captured in the context's pinned buffer (llama_state_seq_capture) and not copied
+    // into it yet: the copy follows the request's first decode and its token (checkpoint_finish), so the token waits
+    // for the copy from the device only
+    common_prompt_checkpoint * ckpt_pending = nullptr;
+    size_t ckpt_pending_size = 0;
+    int ckpt_pending_slot = -1;
+
+    void checkpoint_finish() {
+        if (!ckpt_pending) {
+            return;
+        }
+        common_prompt_checkpoint * cur = ckpt_pending;
+        ckpt_pending = nullptr;
+        if (!cur->update_tgt_captured(ctx_tgt, ckpt_pending_size, &ckpt_spare)) {
+            // cannot happen (one capture at a time, finished before the next): the checkpoint without a state goes
+            SRV_WRN("the captured state of a context checkpoint is gone (slot %d): checkpoint dropped\n", ckpt_pending_slot);
+            for (auto & slot : slots) {
+                slot.prompt.checkpoints.remove_if([cur](const common_prompt_checkpoint & c) { return &c == cur; });
+            }
+        }
+    }
+
     // context checkpoints inside a prompt batch (llama_set_seq_snapshots): the batch is no longer ended where a
     // checkpoint is due, so that its ubatches stay in one decode (they overlap in a pipeline over several GPUs); the
     // state there is captured by the decode and the checkpoint created after it. LLAMA_SERVER_SNAPSHOTS=0: the batch
@@ -2623,6 +2645,7 @@ private:
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max,
             const std::vector<uint8_t> * data_tgt = nullptr) {
+        checkpoint_finish();   // the previous one's state, before the lists change
         const int id_task = slot.task->id;
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
@@ -2676,8 +2699,13 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
+        size_t n_captured = 0;
         if (data_tgt) {
             cur.data_tgt = *data_tgt;
+        } else if ((n_captured = llama_state_seq_capture(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) > 0) {
+            ckpt_pending = &cur;   // copied after the decode that follows (checkpoint_finish)
+            ckpt_pending_size = n_captured;
+            ckpt_pending_slot = slot.id;
         } else {
             cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, &ckpt_spare);
         }
@@ -2690,7 +2718,7 @@ private:
         SLT_TRC(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
-                cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+                cur.pos_max, cur.n_tokens, (float) (cur.size() + n_captured) / 1024 / 1024);
     }
 
     // checkpoints are appended to the slot save file, after the llama state payload
@@ -3439,6 +3467,7 @@ private:
                 }
             } catch (const std::exception & e) {
                 SRV_ERR("decode() failed: %s\n", e.what());
+                checkpoint_finish();
                 abort_all_slots("decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
             }
@@ -3446,12 +3475,15 @@ private:
             try {
                 scoped_timer t(t_post_decode, n_post_decode);
                 post_decode(n_tokens, off);
+                checkpoint_finish();   // after the tokens of this decode are sent
             } catch (const std::exception & e) {
                 SRV_ERR("post_decode() failed: %s\n", e.what());
+                checkpoint_finish();
                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
             }
         }
+        checkpoint_finish();   // whatever path left the loop
     }
 
     void pre_decode() {

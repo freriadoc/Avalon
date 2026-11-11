@@ -513,6 +513,10 @@ private:
 public:
     // llama_set_seq_snapshots / llama_get_seq_snapshot
     void set_seq_snapshots(llama_seq_id seq_id, const llama_pos * pos, int32_t n_pos, llama_state_seq_flags flags);
+
+    // llama_state_seq_capture / llama_state_seq_capture_data
+    size_t state_seq_capture(llama_seq_id seq_id, llama_state_seq_flags flags);
+    size_t state_seq_capture_data(uint8_t * dst, size_t size);
     size_t get_seq_snapshot(llama_seq_id seq_id, llama_pos pos, uint8_t * dst, size_t size);
 
 private:
@@ -528,6 +532,9 @@ private:
     llama_seq_id snap_seq = -1;
     llama_state_seq_flags snap_flags = 0;
     std::vector<seq_snapshot> snaps;
+
+    ggml_backend_buffer_ptr capture_buf;   // llama_state_seq_capture: pinned, kept from a capture to the next
+    size_t capture_size = 0;
 
     bool has_evaluated_once = false;
 

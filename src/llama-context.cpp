@@ -4581,6 +4581,51 @@ void llama_context::seq_snapshots_capture(const llama_ubatch & ubatch) {
     }
 }
 
+size_t llama_context::state_seq_capture(llama_seq_id seq_id, llama_state_seq_flags flags) {
+    capture_size = 0;
+    const size_t size = state_seq_get_size(seq_id, flags);
+    if (size == 0) {
+        return 0;
+    }
+    if (!capture_buf || ggml_backend_buffer_get_size(capture_buf.get()) < size) {
+        ggml_backend_buffer_type_t buft = nullptr;
+        for (const auto & b : backends) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(b.get());
+            if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU && (buft = ggml_backend_dev_host_buffer_type(dev))) {
+                break;
+            }
+        }
+        // a state grows by a few MiB from a request to the next: room for it, so that the pinned buffer is allocated
+        // once (freeing one synchronizes every stream)
+        capture_buf.reset();
+        capture_buf.reset(ggml_backend_buft_alloc_buffer(buft ? buft : ggml_backend_cpu_buffer_type(), size + size / 16));
+        if (!capture_buf) {
+            return 0;
+        }
+    }
+    llama_io_write_snapshot io((uint8_t *) ggml_backend_buffer_get_base(capture_buf.get()), size, backends);
+    try {
+        io.write(&io_magic, sizeof(io_magic));
+        io.write(&seq_id, sizeof(seq_id));
+        state_seq_write_data(io, seq_id, flags);
+        capture_size = io.n_bytes();
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error capturing the state: %s\n", __func__, err.what());
+        synchronize();   // whatever was queued is done before the buffer is used again
+        return 0;
+    }
+    return capture_size;
+}
+
+size_t llama_context::state_seq_capture_data(uint8_t * dst, size_t size) {
+    if (capture_size == 0 || !capture_buf || !dst || size < capture_size) {
+        return 0;
+    }
+    synchronize();
+    memcpy(dst, ggml_backend_buffer_get_base(capture_buf.get()), capture_size);
+    return capture_size;
+}
+
 size_t llama_context::get_seq_snapshot(llama_seq_id seq_id, llama_pos pos, uint8_t * dst, size_t size) {
     if (seq_id != snap_seq) {
         return 0;
@@ -5850,6 +5895,14 @@ void llama_set_seq_snapshots(llama_context * ctx, llama_seq_id seq_id, const lla
 
 size_t llama_get_seq_snapshot(llama_context * ctx, llama_seq_id seq_id, llama_pos pos, uint8_t * dst, size_t size) {
     return ctx->get_seq_snapshot(seq_id, pos, dst, size);
+}
+
+size_t llama_state_seq_capture(llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    return ctx->state_seq_capture(seq_id, flags);
+}
+
+size_t llama_state_seq_capture_data(llama_context * ctx, uint8_t * dst, size_t size) {
+    return ctx->state_seq_capture_data(dst, size);
 }
 
 size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {

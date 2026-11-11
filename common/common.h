@@ -1352,6 +1352,12 @@ struct common_prompt_checkpoint {
             llama_state_seq_flags flags,
             common_checkpoint_spare * spare = nullptr);
 
+    // data_tgt from the state captured before (llama_state_seq_capture, size bytes); false if it is no longer there
+    bool update_tgt_captured(
+            llama_context * ctx,
+            size_t size,
+            common_checkpoint_spare * spare = nullptr);
+
     void update_dft(
             llama_context * ctx,
             llama_seq_id seq_id,

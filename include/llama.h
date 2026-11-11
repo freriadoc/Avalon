@@ -1000,6 +1000,23 @@ extern "C" {
                          uint8_t * dst,
                           size_t   size);
 
+    // The state of a sequence as it is now, as llama_state_seq_get_data_ext(flags) would return it, captured into a
+    // pinned buffer of the context by copies queued on the devices' streams, without synchronizing: what is computed
+    // next comes after them. Returns its size, 0 on failure. llama_state_seq_capture_data copies it into dst (it
+    // synchronizes first) and returns its size, 0 if none or if size is too small. One capture at a time: the next
+    // one replaces it. For a state saved at each request (a context checkpoint): the request's first tokens wait for
+    // the copies at the link's speed only, and the caller's own copy can follow them.
+    LLAMA_API size_t llama_state_seq_capture(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+           llama_state_seq_flags   flags);
+
+    LLAMA_API size_t llama_state_seq_capture_data(
+            struct llama_context * ctx,
+                         uint8_t * dst,
+                          size_t   size);
+
+
     //
     // Decoding
     //
