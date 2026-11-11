@@ -9852,6 +9852,13 @@ static bool moe_hosted_act_f32() {
     return on;
 }
 
+// TAIL_SKIP was fitted on small passes (decode and MTP checks); on a prompt block its per-row loop is quadratic and it
+// almost never skips anything: it stands aside above this many tokens (GGML_CUDA_MOE_SMALL_PASS_MAX)
+static int moe_small_pass_max() {
+    static const int v = getenv("GGML_CUDA_MOE_SMALL_PASS_MAX") ? atoi(getenv("GGML_CUDA_MOE_SMALL_PASS_MAX")) : 16;
+    return v;
+}
+
 // GGML_CUDA_MOE_TAIL_SKIP=R (Strata's STRATA_ROUTE_TAIL_SKIP, the same rule; default 7 as Strata, 0 turns it off; changes
 // the output): a missed expert that every token of the pass routes only at rank R or lower (its position in the top-k, by
 // weight; R from 1 to 9) is neither moved to the GPU nor computed: its rows are zero, the other experts keep the weights the
@@ -9863,7 +9870,7 @@ static int moe_hosted_tail_skip(moe_hosted_state & st, moe_hosted_layer & layer,
         const int r = v ? atoi(v) : 7;
         return r > 0 && r < 10 ? r : 0;
     }();
-    if (rank == 0 || n_cpu == 0) {
+    if (rank == 0 || n_cpu == 0 || rows > moe_small_pass_max() * layer.n_used) {
         return n_cpu;
     }
     const moe_cache_device & device = *st.device;
