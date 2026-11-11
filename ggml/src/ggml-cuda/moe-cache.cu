@@ -667,6 +667,7 @@ struct moe_cache_device {
     // a new prefill lends again
     bool rewarm_active = false;
     bool rewarm_armed = false;   // after a prefill: the restoration starts at the next pass's first hosted layer
+    bool rewarm_bulk_pending = false;   // the restoration at once, handed to the fill worker (moe_cache_rewarm_bulk_locked)
     std::vector<std::pair<int, moe_cache_key>> rewarm_order;   // (pool, key), what the restoration brings back, in order
     size_t rewarm_next = 0;
     long long rewarm_restored = 0;
@@ -2147,12 +2148,21 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
         } else {
             std::unique_lock<std::mutex> lock(session->mu);
             session->cv.wait(lock, [&] {
-                return session->stopping || device->dead.load() ||
+                return session->stopping || device->dead.load() || device->rewarm_bulk_pending ||
                     !device->queue.empty() || (device->pregate_window && device->pg_next < device->pg_cands.size());
             });
             if ((session->stopping || device->dead.load()) &&
                 device->queue.empty()) {
                 break;
+            }
+            if (device->rewarm_bulk_pending) {
+                // the restoration at once: this thread waits for its copies, never the one serving the hosted MoE's
+                // plans (the GPU spins in a kernel for its plan: a wait there for the fill stream never ended on an RTX
+                // 4090 after a prompt of 131k at -ub 27648)
+                device->rewarm_bulk_pending = false;
+                moe_cache_rewarm_bulk_locked(*session, *device, lock);
+                moe_cache_rewarm_feed_locked(*session, *device);
+                continue;
             }
 
             if (device->queue.empty()) {
@@ -4991,7 +5001,7 @@ static void moe_cache_rewarm_start_locked(moe_cache_session & session, moe_cache
         device.rewarm_restored = 0;
         MOE_CACHE_LOG("[moe-cache] CUDA%d rewarm: %zu evicted entries and %zu ranked pairs to restore\n",
                 device.physical, evicted.size(), n_ranked);
-        if (!moe_cache_rewarm_bulk_on()) {   // else at once by the caller (moe_cache_rewarm_bulk_locked), then queued
+        if (!moe_cache_rewarm_bulk_on()) {   // else at once by the fill worker (moe_cache_rewarm_bulk_locked), then queued
             moe_cache_rewarm_feed_locked(session, device);
         }
     }
@@ -5033,10 +5043,12 @@ static void moe_cache_rewarm_feed_locked(moe_cache_session & session, moe_cache_
 
 // The restoration at once (as Strata gives its loan back before a decode window reads): every entry of the order
 // (moe_cache_rewarm_start_locked) not in the cache and registered in place goes into a free entry of its pool, the
-// copies queued back to back on the fill stream and waited for once (an event: the stream keeps its SDMA engine), the
-// first pass of the answer waiting for them; nothing competes with the answer's own admissions, which start after.
+// copies queued back to back on the fill stream and waited for once (an event: the stream keeps its SDMA engine) by the
+// fill worker, the answer's passes going on meanwhile (an entry being copied is a miss); the answer's own admissions
+// queue behind it.
 // What the arena holds instead (not registered in place) is left to the queued restoration, which takes over. Called
-// with the session lock held (by the first hosted layer of the pass, moe_hosted_plan), released during the copies.
+// by the fill worker (moe_cache_worker) with the session lock held, released during the copies; asked for by the first
+// hosted layer of the pass (moe_hosted_plan).
 // Off by default (GGML_CUDA_MOE_REWARM_BULK=1 turns it on): no gain measured on the replay bench, and steps a little longer
 // at the server after long prompts (not explained); a lead, to restore only the entries the loan evicted.
 static bool moe_cache_rewarm_bulk_on() {
@@ -5182,6 +5194,7 @@ static void moe_cache_rewarm_bulk_locked(moe_cache_session & session, moe_cache_
 // or the host weights or the session are going away.
 static void moe_cache_rewarm_stop_locked(moe_cache_device & device) {
     device.rewarm_armed = false;
+    device.rewarm_bulk_pending = false;
     if (!device.rewarm_active) {
         return;
     }
@@ -8913,9 +8926,9 @@ static int moe_hosted_plan(moe_hosted_state & st, moe_hosted_layer & layer, cons
         if (layer.layer_number == device.main_first && device.rewarm_armed) {
             device.rewarm_armed = false;
             moe_cache_rewarm_start_locked(session, device);
-            if (moe_cache_rewarm_bulk_on()) {
-                moe_cache_rewarm_bulk_locked(session, device, lock);
-                moe_cache_rewarm_feed_locked(session, device);
+            if (moe_cache_rewarm_bulk_on() && device.rewarm_active) {
+                device.rewarm_bulk_pending = true;   // the fill worker does it (moe_cache_worker)
+                session.cv.notify_all();
             }
             moe_arena_restore_start_locked(session, device);
         }
