@@ -323,6 +323,10 @@ __attribute__((constructor)) static void ggml_hip_set_hw_queues() {
     setenv("ROCBLAS_DEVICE_MEMORY_SIZE", "65536", /*overwrite =*/ 0);
     setenv("HSA_SCRATCH_SINGLE_LIMIT", "1048576", /*overwrite =*/ 0);
     setenv("GPU_PINNED_MIN_XFER_SIZE", "1048576", /*overwrite =*/ 0);
+    // the prompt's expert ring (GGML_CUDA_MOE_RING_PREFILL, as on NVIDIA below): RX 7900 XT, 262k context with MTP, ABBA,
+    // prefill and steps as with the prefetch's 4 slots, 900 MiB lent by the cache during a prefill instead of 1 800 and
+    // ~10 % fewer entries moved and evicted per loan. Not measured on Windows. An explicit value is kept, 0 turns it off.
+    setenv("GGML_CUDA_MOE_RING_PREFILL", "900", /*overwrite =*/ 0);
 #endif
 }
 #elif !defined(GGML_USE_MUSA) && !defined(_WIN32)
