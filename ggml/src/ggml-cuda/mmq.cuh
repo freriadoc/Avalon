@@ -442,6 +442,20 @@ static __device__ __forceinline__ void mmq_atomic_add(float * p, const float v) 
 #endif // defined(GGML_USE_HIP)
 }
 
+// summed: a column's row of dst with its sign bit set is its token's first product (mmq_args::sum_first): stored, which
+// spares the output's zeroing; else added atomically (an add whose result is not read is posted as a store is: a plain
+// read, add and write waits for the read, and measured slower)
+#define MMQ_SUM_STORE INT_MIN
+static __device__ __forceinline__ void mmq_summed_store(float * __restrict__ dst, const int row, const int stride, const int i,
+                                                        const float v) {
+    float * p = &dst[(row & INT_MAX)*stride + i];
+    if (row < 0) {
+        *p = v;
+    } else {
+        mmq_atomic_add(p, v);
+    }
+}
+
 // summed (ggml_mul_mat_id_sum's down, see mul_mat_q): each column's product, weighted by y_scale[j] (its routing weight),
 // added into its token's row ids_dst[j]; a variant of its own, so that the others keep their plain stores
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1, bool summed = false>
@@ -478,7 +492,7 @@ static __device__ __forceinline__ void ggml_cuda_mmq_write_back_dp4a(
                     dst[ids_dst[j]*stride + i] = sum[(j0/nwarps) * (I/warp_size) + i0/warp_size];
                 }
             } else if constexpr (summed) {
-                mmq_atomic_add(&dst[ids_dst[j]*stride + i], y_scale[j] * sum[(j0/nwarps) * (I/warp_size) + i0/warp_size]);
+                mmq_summed_store(dst, ids_dst[j], stride, i, y_scale[j] * sum[(j0/nwarps) * (I/warp_size) + i0/warp_size]);
                 GGML_UNUSED(y_scale_used);
             } else {
                 dst[ids_dst[j]*stride + i] = sum[(j0/nwarps) * (I/warp_size) + i0/warp_size];
@@ -531,7 +545,7 @@ static __device__ __forceinline__ void ggml_cuda_mmq_write_back_mma(
                         dst[ids_dst[j]*stride + i] = sum[(j0/tile_C::J + n)*tile_C::ne + l];
                     }
                 } else if constexpr (summed) {
-                    mmq_atomic_add(&dst[ids_dst[j]*stride + i], y_scale[j] * sum[(j0/tile_C::J + n)*tile_C::ne + l]);
+                    mmq_summed_store(dst, ids_dst[j], stride, i, y_scale[j] * sum[(j0/tile_C::J + n)*tile_C::ne + l]);
                     GGML_UNUSED(y_scale_used);
                 } else {
                     dst[ids_dst[j]*stride + i] = sum[(j0/tile_C::J + n)*tile_C::ne + l];
@@ -990,7 +1004,8 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     if (fixup) {
         write_back(sum, ids_dst, tmp_fixup + blockIdx.x*(J*I), y_scale, I, I, J);
     } else if constexpr (summed) {
-        if constexpr (write_back == ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1>) {
+        constexpr bool mma = write_back == ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1>;
+        if constexpr (mma) {
             ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1, true>(sum, ids_dst, dst, y_scale, stride_col_dst, tile_x_max_i, tile_y_max_j);
         } else {
             ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1, true>(sum, ids_dst, dst, y_scale, stride_col_dst, tile_x_max_i, tile_y_max_j);
@@ -1039,7 +1054,7 @@ static __global__ void mul_mat_q(
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
         const uint3 ntx, const int32_t * __restrict__ tile_prefix, const int n_experts_tp,
         const int nty_split, const uint64_t * __restrict__ x_experts2, const int64_t x2_off, const int64_t dst2_off,
-        const int sum_n_used) {
+        const int sum_n_used, const uint8_t * __restrict__ sum_first) {
 
     // Skip unused template specializations for faster compilation:
     if (ggml_cuda_mmq_get_config(type, J, fallback, prec_src1).type == GGML_TYPE_COUNT) {
@@ -1127,7 +1142,8 @@ static __global__ void mul_mat_q(
 
                 if constexpr (summed) {   // the columns past the expert's rows: never written back
                     const int idx = j < col_diff - jt*J ? ids_dst[col_low + jt*J + j] : 0;
-                    ids_dst_shared[j] = idx / sum_n_used;
+                    const bool first = sum_first && j < col_diff - jt*J && sum_first[col_low + jt*J + j];
+                    ids_dst_shared[j] = (idx / sum_n_used) | (first ? MMQ_SUM_STORE : 0);
                     row_w_shared[j] = y_scale[idx];
                 } else {
                     ids_dst_shared[j] = ids_dst[col_low + jt*J + j];
@@ -1241,7 +1257,8 @@ static __global__ void mul_mat_q(
 
                 if constexpr (summed) {   // the columns past the expert's rows: never written back
                     const int idx = j < col_diff - jt*J ? ids_dst[col_low + jt*J + j] : 0;
-                    ids_dst_shared[j] = idx / sum_n_used;
+                    const bool first = sum_first && j < col_diff - jt*J && sum_first[col_low + jt*J + j];
+                    ids_dst_shared[j] = (idx / sum_n_used) | (first ? MMQ_SUM_STORE : 0);
                     row_w_shared[j] = y_scale[idx];
                 } else {
                     ids_dst_shared[j] = ids_dst[col_low + jt*J + j];
@@ -1530,6 +1547,9 @@ struct mmq_args {
     // from run to run); the types of ggml_cuda_mmq_summed_type only
     const float * sum_w = nullptr;
     int           sum_n_used = 0;
+    // optional, by compact row (the groups in order on one stream, k_moe_sum_first_rows): 1 for a token's first product,
+    // stored instead of added (the token alone in its first group), so that the output needs no zeroing
+    const uint8_t * sum_first = nullptr;
 };
 
 // the weight types with mul_mat_q's summed variant (MoE down projections), instantiated for them only
@@ -1600,7 +1620,7 @@ static void launch_mul_mat_q_impl(ggml_backend_cuda_context & ctx, const mmq_arg
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
              ntx_fd, args.tile_prefix, (int) args.nchannels_y, nty_split, args.x_experts2, args.x2_off, args.dst2_off,
-             args.sum_n_used);
+             args.sum_n_used, args.sum_first);
         return;
     }
 
@@ -1633,7 +1653,7 @@ static void launch_mul_mat_q_impl(ggml_backend_cuda_context & ctx, const mmq_arg
          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
          sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
          ntx_fd, args.tile_prefix, (int) args.nchannels_y, nty_split, args.x_experts2, args.x2_off, args.dst2_off,
-             args.sum_n_used);
+             args.sum_n_used, args.sum_first);
 
     if (!fixup_needed) {
         return;

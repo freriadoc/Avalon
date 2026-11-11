@@ -8825,15 +8825,16 @@ struct test_topk_moe : public test_case {
 struct test_moe_block : public test_case {
     const ggml_type type_gu, type_d;
     const int n_mats, n_used, n_embd, n_ff, n_tok;
+    const bool sum;   // the down by ggml_mul_mat_id_sum (weighted and summed, LLAMA_MOE_DOWN_SUM)
 
-    std::string vars() override { return VARS_TO_STR7(type_gu, type_d, n_mats, n_used, n_embd, n_ff, n_tok); }
+    std::string vars() override { return VARS_TO_STR8(type_gu, type_d, n_mats, n_used, n_embd, n_ff, n_tok, sum); }
     std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "MOE_BLOCK"; }
     bool run_whole_graph() override { return true; }
     double max_nmse_err() override { return 2e-2; }
 
     test_moe_block(ggml_type type_gu = GGML_TYPE_Q4_0, ggml_type type_d = GGML_TYPE_Q4_0, int n_mats = 64, int n_used = 8,
-                   int n_embd = 256, int n_ff = 512, int n_tok = 256)
-        : type_gu(type_gu), type_d(type_d), n_mats(n_mats), n_used(n_used), n_embd(n_embd), n_ff(n_ff), n_tok(n_tok) {}
+                   int n_embd = 256, int n_ff = 512, int n_tok = 256, bool sum = false)
+        : type_gu(type_gu), type_d(type_d), n_mats(n_mats), n_used(n_used), n_embd(n_embd), n_ff(n_ff), n_tok(n_tok), sum(sum) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * gate = ggml_new_tensor_3d(ctx, type_gu, n_embd, n_ff, n_mats);
@@ -8844,7 +8845,13 @@ struct test_moe_block : public test_case {
         ggml_tensor * g    = ggml_mul_mat_id(ctx, gate, x, ids);
         ggml_tensor * u    = ggml_mul_mat_id(ctx, up, x, ids);
         ggml_tensor * h    = ggml_swiglu_split(ctx, g, u);
-        ggml_tensor * out  = ggml_mul_mat_id(ctx, down, h, ids);
+        ggml_tensor * out;
+        if (sum) {
+            ggml_tensor * w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n_tok);
+            out = ggml_mul_mat_id_sum(ctx, down, h, ids, w);
+        } else {
+            out = ggml_mul_mat_id(ctx, down, h, ids);
+        }
         ggml_set_name(out, "out");
         return out;
     }
@@ -13799,6 +13806,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type t : {GGML_TYPE_Q4_0, GGML_TYPE_IQ2_S, GGML_TYPE_IQ4_NL}) {
         test_cases.emplace_back(new test_moe_block(t, GGML_TYPE_IQ4_NL, 64, 8, 256, 512, 256));
         test_cases.emplace_back(new test_moe_block(t, GGML_TYPE_IQ4_NL, 512, 10, 256, 640, 1024));
+        // the down by ggml_mul_mat_id_sum (by groups: its summed variant, each token's first product stored)
+        test_cases.emplace_back(new test_moe_block(t, GGML_TYPE_IQ4_NL, 64, 8, 256, 512, 256, true));
+        test_cases.emplace_back(new test_moe_block(t, GGML_TYPE_IQ4_NL, 512, 10, 256, 640, 1024, true));
     }
     test_cases.emplace_back(new test_moe_reduce(63,  2, 17));
     test_cases.emplace_back(new test_moe_reduce(2048, 8, 128));

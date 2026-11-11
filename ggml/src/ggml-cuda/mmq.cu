@@ -705,6 +705,47 @@ static __global__ void k_moe_grouped_swiglu(const float * __restrict__ gate, con
     }
 }
 
+// ggml_mul_mat_id_sum's down by groups in order on one stream: each token's product in its first group (the lowest
+// group of its experts, groups of G experts) is stored, its others added (mmq_args::sum_first), so that the output needs
+// no zeroing. A token with two or more experts in that group (they run in one launch: a store could land after the
+// other's add) has all of its products added, its row of the output zeroed instead (~28 % of the tokens at 10 experts
+// of 512 in groups of 32). By token (a block): its first group (-1: none), the zeroing
+static __global__ void k_moe_sum_first_token(const int32_t * __restrict__ ids, const int64_t ids_stride, const int n_used,
+        const int G, int * __restrict__ tok_first, float * __restrict__ out, const int64_t out_stride, const int64_t n_embd) {
+    __shared__ int g_first;
+    const int t = blockIdx.x;
+    if (threadIdx.x == 0) {
+        int lo = INT_MAX, n_lo = 0;
+        for (int s = 0; s < n_used; s++) {
+            lo = min(lo, ids[t*ids_stride + s] / G);
+        }
+        for (int s = 0; s < n_used; s++) {
+            n_lo += ids[t*ids_stride + s] / G == lo;
+        }
+        g_first = n_lo == 1 ? lo : -1;
+        tok_first[t] = g_first;
+    }
+    __syncthreads();
+    if (g_first < 0) {
+        for (int64_t i = threadIdx.x; i < n_embd; i += blockDim.x) {
+            out[t*out_stride + i] = 0.0f;
+        }
+    }
+}
+
+// by compact row (the order the tiles read, ids_dst: compact row -> token*n_used + slot): 1, the token's first product
+static __global__ void k_moe_sum_first_rows(const int32_t * __restrict__ ids, const int64_t ids_stride, const int n_used,
+        const int G, const int32_t * __restrict__ ids_dst, const int * __restrict__ tok_first, uint8_t * __restrict__ first,
+        const int64_t rows) {
+    const int64_t c = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (c >= rows) {
+        return;
+    }
+    const int idx = ids_dst[c];
+    const int t = idx / n_used;
+    first[c] = ids[t*ids_stride + idx % n_used] / G == tok_first[t];
+}
+
 static int mmq_pick_J(ggml_type type, int64_t ncols_opt, bool fallback, int cc, size_t smpbo, ggml_prec prec_src1,
         bool summed = false) {
     int J_best = 0, ntiles_J_best = INT_MAX;
@@ -986,9 +1027,19 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
     const bool pair_ok = fuse_gu && wg->nb[1] == wu->nb[1] && wg->nb[2] == wu->nb[2] && gate->nb[1] == up->nb[1] &&
         gate->nb[2] == up->nb[2] && ((const char *) up->data - (const char *) gate->data) % sizeof(float) == 0;
     // ggml_mul_mat_id_sum: down's summed variant adds each row's product, weighted, into its token's row of the output
-    // (mmq_args::sum_w), which starts at zero
-    if (dsum) {
+    // (mmq_args::sum_w). One stream: each token's first product stored, the output not zeroed (k_moe_sum_first); two: zeroed, all added
+    ggml_cuda_pool_alloc<uint8_t> sum_first(ctx.pool());
+    ggml_cuda_pool_alloc<int> tok_first(ctx.pool());
+    if (dsum && two) {
         CUDA_CHECK(cudaMemsetAsync(down->data, 0, ggml_nbytes(down), stream));
+    } else if (dsum) {
+        const int64_t ids_stride = (int64_t) (ids->nb[1]/sizeof(int32_t));
+        sum_first.alloc(rows);
+        tok_first.alloc(n_tok);
+        k_moe_sum_first_token<<<(unsigned) n_tok, 64, 0, stream>>>((const int32_t *) ids->data, ids_stride, (int) n_used, G,
+            tok_first.get(), (float *) down->data, (int64_t) (down->nb[2]/sizeof(float)), down->ne[0]);
+        k_moe_sum_first_rows<<<(unsigned) ((rows + 255) / 256), 256, 0, stream>>>((const int32_t *) ids->data, ids_stride,
+            (int) n_used, G, ids_dst.get(), tok_first.get(), sum_first.get(), rows);
     }
     if (prefix_once) {
         k_mmq_tile_prefix_groups<<<(unsigned) (n_expert / G), 32, 0, stream>>>(bounds.get(), G, J_gu, J_d, prefix.get());
@@ -1030,6 +1081,7 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
         if (summed) {   // ggml_mul_mat_id_sum's down: each row's product, weighted, into its token's row
             a.sum_w = (const float *) wr->data;
             a.sum_n_used = (int) n_used;
+            a.sum_first = sum_first.get();
         }
         if (prefix_once) {
             a.tile_prefix = prefix.get() + (2*(g0/G) + (role == 2 ? 1 : 0))*(G + 1);
