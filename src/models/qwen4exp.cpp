@@ -1358,10 +1358,10 @@ llama_model_qwen4exp::graph::qsa_sel llama_model_qwen4exp::graph::build_qsa_sel(
     // the tile mask also for a batch that fits one slice (the first batches of a prompt, n_kv up to ~28k cells at 9536
     // tokens), which otherwise runs the dense masked flash attention over every cell; LLAMA_QSA_TILES_ALL=0 keeps that
     static const bool qsa_tiles_all = [] { const char * e = getenv("LLAMA_QSA_TILES_ALL"); return !e || atoi(e) != 0; }();
-    // LLAMA_QSA_ATT_SLICE=S (queries, a multiple of 16; 0, the default: off): the attention by slices of S queries, each
+    // LLAMA_QSA_ATT_SLICE=S (queries, a multiple of 16; 4096 by default, 0: off): the attention by slices of S queries, each
     // with the tile mask of its own queries (their selections by the indexer's slices inside it); build_layer_attn then
     // runs the query projection, the attention, its gate and the output projection slice by slice
-    static const int64_t att_slice = [] { const char * e = getenv("LLAMA_QSA_ATT_SLICE"); return e ? (int64_t) atoll(e) & ~(int64_t) 15 : (int64_t) 0; }();
+    static const int64_t att_slice = [] { const char * e = getenv("LLAMA_QSA_ATT_SLICE"); return e ? (int64_t) atoll(e) & ~(int64_t) 15 : (int64_t) 4096; }();
     if (qsa_tiles && att_slice > 0 && att_slice < n_tokens && pos_mode && cparams.flash_attn) {
         res_d.tiles_slice = [=, this](int64_t t0, int64_t n) {
             ggml_tensor * sel_s   = nullptr;

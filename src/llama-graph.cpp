@@ -2503,10 +2503,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // summed in one node (ggml_mul_mat_id_sum, [n_embd, 1, n_tokens]): the [n_embd, n_expert_used, n_tokens] products,
     // the weighting and the adds stay out of the graph (the grouped block sums them group by group). From 128 tokens
     // (the grouped block's floor; below, the hosted block and its fusions keep today's nodes)
-    // LLAMA_MOE_DOWN_SUM=1 turns it on. Its quality is today's (KLD of 10 Nov., RX 7900 XT, 8 x 4096, EN / FR / code: against
-    // today's nodes 0.0241 / 0.0322 / 0.0057, below the fusions switched off, rounding only: 0.0283 / 0.0355 / 0.0064), but at
-    // -ub 9536 it gave back 272 MiB of compute buffer only and the prompt ran 1 to 15 % slower in 5 cases of 6: off for now
-    static const bool down_sum = getenv("LLAMA_MOE_DOWN_SUM") && atoi(getenv("LLAMA_MOE_DOWN_SUM")) != 0;
+    // On by default (LLAMA_MOE_DOWN_SUM=0 keeps today's nodes). Its quality is theirs (KLD of 10 Nov., RX 7900 XT,
+    // 8 x 4096, EN / FR / code: against them 0.0241 / 0.0322 / 0.0057, below the fusions switched off, rounding only:
+    // 0.0283 / 0.0355 / 0.0064). With the QSA layer by slices (LLAMA_QSA_ATT_SLICE) the compute buffer borrowed at
+    // -ub 9536 goes from 2636 to 2180 MiB a graph; the prefill at 19k, replayed: 1850 - 1862 against 1802 - 1840 t/s
+    // (11 Nov., once the summed down's adds no longer landed 8 in a row on one cache line)
+    static const bool down_sum = !getenv("LLAMA_MOE_DOWN_SUM") || atoi(getenv("LLAMA_MOE_DOWN_SUM")) != 0;
     if (down_sum && n_tokens >= 128 && !weight_before_ffn && !down_exps_b && !down_exps_s && arch != LLM_ARCH_MISTRAL4 &&
             loras->empty() && hparams.n_expert_used(il) == (uint32_t) n_expert_used && n_expert_used > 1) {
         experts = ggml_mul_mat_id_sum(ctx0, down_exps, cur, selected_experts, weights);   // [n_embd, 1, n_tokens]
