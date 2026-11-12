@@ -550,6 +550,8 @@ struct moe_cache_device {
 
     int logical;
     int physical;
+    std::vector<const void *> borrowers;   // contexts that have borrowed; the second one is the draft ctx
+    bool sdma_warned = false;              // the gfx103x SDMA stall warning fired once (moe_cache_borrow)
     // KV: the end of the KV tensors lent to the pools, attached once when they are built (moe_cache_attach_kv)
     bool kv_attached = false;
     int64_t kv_step_rows = 0;    // rows per step (a multiple of 256), 0: nothing lent
@@ -7176,6 +7178,34 @@ static void * moe_cache_borrow(void * opaque, void * backend, size_t bytes) {
     if (device->dead.load() || !device->budget_ready) {
         return nullptr;
     }
+
+    // gfx103x driver bug (ROCm/TheRock#9306): a second context re-grants this device's SDMA
+    // engines and a lost dispatch can freeze the GPU. Warn once at load, before the first
+    // request, unless the mitigation env is set.
+#if defined(GGML_USE_HIP)
+    {
+        const void * ctx = ((ggml_backend_cuda_context *)((ggml_backend_t) backend)->context);
+        if (std::find(device->borrowers.begin(), device->borrowers.end(), ctx) == device->borrowers.end()) {
+            device->borrowers.push_back(ctx);
+        }
+        if (device->borrowers.size() == 2 && !device->sdma_warned && getenv("HIP_ENABLE_DEFERRED_LOADING") == nullptr) {
+            device->sdma_warned = true;
+            int n = 0;
+            if (hipGetDeviceCount(&n) == hipSuccess) {
+                for (int i = 0; i < n; i++) {
+                    hipDeviceProp_t props = {0};
+                    if (hipGetDeviceProperties(&props, i) == hipSuccess && strncmp(props.gcnArchName, "gfx103", 6) == 0) {
+                        GGML_LOG_WARN("[moe-cache] CUDA%d: gfx103x with a second context: known ROCr SDMA engine-grant stall "
+                                "(ROCm/TheRock#9306) can freeze the first request or the first use of a new batch shape. "
+                                "Relaunch with HIP_ENABLE_DEFERRED_LOADING=0 (heavier fallback: HSA_ENABLE_SDMA=0)\n",
+                                device->physical);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+#endif
 
     moe_cache_rewarm_stop_locked(*device);
 
