@@ -1068,6 +1068,7 @@ struct ggml_backend_sched_plan {
     struct ggml_context * ctx = nullptr;
     char * context_buffer     = nullptr;
     std::unordered_set<const struct ggml_tensor *> * moe_hosted = nullptr;
+    int64_t moe_hosted_ring_rows = INT64_MAX;
 };
 
 #define GGML_SCHED_MAX_PLANS 8
@@ -1167,6 +1168,9 @@ struct ggml_backend_sched {
     // MUL_MAT_ID nodes of the MoE blocks left on the GPU with their weights in host memory
     // (unless GGML_MOE_GPU=0), found again by every split_graph
     std::unordered_set<const struct ggml_tensor *> * moe_hosted;
+    // GGML_CUDA_MOE_RING_PREFILL: the hosted blocks of more routed rows than this are the ring's (a prompt's blocks the
+    // hosted path does not take); the others are computed by the hosted path, no ring. INT64_MAX: none
+    int64_t moe_hosted_ring_rows;
 
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
@@ -1508,7 +1512,8 @@ static int ggml_backend_sched_ring_backend(ggml_backend_sched_t sched, int split
     const ggml_backend_sched_split * split = &sched->splits[split_id];
     for (int j = 0; j < split->graph.n_nodes; j++) {
         const ggml_tensor * n = split->graph.nodes[j];
-        if (n->op == GGML_OP_MUL_MAT_ID && n->src[2] && n->src[2]->ne[1] >= 128 && ggml_backend_sched_is_hosted_moe(sched, n)) {
+        if (n->op == GGML_OP_MUL_MAT_ID && n->src[2] && n->src[2]->ne[1] >= 128 &&
+                n->src[2]->ne[0] * n->src[2]->ne[1] > sched->moe_hosted_ring_rows && ggml_backend_sched_is_hosted_moe(sched, n)) {
             return split->backend_id;
         }
     }
@@ -1535,13 +1540,14 @@ static void ggml_backend_sched_find_hosted_moe(ggml_backend_sched_t sched, const
         const size_t step = ggml_sched_packed_expert_step(w);
         return step ? step * (size_t) w->ne[2] : ggml_nbytes(w);
     };
-    struct candidate { const struct ggml_tensor * gate, * up, * down; int64_t rows; };
+    struct candidate { const struct ggml_tensor * gate, * up, * down; int64_t rows, tokens; };
     std::vector<candidate> candidates;
     double row_us_seen = 0.0, fixed_us_seen = 0.0;
     int64_t cross_min = INT64_MAX, cross_max = 0;
     if (sched->moe_hosted) {
         sched->moe_hosted->clear();
     }
+    sched->moe_hosted_ring_rows = INT64_MAX;
     if (!enabled || !sched->moe_cache_session || !ggml_moe_cache.cpu_experts) {
         return;
     }
@@ -1561,10 +1567,11 @@ static void ggml_backend_sched_find_hosted_moe(ggml_backend_sched_t sched, const
         const struct ggml_tensor * gate = glu->src[0];
         const struct ggml_tensor * up   = glu->src[1];
         const struct ggml_tensor * ids  = down->src[2];
+        const bool in_limits = ids && ids->ne[0] * ids->ne[1] <= max_rows && ids->ne[1] <= 1024;   // the hosted path's
         if (!((gate == graph->nodes[i] && up == graph->nodes[i + 1]) || (gate == graph->nodes[i + 1] && up == graph->nodes[i])) ||
             !host_weights(gate) || !host_weights(up) || !host_weights(down) ||
             gate->src[2] != ids || up->src[2] != ids || gate->src[1] != up->src[1] ||
-            (!ring_prefill && (ids->ne[0] * ids->ne[1] > max_rows || ids->ne[1] > 1024))) {
+            (!in_limits && !(ring_prefill && ids->ne[1] >= 128))) {
             continue;
         }
         // a block the cache does not hold (a tensor under its floor: the IQ3_S GGUF's Q2_0 down, 450 KiB an expert
@@ -1574,16 +1581,17 @@ static void ggml_backend_sched_find_hosted_moe(ggml_backend_sched_t sched, const
             i += 3;
             continue;
         }
-        if (ring_prefill && ids->ne[1] >= 128) {
-            // GGML_CUDA_MOE_RING_PREFILL: a prompt's block hosted whatever its rows (ggml-cuda computes it by groups,
-            // its experts through the ring), no split, no prefetch
+        if (!in_limits) {
+            // GGML_CUDA_MOE_RING_PREFILL: a prompt's block beyond the hosted path's limits, hosted whatever its rows
+            // (ggml-cuda computes it by groups, its experts through the ring), no split, no prefetch
             sched->moe_hosted->insert(gate);
             sched->moe_hosted->insert(up);
             sched->moe_hosted->insert(down);
+            sched->moe_hosted_ring_rows = std::min<int64_t>(sched->moe_hosted_ring_rows, ids->ne[0] * ids->ne[1] - 1);
             i += 3;
             continue;
         }
-        candidates.push_back({ gate, up, down, ids->ne[0] * ids->ne[1] });
+        candidates.push_back({ gate, up, down, ids->ne[0] * ids->ne[1], ids->ne[1] });
         double rate = 0.0, fixed_us = 0.0, row_us = 0.0;
         if (!fixed_rows && ggml_moe_cache.hosted_cost &&
             ggml_moe_cache.hosted_cost(sched->moe_cache_session, &rate, &fixed_us, &row_us) && rate > 0.0 && row_us > 0.0) {
@@ -1601,11 +1609,19 @@ static void ggml_backend_sched_find_hosted_moe(ggml_backend_sched_t sched, const
     // spins; seen with 2 CPU threads, layers of 2520 - 4630 rows and a block of 2780; cause not found), while a graph
     // of hosted blocks, or of prefetched layers and a last layer of a few rows (its outputs), works
     const int64_t limit = row_us_seen > 0.0 ? cross_min : max_rows;
+    // GGML_CUDA_MOE_RING_PREFILL: the ring takes the prompt's blocks the hosted path leaves (those the prefetch would
+    // copy), not every block from 128 tokens. The ring copies a layer's missing experts whatever the batch, as the
+    // prefetch: RX 7900 XT, PCIe 3.0, -ub 9536, MTP, prompts of ~295 / 440 / 647 tokens read in 3.1 - 3.6 s through the
+    // ring against 1.3 - 1.5 / 1.7 - 1.9 / 2.3 - 2.7 s hosted; they meet at ~800 tokens, the hosted path's 8191 rows
+    // (12 Nov.; seen on an RX 6800 XT too, #46)
     for (const auto & c : candidates) {
-        if (c.rows <= limit) {
+        if (c.rows <= limit || (ring_prefill && c.tokens >= 128)) {
             sched->moe_hosted->insert(c.gate);
             sched->moe_hosted->insert(c.up);
             sched->moe_hosted->insert(c.down);
+            if (c.rows > limit) {
+                sched->moe_hosted_ring_rows = std::min<int64_t>(sched->moe_hosted_ring_rows, limit);
+            }
         }
     }
     if (row_us_seen > 0.0 && row_us_seen != logged_row_us) {   // at the first hosted graph, again once the CPU scale is measured
@@ -3761,6 +3777,7 @@ static void ggml_backend_sched_plan_swap(ggml_backend_sched_t sched, ggml_backen
     std::swap(sched->ctx,                   p->ctx);
     std::swap(sched->context_buffer,        p->context_buffer);
     std::swap(sched->moe_hosted,            p->moe_hosted);
+    std::swap(sched->moe_hosted_ring_rows,  p->moe_hosted_ring_rows);
     std::swap(sched->plan_key,              p->key);
     std::swap(sched->plan_key_n_nodes,      p->key_n_nodes);
     std::swap(sched->plan_gen,              p->gen);
