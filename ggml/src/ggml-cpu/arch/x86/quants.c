@@ -4272,7 +4272,12 @@ void ggml_vec_dot_iq4_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
 // Several activation rows against one weight row (MoE experts shared by the tokens of an MTP verification): the
 // weights of a block are decoded once, as the one-row kernels above do, and dotted with every row's activations.
 // At most 8 rows; s[c] for vy[c].
-static inline __attribute__((always_inline)) void ggml_vec_dot_iq2_s_q8_K_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
+#if defined(_MSC_VER) && !defined(__clang__)
+#define GGML_MULTI_INLINE static __forceinline
+#else
+#define GGML_MULTI_INLINE static inline __attribute__((always_inline))
+#endif
+GGML_MULTI_INLINE void ggml_vec_dot_iq2_s_q8_K_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
 #if defined(__AVX2__)
     static const uint8_t k_mask1[32] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
                                         0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03};
@@ -4335,7 +4340,7 @@ static inline __attribute__((always_inline)) void ggml_vec_dot_iq2_s_q8_K_multi_
 #endif
 }
 
-static inline __attribute__((always_inline)) void ggml_vec_dot_iq3_k_q8_K_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
+GGML_MULTI_INLINE void ggml_vec_dot_iq3_k_q8_K_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
 #if defined __AVX2__
     const block_iq3_k * GGML_RESTRICT x = vx;
     const int nb = n / QK_K;
@@ -4377,7 +4382,7 @@ static inline __attribute__((always_inline)) void ggml_vec_dot_iq3_k_q8_K_multi_
 #endif
 }
 
-static inline __attribute__((always_inline)) void ggml_vec_dot_iq4_nl_q8_0_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
+GGML_MULTI_INLINE void ggml_vec_dot_iq4_nl_q8_0_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
 #if defined __AVX2__
     const block_iq4_nl * GGML_RESTRICT x = vx;
     const int nb = n / QK4_NL;
@@ -4406,7 +4411,7 @@ static inline __attribute__((always_inline)) void ggml_vec_dot_iq4_nl_q8_0_multi
 // The same with q8_0 activations (ggml_cpu_moe_experts: quantized as the GPU's q8_1, blocks of 32, so that an expert
 // computed by the CPU or by the GPU starts from the same activation bytes): an activation scale per block of 32, the
 // integer sums of each block scaled by it.
-static inline __attribute__((always_inline)) void ggml_vec_dot_iq2_s_q8_0_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
+GGML_MULTI_INLINE void ggml_vec_dot_iq2_s_q8_0_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
 #if defined(__AVX2__)
     static const uint8_t k_mask1[32] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
                                         0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03};
@@ -4467,7 +4472,7 @@ static inline __attribute__((always_inline)) void ggml_vec_dot_iq2_s_q8_0_multi_
 #endif
 }
 
-static inline __attribute__((always_inline)) void ggml_vec_dot_iq3_k_q8_0_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
+GGML_MULTI_INLINE void ggml_vec_dot_iq3_k_q8_0_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
 #if defined __AVX2__
     const block_iq3_k * GGML_RESTRICT x = vx;
     const int nb = n / QK_K;
@@ -4508,7 +4513,7 @@ static inline __attribute__((always_inline)) void ggml_vec_dot_iq3_k_q8_0_multi_
 #endif
 }
 
-static inline __attribute__((always_inline)) void ggml_vec_dot_iq3_ks_q8_0_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
+GGML_MULTI_INLINE void ggml_vec_dot_iq3_ks_q8_0_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
 #if defined __AVX2__
     const block_iq3_ks * GGML_RESTRICT x = vx;
     const int nb = n / QK_K;
@@ -4548,7 +4553,7 @@ static inline __attribute__((always_inline)) void ggml_vec_dot_iq3_ks_q8_0_multi
 // The types of ISTA's IQ3_S experts (IQ3_XXS, IQ3_S, IQ4_XS gate / up; Q2_0 down) with q8_0 activations, a weight
 // block decoded once for every activation row (ggml_cpu_moe_experts_multi): the decoding of the one-row q8_K kernels, the
 // integer sums of each block of 32 scaled by its activation scale.
-static inline __attribute__((always_inline)) void ggml_vec_dot_iq3_xxs_q8_0_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
+GGML_MULTI_INLINE void ggml_vec_dot_iq3_xxs_q8_0_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
 #if defined(__AVX2__)
     const block_iq3_xxs * GGML_RESTRICT x = vx;
     const int nb = n / QK_K;
@@ -4589,7 +4594,7 @@ static inline __attribute__((always_inline)) void ggml_vec_dot_iq3_xxs_q8_0_mult
 #endif
 }
 
-static inline __attribute__((always_inline)) void ggml_vec_dot_iq3_s_q8_0_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
+GGML_MULTI_INLINE void ggml_vec_dot_iq3_s_q8_0_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
 #if defined(__AVX2__)
     static const uint8_t k_mask1[32] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
                                         0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03};
@@ -4645,7 +4650,7 @@ static inline __attribute__((always_inline)) void ggml_vec_dot_iq3_s_q8_0_multi_
 #endif
 }
 
-static inline __attribute__((always_inline)) void ggml_vec_dot_iq4_xs_q8_0_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
+GGML_MULTI_INLINE void ggml_vec_dot_iq4_xs_q8_0_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
 #if defined(__AVX2__)
     const block_iq4_xs * GGML_RESTRICT x = vx;
     const int nb = n / QK_K;
@@ -4677,7 +4682,7 @@ static inline __attribute__((always_inline)) void ggml_vec_dot_iq4_xs_q8_0_multi
 }
 
 // Q2_0: blocks of 64 two-bit values q (w = q - 1), element j in bits 2*(j%4) of byte j/4; two q8_0 blocks per block.
-static inline __attribute__((always_inline)) void ggml_vec_dot_q2_0_q8_0_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
+GGML_MULTI_INLINE void ggml_vec_dot_q2_0_q8_0_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
 #if defined(__AVX2__)
     const block_q2_0 * GGML_RESTRICT x = vx;
     const int nb = n / QK2_0;
@@ -4716,7 +4721,11 @@ static inline __attribute__((always_inline)) void ggml_vec_dot_q2_0_q8_0_multi_n
 // Each column count in a function of its own: the dispatcher is then a jump. With the cases inlined in it, every call
 // (one row of weights) ran the prologue of the largest (stack realigned to 32 bytes, a frame of 0x1c0 - 0x480 bytes,
 // six registers saved), +4 % on an IQ3_XXS expert's gate / up rows.
+#if defined(_MSC_VER) && !defined(__clang__)
+#define GGML_MULTI_CASE_ATTR __declspec(noinline)
+#else
 #define GGML_MULTI_CASE_ATTR __attribute__((noinline))
+#endif
 #define GGML_MULTI_CASES(kern)                                                                                             \
 static GGML_MULTI_CASE_ATTR void kern##_c2(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy) { kern(n, s, vx, vy, 2); } \
 static GGML_MULTI_CASE_ATTR void kern##_c3(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy) { kern(n, s, vx, vy, 3); } \
