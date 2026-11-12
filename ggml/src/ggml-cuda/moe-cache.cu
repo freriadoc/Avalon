@@ -3709,11 +3709,13 @@ static void moe_cache_arena_free(moe_cache_device & device) {
     if (int * d = g_prefill_counts.exchange(nullptr)) {
         (void) cudaFree(d);
     }
+#if defined(__linux__)   // the arena is Linux-only: no file is opened elsewhere, and close() is not declared on Windows (#33)
     for (const auto & f : device.arena_fds) {
         if (f.second >= 0) {
             close(f.second);
         }
     }
+#endif
     device.arena_fds.clear();
     device.arena_files.clear();
     if (!device.arena_base) {
