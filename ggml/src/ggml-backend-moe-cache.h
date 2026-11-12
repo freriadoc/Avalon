@@ -230,6 +230,10 @@ struct ggml_moe_cache_api {
     // whether every GPU of the backend has a flash attention kernel that reads a QSA tile mask (ggml_qsa_select_tiles):
     // the graph builder keeps the dense slices otherwise (RDNA2 has none: the node ran on the CPU, #46); null: not known
     bool (*qsa_tiles)(void);
+    // whether the prefill ring (GGML_CUDA_MOE_RING_PREFILL) can be used: false when only a part of the experts is in
+    // registered RAM (the arena of a machine with less RAM than the experts take), where the ring would copy the others
+    // through the page cache; the scheduler then keeps the prefetch and the graph builds no summed down. null: not known
+    bool (*ring_usable)(void);
     // the hosted MoE's cost, to choose it over the prefetch: a block of 'rows' routed rows takes fixed_us + rows * row_us
     // hosted, its expert tensors' bytes / copy_bytes_per_us prefetched; false when not known (no device yet)
     bool (*hosted_cost)(void * session, double * copy_bytes_per_us, double * fixed_us, double * row_us);

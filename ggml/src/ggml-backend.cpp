@@ -1530,7 +1530,8 @@ static void ggml_backend_sched_find_hosted_moe(ggml_backend_sched_t sched, const
     // GGML_CUDA_MOE_RING_PREFILL: the prompt's blocks of the scheduler that owns the session (a guest, the MTP draft,
     // borrows no zone for a ring: its blocks keep the hosted path's limits)
     static const bool ring_env = getenv("GGML_CUDA_MOE_RING_PREFILL") && atoi(getenv("GGML_CUDA_MOE_RING_PREFILL")) > 0;
-    const bool ring_prefill = ring_env && !sched->moe_cache_guest && sched->prefetch_experts;
+    const bool ring_prefill = ring_env && !sched->moe_cache_guest && sched->prefetch_experts &&
+        (!ggml_moe_cache.ring_usable || ggml_moe_cache.ring_usable());   // not with a part of the experts in the arena
     // the routed rows of a hosted block: the backend's (ggml-cuda's moe_hosted_max_rows, GGML_MOE_HOSTED_MAX_ROWS)
     static const bool fixed_rows = getenv("GGML_MOE_HOSTED_MAX_ROWS") != nullptr;
     const int64_t max_rows = ggml_moe_cache.hosted_max_rows ? ggml_moe_cache.hosted_max_rows() : 64;
@@ -4238,7 +4239,7 @@ static void ggml_backend_sched_prime_moe_cache(ggml_backend_sched_t sched, struc
         for (const ggml_tensor * node : experts) {
             packed = packed || ggml_sched_packed_expert_step(node->src[0]) != 0;
         }
-        if (ring_mib > 1 && packed) {
+        if (ring_mib > 1 && packed && (!ggml_moe_cache.ring_usable || ggml_moe_cache.ring_usable())) {
             sched->prefetch_slot_bytes = GGML_PAD((size_t) ring_mib << 19, 4096);   // half, 4 KiB aligned
             sched->prefetch_ring_zones = 2;
             ggml_moe_cache.set_lend_size(sched->moe_cache_session, sched->prefetch_slot_bytes, 2);

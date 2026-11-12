@@ -7,6 +7,7 @@
 #include "llama-batch.h"
 #include "llama-cparams.h"
 #include "llama-sampler.h"
+#include "../ggml/src/ggml-backend-moe-cache.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -2515,7 +2516,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     static const bool down_sum = (!getenv("LLAMA_MOE_DOWN_SUM") || atoi(getenv("LLAMA_MOE_DOWN_SUM")) != 0) &&
         getenv("GGML_CUDA_MOE_RING_PREFILL") && atoi(getenv("GGML_CUDA_MOE_RING_PREFILL")) > 0;
     // and for a packed layer only (its experts a row apart): the ring takes nothing else (#49)
-    if (down_sum && n_tokens > 1024 && down_exps->nb[2] > down_exps->nb[1]*down_exps->ne[1] && !weight_before_ffn && !down_exps_b && !down_exps_s && arch != LLM_ARCH_MISTRAL4 &&
+    // and not when only a part of the experts is in registered RAM (ggml_moe_cache.ring_usable: no ring then)
+    if (down_sum && n_tokens > 1024 && down_exps->nb[2] > down_exps->nb[1]*down_exps->ne[1] &&
+            (!ggml_moe_cache.ring_usable || ggml_moe_cache.ring_usable()) && !weight_before_ffn && !down_exps_b && !down_exps_s && arch != LLM_ARCH_MISTRAL4 &&
             loras->empty() && hparams.n_expert_used(il) == (uint32_t) n_expert_used && n_expert_used > 1) {
         experts = ggml_mul_mat_id_sum(ctx0, down_exps, cur, selected_experts, weights);   // [n_embd, 1, n_tokens]
         if (prec_policy) {

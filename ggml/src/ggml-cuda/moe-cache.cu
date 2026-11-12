@@ -3877,6 +3877,19 @@ static size_t moe_cache_env_mb(const char * name, size_t dflt) {
 static moe_ram_plan g_ram_plan;
 static std::mutex g_ram_plan_mu;   // taken after a session's mu, never before
 
+// Whether every expert is in registered RAM (1), or only a part of them, the others in the file (0: the arena, or a
+// card's share of several); -1: not known. The prefill ring copies a layer's missing experts straight from their
+// tensors' addresses: with the arena those of an absent expert are the file's mapping, read through the page cache a
+// small machine does not have (32 GB simulated, a 4067-token prompt: 198 - 238 s through the ring against 11 s by the
+// prefetch, which reads them with O_DIRECT into the arena's zone; 0 read "for prefills" in the arena's counters). The
+// ring is used only when this is not 0 (ggml_moe_cache.ring_usable). Predicted from the experts' total before the
+// first graph (moe_cache_host_experts), then set by each card's decision (moe_cache_experts_fit).
+static std::atomic<int> g_experts_all_in_ram{-1};
+
+static bool moe_cache_ring_usable() {
+    return g_experts_all_in_ram.load(std::memory_order_relaxed) != 0;
+}
+
 static moe_ram_mode moe_cache_experts_fit(moe_cache_session & session, moe_cache_device & device) {
     std::vector<std::pair<uintptr_t, uintptr_t>> ranges;
     for (const auto & t : device.seen_tensors) {
@@ -3909,6 +3922,11 @@ static moe_ram_mode moe_cache_experts_fit(moe_cache_session & session, moe_cache
               moe_cache_env_mb("GGML_CUDA_MOE_PIN_RESERVE_BASE_MB", 10240), moe_cache_env_mb("GGML_CUDA_MOE_PIN_RESERVE_CARD_MB", 3072));
     const size_t room_raw = moe_cache_room_bytes();
     const moe_ram_choice c = moe_ram_choose(plan, bytes, room_raw, kfd, reserve_one, reserve_multi);
+    if (c.mode != MOE_RAM_PIN_ALL) {
+        g_experts_all_in_ram = 0;
+    } else if (g_experts_all_in_ram.load() != 0) {
+        g_experts_all_in_ram = 1;   // a card of several that registers its share keeps the others' 0
+    }
     device.pin_quota = c.mode == MOE_RAM_PIN_PART ? c.quota : SIZE_MAX;
     if (plan.n_devices <= 1 || plan.total == 0) {
         const size_t room = room_raw == SIZE_MAX ? 0 : (room_raw > reserve_one ? room_raw - reserve_one : 0);
@@ -6350,6 +6368,19 @@ static void moe_cache_host_experts(void * opaque, size_t bytes, int n_devices) {
     if (!g_ram_plan.decided) {
         g_ram_plan.total = bytes;
         g_ram_plan.n_devices = n_devices;
+    }
+    // one card: its decision (moe_cache_experts_fit's rule) predicted now, before the first graph is built, so that the
+    // graph and the scheduler choose the prefetch from the start on a machine whose RAM does not hold every expert
+    const size_t total = moe_arena_read_number("/proc/meminfo", "MemTotal:");
+    const size_t room_raw = moe_cache_room_bytes();
+    if (n_devices <= 1 && bytes > 0 && total != SIZE_MAX && room_raw != SIZE_MAX && g_experts_all_in_ram.load() < 0) {
+        const size_t ram = total << 10;
+        const size_t kfd = ram - ram / 64 - ((size_t) 3 << 29);
+        const size_t reserve_one = moe_ram_reserve_bytes(1, moe_cache_arena_margin_mb(), 0, 0);
+        const size_t room = room_raw > reserve_one ? room_raw - reserve_one : 0;
+        if (!(bytes + ((size_t) 1 << 30) <= kfd && bytes <= room)) {
+            g_experts_all_in_ram = 0;
+        }
     }
 }
 
@@ -11127,7 +11158,7 @@ static void moe_cache_ring_zone(void * opaque, void * backend, void * base, size
 
 bool ggml_cuda_moe_ring_takes(ggml_backend_cuda_context & ctx, const ggml_tensor * node) {
     static const bool ring_prefill = getenv("GGML_CUDA_MOE_RING_PREFILL") && atoi(getenv("GGML_CUDA_MOE_RING_PREFILL")) > 0;
-    if (!ring_prefill || node->op != GGML_OP_MUL_MAT_ID || !node->src[2] || node->src[2]->ne[1] < 128 || !node->src[0]->buffer ||
+    if (!ring_prefill || !moe_cache_ring_usable() || node->op != GGML_OP_MUL_MAT_ID || !node->src[2] || node->src[2]->ne[1] < 128 || !node->src[0]->buffer ||
             !ggml_backend_buffer_is_host(node->src[0]->buffer)) {
         return false;
     }
@@ -11797,6 +11828,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.lend_room = moe_cache_lend_room;
     ggml_moe_cache.hosted_cost = moe_hosted_cost;
     ggml_moe_cache.qsa_tiles = ggml_cuda_fattn_tile_mask_supported;
+    ggml_moe_cache.ring_usable = moe_cache_ring_usable;
     ggml_moe_cache.plan = nullptr;   // nodes are served by the hosted MoE only (moe_cache_begin)
     ggml_moe_cache.dispatch = nullptr;   // nodes are served by the hosted MoE only (moe_cache_begin)
     ggml_moe_cache.collect = nullptr;   // nodes are served by the hosted MoE only (moe_cache_begin)
