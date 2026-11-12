@@ -698,8 +698,9 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 // out[row] = silu(gate[row]) * up[row] for the compact rows r0 .. r1 - 1 (ids_dst: compact row -> row of the outputs)
 static __global__ void k_moe_grouped_swiglu(const float * __restrict__ gate, const float * __restrict__ up, float * __restrict__ out,
         const int32_t * __restrict__ ids_dst, const int r0, const int64_t n, const int64_t sg, const int64_t su, const int64_t so) {
-    const int64_t row = ids_dst[r0 + blockIdx.y];
-    for (int64_t j = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; j < n; j += (int64_t) gridDim.x*blockDim.x) {
+    // the rows along x: a grid's y stops at 65535, and a group of a ubatch of 35k tokens held more rows than that
+    const int64_t row = ids_dst[r0 + blockIdx.x];
+    for (int64_t j = (int64_t) blockIdx.y*blockDim.x + threadIdx.x; j < n; j += (int64_t) gridDim.y*blockDim.x) {
         const float g = gate[row*sg + j];
         out[row*so + j] = (g / (1.0f + expf(-g))) * up[row*su + j];
     }
@@ -1127,7 +1128,7 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
             launch(wu, up,   q8_gu.get(), ne10p_gu, 1, J_gu, fb_gu, g0, r0, r1, 1, sg);
         }
         {
-            const dim3 grid((unsigned) std::min<int64_t>((n_ff + 255)/256, 8), (unsigned) (r1 - r0));
+            const dim3 grid((unsigned) (r1 - r0), (unsigned) std::min<int64_t>((n_ff + 255)/256, 8));
             k_moe_grouped_swiglu<<<grid, 256, 0, sg>>>((const float *) gate->data, (const float *) up->data, (float *) glu->data,
                 ids_dst.get(), r0, n_ff, gate->nb[1]/sizeof(float), up->nb[1]/sizeof(float), glu->nb[1]/sizeof(float));
         }
