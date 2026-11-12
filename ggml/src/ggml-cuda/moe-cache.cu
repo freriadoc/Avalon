@@ -100,6 +100,9 @@ static inline bool ggml_type_is_exl3(ggml_type) { return false; }
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#if defined(__linux__)
+#include <dirent.h>
+#endif
 
 #if defined(_WIN32)
 #  define WIN32_LEAN_AND_MEAN
@@ -582,6 +585,7 @@ struct moe_cache_device {
     std::vector<std::shared_ptr<moe_expert_arena>> arenas;
     // GGML_CUDA_MOE_RING_PREFILL: the prompt's expert ring in the zones the scheduler borrowed (moe_cache_ring_zone)
     struct moe_ring_state * ring = nullptr;
+    bool queues_warned = false;   // gfx1030: the runlist queue budget check ran (moe_cache_check_queue_budget)
     // EXPERT SPLIT: the experts' host memory (the pin, the arena) is the session's, taken once by the first card
     // (host_ready once done) and shared by the others (host_shared: they register, read and unmap nothing themselves)
     bool host_ready = false;
@@ -11066,11 +11070,83 @@ static void moe_ring_unpin(moe_cache_session & session, std::vector<std::pair<mo
     pins.clear();
 }
 
+#if defined(GGML_USE_HIP) && defined(__linux__)
+// the process's KFD HW queues: /sys/class/kfd/kfd/proc/<pid>/queues/<i>/type (0: compute, 1: SDMA)
+static void moe_cache_count_kfd_queues(int & compute, int & sdma) {
+    compute = 0;
+    sdma = 0;
+    char path[128];
+    snprintf(path, sizeof(path), "/sys/class/kfd/kfd/proc/%ld/queues", (long) getpid());
+    DIR * dir = opendir(path);
+    if (!dir) {
+        return;
+    }
+    struct dirent * ent;
+    while ((ent = readdir(dir)) != nullptr) {
+        if (ent->d_name[0] == '.') {
+            continue;
+        }
+        char type_path[256];
+        snprintf(type_path, sizeof(type_path), "%s/%s/type", path, ent->d_name);
+        FILE * f = fopen(type_path, "r");
+        if (!f) {
+            continue;
+        }
+        int t = -1;
+        if (fscanf(f, "%d", &t) == 1) {
+            if (t == 0) {
+                compute++;
+            } else if (t == 1) {
+                sdma++;
+            }
+        }
+        fclose(f);
+    }
+    closedir(dir);
+}
+
+// gfx1030: the runlist has 8 compute HQD slots. A queue created after load past the budget
+// oversubscribes the runlist, which stops servicing queues, and a copy hangs (issue 27).
+// A count at the first ring setup: the ring's own queue exists then, and the runlist is fully
+// populated (a load-time count would undercount). A snapshot: queues opened later are not re-checked.
+// Counts this process on gfx1030 only: other processes' queues (and ones a dead process leaked,
+// which linger until reboot) are not seen; the gfx1031/1032/1035 siblings are not covered.
+static void moe_cache_check_queue_budget(moe_cache_device & device) {
+    if (device.queues_warned) {
+        return;
+    }
+    int n = 0;
+    if (hipGetDeviceCount(&n) != hipSuccess) {
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        hipDeviceProp_t props = {0};
+        if (hipGetDeviceProperties(&props, i) != hipSuccess || strncmp(props.gcnArchName, "gfx1030", 7) != 0) {
+            continue;
+        }
+        device.queues_warned = true;
+        int compute = 0;
+        int sdma = 0;
+        moe_cache_count_kfd_queues(compute, sdma);
+        if (compute >= 8) {
+            GGML_LOG_WARN("[moe-cache] CUDA%d: gfx1030 at the runlist budget: %d compute HW queues (plus %d SDMA). A queue "
+                    "created after load past the budget oversubscribes the runlist and can hang a copy (issue 27). "
+                    "Relaunch with GPU_MAX_HW_QUEUES=2\n",
+                    device.physical, compute, sdma);
+        }
+        return;
+    }
+}
+#endif
+
 static void moe_cache_ring_zone(void * opaque, void * backend, void * base, size_t bytes) {
     moe_cache_session * session = (moe_cache_session *) opaque;
     moe_cache_device * device = session ? moe_cache_device_for_backend(*session, backend) : nullptr;
     if (!device) {
         return;
+    }
+    if (!base && !device->ring) {
+        return;   // clearing a ring that was never set up: nothing to do (and no stream/HW queue to create)
     }
     ggml_cuda_set_device(device->logical);
     if (!device->ring) {
@@ -11083,6 +11159,9 @@ static void moe_cache_ring_zone(void * opaque, void * backend, void * base, size
             CUDA_CHECK(cudaEventCreateWithFlags(&r.done[k], cudaEventDisableTiming));
             CUDA_CHECK(cudaEventCreateWithFlags(&r.copied[k], cudaEventDisableTiming));
         }
+#if defined(GGML_USE_HIP) && defined(__linux__)
+        moe_cache_check_queue_budget(*device);
+#endif
     }
     moe_ring_state & r = *device->ring;
     if (!base) {
