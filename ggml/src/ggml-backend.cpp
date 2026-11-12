@@ -1540,7 +1540,7 @@ static void ggml_backend_sched_find_hosted_moe(ggml_backend_sched_t sched, const
         const size_t step = ggml_sched_packed_expert_step(w);
         return step ? step * (size_t) w->ne[2] : ggml_nbytes(w);
     };
-    struct candidate { const struct ggml_tensor * gate, * up, * down; int64_t rows, tokens; };
+    struct candidate { const struct ggml_tensor * gate, * up, * down; int64_t rows, tokens; bool ring; };
     std::vector<candidate> candidates;
     double row_us_seen = 0.0, fixed_us_seen = 0.0;
     int64_t cross_min = INT64_MAX, cross_max = 0;
@@ -1571,9 +1571,13 @@ static void ggml_backend_sched_find_hosted_moe(ggml_backend_sched_t sched, const
         if (!((gate == graph->nodes[i] && up == graph->nodes[i + 1]) || (gate == graph->nodes[i + 1] && up == graph->nodes[i])) ||
             !host_weights(gate) || !host_weights(up) || !host_weights(down) ||
             gate->src[2] != ids || up->src[2] != ids || gate->src[1] != up->src[1] ||
-            (!in_limits && !(ring_prefill && ids->ne[1] >= 128))) {
+            (!in_limits && !(ring_prefill && ids->ne[1] >= 128 && ggml_sched_packed_expert_step(gate->src[0])))) {
             continue;
         }
+        // the ring streams a packed layer's experts (gate, up and down of an expert in one row) and nothing else: an
+        // unpacked model's blocks keep the hosted path and the prefetch (before: every block of a prompt was hosted for
+        // the ring, which declined it, and ggml-cuda copied the whole layer into pool memory: out of memory, #49)
+        const bool ring_block = ring_prefill && ids->ne[1] >= 128 && ggml_sched_packed_expert_step(gate->src[0]) != 0;
         // a block the cache does not hold (a tensor under its floor: the IQ3_S GGUF's Q2_0 down, 450 KiB an expert
         // under 512): ggml-cuda cannot host it, it runs on the CPU (before: an abort in ggml-cuda at the first graph)
         if (ggml_moe_cache.hosts &&
@@ -1591,7 +1595,7 @@ static void ggml_backend_sched_find_hosted_moe(ggml_backend_sched_t sched, const
             i += 3;
             continue;
         }
-        candidates.push_back({ gate, up, down, ids->ne[0] * ids->ne[1], ids->ne[1] });
+        candidates.push_back({ gate, up, down, ids->ne[0] * ids->ne[1], ids->ne[1], ring_block });
         double rate = 0.0, fixed_us = 0.0, row_us = 0.0;
         if (!fixed_rows && ggml_moe_cache.hosted_cost &&
             ggml_moe_cache.hosted_cost(sched->moe_cache_session, &rate, &fixed_us, &row_us) && rate > 0.0 && row_us > 0.0) {
@@ -1615,7 +1619,7 @@ static void ggml_backend_sched_find_hosted_moe(ggml_backend_sched_t sched, const
     // ring against 1.3 - 1.5 / 1.7 - 1.9 / 2.3 - 2.7 s hosted; they meet at ~800 tokens, the hosted path's 8191 rows
     // (12 Nov.; seen on an RX 6800 XT too, #46)
     for (const auto & c : candidates) {
-        if (c.rows <= limit || (ring_prefill && c.tokens >= 128)) {
+        if (c.rows <= limit || c.ring) {
             sched->moe_hosted->insert(c.gate);
             sched->moe_hosted->insert(c.up);
             sched->moe_hosted->insert(c.down);
@@ -4229,7 +4233,12 @@ static void ggml_backend_sched_prime_moe_cache(ggml_backend_sched_t sched, struc
         // GGML_CUDA_MOE_RING_PREFILL=MiB (more than 1): the prompt's expert ring in two zones of half that each, instead
         // of the prefetch's slots (the cache keeps the rest)
         static const long ring_mib = getenv("GGML_CUDA_MOE_RING_PREFILL") ? atol(getenv("GGML_CUDA_MOE_RING_PREFILL")) : 0;
-        if (ring_mib > 1) {
+        // for a packed model only (the ring takes nothing else): an unpacked one keeps the prefetch's slots
+        bool packed = false;
+        for (const ggml_tensor * node : experts) {
+            packed = packed || ggml_sched_packed_expert_step(node->src[0]) != 0;
+        }
+        if (ring_mib > 1 && packed) {
             sched->prefetch_slot_bytes = GGML_PAD((size_t) ring_mib << 19, 4096);   // half, 4 KiB aligned
             sched->prefetch_ring_zones = 2;
             ggml_moe_cache.set_lend_size(sched->moe_cache_session, sched->prefetch_slot_bytes, 2);

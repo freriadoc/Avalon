@@ -11124,6 +11124,11 @@ bool ggml_cuda_moe_ring_takes(ggml_backend_cuda_context & ctx, const ggml_tensor
             !ggml_backend_buffer_is_host(node->src[0]->buffer)) {
         return false;
     }
+    // a packed layer only (its experts a row apart, more than this tensor's bytes): the ring block takes nothing else
+    // and the whole-layer copy that replaced it does not fit a card the cache fills (#49)
+    if (node->src[0]->nb[2] <= node->src[0]->nb[1]*node->src[0]->ne[1]) {
+        return false;
+    }
     if (node->src[2]->ne[0] * node->src[2]->ne[1] > moe_hosted_max_rows() || node->src[2]->ne[1] > moe_hosted_tokens_max) {
         return true;
     }
