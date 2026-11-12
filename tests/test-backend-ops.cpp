@@ -14517,6 +14517,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {128, 16, 2, 3}, 2));
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {64, 16, 2, 3}, 3));
 
+    for (int64_t n : { 129, 257, 513, 2048, 4092 }) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, n, 1, 3));
+        test_cases.emplace_back(new test_gated_delta_net_replay(16, 128, 3, n, 3, 1, false));
+    }
     // GATED_DELTA_NET: realistic model configurations
     // TG: n_seq_tokens=1 (autoregressive)
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));   // Qwen3.5-like: 32 heads, d=128
@@ -14537,6 +14541,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
 
+    // Decode and MTP timings for the same Hk16/Hv48 model shape.
+    for (int64_t n : { 1, 2, 3, 4 }) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, n, 1, 3));
+        test_cases.emplace_back(new test_gated_delta_net_replay(16, 128, 3, n, 3, 1, true));
+        test_cases.emplace_back(new test_gated_delta_net_replay(16, 128, 3, n, 3, 1, false));
+    }
     // lightning_indexer
     for (int kv : { 256, 4096, 65536 }) {
         for (int bs : { 1, 512, 2048 }) {
