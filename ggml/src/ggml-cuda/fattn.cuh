@@ -9,3 +9,6 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 // bytes of scratch the flash attention of dst takes instead of pool memory (a dry run of its dispatch: the
 // same kernel, occupancy and block split), 0 if none
 size_t ggml_cuda_flash_attn_ext_scratch_size(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+// every device has a flash attention kernel that reads a tile mask of ggml_qsa_select_tiles
+bool ggml_cuda_fattn_tile_mask_supported();

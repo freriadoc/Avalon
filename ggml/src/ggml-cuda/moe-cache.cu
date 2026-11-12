@@ -11784,6 +11784,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.largest_lend = moe_cache_largest_lend;
     ggml_moe_cache.lend_room = moe_cache_lend_room;
     ggml_moe_cache.hosted_cost = moe_hosted_cost;
+    ggml_moe_cache.qsa_tiles = ggml_cuda_fattn_tile_mask_supported;
     ggml_moe_cache.plan = nullptr;   // nodes are served by the hosted MoE only (moe_cache_begin)
     ggml_moe_cache.dispatch = nullptr;   // nodes are served by the hosted MoE only (moe_cache_begin)
     ggml_moe_cache.collect = nullptr;   // nodes are served by the hosted MoE only (moe_cache_begin)

@@ -609,6 +609,26 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
     }
 }
 
+// The architectures whose sparse MMA kernel reads a tile mask of ggml_qsa_select_tiles: RDNA3 / RDNA4 (WMMA) and NVIDIA
+// from Ampere's instances on. Elsewhere (RDNA2: gfx1030) no kernel reads it and the node would run on the CPU (#46)
+static bool ggml_cuda_fattn_tile_mask_arch(const int cc) {
+    const bool rdna = GGML_CUDA_CC_IS_RDNA(cc) && amd_wmma_available(cc);
+    const bool nv   = GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) &&
+        ggml_cuda_highest_compiled_arch(cc) != GGML_CUDA_CC_TURING && cc != GGML_CUDA_CC_VOLTA;
+    return rdna || nv;
+}
+
+// whether every device has such a kernel: the graph builder asks before it emits tile masks (ggml_moe_cache.qsa_tiles)
+bool ggml_cuda_fattn_tile_mask_supported() {
+    const ggml_cuda_device_info & info = ggml_cuda_info();
+    for (int i = 0; i < info.device_count; i++) {
+        if (!ggml_cuda_fattn_tile_mask_arch(info.devices[i].cc)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
@@ -699,12 +719,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // a tile mask of ggml_qsa_select_tiles: only the sparse MMA kernel of (256, 256, 16, 4) reads it
     if (mask && mask->op == GGML_OP_QSA_SELECT && ggml_get_op_params_i32(mask, 1) == GGML_QSA_SELECT_TILE_MASK) {
-        const bool rdna = GGML_CUDA_CC_IS_RDNA(cc) && amd_wmma_available(cc);
-        const bool nv   = GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) &&
-            ggml_cuda_highest_compiled_arch(cc) != GGML_CUDA_CC_TURING && cc != GGML_CUDA_CC_VOLTA;
         float logit_softcap = 0.0f;
         memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
-        const bool ok = (rdna || nv) && gqa_opt_applies && logit_softcap == 0.0f && K->ne[0] == 256 && V->ne[0] == 256 &&
+        const bool ok = ggml_cuda_fattn_tile_mask_arch(cc) && gqa_opt_applies && logit_softcap == 0.0f && K->ne[0] == 256 && V->ne[0] == 256 &&
             gqa_ratio % 4 == 0 && gqa_ratio % 8 != 0 && Q->ne[1] > 8 && Q->ne[3] == 1 && (mask->ne[1] == 16 || mask->ne[1] == 8);
         return ok ? BEST_FATTN_KERNEL_MMA_F16 : BEST_FATTN_KERNEL_NONE;
     }

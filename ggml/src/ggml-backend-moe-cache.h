@@ -227,6 +227,9 @@ struct ggml_moe_cache_api {
     // what the backend's device could lend the compute buffers now, in bytes: the free room above the cache's floor and
     // under the prefetch zones (the banded slab), or every pool's lendable entries; 0 when not known
     size_t (*lend_room)(void * session, void * backend);
+    // whether every GPU of the backend has a flash attention kernel that reads a QSA tile mask (ggml_qsa_select_tiles):
+    // the graph builder keeps the dense slices otherwise (RDNA2 has none: the node ran on the CPU, #46); null: not known
+    bool (*qsa_tiles)(void);
     // the hosted MoE's cost, to choose it over the prefetch: a block of 'rows' routed rows takes fixed_us + rows * row_us
     // hosted, its expert tensors' bytes / copy_bytes_per_us prefetched; false when not known (no device yet)
     bool (*hosted_cost)(void * session, double * copy_bytes_per_us, double * fixed_us, double * row_us);

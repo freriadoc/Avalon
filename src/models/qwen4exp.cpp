@@ -2,6 +2,7 @@
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
+#include "../../ggml/src/ggml-backend-moe-cache.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -1354,7 +1355,13 @@ llama_model_qwen4exp::graph::qsa_sel llama_model_qwen4exp::graph::build_qsa_sel(
     // the tile mask: the indexer's scores still by slices (its [n_pool, n_t] F32 grows like the dense mask), their
     // selections joined, then one mask by tiles of 16 queries for one flash attention (ggml-cuda's sparse kernel reads
     // it with its lists, no dense mask); LLAMA_QSA_TILES=0 keeps the dense slices
-    static const bool qsa_tiles = [] { const char * e = getenv("LLAMA_QSA_TILES"); return !e || atoi(e) != 0; }();
+    // Only where a GPU kernel reads the tile mask (ggml_moe_cache.qsa_tiles: RDNA3 / RDNA4, NVIDIA from Ampere's
+    // instances): on an RX 6800 XT (gfx1030) the attention of every prompt batch ran on the CPU (133 - 165 t/s
+    // against ~790) and a short last batch aborted in the multi-task kernel (#46). LLAMA_QSA_TILES=1 forces them.
+    static const bool qsa_tiles = [] {
+        const char * e = getenv("LLAMA_QSA_TILES");
+        return e ? atoi(e) != 0 : !ggml_moe_cache.qsa_tiles || ggml_moe_cache.qsa_tiles();
+    }();
     // the tile mask also for a batch that fits one slice (the first batches of a prompt, n_kv up to ~28k cells at 9536
     // tokens), which otherwise runs the dense masked flash attention over every cell; LLAMA_QSA_TILES_ALL=0 keeps that
     static const bool qsa_tiles_all = [] { const char * e = getenv("LLAMA_QSA_TILES_ALL"); return !e || atoi(e) != 0; }();
