@@ -4328,9 +4328,10 @@ static void * moe_cache_session_create(
             ggml_cuda_set_device(logical);
             const int capability = info.devices[logical].cc;
             if (capability < session->config.min_compute_capability) {
-                MOE_CACHE_LOG("[moe-cache] CUDA%d skipped: compute capability %d is below %d\n",
-                        physical, capability,
-                        session->config.min_compute_capability);
+                // a warning: the log otherwise says nothing of a cache that stays off (a Tesla P40, #28)
+                GGML_LOG_WARN("[moe-cache] CUDA%d skipped: compute capability %d is below %d, the expert cache stays off "
+                        "on it (GGML_CUDA_MOE_CACHE_MIN_CC=%d turns it on, untested)\n",
+                        physical, capability, session->config.min_compute_capability, capability);
                 return;
             }
 
@@ -7730,8 +7731,8 @@ static __device__ __forceinline__ unsigned long long moe_tl_clock() {
 static __device__ __forceinline__ void moe_hosted_pause() {
 #if defined(GGML_USE_HIP)
     __builtin_amdgcn_s_sleep(127);
-#else
-    __nanosleep(2000);
+#elif __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+    __nanosleep(2000);   // sm_70 and later (as ggml_cuda_poll_pause): Pascal spins without a pause (#28)
 #endif
 }
 
