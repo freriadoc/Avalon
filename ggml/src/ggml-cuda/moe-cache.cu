@@ -577,7 +577,8 @@ struct moe_cache_device {
     // PIN, direct load (moe_cache_pin_load_direct): the expert ranges made anonymous memory filled from the files with
     // O_DIRECT before they are registered; each one's file and offset, to map it back if KFD refuses it
     bool pin_direct = false;
-    size_t pin_quota = SIZE_MAX;   // the bytes this card may register (moe-ram-budget.h, several cards that do not all fit)
+    size_t pin_quota = SIZE_MAX;   // the bytes this card may register (moe-ram-budget.h, several cards without an arena)
+    size_t arena_quota = SIZE_MAX; // the cap of this card's arena, its share of several cards' budget (moe-ram-budget.h)
     bool arena_off = false, pin_off = false;   // GGML_CUDA_MOE_ARENA_MB=auto's choice (moe_cache_build_pending)
     struct pin_file { uintptr_t start, end; std::string path; uint64_t offset; };
     std::vector<pin_file> pin_files;
@@ -3544,6 +3545,10 @@ static void moe_arena_open_files(moe_cache_device & device) {
 
 static void moe_cache_arena_create(moe_cache_device & device) {
     size_t want = moe_cache_arena_mb() == SIZE_MAX ? moe_cache_arena_auto_bytes() : moe_cache_arena_mb() << 20;
+    // several cards: this card's share of the session's budget, not the whole room (moe-ram-budget.h)
+    if (device.arena_quota != SIZE_MAX) {
+        want = std::min(want, device.arena_quota);
+    }
     if (want == 0 || device.arena_base) {
         return;
     }
@@ -3886,10 +3891,11 @@ static size_t moe_cache_env_mb(const char * name, size_t dflt) {
     return v ? (size_t) atoll(v) : dflt;
 }
 
-// whether this card's expert ranges are registered in place (all, or its quota of the session's budget) or go to the
-// arena (moe-ram-budget.h): one card, every range when they fit both the arena's room (moe_cache_arena_auto_bytes) and
-// KFD's limit for registered memory (RAM - RAM/64 - 1.5 GiB for all processes) less 1 GiB for the pinned buffers
-// allocated later; several cards, the budget decided once at the first card's decision. Sets device.pin_quota
+// whether this card's expert ranges are registered in place (all of them) or go to the arena (moe-ram-budget.h): one
+// card, every range when they fit both the arena's room (moe_cache_arena_auto_bytes) and KFD's limit for registered
+// memory (RAM - RAM/64 - 1.5 GiB for all processes) less 1 GiB for the pinned buffers allocated later; several cards,
+// the budget decided once at the first card's decision, this card's arena capped at its share (device.arena_quota; the
+// share registered in place when the arena cannot be created, device.pin_quota)
 
 // the experts' host RAM, decided once for all the cards of the process (moe-ram-budget.h): one plan for every session,
 // as each stage of a pipeline over several GPUs has a session of its own (a plan per session decided again at the second
@@ -3950,7 +3956,8 @@ static moe_ram_mode moe_cache_experts_fit(moe_cache_session & session, moe_cache
     } else if (g_experts_all_in_ram.load() != 0) {
         g_experts_all_in_ram = 1;   // a card of several that registers its share keeps the others' 0
     }
-    device.pin_quota = c.mode == MOE_RAM_PIN_PART ? c.quota : SIZE_MAX;
+    device.pin_quota = SIZE_MAX;   // the arena's fallback sets it (moe_cache_build_pending)
+    device.arena_quota = c.mode == MOE_RAM_ARENA && plan.n_devices > 1 && plan.total != 0 ? c.quota : SIZE_MAX;
     if (plan.n_devices <= 1 || plan.total == 0) {
         const size_t room = room_raw == SIZE_MAX ? 0 : (room_raw > reserve_one ? room_raw - reserve_one : 0);
         MOE_CACHE_LOG("[moe-cache] CUDA%d experts: %zu MiB, room %zu MiB, KFD limit ~%zu MiB: %s\n", device.physical,
@@ -3960,12 +3967,12 @@ static moe_ram_mode moe_cache_experts_fit(moe_cache_session & session, moe_cache
             MOE_CACHE_LOG("[moe-cache] host RAM for the experts of %d cards: %zu MiB in all, room %zu MiB, reserve %zu MiB, "
                     "KFD limit ~%zu MiB: budget %zu MiB, %s\n", plan.n_devices, plan.total >> 20,
                     plan.room >> 20, reserve_multi >> 20, kfd >> 20, plan.budget >> 20,
-                    plan.all_fit ? "every card registers all its experts" : "each card registers its share");
+                    plan.all_fit ? "every card registers all its experts" : "each card an arena of its share");
         }
         MOE_CACHE_LOG("[moe-cache] CUDA%d experts: %zu MiB, room %zu MiB (session budget %zu MiB, %zu taken): %s %zu MiB, "
                 "read with O_DIRECT%s\n", device.physical, bytes >> 20, plan.room >> 20, plan.budget >> 20, plan.used >> 20,
-                c.mode == MOE_RAM_PIN_ALL ? "registered in place" : "its share registered in place,", c.quota >> 20,
-                c.mode == MOE_RAM_PIN_ALL ? "" : ", the rest left in the page cache");
+                c.mode == MOE_RAM_PIN_ALL ? "registered in place" : (c.mode == MOE_RAM_ARENA ? "arena of" : "its share registered in place,"),
+                c.quota >> 20, c.mode == MOE_RAM_PIN_ALL ? "" : (c.mode == MOE_RAM_ARENA ? " slots" : ", the rest left in the page cache"));
     }
     return c.mode;
 }
@@ -4033,6 +4040,14 @@ static void moe_cache_build_pending(
         }
         if (!device.arena_off) {
             moe_cache_arena_create(device);
+            // several cards, the arena this card's share of the budget: not created (no model file opened with
+            // O_DIRECT), the share registered in place instead, the rest left in the page cache
+            if (device.arena_quota != SIZE_MAX && device.arenas.empty()) {
+                MOE_CACHE_LOG("[moe-cache] CUDA%d arena: none, its share registered in place\n", device.physical);
+                device.pin_quota = device.arena_quota;
+                device.arena_off = true;
+                device.pin_off = false;
+            }
         }
         if (!device.pin_off) {
             moe_cache_pin_experts(session, device);

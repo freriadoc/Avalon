@@ -10,10 +10,11 @@
 // Several cards (pipeline stages or layers split by card; each card holds its own layers' experts, disjoint): the room
 // is measured once, at the first card's decision, before any card took its share, and frozen; the budget is that room
 // less a reserve for what is allocated after the decision (see moe_ram_reserve_bytes), and less 1 GiB under KFD's limit.
-// When the session's experts fit the budget, every card registers all of its own (as before); else each card registers
-// its share of the budget (by its experts' bytes), never more than what the budget still has, and leaves the rest of its
-// experts in the page cache (mapped, not registered: fills copied through the staging buffer, a prefill reads them from
-// the mapping). Never the arena because of several cards.
+// When the session's experts fit the budget, every card registers all of its own (as before); else the arena of each
+// card, capped at its share of the budget: the arena's O_DIRECT readers serve a prefill's missing experts from RAM,
+// while the page cache, mapped and unregistered, page-faults a whole tensor's experts in at the disk's rate (minutes
+// a ubatch on a machine whose RAM holds a small part of them). The arena not possible (no model file opened with
+// O_DIRECT), the share registered in place and the rest left in the page cache, as before.
 //
 // Host only: tests/rambudgettest.cpp exercises it with ASan + UBSan.
 
@@ -24,12 +25,12 @@
 enum moe_ram_mode {
     MOE_RAM_PIN_ALL  = 0,   // every expert range registered in place
     MOE_RAM_ARENA    = 1,   // the arena (one card that does not fit)
-    MOE_RAM_PIN_PART = 2,   // several cards that do not all fit: quota bytes registered, the rest left in the page cache
+    MOE_RAM_PIN_PART = 2,   // several cards that do not all fit and have no arena: quota bytes registered, the rest left in the page cache
 };
 
 struct moe_ram_choice {
     moe_ram_mode mode;
-    size_t quota;   // bytes this card may register (PIN_PART), its experts' bytes otherwise
+    size_t quota;   // bytes this card may register (PIN_ALL, PIN_PART), its arena's cap (ARENA of several cards)
 };
 
 // the session's part, set once
@@ -90,7 +91,7 @@ static inline moe_ram_choice moe_ram_choose(moe_ram_plan & plan, size_t bytes, s
     }
     quota = std::min(quota, left);
     plan.used += quota;
-    return { quota >= bytes ? MOE_RAM_PIN_ALL : MOE_RAM_PIN_PART, quota };
+    return { quota >= bytes ? MOE_RAM_PIN_ALL : MOE_RAM_ARENA, quota };
 }
 
 // the ranges a card registers under its quota (sorted, merged, page-aligned): the first ones in address order (the

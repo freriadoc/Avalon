@@ -1061,7 +1061,7 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
 // hipMemcpy2DAsync copies zeros from a memory-mapped file on Windows: one copy per row there
 static cudaError_t ggml_cuda_memcpy_2d_h2d_async(void * dst, size_t dpitch, const void * src, size_t spitch,
         size_t width, size_t height, cudaStream_t stream) {
-#if defined(GGML_USE_HIP) && defined(_WIN32)
+#if defined(GGML_USE_HIP)
     for (size_t i = 0; i < height; i++) {
         const cudaError_t err = cudaMemcpyAsync((char *) dst + i*dpitch, (const char *) src + i*spitch, width, cudaMemcpyHostToDevice, stream);
         if (err != cudaSuccess) {
@@ -1124,7 +1124,39 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
 #ifdef GGML_CUDA_NO_PEER_COPY
             return false;
 #else
-            CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(src), cudaStreamPerThread));
+            // the runtime's peer copy stages through host memory on the SDMA ring, whose one command
+            // lane a prefill's expert fills can hold for good (Avalon issue #1, with and without
+            // GGML_CUDA_P2P): two plain DMAs through pinned host memory instead, each on its device's
+            // per-thread stream, which holds no graph whose hosted blocks wait for this thread
+            static std::mutex mu;
+            static void * host = nullptr;
+            static size_t host_bytes = 0;
+            const size_t nbytes = ggml_nbytes(src);
+            std::lock_guard<std::mutex> lock(mu);
+            if (host_bytes < nbytes) {
+                if (host) {
+                    (void) cudaFreeHost(host);
+                    host = nullptr;
+                    host_bytes = 0;
+                }
+                cudaError_t err = nbytes <= (size_t) 1 << 30 ? cudaMallocHost(&host, nbytes) : cudaErrorMemoryAllocation;
+                if (err == cudaSuccess) {
+                    host_bytes = nbytes;
+                } else {
+                    (void) cudaGetLastError();
+                    host = nullptr;
+                }
+            }
+            if (!host) {
+                return false;
+            }
+            ggml_cuda_set_device(src_ctx->device);
+            CUDA_CHECK(cudaMemcpyAsync(host, src->data, nbytes, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+            CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+            ggml_cuda_set_device(dst_ctx->device);
+            CUDA_CHECK(cudaMemcpyAsync(dst->data, host, nbytes, cudaMemcpyHostToDevice, cudaStreamPerThread));
+            CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+            return true;
 #endif
         }
         CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -3439,6 +3471,148 @@ static bool ggml_cuda_host_copy_by_kernel(void * dst, const void * src, size_t s
     CUDA_CHECK(cudaGetLastError());
     return true;
 }
+static __global__ void k_ggml_cuda_host_copy_rows(const char * __restrict__ src, char * __restrict__ dst,
+                                                  size_t width, size_t dpitch, size_t rows) {
+    const size_t n = rows * width;
+    const size_t stride = (size_t) gridDim.x * blockDim.x;
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+        const size_t r = i / width;
+        dst[r * dpitch + (i - r * width)] = src[i];
+    }
+}
+
+static bool ggml_cuda_host_copy_rows_by_kernel(char * dst, size_t dpitch, const void * src, size_t spitch,
+                                               size_t width, size_t height, cudaStream_t stream) {
+    if (width * height <= ggml_cuda_host_copy_kernel_min) {
+        return false;
+    }
+    void * dev = ggml_cuda_pinned_device_ptr(src);
+    if (!dev) {
+        return false;
+    }
+    const bool flat = height <= 1 || (dpitch == width && spitch == width);
+    if (flat) {
+        k_ggml_cuda_host_copy<<<ggml_cuda_host_copy_kernel_blocks, 256, 0, stream>>>(
+            (const char *) dev, dst, width * height);
+    } else {
+        k_ggml_cuda_host_copy_rows<<<ggml_cuda_host_copy_kernel_blocks, 256, 0, stream>>>(
+            (const char *) dev, dst, width, dpitch, height);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+// host memory the runtime does not know, or knows without a device address: pageable
+static bool ggml_cuda_host_ptr_pageable(const void * p) {
+    hipPointerAttribute_t attr;
+    if (hipPointerGetAttributes(&attr, p) != hipSuccess) {
+        (void) hipGetLastError();
+        return true; // plain host memory (the model file's mapping)
+    }
+    return attr.type != hipMemoryTypeDevice && !attr.devicePointer;
+}
+
+// A pageable host source cannot go to hipMemcpyAsync either: ROCm stages such a copy through
+// internal pinned buffers, each chunk waiting for its SDMA completion on the one command ring the
+// process shares, and a ring held back by other work never lets it finish (a prefill's experts
+// copied from the model file's mapping, multi-card: most experts mapped, not registered, froze
+// there for good). The CPU fills a pinned bounce buffer, a kernel moves it: the compute engine,
+// never the ring. A slot is free for reuse once its kernel ends, an event on the stream right
+// after it; the event is polled through ggml_cuda_moe_hosted_wait, which serves the stream's
+// hosted MoE blocks meanwhile (they wait for this thread, and would otherwise hold the kernel,
+// and with it every copy after it, back for good)
+static constexpr size_t ggml_cuda_host_bounce_bytes = 16 << 20;
+static constexpr int    ggml_cuda_host_bounce_slots = 4;
+struct ggml_cuda_host_bounce {
+    char *     host = nullptr; // the slots, pinned
+    void *     dev = nullptr;  // the same, as the device sees it
+    cudaEvent_t done[ggml_cuda_host_bounce_slots] = {};
+    cudaStream_t stream = nullptr; // the kernels' own: never a graph, so a slot's event tracks its kernel alone
+    std::mutex mu;
+    int next = 0; // the slot the next copy takes, round-robin
+};
+static ggml_cuda_host_bounce g_host_bounce[GGML_CUDA_MAX_DEVICES];
+
+static void ggml_cuda_host_bounce_wait(cudaEvent_t event) {
+    if (!ggml_cuda_moe_hosted_wait(nullptr, event, -1)) {
+        CUDA_CHECK(cudaEventSynchronize(event));
+    }
+}
+
+// copies rows of 'width' bytes (strided in src and dst) from pageable host memory; true when done.
+// Small copies stay with cudaMemcpyAsync, whose staged path returns
+static bool ggml_cuda_host_copy_bounce(char * dst, size_t dpitch, const char * src, size_t spitch,
+                                       size_t width, size_t height, cudaStream_t stream) {
+    if (width == 0 || height == 0 || width * height <= ggml_cuda_host_copy_kernel_min ||
+        !ggml_cuda_host_ptr_pageable(src)) {
+        return false;
+    }
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
+        return false;
+    }
+    ggml_cuda_host_bounce & b = g_host_bounce[device];
+    std::lock_guard<std::mutex> lock(b.mu);
+    if (!b.host) {
+        const size_t bytes = (size_t) ggml_cuda_host_bounce_slots * ggml_cuda_host_bounce_bytes;
+        if (hipHostMalloc((void **) &b.host, bytes, hipHostMallocPortable | hipHostMallocCoherent) != hipSuccess ||
+            !b.host || !(b.dev = ggml_cuda_pinned_device_ptr(b.host))) {
+            (void) hipGetLastError();
+            b.host = nullptr;
+            return false;
+        }
+        for (int i = 0; i < ggml_cuda_host_bounce_slots; ++i) {
+            if (cudaEventCreateWithFlags(&b.done[i], cudaEventDisableTiming) != cudaSuccess) {
+                (void) cudaGetLastError();
+                for (int j = 0; j < i; ++j) {
+                    (void) cudaEventDestroy(b.done[j]);
+                    b.done[j] = nullptr;
+                }
+                b.host = nullptr;
+                return false;
+            }
+        }
+        if (hipStreamCreate(&b.stream) != hipSuccess) {
+            (void) cudaGetLastError();
+            for (int i = 0; i < ggml_cuda_host_bounce_slots; ++i) {
+                (void) cudaEventDestroy(b.done[i]);
+                b.done[i] = nullptr;
+            }
+            b.host = nullptr;
+            return false;
+        }
+    }
+    const bool flat = height <= 1 || (dpitch == width && spitch == width);
+    const size_t total = flat ? width * height : 0;
+    for (size_t off = 0; flat ? off < total : off < height; ) {
+        const int slot = b.next;
+        b.next = (b.next + 1) % ggml_cuda_host_bounce_slots;
+        ggml_cuda_host_bounce_wait(b.done[slot]);
+        char * s = (char *) b.dev + (size_t) slot * ggml_cuda_host_bounce_bytes;
+        char * d = flat ? dst + off : dst + off * dpitch;
+        size_t n = 0, rows = 0;
+        if (flat) {
+            n = std::min(total - off, ggml_cuda_host_bounce_bytes);
+            memcpy(b.host + (size_t) slot * ggml_cuda_host_bounce_bytes, src + off, n);
+            k_ggml_cuda_host_copy<<<ggml_cuda_host_copy_kernel_blocks, 256, 0, b.stream>>>((const char *) s, d, n);
+        } else {
+            rows = std::min(height - off, std::max<size_t>(1, ggml_cuda_host_bounce_bytes / width));
+            for (size_t i = 0; i < rows; i++) {
+                memcpy(b.host + (size_t) slot * ggml_cuda_host_bounce_bytes + i * width,
+                       src + (off + i) * spitch, width);
+            }
+            k_ggml_cuda_host_copy_rows<<<ggml_cuda_host_copy_kernel_blocks, 256, 0, b.stream>>>(
+                (const char *) s, d, width, dpitch, rows);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaEventRecord(b.done[slot], b.stream));
+        // the caller's stream: its consumers (a graph, a prefetch slot's ready event) read the copy
+        CUDA_CHECK(cudaStreamWaitEvent(stream, b.done[slot], 0));
+        off += flat ? ggml_cuda_host_bounce_bytes : rows;
+    }
+    return true;
+}
 #endif
 
 // The scheduler's small inputs from pinned host memory (ggml_backend_cuda_host_buffer_type, mapped at the same address
@@ -3502,8 +3676,10 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
 #if defined(GGML_USE_HIP)
-    if (cuda_ctx->split_wait_queued &&
-        ggml_cuda_host_copy_by_kernel((char *) tensor->data + offset, data, size, false, cuda_ctx->stream())) {
+    ggml_cuda_set_device(cuda_ctx->device);   // the kernel paths launch on this device's stream
+    if (ggml_cuda_host_copy_by_kernel((char *) tensor->data + offset, data, size, false, cuda_ctx->stream()) ||
+        ggml_cuda_host_copy_bounce((char *) tensor->data + offset, 0, (const char *) data, 0, size, 1,
+                                   cuda_ctx->stream())) {
         return;
     }
 #endif
@@ -3532,6 +3708,15 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+#if defined(GGML_USE_HIP)
+    ggml_cuda_set_device(cuda_ctx->device);   // the kernel paths launch on this device's stream
+    if (ggml_cuda_host_copy_rows_by_kernel((char *) tensor->data + offset, stride_tensor, data, stride_data,
+                                           size, n_copies, cuda_ctx->stream()) ||
+        ggml_cuda_host_copy_bounce((char *) tensor->data + offset, stride_tensor, (const char *) data, stride_data,
+                                   size, n_copies, cuda_ctx->stream())) {
+        return;
+    }
+#endif
     CUDA_CHECK(ggml_cuda_memcpy_2d_h2d_async(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cuda_ctx->stream()));
 }

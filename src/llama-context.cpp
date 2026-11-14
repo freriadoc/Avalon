@@ -2559,7 +2559,8 @@ bool llama_context::stage_step(ggml_tensor * out, uint32_t & n_tokens) {
     kv_rows_ahead = 0;
     if (!res) {
         LLAMA_LOG_ERROR("%s: the first stage failed (status %d)\n", __func__, (int) status);
-        stage_more = false;
+        // stage_more stays set: a failure is not a clean end, and its caller reports one as failed
+        // (stage_first_step) instead of the pipeline's batches simply ending
         return false;
     }
     stage_more = stage_mctx->next();

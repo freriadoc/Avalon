@@ -1,7 +1,8 @@
 // Bench of the experts' host RAM decision (ggml/src/ggml-cuda/moe-ram-budget.h): the measured cases (2 x RTX 5060 Ti in
 // a cgroup of 61 648 MiB, 7 Nov.), then random sessions. Invariants: one card (or an unknown total) decides exactly as
-// before; several cards never take the arena; the quotas never exceed the budget; when the session fits, every card
-// registers all its experts; the ranges kept by moe_ram_select stay within the quota.
+// before; several cards that do not all fit take the arena, each capped at its share of the budget; the caps never
+// exceed the budget; when the session fits, every card registers all its experts; the ranges kept by moe_ram_select
+// stay within the quota.
 // c++ -std=c++17 -O1 -g -fsanitize=address,undefined -I ggml/src/ggml-cuda tests/rambudgettest.cpp -o rambudgettest && ./rambudgettest
 
 #include "moe-ram-budget.h"
@@ -42,14 +43,17 @@ static std::vector<moe_ram_choice> run(const char * name, const std::vector<size
     for (size_t b : cards) {
         const moe_ram_choice c = moe_ram_choose(plan, b, room, kfd, reserve_one, reserve_multi);
         out.push_back(c);
-        const size_t taken = c.mode == MOE_RAM_ARENA ? 0 : std::min(c.quota, b);
-        sum += c.mode == MOE_RAM_ARENA ? 0 : c.quota;
+        const bool multi = cards.size() > 1 && known_total;
+        const size_t taken = c.mode == MOE_RAM_ARENA && !multi ? 0 : std::min(c.quota, b);
+        sum += c.mode == MOE_RAM_ARENA && !multi ? 0 : c.quota;
         room = room == SIZE_MAX ? room : (room > taken ? room - taken : 0);
         if (cards.size() <= 1 || !known_total) {
             CHECK((c.mode == MOE_RAM_PIN_ALL) == legacy_fit(b, room + taken, kfd, 4 * 1024 * MiB));
             CHECK(c.mode != MOE_RAM_PIN_PART);
         } else {
-            CHECK(c.mode != MOE_RAM_ARENA);
+            if (!plan.all_fit) {
+                CHECK(c.mode == MOE_RAM_ARENA);
+            }
             CHECK(c.quota <= b || c.mode == MOE_RAM_PIN_ALL);
             CHECK(sum <= plan.budget || plan.all_fit);
             if (plan.all_fit) {
@@ -84,13 +88,13 @@ int main(int argc, char ** argv) {
     // the pod: 2 cards, 27 728 + 22 015 MiB, room 60 168 MiB at the first decision (56 072 + the 4 GiB margin); killed
     // before with everything registered
     auto pod = run("2 cards in 60 GiB (the pod)", {27728 * MiB, 22015 * MiB}, 60168 * MiB, kfd_pod);
-    CHECK(pod[0].mode == MOE_RAM_PIN_PART && pod[1].mode == MOE_RAM_PIN_PART);
+    CHECK(pod[0].mode == MOE_RAM_ARENA && pod[1].mode == MOE_RAM_ARENA);
     CHECK(pod[0].quota + pod[1].quota <= 60168 * MiB - (10240 + 3072) * MiB);
-    printf("  pod: %zu MiB registered, %zu MiB left in the page cache\n", (pod[0].quota + pod[1].quota) / MiB,
+    printf("  pod: %zu MiB of arenas, %zu MiB left to the page cache\n", (pod[0].quota + pod[1].quota) / MiB,
            (27728 + 22015) * MiB / MiB - (pod[0].quota + pod[1].quota) / MiB);
     // three cards
     auto three = run("3 cards in 60 GiB", {17000 * MiB, 16000 * MiB, 16743 * MiB}, 60168 * MiB, kfd_pod);
-    for (auto & c : three) CHECK(c.mode == MOE_RAM_PIN_PART);
+    for (auto & c : three) CHECK(c.mode == MOE_RAM_ARENA);
     auto three_ok = run("3 cards in 120 GiB", {17000 * MiB, 16000 * MiB, 16743 * MiB}, 120000 * MiB, kfd_pod);
     for (auto & c : three_ok) CHECK(c.mode == MOE_RAM_PIN_ALL);
     // no cgroup, no MemAvailable (room unknown): one card the arena as before (room 0), several cards nothing registered
@@ -102,7 +106,7 @@ int main(int argc, char ** argv) {
     // KFD's limit binds (ROCm, 2 cards): RAM 50 GiB -> limit 50 - 0.78 - 1.5
     const size_t ram = 50 * GiB, kfd64 = ram - ram / 64 - 3 * (GiB / 2);
     auto kfd2 = run("2 cards, KFD limit binds", {27728 * MiB, 22015 * MiB}, 90 * GiB, kfd64);
-    CHECK(kfd2[0].mode == MOE_RAM_PIN_PART && kfd2[0].quota + kfd2[1].quota <= kfd64 - GiB);
+    CHECK(kfd2[0].mode == MOE_RAM_ARENA && kfd2[0].quota + kfd2[1].quota <= kfd64 - GiB);
     // the total unknown (an old caller): the rule of before per card
     run("2 cards, total unknown (legacy)", {27728 * MiB, 22015 * MiB}, 60168 * MiB, kfd_pod, false);
 
@@ -144,7 +148,7 @@ int main(int argc, char ** argv) {
                 CHECK((c.mode == MOE_RAM_PIN_ALL) == legacy_fit(b[i], room, kfd, 4096 * MiB));
                 CHECK(c.mode != MOE_RAM_PIN_PART && c.quota == b[i]);
             } else {
-                CHECK(c.mode != MOE_RAM_ARENA);
+                CHECK(c.mode != MOE_RAM_PIN_PART);
                 sum += c.quota;
                 CHECK(sum <= plan.budget);
                 CHECK(plan.all_fit == (total <= plan.budget));
