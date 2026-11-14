@@ -9,10 +9,22 @@ void ggml_sycl_op_out_prod(ggml_backend_sycl_context& ctx, ggml_tensor* dst) {
     GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_Q1_0);
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
-    GGML_ASSERT(ggml_is_contiguous(src0));
+
     GGML_ASSERT(ggml_is_contiguous(dst));
 
     GGML_TENSOR_BINARY_OP_LOCALS
+
+    if (src0->type == GGML_TYPE_F32) {
+        // GEMM requires contiguous elements within each column.
+        GGML_ASSERT(nb00 == sizeof(float));
+
+        // Column stride must be a valid GEMM leading dimension.
+        GGML_ASSERT(nb01 % sizeof(float) == 0);
+        GGML_ASSERT(nb01 / sizeof(float) >= ne00);
+    } else {
+        // Current Q1_0 conversion assumes contiguous input.
+        GGML_ASSERT(ggml_is_contiguous(src0));
+    }
 
     // Get SYCL queue
     dpct::queue_ptr stream = ctx.stream();
@@ -71,9 +83,11 @@ void ggml_sycl_op_out_prod(ggml_backend_sycl_context& ctx, ggml_tensor* dst) {
                 float * dst_plane = (float *) ((char *) dst_d + i2 * nb2 + i3 * nb3);
 
                 // Perform matrix multiplication using oneMKL GEMM
-                oneapi::mkl::blas::column_major::gemm(*stream, oneapi::mkl::transpose::nontrans, src1_op,
-                                                      ne0, ne1, ne01, alpha, src0_plane, ne00,
-                                                      src1_plane, ldb, beta, dst_plane, ne0);
+                const int64_t lda = src0->type == GGML_TYPE_Q1_0 ? ne00 : nb01 / sizeof(float);
+
+                oneapi::mkl::blas::column_major::gemm(*stream, oneapi::mkl::transpose::nontrans, src1_op, ne0, ne1,
+                                                      ne01, alpha, src0_plane, lda, src1_plane, ldb, beta, dst_plane,
+                                                      ne0);
             }
         }
     } catch (sycl::exception const& exc) {
