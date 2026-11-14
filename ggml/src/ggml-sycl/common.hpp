@@ -883,8 +883,11 @@ static __dpct_inline__ float get_alibi_slope(const float    max_bias,
     return dpct::pow(base, exph);
 }
 
-static const sycl::uint3 init_fastdiv_values(uint32_t d) {
-    GGML_ASSERT(d != 0);
+static const sycl::uint3 init_fastdiv_values(uint64_t d_64) {
+    GGML_ASSERT(d_64 != 0);
+    GGML_ASSERT(d_64 <= std::numeric_limits<uint32_t>::max());
+
+    const uint32_t d = (uint32_t) d_64;
 
     uint32_t L = 0;
     while (L < 32 && (uint32_t{ 1 } << L) < d) {
