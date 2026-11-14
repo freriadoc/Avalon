@@ -55,6 +55,13 @@ void ggml_cuda_moe_split_capture_end(int device, const void * owner);
 void ggml_cuda_moe_split_graph_launch(int device, const void * owner);
 // a hosted MoE block exists (its kernels may wait for the host)
 bool ggml_cuda_moe_hosted_active();   // cudaStream_t, cudaEvent_t, the stream's device
+#if defined(GGML_USE_HIP)
+// a copy from pageable host memory by a kernel through a pinned bounce buffer (the compute engine, never
+// the SDMA ring's staging, whose one lane a prefill's expert copies can hold for good): false when the
+// copy stayed with cudaMemcpyAsync (small, or the source pinned)
+bool ggml_cuda_host_copy_bounce(char * dst, size_t dpitch, const char * src, size_t spitch,
+                                size_t width, size_t height, void * stream);
+#endif
 
 // Prefill: the table of expert addresses of a prefetched MUL_MAT_ID weight (one per expert: its entry in the cache,
 // or its place in the prefetch slot), registered by the scheduler for the duration of its split; nullptr otherwise.
