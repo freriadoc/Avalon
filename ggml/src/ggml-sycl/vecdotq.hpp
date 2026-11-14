@@ -400,6 +400,10 @@ template <> struct reorder_vec_dot_shared_activations<GGML_TYPE_Q5_K> {
     static constexpr bool value = true;
 };
 
+template <> struct reorder_vec_dot_shared_activations<GGML_TYPE_Q6_K> {
+    static constexpr bool value = true;
+};
+
 template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q4_0> {
     static constexpr ggml_type gtype = GGML_TYPE_Q4_0;
 
@@ -782,40 +786,65 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q6_K> {
     using q6_k_block  = ggml_sycl_reordered::block_q_t<GGML_TYPE_Q6_K>;
     using q6_k_traits = typename q6_k_block::traits;
 
-    __dpct_inline__ float vec_dot_q6_K_q8_1_impl_mmvq(const int vl, const int vh, const int * __restrict__ u,
-                                                      const int8_t * __restrict__ scales, const float d,
-                                                      const float * __restrict__ d8) {
+    struct weights {
+        int       vl;
+        int       vh;
+        int8_t    sc0;
+        int8_t    sc1;
+        ggml_half d;
+    };
+
+    struct activations {
+        int   u0;
+        int   u1;
+        float d80;
+        float d81;
+    };
+
+    __dpct_inline__ static weights load(const void * __restrict__ vbq, const std::pair<int, int> ibx_offset,
+                                        const std::pair<int, int> d_offset, const int & iqs) {
+        const uint8_t * base   = static_cast<const uint8_t *>(vbq);
+        const uint8_t * ql     = base + ibx_offset.first;
+        const uint8_t * qh     = base + ibx_offset.second;
+        const int8_t *  scales = reinterpret_cast<const int8_t *>(base + d_offset.first);
+        const ggml_half * d    = reinterpret_cast<const ggml_half *>(base + d_offset.second);
+
+        const int scale_offset = (QI6_K / 4) * (iqs / (QI6_K / 2)) +
+                                 (iqs % (QI6_K / 2)) / (QI6_K / 8);
+        const int vh_shift = 2 * ((iqs % (QI6_K / 2)) / (QI6_K / 4));
+
+        weights w;
+        w.vl  = get_int_from_uint8(ql, iqs);
+        w.vh  = get_int_from_uint8(qh, (QI6_K / 4) * (iqs / (QI6_K / 2)) +
+                                       iqs % (QI6_K / 4)) >> vh_shift;
+        w.sc0 = scales[scale_offset + 0];
+        w.sc1 = scales[scale_offset + 4];
+        w.d   = *d;
+        return w;
+    }
+
+    __dpct_inline__ static activations load_activations(const int8_t * q8_1_quant_ptr,
+                                                        const sycl::half2 * q8_1_ds, const int & iqs) {
+        const int bq8_offset = 2 * QR6_K * (iqs / (QI6_K / 2)) +
+                               (iqs % (QI6_K / 2)) / (QI6_K / 4);
+        activations a;
+        a.u0  = get_int_from_int8_aligned(q8_1_quant_ptr + bq8_offset * QK8_1, iqs % QI8_1);
+        a.u1  = get_int_from_int8_aligned(q8_1_quant_ptr + (bq8_offset + 2) * QK8_1, iqs % QI8_1);
+        a.d80 = (*(q8_1_ds + bq8_offset + 0))[0];
+        a.d81 = (*(q8_1_ds + bq8_offset + 2))[0];
+        return a;
+    }
+
+    __dpct_inline__ static float apply(const weights & w, const activations & a) {
         return vec_dot_q6_K_q8_1_impl_mmvq_scalar(
-            vl, vh, u[0], u[1], scales[0], scales[4], d, d8[0], d8[1]);
+            w.vl, w.vh, a.u0, a.u1, w.sc0, w.sc1, w.d, a.d80, a.d81);
     }
 
     __dpct_inline__ float operator()(const void * __restrict__ vbq, const std::pair<int, int> ibx_offset,
-                     const std::pair<int, int> d_offset, const int8_t * q8_1_quant_ptr, const sycl::half2 * q8_1_ds,
-                     const int iqs) {
-        const uint8_t *   base   = static_cast<const uint8_t *>(vbq);
-        const uint8_t *   ql     = base + ibx_offset.first;
-        const uint8_t *   qh     = base + ibx_offset.second;
-        const int8_t *    scales = reinterpret_cast<const int8_t *>(base + d_offset.first);
-        const ggml_half * d      = (const ggml_half *) (base + d_offset.second);
-
-        const int bq8_offset   = 2 * QR6_K * (iqs / (QI6_K / 2)) + (iqs % (QI6_K / 2)) / (QI6_K / 4);
-        const int scale_offset = (QI6_K / 4) * (iqs / (QI6_K / 2)) + (iqs % (QI6_K / 2)) / (QI6_K / 8);
-        const int vh_shift     = 2 * ((iqs % (QI6_K / 2)) / (QI6_K / 4));
-
-        const int vl = get_int_from_uint8(ql, iqs);
-        const int vh = get_int_from_uint8(qh, (QI6_K / 4) * (iqs / (QI6_K / 2)) + iqs % (QI6_K / 4)) >> vh_shift;
-
-        const int8_t * scs = scales + scale_offset;
-
-        const int u0 = get_int_from_int8_aligned(
-            q8_1_quant_ptr + bq8_offset * QK8_1, iqs % QI8_1);
-        const int u1 = get_int_from_int8_aligned(
-            q8_1_quant_ptr + (bq8_offset + 2) * QK8_1, iqs % QI8_1);
-        const float d80 = (*(q8_1_ds + bq8_offset + 0))[0];
-        const float d81 = (*(q8_1_ds + bq8_offset + 2))[0];
-
-        return vec_dot_q6_K_q8_1_impl_mmvq_scalar(
-            vl, vh, u0, u1, scs[0], scs[4], *d, d80, d81);
+                                     const std::pair<int, int> d_offset, const int8_t * q8_1_quant_ptr,
+                                     const sycl::half2 * q8_1_ds, const int iqs) {
+        return apply(load(vbq, ibx_offset, d_offset, iqs),
+                     load_activations(q8_1_quant_ptr, q8_1_ds, iqs));
     }
 };
 
