@@ -1295,6 +1295,34 @@ ESIMD_INLINE void xmx_mul_mat(const void * vx,
     }
 }
 
+// The kernel properties (including GRF size) are embedded in the functor type.
+// oneAPI 2026.2 deprecates passing these properties directly to handler::parallel_for.
+template <typename T, int NC, int KS_MAX, bool FUSED>
+struct xmx_mul_mat_kernel {
+    const void * vx;
+    const void * vg;
+    const char * vy;
+    float *      dst;
+    int          ncols;
+    int          nrows;
+    int          ncv;
+    int          stride_y_bytes;
+    int          ldd;
+    int          glu_op;
+    int          ks;
+
+    [[intel::sycl_explicit_simd]] void operator()(sycl::nd_item<1> it) const {
+        xmx_mul_mat<T, NC, KS_MAX, FUSED>(vx, vg, vy, dst, ncols, nrows, ncv, stride_y_bytes, ldd,
+                                          glu_op, (int) it.get_group(0), (int) it.get_local_id(0), ks);
+    }
+
+    auto get(sycl::ext::oneapi::experimental::properties_tag) const {
+        return sycl::ext::oneapi::experimental::properties{
+            sycl::ext::intel::experimental::grf_size<xmx_grf<T, NC, FUSED>()>
+        };
+    }
+};
+
 // KS_MAX bounds the threads that split K for one tile, the launch uses as few as keep every thread to the same
 // number of super-blocks as the busiest one
 template <typename T, int NC, int KS_MAX, bool FUSED>
@@ -1315,14 +1343,11 @@ static void xmx_mul_mat_launch_ks(const void *    vx,
     const int    rounds  = (bpr + KS_MAX - 1) / KS_MAX;
     const int    ks      = (bpr + rounds - 1) / rounds;
     stream->submit([&](sycl::handler & cgh) {
-        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(n_tiles * ks), sycl::range<1>(ks)),
-                         sycl::ext::oneapi::experimental::properties{
-                             sycl::ext::intel::experimental::grf_size<xmx_grf<T, NC, FUSED>()> },
-                         [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
-                             xmx_mul_mat<T, NC, KS_MAX, FUSED>(vx, vg, vy, dst, ncols, nrows, ncv, stride_y_bytes, ldd,
-                                                               glu_op, (int) it.get_group(0), (int) it.get_local_id(0),
-                                                               ks);
-                         });
+        cgh.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(n_tiles * ks), sycl::range<1>(ks)),
+            xmx_mul_mat_kernel<T, NC, KS_MAX, FUSED>{
+                vx, vg, vy, dst, ncols, nrows, ncv, stride_y_bytes, ldd, glu_op, ks
+            });
     });
 }
 
