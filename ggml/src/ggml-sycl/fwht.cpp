@@ -176,14 +176,14 @@ static void fwht_kernel_wide(const T * __restrict__ src,
         for (int j = 0; j < el_w; ++j) {
             smem[j * NT + tid] = reg[j];
         }
-        item.barrier(sycl::access::fence_space::local_space);
+        sycl::group_barrier(item.get_group());
 #pragma unroll
         for (int j = 0; j < el_w; ++j) {
             const float val  = reg[j];
             const float val2 = smem[j * NT + (tid ^ h)];
             reg[j]           = (tid & h) == 0 ? val + val2 : val2 - val;
         }
-        item.barrier(sycl::access::fence_space::local_space);
+        sycl::group_barrier(item.get_group());
     }
 
     // Butterflies across registers: h is a multiple of NT, so the partner of element

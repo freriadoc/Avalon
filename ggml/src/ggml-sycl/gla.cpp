@@ -35,11 +35,11 @@ static void gated_linear_attn_f32_kernel(const dpct::queue_ptr stream, u_int B, 
             for (u_int t = batch_i * n_seq_tokens * C + head_i * head_size + tid;
                  t < (batch_i + 1) * n_seq_tokens * C + head_i * head_size + tid; t += C) {
 
-                item.barrier(sycl::access::fence_space::local_space);  //sync threads
+                sycl::group_barrier(item.get_group());  //sync threads
                 _k[tid]  = k[t];
                 _r[tid]  = r[t];
                 _td[tid] = td[t];
-                item.barrier(sycl::access::fence_space::local_space);  //sync threads
+                sycl::group_barrier(item.get_group());  //sync threads
 
                 const float _v = v[t];
                 float       y  = 0;

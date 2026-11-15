@@ -29,7 +29,7 @@ static void cumsum_f32_kernel(
     if (tid == 0) {
         s_carry[0] = 0.0f;
     }
-    item.barrier(sycl::access::fence_space::local_space);
+    sycl::group_barrier(item.get_group());
 
     const int64_t i3 = item.get_group(0);
     const int64_t i2 = item.get_group(1);
@@ -64,7 +64,7 @@ static void cumsum_f32_kernel(
         if (lane == WARP_SIZE - 1) {
             s_warp_sums[warp] = val;
         }
-        item.barrier(sycl::access::fence_space::local_space);
+        sycl::group_barrier(item.get_group());
 
         if (warp == 0) {
             float w = (tid < warps_per_block) ? s_warp_sums[tid] : 0.0f;
@@ -76,7 +76,7 @@ static void cumsum_f32_kernel(
                 s_carry[1] = inc;
             }
         }
-        item.barrier(sycl::access::fence_space::local_space);
+        sycl::group_barrier(item.get_group());
 
         float carry = s_carry[0];
         float final_offset = s_vals[tid] + s_warp_sums[warp] + carry - temp[num_unroll - 1];
@@ -88,7 +88,7 @@ static void cumsum_f32_kernel(
             }
         }
 
-        item.barrier(sycl::access::fence_space::local_space);
+        sycl::group_barrier(item.get_group());
 
         if (tid == 0) {
             s_carry[0] += s_carry[1];

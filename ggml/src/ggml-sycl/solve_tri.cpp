@@ -41,7 +41,7 @@ static void solve_tri_f32_fast(const float * __restrict__ A,
         }
     }
 
-    item.barrier(sycl::access::fence_space::local_space);
+    sycl::group_barrier(item.get_group());
 
     float x_low  = (lane < n) ? B_batch[lane * k + col_idx] : 0.0f;
     float x_high = (WARP_SIZE + lane < n) ? B_batch[(WARP_SIZE + lane) * k + col_idx] : 0.0f;
@@ -117,7 +117,10 @@ inline void ggml_sycl_op_solve_tri(ggml_backend_sycl_context & ctx, ggml_tensor 
 
     GGML_ASSERT(ggml_is_contiguous(src0));
     GGML_ASSERT(ggml_is_contiguous(src1));
+    GGML_ASSERT(ggml_is_contiguous(dst));
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
 
     dpct::queue_ptr stream = ctx.stream();
     SYCL_CHECK(ggml_sycl_set_device(ctx.device));
