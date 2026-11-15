@@ -674,7 +674,7 @@ device_index: device index from 0 to n (continue numbers).
     It is used for device select/set in SYCL backend internal data structure.
 */
 inline void check_allow_gpu_index(const int device_index) {
-  if (device_index >= ggml_sycl_info().device_count) {
+  if (device_index < 0 || device_index >= ggml_sycl_info().device_count) {
     char error_buf[256];
     snprintf(
         error_buf,
@@ -855,11 +855,12 @@ catch (sycl::exception const &exc) {
 static bool ggml_sycl_buffer_init_staging(ggml_backend_sycl_buffer_context * ctx) {
     const int n_slots = g_ggml_sycl_upload_staging_slots;
     if (n_slots > 0 && ctx->staging.data == nullptr) {
-        ctx->staging.data = sycl::malloc_host(n_slots * ctx->staging_slot_size, *ctx->stream);
-        if (ctx->staging.data != nullptr) {
-            ctx->staging.events.resize(n_slots);
-            ctx->staging.submitted.assign(n_slots, false);
-        }
+        // Prepare bookkeeping first: if a vector allocation throws, no pinned
+        // allocation has been made and therefore cannot be leaked.
+        ctx->staging.events.resize(n_slots);
+        ctx->staging.submitted.assign(n_slots, false);
+        ctx->staging.data = sycl::malloc_host(
+            static_cast<size_t>(n_slots) * ctx->staging_slot_size, *ctx->stream);
     }
     return ctx->staging.data != nullptr;
 }
@@ -905,8 +906,14 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
     // Note: Use host buffer to save the data from mmap(), then copy to device. It's workaround for mmap() issue on PVC GPU.
     // This function will be called during load model from disk. Use memory buffer replace dynamic won't save more time and brings potential memory leak risk here.
     char * host_buf = (char *) malloc(size);
-    memcpy(host_buf, data, size);
-    SYCL_CHECK(CHECK_TRY_ERROR((*stream).memcpy((char *) tensor->data + offset, host_buf, size).wait()));
+    if (host_buf == nullptr && size != 0) {
+        GGML_LOG_ERROR("%s: can't allocate %zu Bytes of host staging memory\n", __func__, size);
+        GGML_ABORT("fatal error");
+    }
+    if (size != 0) {
+        memcpy(host_buf, data, size);
+        SYCL_CHECK(CHECK_TRY_ERROR((*stream).memcpy((char *) tensor->data + offset, host_buf, size).wait()));
+    }
     free(host_buf);
 #else
     SYCL_CHECK(CHECK_TRY_ERROR((*stream).memcpy((char *) tensor->data + offset, data, size).wait()));
@@ -926,6 +933,10 @@ static void ggml_backend_sycl_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_backend_sycl_buffer_context * ctx = (ggml_backend_sycl_buffer_context *) buffer->context;
     const char * src = (const char *) data;
     ggml_sycl_set_device(ctx->device);
+
+    if (size == 0 || n_copies == 0) {
+        return;
+    }
 
     if (stride_tensor != size || size > ctx->staging_slot_size || !ggml_sycl_buffer_init_staging(ctx)) {
         // dst rows not contiguous, row larger than a staging slot, or no staging: same as the generic fallback
@@ -2461,7 +2472,7 @@ k_argsort_f32_i32(const float *x, int *dst, const int ncols, int ncols_pad,
         dst_row[col] = col;
     }
 
-    item_ct1.barrier(sycl::access::fence_space::local_space);
+    sycl::group_barrier(item_ct1.get_group());
 
     for (int k = 2; k <= ncols_pad; k *= 2) {
         for (int j = k / 2; j > 0; j /= 2) {
@@ -2489,7 +2500,7 @@ k_argsort_f32_i32(const float *x, int *dst, const int ncols, int ncols_pad,
                         }
                     }
                 }
-                item_ct1.barrier(sycl::access::fence_space::local_space);
+                sycl::group_barrier(item_ct1.get_group());
             }
         }
     }
@@ -2754,11 +2765,14 @@ static void argsort_f32_i32_sycl(const float *x, int *dst, const int ncols,
     }
 
     int nth = 1;
-    int max_block_size = ggml_sycl_info().max_work_group_sizes[device];
-    while (nth < ncols_pad && nth < max_block_size)
+    const int max_block_size = ggml_sycl_info().max_work_group_sizes[device];
+    GGML_ASSERT(max_block_size >= 1);
+
+    // Bitonic sort requires a power-of-two work-group. Keep nth at the largest
+    // power of two that fits both the padded row and the device work-group limit.
+    while (nth < ncols_pad && nth <= max_block_size / 2) {
         nth *= 2;
-    if (nth > max_block_size)
-        nth = max_block_size;
+    }
 
     const int tasks_per_thread = ncols_pad / nth;
 
@@ -2863,7 +2877,7 @@ static void top_k_scan_merge_f32(
         }
     }
 
-    item_ct1.barrier(sycl::access::fence_space::local_space);
+    sycl::group_barrier(item_ct1.get_group());
 
     if (tid != 0) {
         return;
@@ -3104,7 +3118,7 @@ static void argmax_f32_i32_sycl(const float *x, int *dst, const int ncols,
 
                 shared_data[tid] = max_val;
                 shared_indices[tid] = max_idx;
-                item_ct1.barrier(sycl::access::fence_space::local_space);
+                sycl::group_barrier(item_ct1.get_group());
 
                 for (int stride = 256/2; stride > 0; stride >>= 1) {
                     if (tid < stride) {
@@ -3115,7 +3129,7 @@ static void argmax_f32_i32_sycl(const float *x, int *dst, const int ncols,
                             shared_indices[tid] = shared_indices[tid + stride];
                         }
                     }
-                    item_ct1.barrier(sycl::access::fence_space::local_space);
+                    sycl::group_barrier(item_ct1.get_group());
                 }
 
 

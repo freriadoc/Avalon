@@ -222,7 +222,9 @@ static void convert_mul_mat_vec_f16_sycl(const void *vx, const dfloat *y,
                                          float *dst, const int ncols,
                                          const int nrows,
                                          dpct::queue_ptr stream) {
-    GGML_ASSERT(ncols % GGML_SYCL_DMMV_X == 0);
+    // The qk=1 kernel iterates with stride 2*GGML_SYCL_DMMV_X and loads
+    // pairs of values per lane, so the final iteration must be complete.
+    GGML_ASSERT(ncols % (2*GGML_SYCL_DMMV_X) == 0);
     const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
     const sycl::range<3> block_nums(1, 1, block_num_y);
     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
@@ -1965,7 +1967,7 @@ ESIMD_INLINE void dequantize_mul_mat_vec_reorder_esimd(
 
     lmem[tid * 2 + 0] = reduce<float>(acc_a, std::plus<>{});
     lmem[tid * 2 + 1] = reduce<float>(acc_b, std::plus<>{});
-    it.barrier(sycl::access::fence_space::local_space);
+    sycl::group_barrier(it.get_group());
 
     if (tid == 0) {
         float sum_a = 0.0f;
@@ -2145,7 +2147,7 @@ ESIMD_INLINE void dequantize_mul_mat_vec_q8_0_reorder_esimd(
 
     lmem[tid * 2 + 0] = reduce<float>(acc_a, std::plus<>{});
     lmem[tid * 2 + 1] = reduce<float>(acc_b, std::plus<>{});
-    it.barrier(sycl::access::fence_space::local_space);
+    sycl::group_barrier(it.get_group());
 
     if (tid == 0) {
         float sum_a = 0.0f;

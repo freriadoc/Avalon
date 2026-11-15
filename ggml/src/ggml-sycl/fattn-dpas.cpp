@@ -286,7 +286,7 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int 
                     sL[tid] = sink ? 1.0f : 0.0f;
                     sA[tid] = 1.0f;
                 }
-                it.barrier(sycl::access::fence_space::local_space);
+                sycl::group_barrier(it.get_group());
 
                 const int    k_begin = split * p.chunk;
                 const int    k_end   = sycl::min(k_begin + p.chunk, p.ne11);
@@ -380,7 +380,7 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int 
                 for (int t0 = k_begin; t0 < k_end; t0 += TK) {
                     if constexpr (ST) {
                         stage(Kh, p.nb11, t0);
-                        it.barrier(sycl::access::fence_space::local_space);
+                        sycl::group_barrier(it.get_group());
                     }
                     prefetch_rows(Vh, p.nb21, t0);
 
@@ -444,7 +444,7 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int 
                             }
                         }
                     }
-                    it.barrier(sycl::access::fence_space::local_space);
+                    sycl::group_barrier(it.get_group());
                     if constexpr (ST) {
                         stage(Vh, p.nb21, t0); // the softmax does not use sKV
                     }
@@ -476,7 +476,7 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int 
                             sM[r] = m_new;
                         }
                     }
-                    it.barrier(sycl::access::fence_space::local_space);
+                    sycl::group_barrier(it.get_group());
 
                     prefetch_rows(Kh, p.nb11, t0 + TK);
 
@@ -527,7 +527,7 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int 
                             }
                         }
                     }
-                    it.barrier(sycl::access::fence_space::local_space);
+                    sycl::group_barrier(it.get_group());
                 }
 
 #pragma unroll

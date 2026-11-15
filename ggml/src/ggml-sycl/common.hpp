@@ -1144,7 +1144,7 @@ static T block_reduce(T val, T * shared_vals, int block_size_template) {
         if (lane_id == 0) {
             shared_vals[warp_id] = val;
         }
-        item_ct1.barrier(sycl::access::fence_space::local_space);
+        sycl::group_barrier(item_ct1.get_group());
 
         size_t nreduce = nwarps / WARP_SIZE;
         float tmp = 0.f;
