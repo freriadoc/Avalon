@@ -624,10 +624,11 @@ static void fattn_dpas_case(ggml_backend_sycl_context & ctx, ggml_tensor * dst) 
     p.nb31 = mask ? mask->nb[1] : 0;
     p.nb33 = mask ? mask->nb[3] : 0;
 
-    // split the keys so that all work-groups run in one wave
-    // SLM fits about 4 work-groups per Xe2 core with 16 rows, 2 with 32. Xe2 core = 8 EUs, nsm = EUs / 16.
+    // Split keys to expose enough work-groups to occupy the GPU. Larger query
+    // tiles use more SLM, so target fewer resident work-groups per Xe2 core.
+    // Xe2 core = 8 EUs, nsm = EUs / 16.
     const int xe_cores = std::max(1, ggml_sycl_info().devices[ctx.device].nsm * 2);
-    const int wave     = xe_cores * (NR16 == 1 ? 4 : 2);
+    const int wave     = xe_cores * (NR16 == 1 ? 4 : NR16 == 2 ? 2 : 1);
     const int ntiles   = (ne11 + TK - 1) / TK;
     int nsplit = std::max(1, std::min(wave / (nkvh * ne03 * p.nqc), ntiles));
     p.chunk    = ((ntiles + nsplit - 1) / nsplit) * TK;
@@ -644,8 +645,9 @@ static void fattn_dpas_case(ggml_backend_sycl_context & ctx, ggml_tensor * dst) 
     p.meta  = meta.get();
 
     dpct::queue_ptr stream = ctx.stream();
-    // the large register file pays off for 32-row launches from about 4K keys
-    if (NR16 == 2 && ne11 >= 4096) {
+    // Larger query tiles have higher register pressure; use the large register
+    // file for these launches at long context, where the extra capacity pays off.
+    if (NR16 >= 2 && ne11 >= 4096) {
         fattn_dpas_kernel<D, NR16, KG, TC, ST, true, Q8>(p, nkvh, ne03, stream);
     } else {
         fattn_dpas_kernel<D, NR16, KG, TC, ST, false, Q8>(p, nkvh, ne03, stream);
@@ -688,13 +690,18 @@ template <bool Q8> static void fattn_dpas_dispatch(ggml_backend_sycl_context & c
         return;
     }
     const bool rows16 = ne01 * G <= 16;
-    // 256-key tiles for one row tile; 128 at head size 512 so S and the Q copy stay in SLM for the planned waves
+    const bool rows32 = ne01 * G <= 32;
+    // 256-key tiles for one 16-row tile; 128-key tiles for larger query tiles.
+    // The 64-row variant is experimental: it trades more SLM/register use for
+    // fewer query chunks and better K/V reuse across query rows.
 #define FATTN_DPAS_D(D_, KG16_)                                                                        \
     case D_:                                                                                           \
         if (rows16) {                                                                                  \
             fattn_dpas_case<D_, 1, KG16_, 1, 0, Q8>(ctx, dst);                                     \
-        } else {                                                                                       \
+        } else if (rows32) {                                                                           \
             fattn_dpas_case<D_, 2, 8, 2, 0, Q8>(ctx, dst);                                         \
+        } else {                                                                                       \
+            fattn_dpas_case<D_, 4, 4, 2, 0, Q8>(ctx, dst);                                         \
         }                                                                                              \
         break;
     // q8_0 at head size 128: its 136-byte rows gather poorly per lane, stage them in SLM by coalesced dword loads
@@ -705,8 +712,10 @@ template <bool Q8> static void fattn_dpas_dispatch(ggml_backend_sycl_context & c
     if (Q8 && D == 128 && aligned4) {
         if (rows16) {
             fattn_dpas_case<128, 1, 16, 1, 2, Q8>(ctx, dst);
-        } else {
+        } else if (rows32) {
             fattn_dpas_case<128, 2, 8, 2, 2, Q8>(ctx, dst);
+        } else {
+            fattn_dpas_case<128, 4, 4, 2, 2, Q8>(ctx, dst);
         }
         return;
     }
@@ -715,7 +724,13 @@ template <bool Q8> static void fattn_dpas_dispatch(ggml_backend_sycl_context & c
         FATTN_DPAS_D( 96, 16)
         FATTN_DPAS_D(128, 16)
         FATTN_DPAS_D(256, 16)
-        FATTN_DPAS_D(512, 8)
+        case 512:
+            if (rows16) {
+                fattn_dpas_case<512, 1, 8, 1, 0, Q8>(ctx, dst);
+            } else {
+                fattn_dpas_case<512, 2, 8, 2, 0, Q8>(ctx, dst);
+            }
+            break;
         default:
             GGML_ABORT("fattn-dpas: unsupported head size %d", D);
     }
