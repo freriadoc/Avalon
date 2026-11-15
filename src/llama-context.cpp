@@ -1158,6 +1158,8 @@ void llama_context::sched_reserve() {
         n_input_tensors_tg = this->n_input_tensors;
     }
 
+    LLAMA_LOG_INFO("%s: graph nodes: prompt %d (%u tokens), generation %d; capacity %zu (%u tensors)\n", __func__, n_nodes_pp, n_tokens, n_nodes_tg,
+            cap_nodes, (unsigned) model.n_tensors());
     // the device compute buffer of a prompt ubatch as a + b x tokens (ubatch_fit): the worst case is measured again at
     // half the ubatch (planned, nothing allocated); with the size just reserved, two points of a line. Once, at the
     // first reservation with borrowed buffers: the layout of the graph does not change after that
@@ -3641,6 +3643,13 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     } else if (model.arch == LLM_ARCH_HRM_TEXT) {
         // the 128-slot looped graph needs roughly one stack per token budget
         res = std::max<uint32_t>(n_tokens * 80, 64u * model.n_tensors());
+    } else if (model.arch == LLM_ARCH_QWEN4EXP && !getenv("LLAMA_QSA_ATT_SLICE")) {
+        // its graph grows with the batch by the attention's slices of 4096 queries only: 8 818 nodes at 9536 tokens,
+        // 14 338 at 32768 (0.24 a token), 6 947 for a generated token (1 224 tensors). The scheduler sizes its tables
+        // by this bound (60 tensors of metadata a node, 25 GiB of address space at 40 nodes a token and 32768 tokens)
+        // and clears part of them at each graph: 3.4 GiB of RAM more at -ub 32768 than at 9536. Another slice size
+        // (LLAMA_QSA_ATT_SLICE) keeps the bound below
+        res = 32u * model.n_tensors() + n_tokens * 2;
     } else if (model.arch == LLM_ARCH_QWEN3NEXT ||
         model.arch == LLM_ARCH_KIMI_LINEAR ||
         model.arch == LLM_ARCH_BAILINGMOE3 ||
