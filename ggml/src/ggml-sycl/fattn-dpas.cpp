@@ -205,12 +205,13 @@ template <typename Kernel>
 struct fa_dpas_grf256_kernel {
     Kernel kernel;
 
-    void operator()(sycl::nd_item<3> item) const [[sycl::reqd_sub_group_size(16)]] {
+    void operator()(sycl::nd_item<3> item) const {
         kernel(item);
     }
 
     auto get(sycl::ext::oneapi::experimental::properties_tag) const {
         return sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::sub_group_size<16>,
             sycl::ext::intel::experimental::grf_size<256>
         };
     }
