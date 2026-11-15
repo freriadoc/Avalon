@@ -4652,7 +4652,7 @@ static bool ggml_cpu_moe_experts_multi(const struct ggml_tensor * gate_w, const 
         }
     }
     // the activations quantized by the GPU, else here
-    uint8_t * a8 = act_q8 ? (uint8_t *) act_q8 : buf;
+    const uint8_t * a8 = act_q8 ? (const uint8_t *) act_q8 : buf;
     uint8_t * h8 = buf + (size_t) n * a_row;
     float   * g  = (float *) GGML_PAD((uintptr_t) (h8 + (size_t) n * h_row), 64);
     float   * u  = g + (size_t) n * n_ff;
@@ -4698,7 +4698,7 @@ static bool ggml_cpu_moe_experts_multi(const struct ggml_tensor * gate_w, const 
             #pragma omp for
             for (int it = 0; it < n * nb_a; it++) {
                 const int j = it / nb_a, b = it % nb_a;
-                quantize_row_q8_0_gpu(act + (size_t) j * n_embd + (size_t) b * QK8_0, a8 + (size_t) j * a_row + (size_t) b * sizeof(block_q8_0), QK8_0);
+                quantize_row_q8_0_gpu(act + (size_t) j * n_embd + (size_t) b * QK8_0, buf + (size_t) j * a_row + (size_t) b * sizeof(block_q8_0), QK8_0);
             }
         }
         const int l3_g = l3_split ? ggml_cpu_moe_l3_group() : 0;
@@ -4898,8 +4898,9 @@ static void ggml_cpu_moe_experts(const struct ggml_tensor * gate_w, const struct
         for (int j = 0; j < n; j++) {
             double d2 = 0.0, n2 = 0.0;
             for (int64_t i = 0; i < n_embd; i++) {
-                const double a = out[(size_t) j * n_embd + i], b = chk[(size_t) j * n_embd + i];
-                d2 += (a - b) * (a - b); n2 += a * a;
+                const double actual = out[(size_t) j * n_embd + i];
+                const double expected = chk[(size_t) j * n_embd + i];
+                d2 += (actual - expected) * (actual - expected); n2 += actual * actual;
             }
             const double rel = sqrt(d2 / (n2 > 1e-30 ? n2 : 1e-30));
             c_rows++; c_sum += rel; c_max = rel > c_max ? rel : c_max; c_bad += rel > 1e-3;
