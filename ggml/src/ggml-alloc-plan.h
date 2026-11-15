@@ -30,7 +30,7 @@ struct ggml_alloc_plan_iv {
     size_t lo, hi; // [lo, hi) in the plan's linear address space
 };
 
-static int ggml_alloc_plan_cmp_size(const void * a, const void * b, void * blocks_v) {
+static int ggml_alloc_plan_cmp_size(const void * a, const void * b, const void * blocks_v) {
     const struct ggml_alloc_plan_block * blocks = (const struct ggml_alloc_plan_block *) blocks_v;
     const struct ggml_alloc_plan_block * x = &blocks[*(const int *) a];
     const struct ggml_alloc_plan_block * y = &blocks[*(const int *) b];
@@ -96,7 +96,7 @@ static void ggml_alloc_plan_sort_order(int * order, int n, const struct ggml_all
             const int hi  = lo + 2*w < n ? lo + 2*w : n;
             int i = lo, j = mid, k = lo;
             while (i < mid && j < hi) {
-                tmp[k++] = ggml_alloc_plan_cmp_size(&order[j], &order[i], (void *) blocks) < 0 ? order[j++] : order[i++];
+                tmp[k++] = ggml_alloc_plan_cmp_size(&order[j], &order[i], blocks) < 0 ? order[j++] : order[i++];
             }
             while (i < mid) tmp[k++] = order[i++];
             while (j < hi)  tmp[k++] = order[j++];
