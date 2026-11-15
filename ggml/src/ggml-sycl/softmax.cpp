@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <utility>
 #include <cmath>
+#include <cstring>
 
 
 template <typename T> static __dpct_inline__ float t2f32(T val) {
@@ -50,13 +51,14 @@ static void soft_max_f32(const float *         x,
                          const soft_max_params p,
                          uint8_t *             dpct_local) {
     auto      item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-    const int ncols    = ncols_template == 0 ? p.ncols : ncols_template;
+    const int64_t ncols = ncols_template == 0 ? p.ncols : ncols_template;
     const int block_size = block_size_template == 0
                                ? item_ct1.get_local_range(2)
                                : block_size_template;
     const int nthreads = block_size;
     const int nwarps = nthreads / WARP_SIZE;
-    const size_t nreduce = nwarps / WARP_SIZE;
+    // Number of warp-sized groups needed to reduce all warp partials.
+    const int nreduce = (nwarps + WARP_SIZE - 1) / WARP_SIZE;
 
     const int tid = item_ct1.get_local_id(2);
 
@@ -65,7 +67,7 @@ static void soft_max_f32(const float *         x,
     const int64_t i01 = item_ct1.get_group(2);
 
     //TODO: noncontigous inputs/outputs
-    const int rowx = item_ct1.get_group(2) +
+    const int64_t rowx = item_ct1.get_group(2) +
                      item_ct1.get_group(1) * item_ct1.get_group_range(2) +
                      item_ct1.get_group(0) * item_ct1.get_group_range(2) *
                          item_ct1.get_group_range(1);
@@ -75,7 +77,9 @@ static void soft_max_f32(const float *         x,
     const int64_t i13 = i03 % p.ne13;
 
     x    += int64_t(rowx)*ncols;
-    mask += (i11*p.nb11 + i12*p.nb12 + i13*p.nb13) / sizeof(T) * (mask != nullptr);
+    if (mask != nullptr) {
+        mask += (i11 * p.nb11 + i12 * p.nb12 + i13 * p.nb13) / sizeof(T);
+    }
     dst  += int64_t(rowx)*ncols;
 
     const int warp_id = item_ct1.get_local_id(2) / WARP_SIZE;
@@ -89,8 +93,8 @@ static void soft_max_f32(const float *         x,
     float *vals = use_shared ? buf_iw + sycl::max(nwarps, WARP_SIZE) : dst;
     float max_val = sinks ? sinks[i02] : -INFINITY;
 #pragma unroll
-    for (int col0 = 0; col0 < ncols; col0 += block_size) {
-        const int col = col0 + tid;
+    for (int64_t col0 = 0; col0 < ncols; col0 += block_size) {
+        const int64_t col = col0 + tid;
 
         if (ncols_template == 0 && col >= ncols) {
             break;
@@ -108,7 +112,7 @@ static void soft_max_f32(const float *         x,
         if (lane_id == 0) {
             buf_iw[warp_id] = max_val;
         }
-        item_ct1.barrier();
+        sycl::group_barrier(item_ct1.get_group());
 
         max_val = -INFINITY;
         for (int i = lane_id; i < nwarps; i += WARP_SIZE) {
@@ -119,8 +123,8 @@ static void soft_max_f32(const float *         x,
     float tmp = 0.0f; // partial sum
 
 #pragma unroll
-    for (int col0 = 0; col0 < ncols; col0 += block_size) {
-        const int col = col0 + tid;
+    for (int64_t col0 = 0; col0 < ncols; col0 += block_size) {
+        const int64_t col = col0 + tid;
 
         if (ncols_template == 0 && col >= ncols) {
             break;
@@ -133,19 +137,19 @@ static void soft_max_f32(const float *         x,
     // find the sum of exps in the block
     tmp = warp_reduce_sum<WARP_SIZE>(tmp);
     if (block_size > WARP_SIZE) {
-        item_ct1.barrier();
+        sycl::group_barrier(item_ct1.get_group());
         if (warp_id == 0) {
             buf_iw[lane_id] = 0.0f;
             for (size_t i = 1; i < nreduce; i += 1) {
                 buf_iw[lane_id + i * WARP_SIZE] = 0.f;
             }
         }
-        item_ct1.barrier();
+        sycl::group_barrier(item_ct1.get_group());
 
         if (lane_id == 0) {
             buf_iw[warp_id] = tmp;
         }
-        item_ct1.barrier();
+        sycl::group_barrier(item_ct1.get_group());
 
         tmp = buf_iw[lane_id];
         for (size_t i = 1; i < nreduce; i += 1) {
@@ -159,8 +163,8 @@ static void soft_max_f32(const float *         x,
     const float inv_sum = 1.0f / tmp;
 
 #pragma unroll
-    for (int col0 = 0; col0 < ncols; col0 += block_size) {
-        const int col = col0 + tid;
+    for (int64_t col0 = 0; col0 < ncols; col0 += block_size) {
+        const int64_t col = col0 + tid;
 
         if (ncols_template == 0 && col >= ncols) {
             return;
@@ -174,10 +178,10 @@ static void soft_max_f32(const float *         x,
 #endif // __clang__
 
 static void soft_max_back_f32(const float *grad, const float *dstf, float *dst,
-                              const int ncols, const float scale) {
+                              const int64_t ncols, const float scale) {
     auto      item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const int tid      = item_ct1.get_local_id(2);
-    const int rowx     = item_ct1.get_group(2);
+    const int64_t rowx = item_ct1.get_group(2);
 
     grad += int64_t(rowx)*ncols;
     dstf += int64_t(rowx)*ncols;
@@ -185,13 +189,13 @@ static void soft_max_back_f32(const float *grad, const float *dstf, float *dst,
 
     float dgf_dot = 0.0f; // dot product of dst from forward pass and gradients
 
-    for (int col = tid; col < ncols; col += WARP_SIZE) {
+    for (int64_t col = tid; col < ncols; col += WARP_SIZE) {
         dgf_dot += dstf[col]*grad[col];
     }
 
     dgf_dot = warp_reduce_sum<WARP_SIZE>(dgf_dot);
 
-    for (int col = tid; col < ncols; col += WARP_SIZE) {
+    for (int64_t col = tid; col < ncols; col += WARP_SIZE) {
         dst[col] = scale * (grad[col] - dgf_dot) * dstf[col];
     }
 }
@@ -304,15 +308,17 @@ static void soft_max_f32_sycl(const float *x, const T *mask,
 static void soft_max_back_f32_sycl(const float *   grad,
                                    const float *   dstf,
                                    float *         dst,
-                                   const int       ncols,
-                                   const int       nrows,
+                                   const int64_t   ncols,
+                                   const int64_t   nrows,
                                    const float     scale,
                                    dpct::queue_ptr stream) {
     const dpct::dim3 block_dims(WARP_SIZE, 1, 1);
     const dpct::dim3 block_nums(nrows, 1, 1);
 
-    stream->parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
-                         [=](sycl::nd_item<3> item_ct1) {
+    stream->parallel_for(
+        sycl::nd_range<3>(block_nums * block_dims, block_dims),
+        [=](sycl::nd_item<3> item_ct1)
+            [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
                              soft_max_back_f32(grad, dstf, dst, ncols, scale);
                              GGML_UNUSED(item_ct1);
                          });
@@ -333,10 +339,31 @@ void ggml_sycl_op_soft_max(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     dpct::queue_ptr stream = ctx.stream();
 
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
-    GGML_ASSERT( dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(src0));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(src0->ne[0] > 0);
+    GGML_ASSERT(src0->ne[2] > 0);
+    GGML_ASSERT(src0->ne[0] == dst->ne[0] &&
+                src0->ne[1] == dst->ne[1] &&
+                src0->ne[2] == dst->ne[2] &&
+                src0->ne[3] == dst->ne[3]);
 
     // src1 contains mask and it is optional
     GGML_ASSERT(!src1 || src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_F32);
+    if (src1 != nullptr) {
+        GGML_ASSERT(src1->ne[0] >= src0->ne[0]);
+        GGML_ASSERT(src1->ne[1] >= src0->ne[1]);
+        GGML_ASSERT(src1->nb[0] == ggml_type_size(src1->type));
+        GGML_ASSERT(src1->nb[1] % ggml_type_size(src1->type) == 0);
+        GGML_ASSERT(src1->nb[2] % ggml_type_size(src1->type) == 0);
+        GGML_ASSERT(src1->nb[3] % ggml_type_size(src1->type) == 0);
+    }
+    if (src2 != nullptr) {
+        GGML_ASSERT(src2->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_is_contiguous(src2));
+        GGML_ASSERT(src2->ne[0] >= src0->ne[2]);
+    }
 
     const int64_t nrows_x = ggml_nrows(src0);
     const int64_t nrows_y = src0->ne[1];
@@ -346,8 +373,8 @@ void ggml_sycl_op_soft_max(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     float scale    = 1.0f;
     float max_bias = 0.0f;
 
-    memcpy(&scale,    (const float *) dst->op_params + 0, sizeof(float));
-    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
+    std::memcpy(&scale,    (const float *) dst->op_params + 0, sizeof(float));
+    std::memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
 
     const bool use_f16 = (src1 && src1->type == GGML_TYPE_F16);
 
@@ -358,7 +385,9 @@ void ggml_sycl_op_soft_max(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     const int64_t ne12 = src1 ? src1->ne[2] : 1;
     const int64_t ne13 = src1 ? src1->ne[3] : 1;
 
-    const uint32_t n_head      = src0->ne[2];
+    GGML_ASSERT(src0->ne[2] > 0);
+    GGML_ASSERT(src0->ne[2] <= UINT32_MAX);
+    const uint32_t n_head      = (uint32_t) src0->ne[2];
     const uint32_t n_head_log2 = 1u << (uint32_t) floorf(log2f((float) n_head));
 
     const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
@@ -408,7 +437,19 @@ void ggml_sycl_op_soft_max_back(ggml_backend_sycl_context & ctx, ggml_tensor * d
 
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
-    GGML_ASSERT( dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(src0));
+    GGML_ASSERT(ggml_is_contiguous(src1));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(src0->ne[0] > 0);
+    GGML_ASSERT(src0->ne[0] == src1->ne[0] &&
+                src0->ne[1] == src1->ne[1] &&
+                src0->ne[2] == src1->ne[2] &&
+                src0->ne[3] == src1->ne[3]);
+    GGML_ASSERT(src0->ne[0] == dst->ne[0] &&
+                src0->ne[1] == dst->ne[1] &&
+                src0->ne[2] == dst->ne[2] &&
+                src0->ne[3] == dst->ne[3]);
 
     const int64_t ncols = src0->ne[0];
     const int64_t nrows = ggml_nrows(src0);
@@ -416,8 +457,8 @@ void ggml_sycl_op_soft_max_back(ggml_backend_sycl_context & ctx, ggml_tensor * d
     float scale    = 1.0f;
     float max_bias = 0.0f;
 
-    memcpy(&scale,    (const float *) dst->op_params + 0, sizeof(float));
-    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
+    std::memcpy(&scale,    (const float *) dst->op_params + 0, sizeof(float));
+    std::memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
 
     GGML_ASSERT(max_bias == 0.0f);
 

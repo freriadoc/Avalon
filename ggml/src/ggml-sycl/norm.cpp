@@ -38,7 +38,7 @@ static void norm_f32(const float* x, float* dst, const int ncols,
         if (wi_in_sg == 0) {
             s_sum[sg_id] = mean_var;
         }
-        item_ct1.barrier(sycl::access::fence_space::local_space);
+        sycl::group_barrier(item_ct1.get_group());
         mean_var = 0.f;
         const size_t nreduce = ceil_div(nwarps, WARP_SIZE);
         for (size_t i = 0; i < nreduce; i += 1)
@@ -93,13 +93,17 @@ static void group_norm_f32(const float* x, float* dst, const int group_size, con
         sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
         better performance if there is no access to global memory.
         */
-        item_ct1.barrier();
+        sycl::group_barrier(item_ct1.get_group());
         tmp = 0.f;
         for (size_t i = 0; i < nreduce; i += 1)
         {
             tmp += s_sum[lane_id + i * WARP_SIZE];
         }
         tmp = warp_reduce_sum(tmp, item_ct1);
+
+        // s_sum is reused for the variance reduction below. Ensure every
+        // subgroup has finished reading the mean partials before overwriting it.
+        sycl::group_barrier(item_ct1.get_group());
     }
 
     float mean = tmp / group_size;
@@ -128,7 +132,7 @@ static void group_norm_f32(const float* x, float* dst, const int group_size, con
         sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
         better performance if there is no access to global memory.
         */
-        item_ct1.barrier();
+        sycl::group_barrier(item_ct1.get_group());
         tmp = 0.f;
         for (size_t i = 0; i < nreduce; i += 1)
         {
@@ -203,7 +207,7 @@ static void rms_norm_f32(const float* x, float* dst, const int ncols,
             s_sum[sg_id] = tmp;
         }
 
-        item_ct1.barrier(sycl::access::fence_space::local_space);
+        sycl::group_barrier(item_ct1.get_group());
         const size_t nreduce = ceil_div(nwarps, WARP_SIZE);
         tmp = 0.f;
         for (size_t i = 0; i < nreduce; i += 1)
@@ -575,7 +579,7 @@ static void l2_norm_f32_sycl(const float *   x,
         const int work_group_size = ggml_sycl_info().max_work_group_sizes[device];
         assert(work_group_size % (warp_size * warp_size) == 0);
         const sycl::range<3> block_dims(1, 1, work_group_size);
-        int lsm_size =  block_dims[2] > warp_size ? work_group_size / warp_size * sizeof(float): 0;
+        const int lsm_size = block_dims[2] > warp_size ? work_group_size / warp_size : 0;
         stream->submit([&](sycl::handler& cgh) {
             sycl::local_accessor<float, 1> s_sum_acc_ct1(sycl::range<1>(lsm_size),
                 cgh);
@@ -798,6 +802,8 @@ void ggml_sycl_op_rms_norm_fused(ggml_backend_sycl_context & ctx, ggml_tensor * 
     GGML_ASSERT(rms_norm_src->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
     GGML_ASSERT(mul_tensor->type == GGML_TYPE_F32);
+    GGML_ASSERT(mul_src != nullptr);
+    GGML_ASSERT(mul_src->type == GGML_TYPE_F32);
     GGML_ASSERT(eps >= 0.0f);
 
     const int64_t ne00 = rms_norm_src->ne[0];
@@ -873,6 +879,10 @@ void ggml_sycl_op_rms_norm_fused_add(ggml_backend_sycl_context & ctx, ggml_tenso
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
     GGML_ASSERT(mul_tensor->type == GGML_TYPE_F32);
     GGML_ASSERT(add_tensor->type == GGML_TYPE_F32);
+    GGML_ASSERT(mul_src != nullptr);
+    GGML_ASSERT(mul_src->type == GGML_TYPE_F32);
+    GGML_ASSERT(add_src != nullptr);
+    GGML_ASSERT(add_src->type == GGML_TYPE_F32);
     GGML_ASSERT(eps >= 0.0f);
 
     const int64_t ne00 = rms_norm_src->ne[0];
@@ -1036,7 +1046,7 @@ void ggml_sycl_op_rms_norm_back(ggml_backend_sycl_context & ctx, ggml_tensor * d
                         l_xx[sg_id] = xx;
                         l_xg[sg_id] = xg;
                     }
-                    item_ct1.barrier(sycl::access::fence_space::local_space);
+                    sycl::group_barrier(item_ct1.get_group());
 
                     if (sg_id == 0) {
                         const unsigned wi_u = wi_in_sg;
@@ -1112,7 +1122,13 @@ void ggml_sycl_op_l2_norm(ggml_backend_sycl_context& ctx, ggml_tensor* dst) {
 // nodes[0..count) are independent, same-shape, same-eps, same-nb L2_NORM ops validated
 // by the caller; requires ncols < 1024 (the warp reduction path).
 void ggml_sycl_l2_norm_batch(ggml_backend_sycl_context & ctx, ggml_tensor ** nodes, int count) {
+    GGML_ASSERT(nodes != nullptr);
+    GGML_ASSERT(count > 0 && count <= GGML_SYCL_L2_BATCH_MAX);
+
     const ggml_tensor * s0 = nodes[0]->src[0];
+    GGML_ASSERT(s0 != nullptr);
+    GGML_ASSERT(s0->type == GGML_TYPE_F32);
+    GGML_ASSERT(s0->ne[0] > 0 && s0->ne[0] < 1024);
     const int ncols       = (int) s0->ne[0];
     const int nrows_total = (int) ggml_nrows(s0);
     float eps;
