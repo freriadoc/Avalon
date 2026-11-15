@@ -5,13 +5,9 @@
 #include <cstring>
 
 
-template <typename T> static __dpct_inline__ float t2f32(T val) {
-    return (float) val;
-}
-
-template <> float __dpct_inline__ t2f32<sycl::half>(sycl::half val) {
-  return sycl::vec<sycl::half, 1>(val)
-      .convert<float, sycl::rounding_mode::automatic>()[0];
+template <typename T>
+static __dpct_inline__ float t2f32(T val) {
+    return static_cast<float>(val);
 }
 
 struct soft_max_params {
@@ -140,7 +136,7 @@ static void soft_max_f32(const float *         x,
         sycl::group_barrier(item_ct1.get_group());
         if (warp_id == 0) {
             buf_iw[lane_id] = 0.0f;
-            for (size_t i = 1; i < nreduce; i += 1) {
+            for (int i = 1; i < nreduce; i += 1) {
                 buf_iw[lane_id + i * WARP_SIZE] = 0.f;
             }
         }
@@ -152,7 +148,7 @@ static void soft_max_f32(const float *         x,
         sycl::group_barrier(item_ct1.get_group());
 
         tmp = buf_iw[lane_id];
-        for (size_t i = 1; i < nreduce; i += 1) {
+        for (int i = 1; i < nreduce; i += 1) {
             tmp += buf_iw[lane_id + i * WARP_SIZE];
         }
         tmp = warp_reduce_sum<WARP_SIZE>(tmp);
