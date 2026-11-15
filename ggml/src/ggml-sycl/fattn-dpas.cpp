@@ -198,6 +198,24 @@ struct fa_dpas_params {
     int64_t        nb31, nb33;
 };
 
+// Wrapper for the large-register-file variant. oneAPI 2026.2 deprecates the
+// parallel_for overload that takes properties as a separate argument; kernel
+// properties are now supplied by the functor itself.
+template <typename Kernel>
+struct fa_dpas_grf256_kernel {
+    Kernel kernel;
+
+    void operator()(sycl::nd_item<3> item) const [[sycl::reqd_sub_group_size(16)]] {
+        kernel(item);
+    }
+
+    auto get(sycl::ext::oneapi::experimental::properties_tag) const {
+        return sycl::ext::oneapi::experimental::properties{
+            sycl::ext::intel::experimental::grf_size<256>
+        };
+    }
+};
+
 // One work-group = one KV head x nq query tokens x one slice of the keys: S = Q K^T by s8 x s4 / s8 x s8 DPAS on the
 // raw K blocks, online softmax, O^T += V^T P^T by f16 DPAS. ST: stage K/V tiles in SLM (1: 16-byte, 2: dword loads).
 // LG: 256-register file (no spills at 32 rows, same occupancy). Q8: K/V are q8_0, else q4_0.
@@ -557,7 +575,8 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int 
                 }
             };
         if constexpr (LG) {
-            cgh.parallel_for(ndr, sycl::ext::oneapi::experimental::properties{ sycl::ext::intel::experimental::grf_size<256> }, kern);
+            const fa_dpas_grf256_kernel<decltype(kern)> grf_kern{kern};
+            cgh.parallel_for(ndr, grf_kern);
         } else {
             cgh.parallel_for(ndr, kern);
         }
