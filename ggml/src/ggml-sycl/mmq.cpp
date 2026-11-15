@@ -13,6 +13,16 @@
 #include "mmq.hpp"
 #include "vecdotq.hpp"
 
+// Optional MMQ tile-size experiment. Enable with
+// -DGGML_SYCL_MMQ_EXPERIMENTAL_TILES=1 to halve 128-row tiles to 64 rows.
+// The default build retains the original tile sizes. This is a benchmark
+// profile, not an assumed performance improvement.
+#if defined(GGML_SYCL_MMQ_EXPERIMENTAL_TILES)
+#define GGML_SYCL_MMQ_TILE_Y_128 64
+#else
+#define GGML_SYCL_MMQ_TILE_Y_128 128
+#endif
+
 typedef void (*allocate_tiles_sycl_t)(
     int** x_ql,
     sycl::half2** x_dm,
@@ -1284,7 +1294,7 @@ mul_mat_q(const void *__restrict__ vx, const void *__restrict__ vy,
             sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
             better performance if there is no access to global memory.
             */
-            item_ct1.barrier();
+            item_ct1.barrier(sycl::access::fence_space::local_space);
 
 // #pragma unroll // unrolling this loop causes too much register pressure
             for (int k = ir*WARP_SIZE/qr; k < (ir+1)*WARP_SIZE/qr; k += vdr) {
@@ -1309,7 +1319,7 @@ mul_mat_q(const void *__restrict__ vx, const void *__restrict__ vy,
             sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
             better performance if there is no access to global memory.
             */
-            item_ct1.barrier();
+            item_ct1.barrier(sycl::access::fence_space::local_space);
         }
     }
 
@@ -1335,7 +1345,7 @@ mul_mat_q(const void *__restrict__ vx, const void *__restrict__ vy,
 }
 
 #define  MMQ_X_Q4_0_RDNA2  64
-#define  MMQ_Y_Q4_0_RDNA2  128
+#define  MMQ_Y_Q4_0_RDNA2  GGML_SYCL_MMQ_TILE_Y_128
 #define NWARPS_Q4_0_RDNA2  8
 #define  MMQ_X_Q4_0_RDNA1  64
 #define  MMQ_Y_Q4_0_RDNA1  64
@@ -1346,7 +1356,7 @@ mul_mat_q(const void *__restrict__ vx, const void *__restrict__ vy,
 #define NWARPS_Q4_0_AMPERE 4
 #else
 #define  MMQ_X_Q4_0_AMPERE 64
-#define  MMQ_Y_Q4_0_AMPERE 128
+#define  MMQ_Y_Q4_0_AMPERE GGML_SYCL_MMQ_TILE_Y_128
 #define NWARPS_Q4_0_AMPERE 4
 #endif
 #define  MMQ_X_Q4_0_PASCAL 64
@@ -1379,7 +1389,7 @@ template <bool need_check> static void
 }
 
 #define  MMQ_X_Q4_1_RDNA2  64
-#define  MMQ_Y_Q4_1_RDNA2  128
+#define  MMQ_Y_Q4_1_RDNA2  GGML_SYCL_MMQ_TILE_Y_128
 #define NWARPS_Q4_1_RDNA2  8
 #define  MMQ_X_Q4_1_RDNA1  64
 #define  MMQ_Y_Q4_1_RDNA1  64
@@ -1390,7 +1400,7 @@ template <bool need_check> static void
 #define NWARPS_Q4_1_AMPERE 4
 #else
 #define  MMQ_X_Q4_1_AMPERE 64
-#define  MMQ_Y_Q4_1_AMPERE 128
+#define  MMQ_Y_Q4_1_AMPERE GGML_SYCL_MMQ_TILE_Y_128
 #define NWARPS_Q4_1_AMPERE 4
 #endif
 #define  MMQ_X_Q4_1_PASCAL 64
@@ -1422,7 +1432,7 @@ template <bool need_check> static void
 }
 
 #define  MMQ_X_Q5_0_RDNA2  64
-#define  MMQ_Y_Q5_0_RDNA2  128
+#define  MMQ_Y_Q5_0_RDNA2  GGML_SYCL_MMQ_TILE_Y_128
 #define NWARPS_Q5_0_RDNA2  8
 #define  MMQ_X_Q5_0_RDNA1  64
 #define  MMQ_Y_Q5_0_RDNA1  64
@@ -1465,7 +1475,7 @@ template <bool need_check> static void
 }
 
 #define  MMQ_X_Q5_1_RDNA2  64
-#define  MMQ_Y_Q5_1_RDNA2  128
+#define  MMQ_Y_Q5_1_RDNA2  GGML_SYCL_MMQ_TILE_Y_128
 #define NWARPS_Q5_1_RDNA2  8
 #define  MMQ_X_Q5_1_RDNA1  64
 #define  MMQ_Y_Q5_1_RDNA1  64
@@ -1508,7 +1518,7 @@ mul_mat_q5_1(
 }
 
 #define  MMQ_X_Q8_0_RDNA2  64
-#define  MMQ_Y_Q8_0_RDNA2  128
+#define  MMQ_Y_Q8_0_RDNA2  GGML_SYCL_MMQ_TILE_Y_128
 #define NWARPS_Q8_0_RDNA2  8
 #define  MMQ_X_Q8_0_RDNA1  64
 #define  MMQ_Y_Q8_0_RDNA1  64
@@ -1551,7 +1561,7 @@ template <bool need_check> static void
 }
 
 #define  MMQ_X_Q2_K_RDNA2  64
-#define  MMQ_Y_Q2_K_RDNA2  128
+#define  MMQ_Y_Q2_K_RDNA2  GGML_SYCL_MMQ_TILE_Y_128
 #define NWARPS_Q2_K_RDNA2  8
 #define  MMQ_X_Q2_K_RDNA1  128
 #define  MMQ_Y_Q2_K_RDNA1  32
@@ -1562,7 +1572,7 @@ template <bool need_check> static void
 #define NWARPS_Q2_K_AMPERE 4
 #else
 #define  MMQ_X_Q2_K_AMPERE 64
-#define  MMQ_Y_Q2_K_AMPERE 128
+#define  MMQ_Y_Q2_K_AMPERE GGML_SYCL_MMQ_TILE_Y_128
 #define NWARPS_Q2_K_AMPERE 4
 #endif
 #define  MMQ_X_Q2_K_PASCAL 64
@@ -1598,7 +1608,7 @@ mul_mat_q2_K(
 #define  MMQ_Y_Q3_K_RDNA2  64
 #define NWARPS_Q3_K_RDNA2  8
 #define  MMQ_X_Q3_K_RDNA1  32
-#define  MMQ_Y_Q3_K_RDNA1  128
+#define  MMQ_Y_Q3_K_RDNA1  GGML_SYCL_MMQ_TILE_Y_128
 #define NWARPS_Q3_K_RDNA1  8
 #if defined(GGML_SYCL_SUPPORT_XMX) && !defined(GGML_SYCL_FORCE_MMQ)
 #define  MMQ_X_Q3_K_AMPERE 4
@@ -1606,7 +1616,7 @@ mul_mat_q2_K(
 #define NWARPS_Q3_K_AMPERE 4
 #else
 #define  MMQ_X_Q3_K_AMPERE 128
-#define  MMQ_Y_Q3_K_AMPERE 128
+#define  MMQ_Y_Q3_K_AMPERE GGML_SYCL_MMQ_TILE_Y_128
 #define NWARPS_Q3_K_AMPERE 4
 #endif
 #define  MMQ_X_Q3_K_PASCAL 64
@@ -1640,7 +1650,7 @@ mul_mat_q3_K(
 }
 
 #define  MMQ_X_Q4_K_RDNA2  64
-#define  MMQ_Y_Q4_K_RDNA2  128
+#define  MMQ_Y_Q4_K_RDNA2  GGML_SYCL_MMQ_TILE_Y_128
 #define NWARPS_Q4_K_RDNA2  8
 #define  MMQ_X_Q4_K_RDNA1  32
 #define  MMQ_Y_Q4_K_RDNA1  64
@@ -1651,7 +1661,7 @@ mul_mat_q3_K(
 #define NWARPS_Q4_K_AMPERE 4
 #else
 #define  MMQ_X_Q4_K_AMPERE 64
-#define  MMQ_Y_Q4_K_AMPERE 128
+#define  MMQ_Y_Q4_K_AMPERE GGML_SYCL_MMQ_TILE_Y_128
 #define NWARPS_Q4_K_AMPERE 4
 #endif
 #define  MMQ_X_Q4_K_PASCAL 64
@@ -1684,7 +1694,7 @@ template <bool need_check> static void
 }
 
 #define  MMQ_X_Q5_K_RDNA2  64
-#define  MMQ_Y_Q5_K_RDNA2  128
+#define  MMQ_Y_Q5_K_RDNA2  GGML_SYCL_MMQ_TILE_Y_128
 #define NWARPS_Q5_K_RDNA2  8
 #define  MMQ_X_Q5_K_RDNA1  32
 #define  MMQ_Y_Q5_K_RDNA1  64
@@ -1695,7 +1705,7 @@ template <bool need_check> static void
 #define NWARPS_Q5_K_AMPERE 4
 #else
 #define  MMQ_X_Q5_K_AMPERE 64
-#define  MMQ_Y_Q5_K_AMPERE 128
+#define  MMQ_Y_Q5_K_AMPERE GGML_SYCL_MMQ_TILE_Y_128
 #define NWARPS_Q5_K_AMPERE 4
 #endif
 #define  MMQ_X_Q5_K_PASCAL 64
@@ -1728,7 +1738,7 @@ mul_mat_q5_K(
 }
 
 #define  MMQ_X_Q6_K_RDNA2  64
-#define  MMQ_Y_Q6_K_RDNA2  128
+#define  MMQ_Y_Q6_K_RDNA2  GGML_SYCL_MMQ_TILE_Y_128
 #define NWARPS_Q6_K_RDNA2  8
 #define  MMQ_X_Q6_K_RDNA1  32
 #define  MMQ_Y_Q6_K_RDNA1  64
