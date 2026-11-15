@@ -219,7 +219,7 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
         }
 
 
-        item_ct1.barrier(sycl::access::fence_space::local_space);
+        sycl::group_barrier(item_ct1.get_group());
 
 #pragma unroll
         for (int j = 0; j < ncols; ++j) {
@@ -236,7 +236,7 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
             }
         }
 
-        item_ct1.barrier(sycl::access::fence_space::local_space);
+        sycl::group_barrier(item_ct1.get_group());
 
     } else {
 #ifdef GGML_SYCL_F16
@@ -461,7 +461,7 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
         }
     }
 
-    item_ct1.barrier(sycl::access::fence_space::local_space);
+    sycl::group_barrier(item_ct1.get_group());
 
 #pragma unroll
     for (int j = 0; j < ncols; ++j) {
@@ -470,7 +470,7 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
         }
     }
 
-    item_ct1.barrier(sycl::access::fence_space::local_space);
+    sycl::group_barrier(item_ct1.get_group());
 
 #pragma unroll
     for (int j_VKQ = 0; j_VKQ < ncols; ++j_VKQ) {
@@ -524,7 +524,7 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
             KQ_sum_shared[j_VKQ*warp_size+item_ct1.get_local_id(1)] = KQ_sum[j_VKQ];
         }
 
-        item_ct1.barrier(sycl::access::fence_space::local_space);
+        sycl::group_barrier(item_ct1.get_group());
 
 
         if (nthreads <= D || tid < D) {
@@ -552,7 +552,7 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
         }
 
         if (j_VKQ < ncols-1) {
-            item_ct1.barrier(sycl::access::fence_space::local_space);
+            sycl::group_barrier(item_ct1.get_group());
         }
 
     }

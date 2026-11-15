@@ -861,6 +861,11 @@ template<typename dst_t>
 static void dequantize_block_q8_0_reorder_wide(const void * __restrict__ vx, dst_t * __restrict__ yy, int64_t k,
                                                const sycl::id<1> idx) {
     const int64_t i = 4 * (int64_t) idx[0];
+    // Each work-item reads and writes four consecutive values. Guard against
+    // an over-sized global range in case the launch is rounded up.
+    if (i + 3 >= k) {
+        return;
+    }
 
     const int8_t *     qs    = (const int8_t *) vx;
     const sycl::half * d_ptr = (const sycl::half *) ((const uint8_t *) vx + k);
@@ -1204,7 +1209,7 @@ static void dequantize_block_q4_K_reorder(const void * __restrict__ vx, dst_t * 
         scales_local[tid] = scales_ptr[tid];
     }
 
-    item_ct1.barrier(sycl::access::fence_space::local_space);
+    sycl::group_barrier(item_ct1.get_group());
     dequantize_q4_K_common(y, qs_ptr, dall, dmin, scales_local, il, ir);
 }
 
@@ -1291,7 +1296,7 @@ static void dequantize_block_q5_K_reorder(const void * __restrict__ vx, dst_t * 
         scales_local[tid] = scales_ptr[tid];
     }
 
-    item_ct1.barrier(sycl::access::fence_space::local_space);
+    sycl::group_barrier(item_ct1.get_group());
 
     uint8_t sc, m;
     get_scale_min_k4(is + 0, scales_local, sc, m);

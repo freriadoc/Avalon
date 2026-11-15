@@ -82,7 +82,7 @@ static void top_k_radix_select_f32(
         for (int i = tid; i < SYCL_TOP_K_RADIX_HIST_SIZE; i += block_size) {
             hist[i] = 0;
         }
-        item_ct1.barrier(sycl::access::fence_space::local_space);
+        sycl::group_barrier(item_ct1.get_group());
 
         for (int col = tid; col < ncols; col += block_size) {
             const uint32_t key = top_k_radix_key(src[col]);
@@ -91,7 +91,7 @@ static void top_k_radix_select_f32(
                 local_atomic(hist[bucket * SYCL_TOP_K_RADIX_HIST_COPIES + copy]).fetch_add(1u);
             }
         }
-        item_ct1.barrier(sycl::access::fence_space::local_space);
+        sycl::group_barrier(item_ct1.get_group());
 
         // Lane t takes bucket 255 - t, so an inclusive scan over lanes counts from the top
         // bucket downward. The pivot is the unique bucket whose cumulative count first
@@ -110,7 +110,7 @@ static void top_k_radix_select_f32(
             *s_bucket = cnt;
             *s_need   = need - (incl - cnt);
         }
-        item_ct1.barrier(sycl::access::fence_space::local_space);
+        sycl::group_barrier(item_ct1.get_group());
 
         const uint32_t digit      = *s_digit;
         const uint32_t bucket_cnt = *s_bucket;
@@ -124,10 +124,10 @@ static void top_k_radix_select_f32(
             break;
         }
         // The next pass rewrites hist and s_*; the reads above must land first.
-        item_ct1.barrier(sycl::access::fence_space::local_space);
+        sycl::group_barrier(item_ct1.get_group());
     }
 
-    item_ct1.barrier(sycl::access::fence_space::local_space);
+    sycl::group_barrier(item_ct1.get_group());
 
     // Exactly k - need columns have (key & mask) > prefix; the first need of the pivot-equal
     // columns fill the tail. Both counters live in SLM since the whole row is this group.
@@ -283,7 +283,7 @@ static void top_k_radix_split_pass_f32(
     for (int i = tid; i < SYCL_TOP_K_RADIX_HIST_SIZE; i += block_size) {
         hist[i] = 0;
     }
-    item_ct1.barrier(sycl::access::fence_space::local_space);
+    sycl::group_barrier(item_ct1.get_group());
 
     const uint32_t prefix = s_row[0];
     const uint32_t mask   = s_row[1];
@@ -301,7 +301,7 @@ static void top_k_radix_split_pass_f32(
             local_atomic(hist[bucket * SYCL_TOP_K_RADIX_HIST_COPIES + copy]).fetch_add(1u);
         }
     }
-    item_ct1.barrier(sycl::access::fence_space::local_space);
+    sycl::group_barrier(item_ct1.get_group());
 
     // One global atomic per bucket per group, not per element.
     for (int b = tid; b < SYCL_TOP_K_RADIX_BUCKETS; b += block_size) {
@@ -317,14 +317,14 @@ static void top_k_radix_split_pass_f32(
     // Publish this group's bins, then claim the scan if this group is the row's last.
     // The group-wide barrier flushes the atomics above; only the claiming lane needs the
     // release, so the device-scope fence is paid once per group rather than per work-item.
-    item_ct1.barrier(sycl::access::fence_space::global_and_local);
+    sycl::group_barrier(item_ct1.get_group(), sycl::memory_scope::device);
     if (tid == 0) {
         sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
         sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device,
                          sycl::access::address_space::global_space> done(state[SYCL_TOP_K_RADIX_ROW_DONE]);
         *s_last = (done.fetch_add(1u) == (uint32_t) (nparts - 1)) ? 1u : 0u;
     }
-    item_ct1.barrier(sycl::access::fence_space::local_space);
+    sycl::group_barrier(item_ct1.get_group());
 
     if (*s_last == 0u) {
         return;
@@ -345,7 +345,7 @@ static void top_k_radix_split_pass_f32(
             mask | ((uint32_t) (SYCL_TOP_K_RADIX_BUCKETS - 1) << shift));
         top_k_radix_gatomic(state[SYCL_TOP_K_RADIX_ROW_NEED]).store(need - (incl - cnt));
     }
-    item_ct1.barrier(sycl::access::fence_space::local_space);
+    sycl::group_barrier(item_ct1.get_group());
 
     // Clear for the next pass; the next launch is the barrier that orders this.
     for (int b = tid; b < SYCL_TOP_K_RADIX_BUCKETS; b += block_size) {
@@ -388,7 +388,7 @@ static void top_k_radix_split_emit_f32(
         s_row[1] = state[SYCL_TOP_K_RADIX_ROW_MASK];
         s_row[2] = state[SYCL_TOP_K_RADIX_ROW_NEED];
     }
-    item_ct1.barrier(sycl::access::fence_space::local_space);
+    sycl::group_barrier(item_ct1.get_group());
 
     const uint32_t prefix = s_row[0];
     const uint32_t mask   = s_row[1];
@@ -412,7 +412,7 @@ static void top_k_radix_split_emit_f32(
             local_atomic(*s_eq).fetch_add(1u);
         }
     }
-    item_ct1.barrier(sycl::access::fence_space::local_space);
+    sycl::group_barrier(item_ct1.get_group());
 
     if (tid == 0) {
         const uint32_t n_gt = *s_gt;
@@ -422,7 +422,7 @@ static void top_k_radix_split_emit_f32(
         *s_gt = 0;
         *s_eq = 0;
     }
-    item_ct1.barrier(sycl::access::fence_space::local_space);
+    sycl::group_barrier(item_ct1.get_group());
 
     const uint32_t base_gt_g = *s_base_gt;
     const uint32_t base_eq_g = *s_base_eq;

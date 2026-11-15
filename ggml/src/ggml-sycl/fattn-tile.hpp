@@ -340,7 +340,7 @@ static __dpct_inline__ void flash_attn_tile_iter_KQ(T_vec_dot * const Q_tmp,
 
     flash_attn_tile_load_tile<warp_size, nwarps, nbatch_fa, nbatch_K, cpy_ne, oob_check>
         (K_h2 + int64_t(k_VKQ_0)*stride_K2 + k_KQ_0/2, KV_tmp, stride_K2, k_VKQ_sup);
-    item_ct1.barrier(sycl::access::fence_space::local_space);
+    sycl::group_barrier(item_ct1.get_group());
 
 #ifdef SYCL_FAST_FP16
     static_assert((nbatch_K/2) % cpy_ne == 0, "bad nbatch_K");
@@ -390,7 +390,7 @@ static __dpct_inline__ void flash_attn_tile_iter_KQ(T_vec_dot * const Q_tmp,
     }
 
     if (k_KQ_0 + nbatch_K < DKQ) {
-        item_ct1.barrier(sycl::access::fence_space::local_space);  // Sync not needed on last iteration.
+        sycl::group_barrier(item_ct1.get_group());  // Sync not needed on last iteration.
     }
 }
 
@@ -505,14 +505,14 @@ static __dpct_inline__ void flash_attn_tile_iter(T_vec_dot * const Q_tmp,
     }
 
     if constexpr (np == 1) {
-        item_ct1.barrier(sycl::access::fence_space::local_space);
+        sycl::group_barrier(item_ct1.get_group());
     } else {
         static_assert(cpw == 1, "bad cpw");
 
         if (item_ct1.get_local_id(2) == 0) {
             KQ_max_new_shared[item_ct1.get_local_id(1)] = KQ_max_new[0];
         }
-        item_ct1.barrier(sycl::access::fence_space::local_space);
+        sycl::group_barrier(item_ct1.get_group());
         KQ_max_new[0] = KQ_max_new_shared[(item_ct1.get_local_id(1) & ~(np - 1)) + item_ct1.get_local_id(2) % np];
         KQ_max_new[0] = warp_reduce_max<np>(KQ_max_new[0]);
     }
@@ -582,7 +582,7 @@ static __dpct_inline__ void flash_attn_tile_iter(T_vec_dot * const Q_tmp,
     for (int k0 = 0; k0 < nbatch_fa; k0 += nbatch_V) {
         flash_attn_tile_load_tile<warp_size, nwarps, nbatch_V, DV, 0, oob_check>
             (V_h2 + int64_t(k_VKQ_0 + k0)*stride_V2, KV_tmp, stride_V2, k_VKQ_sup - k0);
-        item_ct1.barrier(sycl::access::fence_space::local_space);
+        sycl::group_barrier(item_ct1.get_group());
 
 #ifdef SYCL_FAST_FP16
 #pragma unroll
@@ -650,7 +650,7 @@ static __dpct_inline__ void flash_attn_tile_iter(T_vec_dot * const Q_tmp,
             }
         }
 #endif // SYCL_FAST_FP16
-        item_ct1.barrier(sycl::access::fence_space::local_space);
+        sycl::group_barrier(item_ct1.get_group());
     }
 }
 
@@ -857,7 +857,7 @@ static void flash_attn_tile(const char *  Q,
         }
     }
 
-    item_ct1.barrier(sycl::access::fence_space::local_space);
+    sycl::group_barrier(item_ct1.get_group());
 
     // Main loop over KV cache:
     const int k_VKQ_max = KV_max ? KV_max[sequence * item_ct1.get_group_range(2) + item_ct1.get_group(2)] : ne11;
@@ -933,10 +933,13 @@ static void flash_attn_tile(const char *  Q,
             if (item_ct1.get_local_id(2) == 0) {
                 KQ_sum_combine[item_ct1.get_local_id(1)] = KQ_sum[0];
             }
-            return;
         }
 
-        item_ct1.barrier(sycl::access::fence_space::local_space);
+        sycl::group_barrier(item_ct1.get_group());
+
+        if (item_ct1.get_local_id(1) % np != 0) {
+            return;
+        }
 
 #pragma unroll
         for (int ip = 1; ip < np; ++ip) {
