@@ -234,13 +234,16 @@ cmake --build build -j$(nproc) --target llama-server
 hf download freriadoc/Qwen3.8-Flash-Next-Avalon-GGUF --local-dir Qwen3.8-Flash-Next-Avalon-GGUF
 cd Qwen3.8-Flash-Next-Avalon-GGUF
 ../Avalon/build/bin/llama-server -m Qwen3.8-Flash-Next-Avalon-IQ3KS-00001-of-00033.gguf \
-  -c 262144 -b 9536 -ub 9536 -fa on -ctk q8_0 -ctv q4_0 --jinja --parallel 1 \
+  -c 262144 -b 32768 -ub 32768 -fa on -ctk q8_0 -ctv q4_0 --jinja --parallel 1 \
   -md MTP/mtp-Qwen3.8-Flash-Next-shared-IQ3K-IQ4NL-FR65k.gguf --spec-type draft-mtp \
   --spec-draft-n-max 2 -ubd 256 -ctkd q8_0 -ctvd q8_0
 ```
 
 Nothing else to set: `--fit` (on by default) places the dense weights on the GPU and the experts in RAM, the expert
 cache takes the rest of the VRAM, and the cache is prefilled from `moe-cache-ranking.bin` next to the model.
+`-ub 32768` is a ceiling: each prompt runs in the largest ubatch the expert cache can lend VRAM for (about 20,500
+tokens with 4 GiB less VRAM, 4,800 with 8 GiB less). On the RX 7900 XT it gives 11 – 20% more prefill than `-ub 9536`
+(3,080 / 3,016 t/s at 32k / 131k).
 `--parallel 1` matters: other slots would keep their part of the KV cache.
 On NVIDIA, backend sampling is on by default: the target's argmax runs on the GPU instead of over 248k logits on the
 CPU, 6% faster per step on the RTX 4090 (neutral on the RX 7900 XT, where it stays off; `-bs` / `-no-bs` force it).
@@ -251,7 +254,7 @@ CPU, 6% faster per step on the RTX 4090 (neutral on the RX 7900 XT, where it sta
 start `lemond` with `LEMONADE_LLAMACPP_ROCM_BIN=/path/to/Avalon/build/bin/llama-server` (for the systemd service, in
 its environment), list the model where it is with `lemonade config set extra_models_dir=/path/to/models` (the 33 parts
 are one model; `lemonade list` gives its name), and give it Avalon's settings in `recipe_options.json`: `"ctx_size":
-262144`, `"llamacpp_backend": "rocm"` and `"llamacpp_args": "-b 9536 -ub 9536 -fa on -ctk q8_0 -ctv q4_0 -md
+262144`, `"llamacpp_backend": "rocm"` and `"llamacpp_args": "-b 32768 -ub 32768 -fa on -ctk q8_0 -ctv q4_0 -md
 /path/to/models/Qwen3.8-Flash-Next-Avalon-GGUF/MTP/mtp-Qwen3.8-Flash-Next-shared-IQ3K-IQ4NL-FR65k.gguf --spec-type
 draft-mtp --spec-draft-n-max 2 -ubd 256 -ctkd q8_0 -ctvd q8_0"`. Lemonade adds the model, the context, the port,
 `--jinja` and `--parallel 1` itself and no `-ngl`, so `--fit` keeps placing the model. Not tried yet: if you do, please
