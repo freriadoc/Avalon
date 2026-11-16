@@ -127,6 +127,7 @@ struct llama_context {
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
     bool set_mtp_h_from(llama_context & tgt, const float * row_first);                    // llama_set_mtp_h_from
+    void set_mtp_h_window(int64_t row_base) { mtp_h_src.row_base = row_base; }             // llama_set_mtp_h_window
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
@@ -411,6 +412,9 @@ private:
     ggml_backend_event_t    h_stage_ready   = nullptr;
     ggml_backend_event_t    h_stage_done    = nullptr;
     bool                    h_stage_busy    = false;   // h_stage_done recorded behind reads not waited for yet
+    // the staging buffer of a prompt's last large batch (LLAMA_MTP_FINAL_STAGE): kept until the cache's restoration is
+    // over, so that its memory goes back to the cache as free entries (room for the answer's admissions)
+    bool                    h_stage_keep    = false;
     std::vector<float>      h_stage_last;
     void h_stage_release();
 

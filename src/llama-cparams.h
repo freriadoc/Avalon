@@ -23,6 +23,7 @@ struct llama_mtp_h_src {
     // or the target's rows in its host output buffer (a decode of several ubatches): copied from there to the draft's
     // device on its stream, without passing through the batch; the draft's decode synchronizes before it returns
     const float * host = nullptr;
+    int64_t       row_base = 0;          // the target's row of batch row 0 (llama_set_mtp_h_window: the batch is a tail)
 };
 
 struct llama_cparams {

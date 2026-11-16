@@ -115,6 +115,9 @@ LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t 
 // until then); that batch carries tokens only. False, nothing set, when tgt's last decode cannot serve it (several
 // ubatches, nextn rows of the outputs only). Serves that one decode.
 LLAMA_API bool llama_set_mtp_h_from(struct llama_context * ctx, struct llama_context * tgt, const float * row_first);
+// after llama_set_mtp_h_from: the next decode's batch is the tail of the target's, its row 0 the target's row row_base
+// (> 0: it takes the target's row row_base - 1, row_first is not read)
+LLAMA_API void llama_set_mtp_h_window(struct llama_context * ctx, int64_t row_base);
 
 // Pipeline stages: an MTP draft fed ubatch by ubatch during the target's decode, instead of from a host copy of the
 // nextn rows of the whole batch (n_embd_out floats per token: 10 GiB of pinned RAM at a batch of 262 144 tokens).

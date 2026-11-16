@@ -161,7 +161,7 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
     if (h_dev && h_src && h_src->host && !ubatch->embd) {
         // the target's rows from its host output buffer, copied on the draft's stream behind its previous pass
         const size_t  row  = h->nb[1];
-        const int64_t r0   = h_src->row0;
+        const int64_t r0   = h_src->row0 + h_src->row_base;
         GGML_ASSERT(r0 + n_tokens - 1 <= h_src->n_rows && h->type == GGML_TYPE_F32);
         int64_t d0 = 0;
         if (r0 == 0) {
@@ -174,7 +174,7 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
     } else if (h_dev && h_src && h_src->src && !ubatch->embd) {
         // rows [row0, row0 + n) of the batch: the target's rows one before, batch row 0 from the host
         const size_t  row  = h->nb[1];
-        const int64_t r0   = h_src->row0;
+        const int64_t r0   = h_src->row0 + h_src->row_base;
         GGML_ASSERT(h_src->src->ne[0] == h->ne[0] && h_src->src->type == h->type && ggml_is_contiguous(h_src->src));
         GGML_ASSERT(r0 + n_tokens - 1 <= h_src->n_rows);
         // h lives on the GPU, out of the scheduler's input copies and their events: the draft's previous pass may still

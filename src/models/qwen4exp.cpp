@@ -1116,7 +1116,12 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
 // LLAMA_QSA_TILE_COLS=16 / 8 / 1 forces one, LLAMA_QSA_QUERY_MIN_KV moves the limit.
 static int32_t qsa_tile_cols(int64_t n_kv) {
     static const int32_t forced = [] { const char * e = getenv("LLAMA_QSA_TILE_COLS"); const int v = e ? atoi(e) : 0; return v == 16 || v == 8 || v == 1 ? v : 0; }();
-    static const int64_t min_kv = [] { const char * e = getenv("LLAMA_QSA_QUERY_MIN_KV"); return e ? (int64_t) atoll(e) : (int64_t) 32768; }();
+    // the backend's own limit when it has one (RDNA3's FP16 kernel of a list per query: 16384 cells)
+    static const int64_t min_kv = [] {
+        const char * e = getenv("LLAMA_QSA_QUERY_MIN_KV");
+        const int64_t be = ggml_moe_cache.qsa_query_min_kv ? ggml_moe_cache.qsa_query_min_kv() : 0;
+        return e ? (int64_t) atoll(e) : be > 0 ? be : (int64_t) 32768;
+    }();
     return forced ? forced : n_kv > min_kv ? 1 : 16;
 }
 
@@ -2121,7 +2126,14 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
     {
         ggml_tensor * ple = model.per_layer_tok_embd;
 
-        const bool prefetch = model.can_prefetch.count(ple);
+        // Linux, a prompt batch: the gather's threads advise their own rows before they copy them (ggml-cpu's
+        // ggml_get_rows_advise; GGML_CPU_GET_ROWS_ADVISE=0: the hint for every row here, before the launch)
+#if defined(__linux__)
+        static const bool by_threads = !getenv("GGML_CPU_GET_ROWS_ADVISE") || atoi(getenv("GGML_CPU_GET_ROWS_ADVISE")) != 0;
+#else
+        static const bool by_threads = false;
+#endif
+        const bool prefetch = model.can_prefetch.count(ple) && !(by_threads && idx.size() >= 65536);
         if (prefetch) {
             llama_prefetch_rows(ple, idx.data(), idx.size());
         }

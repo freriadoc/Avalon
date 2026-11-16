@@ -2772,12 +2772,19 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         break;
     }
 
-    // pipeline stages, a batch of several ubatches: the MTP draft takes its nextn rows ubatch by ubatch (nextn_cb), the
+    // pipeline stages, a prompt batch: the MTP draft takes its nextn rows ubatch by ubatch (nextn_cb), the
     // host buffer none of them; otherwise it holds them all (grown to the batch)
+    llama_nextn_rows final_q = {};
+    bool final_q_set = false;
     nextn_cb_on = false;
     if (nextn_cb && (stage_first || llama_mtp_rows_cb_single())) {
+        // a prompt batch that fits one ubatch too (over 64 tokens; LLAMA_MTP_ROWS_CB_MIN=N: over N, 0: only a batch of
+        // several ubatches): its rows were also copied to the host buffer (320 MB for 32764 tokens), which the draft,
+        // reading them on the device, waited for (92 ms of a 32k prompt at -ub 32768: 3037 / 3044 / 3039 / 3065 t/s ->
+        // 3070 / 3075 / 3067 / 3088)
+        static const int64_t cb_min = getenv("LLAMA_MTP_ROWS_CB_MIN") ? atoll(getenv("LLAMA_MTP_ROWS_CB_MIN")) : 64;
         if (cparams.embeddings_nextn && !cparams.embeddings_nextn_masked && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE &&
-            n_tokens_all > cparams.n_ubatch) {
+            (n_tokens_all > cparams.n_ubatch || (cb_min > 0 && (int64_t) n_tokens_all > cb_min))) {
             const llama_batch & b = balloc->get_batch();
             llama_seq_id seq = b.token && !b.embd ? b.seq_id[0][0] : -1;
             for (uint32_t i = 0; seq >= 0 && i < n_tokens_all; i++) {
@@ -2788,7 +2795,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
         nextn_rows_want = std::max<int64_t>(cparams.n_ubatch, nextn_cb_on ? 0 : (int64_t) n_tokens_all);
     }
-    if (!nextn_cb_on && h_stage) {
+    if (!nextn_cb_on && h_stage && !(h_stage_keep && ggml_backend_sched_moe_cache_rewarm_active(sched.get()))) {
+        h_stage_keep = false;
         h_stage_release();
     }
 
@@ -3134,7 +3142,20 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 // LLAMA_MTP_ROWS_ASYNC=1, one device: the rows go to the staging buffer on the target's stream and the
                 // draft reads them there while the target goes on (no wait for the draft's pass here)
                 static const bool rows_async = getenv("LLAMA_MTP_ROWS_ASYNC") && atoi(getenv("LLAMA_MTP_ROWS_ASYNC")) != 0;
-                if (rows_async && !stage_first) {
+                // The last ubatch of a prompt's last large batch (no output, shorter than n_batch: the server keeps the
+                // prompt's last tokens for a batch of their own): its rows (10 KB each, 320 MiB for 32764 of them) go to
+                // the staging buffer too, taken from the cache's free memory; the compute buffer borrowed from the cache
+                // (7 GiB at 32768 tokens) is then given back and the cache's restoration started before the draft's pass
+                // and the server's checkpoint, not after them: the batch of the last tokens and the first generated ones
+                // find the most demanded experts back. The staging buffer goes back once the restoration is over: free
+                // entries, which the answer's admissions take. TRIAL, off by default (LLAMA_MTP_FINAL_STAGE=1): the rows are
+                // the 4 streams (40 KB a token, 1280 MiB for 32764 tokens, not 320), and the draft's own loan stops the
+                // restoration just started (moe_cache_borrow), whose list of evicted entries is then lost: no gain yet
+                static const bool final_stage_on = getenv("LLAMA_MTP_FINAL_STAGE") && atoi(getenv("LLAMA_MTP_FINAL_STAGE")) != 0;
+                const bool final_stage = final_stage_on && !stage_first && !moe_cache_shared && n_outputs_all == 0 &&
+                    n_tokens_all < cparams.n_batch && n_tokens_prev + n_rows == (int64_t) n_tokens_all &&
+                    ggml_backend_sched_compute_borrowed(sched.get());
+                if ((rows_async || final_stage) && !stage_first) {
                     const int64_t n_embd_h = t_h_nextn->ne[0];
                     if (h_stage && (h_stage_backend != backend_h || h_stage->ne[0] != n_embd_h || h_stage->ne[1] < n_rows)) {
                         h_stage_release();
@@ -3185,12 +3206,18 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                         q.last_row = h_stage_last.data();
                     }
                 }
-                if (!nextn_cb(nextn_cb_user, &q)) {
-                    LLAMA_LOG_ERROR("%s: the MTP draft failed on the nextn rows [%lld, %lld)\n", __func__,
-                            (long long) n_tokens_prev, (long long) (n_tokens_prev + n_rows));
-                    return -3;
+                if (final_stage && q.ev_done != nullptr) {
+                    // the draft takes them once the loan is back (after the loop: nothing of this graph is read then)
+                    final_q     = q;
+                    final_q_set = true;
+                } else {
+                    if (!nextn_cb(nextn_cb_user, &q)) {
+                        LLAMA_LOG_ERROR("%s: the MTP draft failed on the nextn rows [%lld, %lld)\n", __func__,
+                                (long long) n_tokens_prev, (long long) (n_tokens_prev + n_rows));
+                        return -3;
+                    }
+                    h_stage_busy = h_stage_busy || q.ev_done != nullptr;
                 }
-                h_stage_busy = h_stage_busy || q.ev_done != nullptr;
                 h_host_ok = false;
             } else if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
                 ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
@@ -3283,6 +3310,30 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
     } while (mctx->next());
     kv_rows_ahead = 0;
+    if (final_q_set) {
+        // the rows are in the staging buffer (the copy is queued on the target's stream): the loan back, the restoration
+        // started, then the draft's pass
+        ggml_backend_sched_release_borrowed(sched.get());   // synchronizes
+        gf_res_prev_active = nullptr;
+        ggml_backend_sched_moe_cache_rewarm_now(sched.get());
+        h_stage_keep = true;
+        if (!nextn_cb(nextn_cb_user, &final_q)) {
+            LLAMA_LOG_ERROR("%s: the MTP draft failed on the nextn rows [%lld, %lld)\n", __func__,
+                    (long long) final_q.row0, (long long) (final_q.row0 + final_q.n_rows));
+            return -3;
+        }
+        h_stage_busy = true;
+    }
+    // a guest of another context's MoE cache (the MTP draft) that only stored a prompt batch: its compute buffer goes back
+    // to the cache now, before the owner's next ubatch borrows its own (a draft's loan of 1.1 GiB left there, -ubd 4096,
+    // made the owner's 7.6 GiB fail at 131k); LLAMA_GUEST_RELEASE=0 keeps it
+    {
+        static const bool keep = getenv("LLAMA_GUEST_RELEASE") && atoi(getenv("LLAMA_GUEST_RELEASE")) == 0;
+        if (!keep && moe_cache_shared && n_outputs_all == 0 && n_tokens_all > 8 && ggml_backend_sched_compute_borrowed(sched.get())) {
+            ggml_backend_sched_release_borrowed(sched.get());
+            gf_res_prev_active = nullptr;
+        }
+    }
     // every row gathered on the device: the MTP draft reads them there
     if (h_rows && h_rows_ok && h_rows_n == (int64_t) n_tokens_all) {
         h_nextn_dev      = h_rows;
@@ -5575,6 +5626,10 @@ void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
 
 bool llama_set_mtp_h_from(llama_context * ctx, llama_context * tgt, const float * row_first) {
     return ctx->set_mtp_h_from(*tgt, row_first);
+}
+
+void llama_set_mtp_h_window(llama_context * ctx, int64_t row_base) {
+    ctx->set_mtp_h_window(row_base);
 }
 
 void llama_set_nextn_rows_cb(llama_context * ctx, llama_nextn_rows_cb cb, void * user) {

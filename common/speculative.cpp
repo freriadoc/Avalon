@@ -1614,12 +1614,33 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
             }
         }
+        // TRIAL LLAMA_MTP_WINDOW=N (see process()): the draft decodes the last N rows of the batch only; the rows of this
+        // ubatch before them are skipped, its last row still kept for the next ubatch (pending_h)
+        // 32k prompts, N = 4096 (16 Nov.): -ub 32768 3109 / 3128 / 3090 / 3090 t/s -> 3173 / 3196 / 3135 / 3121, -ub 9536
+        // 2568 / 2548 / 2569 / 2501 -> 2572 / 2568 / 2537 / 2573. NOT TO BE TURNED ON as it is: at 251k (-b 32768) the
+        // fifth batch never ends, the host spinning in the draft's wait for its hosted experts (ggml_cuda_moe_hosted_wait);
+        // its effect on the acceptance at depth is not measured
+        static const int mtp_window_cb = getenv("LLAMA_MTP_WINDOW") ? atoi(getenv("LLAMA_MTP_WINDOW")) : 0;
+        const int64_t win0    = mtp_window_cb > 0 && r.n_total > mtp_window_cb ? r.n_total - mtp_window_cb : 0;
+        const int64_t k_first = std::min<int64_t>(std::max<int64_t>(win0 - r.row0, 0), r.n_rows);
+        if (k_first == r.n_rows && !r.ev_done) {
+            ggml_backend_tensor_get(r.rows, pending_h[seq_id].data(), (size_t) (r.n_rows - 1) * r.rows->nb[1],
+                    (size_t) n_embd * sizeof(float));
+            rows_cb_n += r.n_rows;
+            if (rows_cb_n == r.n_total) {
+                rows_cb_done = r.n_total;
+            }
+            return true;
+        }
         if (!llama_set_mtp_h_rows_ev(ctx_dft, r.rows, r.n_rows, r.backend, pending_h[seq_id].data(), r.ev_ready)) {
             SPC_ERR("%s", "the draft has no backend on the device of the target's rows\n");
             return false;
         }
+        if (k_first > 0 && !r.ev_done) {
+            llama_set_mtp_h_window(ctx_dft, k_first);
+        }
         batch.clear();
-        for (int64_t i = 0; i < r.n_rows; ++i) {
+        for (int64_t i = r.ev_done ? 0 : k_first; i < r.n_rows; ++i) {
             batch.add(r.tokens[i], r.pos[i], seq_id, false);
         }
         const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
@@ -1818,7 +1839,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     }
                 }
 
-                for (int k = 0; k < n_tokens; ++k) {
+                // TRIAL LLAMA_MTP_WINDOW=N: a prompt batch gives the draft its last N rows only (Strata's --mtp-window: the
+                // draft layer then attends to the end of the context; its drafts are verified, so only the acceptance
+                // can change)
+                static const int mtp_window = getenv("LLAMA_MTP_WINDOW") ? atoi(getenv("LLAMA_MTP_WINDOW")) : 0;
+                const int k_first = h_dev && mtp_window > 0 && n_tokens > mtp_window ? n_tokens - mtp_window : 0;
+                if (k_first > 0) {
+                    llama_set_mtp_h_window(ctx_dft, k_first);
+                }
+
+                for (int k = k_first; k < n_tokens; ++k) {
                     const llama_seq_id seq_id = batch_in.tokens[k].seq_id;
 
                     const int32_t idx = batch.add(batch_in.tokens[k].id, batch_in.tokens[k].pos[0], seq_id, false);
