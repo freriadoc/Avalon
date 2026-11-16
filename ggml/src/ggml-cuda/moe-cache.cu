@@ -71,6 +71,8 @@ bool ggml_cuda_host_rows_node(ggml_backend_cuda_context & ctx, ggml_tensor * nod
 #include <functional>
 
 // EXL3 weights are not part of this tree: every path below that tests for them is dead.
+int64_t ggml_cuda_qattn_query_min_kv();   // qattn-i8.cu
+
 static inline bool ggml_type_is_exl3(ggml_type) { return false; }
 
 #include <algorithm>
@@ -1842,6 +1844,7 @@ static void moe_cache_rewarm_stop_locked(moe_cache_device & device);
 static void moe_ring_ahead_cancel_locked(moe_cache_device & device);
 static void moe_ring_ahead_stop(moe_cache_device & device);
 static void moe_cache_rewarm_start_locked(moe_cache_session & session, moe_cache_device & device);
+static void moe_arena_restore_start_locked(moe_cache_session & sess, moe_cache_device & device);
 static bool moe_cache_rewarm_bulk_on();
 static void moe_cache_rewarm_bulk_locked(moe_cache_session & session, moe_cache_device & device,
                                          std::unique_lock<std::mutex> & lock);
@@ -4982,6 +4985,14 @@ static int moe_cache_rewarm_from() {
 // grouped by count (counting sort: counts are at most lfu_cap), merged with the ranking (hottest first, so its counts
 // never rise); an evicted entry first on equal counts. Linear in the lists, no sort.
 static void moe_cache_rewarm_start_locked(moe_cache_session & session, moe_cache_device & device) {
+    // TRIAL GGML_CUDA_MOE_REWARM_NONE=1: nothing restored after a prefill, the answer's admissions fill the cache
+    static const bool rewarm_none = getenv("GGML_CUDA_MOE_REWARM_NONE") && atoi(getenv("GGML_CUDA_MOE_REWARM_NONE")) != 0;
+    if (rewarm_none) {
+        for (auto & pool_ptr : device.pools) {
+            pool_ptr->rewarm.clear();
+        }
+        return;
+    }
     device.rewarm_order.clear();
     device.rewarm_next = 0;
     device.renewed_demands = 0;
@@ -5227,6 +5238,8 @@ static void moe_cache_rewarm_stop_locked(moe_cache_device & device) {
     if (!device.rewarm_active) {
         return;
     }
+    MOE_CACHE_LOG("[moe-cache] CUDA%d rewarm: stopped by a loan, %lld entries restored, at %zu of %zu of its order\n", device.physical,
+            device.rewarm_restored, device.rewarm_next, device.rewarm_order.size());
     device.rewarm_active = false;
     device.rewarm_order.clear();
 }
@@ -6255,6 +6268,35 @@ static void moe_cache_preload(const moe_cache_session & session, moe_cache_devic
     std::vector<moe_cache_pool *> installed_pool;
     std::vector<std::pair<moe_expert_arena *, int>> arena_held;
     cudaError_t err = cudaSuccess;
+    // GGML_CUDA_MOE_CACHE_PRELOAD_FREE=N (240 by default, 0: none): N slots of the cache left free by the preload, shared
+    // by the pools in proportion to their slots (the ranking's least demanded experts of each pool are left out). A
+    // pool with free slots admits a demanded expert sooner (admit_after, not readmit_after) and evicts nothing for it:
+    // the cache follows the text sooner, as it did when the loans evicted more entries (the prefetch's zones, twice
+    // the ring's). RX 7900 XT, MTP, 13 answers of 512 tokens to 6 short prompts a server, 4 servers a value, 14 Nov.:
+    // misses 13.08 % (0), 13.24 (100), 13.09 (150), 13.02 (200), 12.94 (250), 13.05 (300); the step the same within the
+    // series' spread (23.02 - 23.10 ms), as with 70, 140, 280 and the whole zone (454) in two other series
+    static const int preload_free = getenv("GGML_CUDA_MOE_CACHE_PRELOAD_FREE") ? atoi(getenv("GGML_CUDA_MOE_CACHE_PRELOAD_FREE")) : 240;
+    std::vector<int> pool_left(device.pools.size(), INT_MAX);
+    if (preload_free > 0) {
+        int64_t total = 0;
+        for (const auto & pp : device.pools) {
+            total += pp->n_slots;
+        }
+        for (size_t p = 0; p < device.pools.size(); p++) {
+            const moe_cache_pool & pool = *device.pools[p];
+            int usable = 0;
+            for (const int c : pool.free_slots) {
+                bool kv_row = false;
+                for (const auto & kv : pool.kv) {
+                    kv_row = kv_row || (c >= kv.first && c < kv.first + kv.count);
+                }
+                const bool zone = c >= pool.zone_begin && c < pool.zone_end;
+                usable += !kv_row && (!zone || moe_cache_preload_zones());
+            }
+            const int reserve = (int) ((int64_t) preload_free * pool.n_slots / std::max<int64_t>(total, 1));
+            pool_left[p] = std::max(0, usable - reserve);
+        }
+    }
     for (uint32_t i = 0; i < n_ranked && err == cudaSuccess; i++) {
         const int layer_number = ranking[i].layer, expert = ranking[i].expert;
         const auto l = device.layers.find(layer_number);
@@ -6273,6 +6315,9 @@ static void moe_cache_preload(const moe_cache_session & session, moe_cache_devic
         device.ranking.push_back({pool_index, key, device.ranking_src[i].share});
         if (pool.map.count(key)) {
             continue;
+        }
+        if (pool_left[(size_t) pool_index] <= 0) {
+            continue;   // PRELOAD_FREE: the rest of this pool stays free
         }
         // first the entries no loan takes (the hottest experts there), then the prefetch zone: a short prompt's
         // answers (no prefetch, nothing lent) find a full cache, the first long prompt lends the zone (its experts,
@@ -6331,6 +6376,7 @@ static void moe_cache_preload(const moe_cache_session & session, moe_cache_devic
         moe_cache_direct_set(pool, key, s);
         installed.push_back(s);
         installed_pool.push_back(&pool);
+        pool_left[(size_t) pool_index] -= pool_left[(size_t) pool_index] != INT_MAX;
         loaded++;
         bytes += pool.expert_size;
     }
@@ -6567,6 +6613,43 @@ static int64_t moe_cache_kv_first_lent_row(void * opaque) {
         }
     }
     return first;
+}
+
+// The restoration after a prefill started by the caller, which gave the prefill's loans back (a prompt's last large batch,
+// before the draft's pass over it and the server's checkpoint: ~190 ms sooner than the first hosted layer of the next
+// graph that does not lend, moe_hosted_plan)
+static void moe_cache_rewarm_now(void * opaque) {
+    moe_cache_session * session = (moe_cache_session *) opaque;
+    if (!session) {
+        return;
+    }
+    std::unique_lock<std::mutex> lock(session->mu);
+    session->lent_since_evictions = false;
+    session->lent_in_last_graph   = false;
+    for (auto & device_ptr : session->devices) {
+        moe_cache_device & device = *device_ptr;
+        device.rewarm_armed = false;
+        moe_cache_rewarm_start_locked(*session, device);
+        if (moe_cache_rewarm_bulk_on() && device.rewarm_active) {
+            device.rewarm_bulk_pending = true;
+            session->cv.notify_all();
+        }
+        moe_arena_restore_start_locked(*session, device);
+    }
+}
+
+static bool moe_cache_rewarm_active(void * opaque) {
+    moe_cache_session * session = (moe_cache_session *) opaque;
+    if (!session) {
+        return false;
+    }
+    std::unique_lock<std::mutex> lock(session->mu);
+    for (auto & device_ptr : session->devices) {
+        if (device_ptr->rewarm_active) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static moe_cache_device * moe_cache_device_for_backend(
@@ -7216,7 +7299,15 @@ static void * moe_cache_borrow(void * opaque, void * backend, size_t bytes) {
         return nullptr;
     }
 
-    moe_cache_rewarm_stop_locked(*device);
+    // A loan stops the restoration, the MTP draft's too: it borrows its own compute buffer again for its first generation
+    // pass, 88 ms after the restoration started, which has then brought back 328 of the 5 614 entries the prefill evicted
+    // (a 32k prompt at -ub 32768). Run to its end (GGML_CUDA_MOE_REWARM_STOP_ON_BORROW=0: 3 268 entries in 0.57 s of
+    // copies beside the first steps), the 256 tokens after the prompt took 13.91 / 13.63 / 13.07 / 13.77 / 13.58 / 13.26
+    // ms a token against 12.08 / 12.38 / 11.74 / 12.55 / 11.84 / 11.44 stopped (15 Nov., two alternated pairs of servers)
+    static const bool stop_on_borrow = !(getenv("GGML_CUDA_MOE_REWARM_STOP_ON_BORROW") && atoi(getenv("GGML_CUDA_MOE_REWARM_STOP_ON_BORROW")) == 0);
+    if (stop_on_borrow) {
+        moe_cache_rewarm_stop_locked(*device);
+    }
 
     // BANDS: the highest free gap under the zones that holds the chunk, above the floor of 5 %; every banded pool gives
     // the slots the chunk overlaps (a slot astride a neighbouring loan is already out)
@@ -11093,6 +11184,7 @@ struct moe_ring_state {
     // until the next block's synchronization, as the cache entries read in place
     std::vector<std::pair<moe_expert_arena *, int>> arena_pins, arena_pins_prev;
     uint64_t copies = 0, in_place = 0, from_arena = 0, from_transit = 0, from_mapping = 0, from_ahead = 0;
+    uint64_t calls = 0;              // the copies submitted (a run of experts is one)
     double ahead_wait_us = 0.0;
 
     // ARENA, the reads ahead (GGML_CUDA_MOE_RING_AHEAD=0 turns them off; moe-ring-ahead.h, tests/ringaheadtest.cpp): a
@@ -11179,8 +11271,8 @@ static void moe_cache_ring_zone(void * opaque, void * backend, void * base, size
                 std::lock_guard<std::mutex> lock(session->mu);
                 moe_ring_ahead_cancel_locked(*device);
             }
-            MOE_CACHE_LOG("[moe-cache] CUDA%d prefill ring: %llu experts copied, %llu read in place (%.1f %% in place)\n",
-                    device->physical, (unsigned long long) r.copies, (unsigned long long) r.in_place,
+            MOE_CACHE_LOG("[moe-cache] CUDA%d prefill ring: %llu experts copied in %llu copies, %llu read in place (%.1f %% in place)\n",
+                    device->physical, (unsigned long long) r.copies, (unsigned long long) r.calls, (unsigned long long) r.in_place,
                     100.0 * r.in_place / std::max<uint64_t>(1, r.copies + r.in_place));
             if (!device->arenas.empty()) {
                 MOE_CACHE_LOG("[moe-cache] CUDA%d prefill ring: of the copies, %llu from the arena, %llu read into its zone, "
@@ -11284,10 +11376,16 @@ int ggml_cuda_moe_ring_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cgra
         }
         span = std::max(span, role_off[k] + w[k]->nb[1]*w[k]->ne[1]);
     }
-    // GGML_CUDA_MOE_RING_GROUP=G: the experts of a group (32 by default): a larger group, fewer launches and fewer idle
-    // SMs in each launch's last wave, against a ring that must hold a group and later reads of a group's first copies
+    // GGML_CUDA_MOE_RING_GROUP=G: the experts of a group (128 by default): a larger group, fewer launches and fewer idle
+    // SMs in each launch's last wave, against a ring that must hold a group and later reads of a group's first copies.
+    // RX 7900 XT, prompts of 32k / 131k tokens, the FP16 kernels: -ub 9536 2288 / 2245 t/s (32) -> 2357 / 2311 (64);
+    // -ub 32768 2587 / 2420 -> 2572 / 2430; 128 and 256 lower (2549 / 2397, 2515 / 2358 before the row sort).
+    // 128 since the down's rows are computed apart and the hyper-connections' kernels changed (15 Nov., 32k prompts,
+    // two alternated pairs of runs each): -ub 32768 2984 / 2983 / 2973 / 2962 t/s (64) -> 2993 / 3041 / 2964 / 2981,
+    // -ub 9536 2478 / 2511 / 2520 / 2534 -> 2531 / 2516 / 2536 / 2521; the kernels' time is the same (2 006 ms of
+    // gate / up against 2 019), the GPU waits less for the copies in the blocks (398 ms against 482 a 32k prompt)
     static const int G = getenv("GGML_CUDA_MOE_RING_GROUP") && atoi(getenv("GGML_CUDA_MOE_RING_GROUP")) > 0 ?
-                         atoi(getenv("GGML_CUDA_MOE_RING_GROUP")) : 32;
+                         atoi(getenv("GGML_CUDA_MOE_RING_GROUP")) : 128;
     // this layer's entry: its expert's row and what MMQ reads past the down's last row (72 B; the zones are zeroed once,
     // then hold copied experts: finite)
     const size_t eb = GGML_PAD(stride + 1024, 256);
@@ -11545,20 +11643,57 @@ int ggml_cuda_moe_ring_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cgra
     cudaStream_t cs = ctx.stream();
     const int64_t seq0 = r.seq;
     const int64_t n_groups = n_expert / G;
-    struct pend { int64_t e; int64_t wait; int64_t off; bool issued; };
+    // run: the experts of the copy this one heads (0: copied with its run's head, whose wait covers it)
+    struct pend { int64_t e; int64_t wait; int64_t off; bool issued; int run; };
     std::vector<std::vector<pend>> by_group(n_groups);
-    for (int64_t e = 0; e < n_expert; e++) {
+    // GGML_CUDA_MOE_RING_RUNS=0: a copy per expert. Else the absent experts of a group whose rows follow each other (in
+    // the layer's mapping, or in one registered piece of the arena) are one copy, into entries that follow each other in the ring (a row's margin is
+    // then the next row; the run's last entry keeps the margin of its own): the host submits a copy per run, not per
+    // expert (a copy's submission has a fixed cost, and the same thread launches the groups' kernels)
+    static const bool runs_on = !getenv("GGML_CUDA_MOE_RING_RUNS") || atoi(getenv("GGML_CUDA_MOE_RING_RUNS")) != 0;
+    auto follows = [&](const int64_t e) {   // e's row right after e - 1's: in the layer's mapping, or in one piece of the arena
+        if (!src_row[e] && !src_row[e - 1]) {
+            return true;   // both read where the file is mapped: the rows of one tensor, registered whole or not at all
+        }
+        if (!src_row[e] || !src_row[e - 1] || src_row[e] != src_row[e - 1] + stride) {
+            return false;
+        }
+        for (const auto & piece : device->arena_pieces) {
+            if (src_row[e - 1] >= piece.first && src_row[e] + stride <= piece.first + piece.second) {
+                return true;
+            }
+        }
+        return false;
+    };
+    for (int64_t e = 0; e < n_expert; ) {
         if (xe[0][e]) {
             r.in_place++;
+            e++;
             continue;
         }
-        int64_t wait = -1;
-        const int64_t off = r.ring.take(moe_cache_key{w[0]->data, (int32_t) e}, seq0 + e / G, eb, &wait);
-        GGML_ASSERT(off >= 0);
-        for (int k = 0; k < 3; k++) {
-            xe[k][e] = (uint64_t) (uintptr_t) (r.base + (size_t) off + role_off[k]);
+        int64_t n = 1;   // never the layer's last expert, copied by its parts
+        while (runs_on && e + n < n_expert - 1 && (e + n) / G == e / G && !xe[0][e + n] && follows(e + n)) {
+            n++;
         }
-        by_group[e / G].push_back({e, wait, off, false});
+        if (n > 1 && r.ring.head + (size_t) (n - 1)*stride + eb > r.ring.cap) {
+            n = 1;   // no run across the ring's end
+        }
+        const size_t head_i = by_group[e / G].size();
+        int64_t wait_run = -1, off0 = -1;
+        for (int64_t j = 0; j < n; j++) {
+            int64_t wait = -1;
+            const int64_t off = r.ring.take(moe_cache_key{w[0]->data, (int32_t) (e + j)}, seq0 + e / G, j + 1 < n ? stride : eb, &wait);
+            GGML_ASSERT(off >= 0);
+            off0 = j == 0 ? off : off0;
+            GGML_ASSERT(off == off0 + (int64_t) (j*stride));
+            for (int k = 0; k < 3; k++) {
+                xe[k][e + j] = (uint64_t) (uintptr_t) (r.base + (size_t) off + role_off[k]);
+            }
+            by_group[e / G].push_back({e + j, wait, off, false, j == 0 ? (int) n : 0});
+            wait_run = std::max(wait_run, wait);
+        }
+        by_group[e / G][head_i].wait = wait_run;
+        e += n;
     }
     // GGML_CUDA_MOE_GROUPED_CHECK computes the block again after its groups, reading the entries: a ring smaller than
     // the block's copies has overwritten its first entries by then (the reference differs, not the block)
@@ -11605,7 +11740,9 @@ int ggml_cuda_moe_ring_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cgra
     auto advance = [&]() {
         while (next_group_to_close < n_groups) {
             bool all = true;
-            for (auto & p : by_group[next_group_to_close]) {
+            auto & bg = by_group[next_group_to_close];
+            for (size_t pi = 0; pi < bg.size(); pi++) {
+                auto & p = bg[pi];
                 if (p.issued) {
                     continue;
                 }
@@ -11628,12 +11765,16 @@ int ggml_cuda_moe_ring_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cgra
                 const size_t bytes = p.e == n_expert - 1 ? span : stride;
                 const char * from = src_row[p.e] ? src_row[p.e] : lo + (size_t) p.e*stride;
                 r.from_mapping += !src_row[p.e] && !device->arenas.empty();
-                CUDA_CHECK(cudaMemcpyAsync(dst, from, bytes, cudaMemcpyHostToDevice, r.copy));
+                GGML_ASSERT(p.run >= 1);
+                CUDA_CHECK(cudaMemcpyAsync(dst, from, (size_t) (p.run - 1)*stride + bytes, cudaMemcpyHostToDevice, r.copy));
                 if (bytes < stride) {
                     CUDA_CHECK(cudaMemsetAsync(dst + bytes, 0, stride - bytes, r.copy));
                 }
-                r.copies++;
-                p.issued = true;
+                r.copies += p.run;
+                r.calls++;
+                for (int j = 0; j < p.run; j++) {
+                    bg[pi + j].issued = true;
+                }
             }
             if (!all) {
                 break;
@@ -12093,6 +12234,8 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.kv_needs_set_rows = moe_cache_kv_needs_set_rows;
     ggml_moe_cache.kv_set_rows = moe_cache_kv_set_rows;
     ggml_moe_cache.kv_first_lent_row = moe_cache_kv_first_lent_row;
+    ggml_moe_cache.rewarm_now = moe_cache_rewarm_now;
+    ggml_moe_cache.rewarm_active = moe_cache_rewarm_active;
     ggml_moe_cache.host_experts = moe_cache_host_experts;
     ggml_moe_cache.session_leave = moe_cache_session_leave;
     ggml_moe_cache.begin = moe_cache_begin;
@@ -12105,6 +12248,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.lend_room = moe_cache_lend_room;
     ggml_moe_cache.hosted_cost = moe_hosted_cost;
     ggml_moe_cache.qsa_tiles = ggml_cuda_fattn_tile_mask_supported;
+    ggml_moe_cache.qsa_query_min_kv = ggml_cuda_qattn_query_min_kv;
     ggml_moe_cache.ring_usable = moe_cache_ring_usable;
     ggml_moe_cache.plan = nullptr;   // nodes are served by the hosted MoE only (moe_cache_begin)
     ggml_moe_cache.dispatch = nullptr;   // nodes are served by the hosted MoE only (moe_cache_begin)

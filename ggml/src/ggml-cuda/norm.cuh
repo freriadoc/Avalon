@@ -16,7 +16,7 @@ bool ggml_cuda_rms_norm_mul_inject_supported(const ggml_tensor * rms_norm, const
 // SIGMOID -> SCALE, no comb), computed by the same kernel; 4 outputs
 void ggml_cuda_op_rms_norm_mul_inject(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, ggml_tensor * mul,
         ggml_tensor * mm, ggml_cuda_img img = ggml_cuda_img(), const ggml_tensor * gate_scale_in = nullptr,
-        const ggml_tensor * gate_scale_out = nullptr);
+        const ggml_tensor * gate_scale_out = nullptr, bool lazy = false, bool x16 = false, bool dst16 = false);
 
 void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * scale_tensor);
 

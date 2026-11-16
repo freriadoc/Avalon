@@ -2573,6 +2573,12 @@ void ggml_cuda_f16_image_lost(const ggml_tensor * dst, const ggml_tensor * src1)
     }
 }
 
+bool ggml_cuda_dense_f16_applies(int cc, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
+size_t ggml_cuda_dense_f16_min_bytes(const ggml_tensor * src0);
+void ggml_cuda_dense_f16(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, char * w16, size_t w16_bytes,
+        cudaStream_t stream, const void * x16 = nullptr);
+bool ggml_cuda_dense_f16_image_applies(int cc, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
+
 // the image a product of out can read (ggml_cuda_img_kind), -1: none
 static int ggml_cuda_f16_image_kind(const ggml_tensor * mm, const ggml_tensor * out, int device) {
     if (mm->op != GGML_OP_MUL_MAT || out->type != GGML_TYPE_F32 || !ggml_is_contiguous(out)) {
@@ -2588,10 +2594,17 @@ static int ggml_cuda_f16_image_kind(const ggml_tensor * mm, const ggml_tensor * 
     const int cc = ggml_cuda_info().devices[device].cc;
     switch (ggml_cuda_mul_mat_get_path(src0, src1, mm, device)) {
         case GGML_CUDA_MM_CUBLAS: {
+            if (ggml_cuda_dense_f16_applies(cc, src0, src1, mm)) {
+                return -1;
+            }
             const ggml_type t = ggml_cuda_cublas_compute_type(src0, src1, mm, cc);
             return t == GGML_TYPE_F16 ? GGML_CUDA_IMG_F16 : t == GGML_TYPE_BF16 ? GGML_CUDA_IMG_BF16 : -1;
         }
         case GGML_CUDA_MM_MMQ: {
+            // the FP16 product (dense-f16.cu) reads the F32 activation itself: no image, which would keep it on MMQ
+            if (ggml_cuda_dense_f16_applies(cc, src0, src1, mm)) {
+                return -1;
+            }
             int64_t key[GGML_CUDA_MMQ_SCRATCH_KEY];
             const bool ok = mmq_get_q8_1_ds_layout(src0->type) == MMQ_Q8_1_DS_LAYOUT_D4 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
                 src1->ne[0] % MATRIX_ROW_PADDING == 0 && ggml_cuda_mmq_scratch_size(mm, cc, key) > 0;
@@ -2689,6 +2702,16 @@ static void ggml_cuda_f16_image_written(ggml_backend_cuda_context & ctx, const g
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
+    if (ctx.x16_mm == dst) {
+        // its activation is an FP16 image (ggml_cuda_hc_down16 checked the product and its scratch): the FP16 product,
+        // the weight decoded into the scratch
+        const ggml_tensor * scratch_t = dst->src[GGML_SCHED_SCRATCH_SRC];
+        ctx.mmq_scratch_last = nullptr;
+        ggml_cuda_dense_f16(src0, src1, dst, (char *) scratch_t->data, ggml_nbytes(scratch_t), ctx.stream(), ctx.x16_p);
+        ctx.x16_mm = nullptr;
+        return;
+    }
+
     ggml_cuda_mul_mat_path path = ggml_cuda_mul_mat_get_path(src0, src1, dst, ctx.device);
     if (path == GGML_CUDA_MM_FWHT) {
         if (ggml_cuda_op_fwht(ctx, src1, dst)) {
@@ -2723,6 +2746,19 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
             return;
         case GGML_CUDA_MM_CUBLAS:
+            // RDNA3, a prompt batch against BF16 weights: the FP16 product (dense-f16.cu), its FP16 weight in the scratch
+            if (ggml_cuda_dense_f16_applies(ggml_cuda_info().devices[ctx.device].cc, src0, src1, dst)) {
+                const ggml_tensor * scratch_t = dst->src[GGML_SCHED_SCRATCH_SRC];
+                const size_t w16_min = ggml_cuda_dense_f16_min_bytes(src0);
+                const bool   in_scratch = scratch_t && scratch_t->data && ggml_nbytes(scratch_t) >= w16_min &&
+                    (uintptr_t) scratch_t->data % 16 == 0;
+                ggml_cuda_pool_alloc<char> w16_pool(ctx.pool());
+                const size_t w16_bytes = in_scratch ? ggml_nbytes(scratch_t) : (size_t) ne01*ne00*sizeof(half);
+                char * w16 = in_scratch ? (char *) scratch_t->data : w16_pool.alloc(w16_bytes);
+                ctx.mmq_scratch_last = nullptr;
+                ggml_cuda_dense_f16(src0, src1, dst, w16, w16_bytes, ctx.stream());
+                return;
+            }
             ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
             return;
         case GGML_CUDA_MM_Q8_0_F32:
@@ -5305,6 +5341,217 @@ static bool ggml_cuda_hc_post_norm_fusable(const ggml_cgraph * cgraph, int i) {
     return true;
 }
 
+// hc-mix.cu
+bool ggml_cuda_hc_upmix_supported(int cc, const ggml_tensor * mm, const ggml_tensor * pre);
+void ggml_cuda_hc_upmix(ggml_backend_cuda_context & ctx, const ggml_tensor * mm, ggml_tensor * pre, const ggml_tensor * res,
+        const ggml_tensor * w_norm, bool res16);
+
+// the gate of a hyper-connection read and its mix (qwen4exp, build_hc_mix): MUL_MAT (W_up, Q8_0) of a prompt batch at i,
+// the view of its result, DSV4_HC_PRE (gated) -> one kernel (hc-mix.cu). The mix's node, or -1: the nodes are not those,
+// or the mix lies over the streams it reads
+static int ggml_cuda_hc_upmix_match(const ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int i) {
+    const ggml_tensor * node = cgraph->nodes[i];
+    if (node->op != GGML_OP_MUL_MAT || i + 2 >= cgraph->n_nodes) {
+        return -1;
+    }
+    int k = i + 1;
+    while (k < cgraph->n_nodes && k < i + 4 && ggml_cuda_is_view_or_noop(cgraph->nodes[k])) {
+        k++;
+    }
+    const ggml_tensor * pre = k < cgraph->n_nodes ? cgraph->nodes[k] : nullptr;
+    if (!pre || pre->op != GGML_OP_DSV4_HC_PRE || k == i + 1 || !pre->src[1] || pre->src[1]->view_src != node ||
+            !ggml_cuda_hc_upmix_supported(ggml_cuda_info().devices[cuda_ctx->device].cc, node, pre)) {
+        return -1;
+    }
+    int nodes[4];
+    enum ggml_op ops[4];
+    int n = 0;
+    for (int j = i; j <= k; j++) {
+        nodes[n] = j;
+        ops[n++] = cgraph->nodes[j]->op;
+    }
+    const ggml_tensor * xn = pre->src[0];
+    const ggml_tensor * lo = node->src[1];
+    const char * a0 = (const char *) pre->data, * a1 = a0 + ggml_nbytes(pre);
+    const char * b0 = (const char *) xn->data,  * b1 = b0 + ggml_nbytes(xn);
+    const char * c0 = (const char *) lo->data,  * c1 = c0 + ggml_nbytes(lo);
+    return ggml_can_fuse_subgraph_ext(cgraph, nodes, n, ops, &k, 1) && !(a0 < b1 && b0 < a1) && !(a0 < c1 && c0 < a1) ? k : -1;
+}
+
+// the normalized streams of a hyper-connection read (mul, [n_embd, hc, T]) not written at all (GGML_CUDA_HC_XN_LAZY=0:
+// written, F32): their producer leaves the norm's scale of each (token, stream) in their memory and the gate + mix
+// kernel computes them again from the streams the norm read and its weights (1.34 GB less written at 32768 tokens; the
+// write of half of it as FP16 took 2.1 ms of the producer's 7). Only when nothing reads them: their readers from
+// `first` on are the inject (k_inject, computed by the producer), the batched Q8_0 products that read their q8_1 image
+// (the down), and the mix, which the one kernel takes with its gate (ggml_cuda_hc_upmix_match, the same test as when it
+// gets there). GGML_CUDA_HC_XN_LOG=1 says a refusal
+static struct { const void * xn = nullptr; const ggml_tensor * res = nullptr, * w = nullptr; } g_hc_lazy;   // the streams last left so, until their mix
+static bool ggml_cuda_hc_xn_lazy_ok(const ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int first,
+        const ggml_tensor * mul, const int k_inject, const ggml_cuda_img & img, const ggml_tensor * img_mm) {
+    static const bool on = !getenv("GGML_CUDA_HC_XN_LAZY") || atoi(getenv("GGML_CUDA_HC_XN_LAZY")) != 0;
+    static const bool why = getenv("GGML_CUDA_HC_XN_LOG") != nullptr;
+    static int said = 0;
+    const auto no = [&](const char * reason, const ggml_tensor * t) {
+        if (why && mul->ne[2] >= 256 && said < 12) {
+            said++;
+            GGML_LOG_INFO("hc lazy streams refused: %s (%s %s)\n", reason, t ? ggml_op_name(t->op) : "-", t ? t->name : "-");
+        }
+        return false;
+    };
+    if (!on || !img.p || img.kind != GGML_CUDA_IMG_Q8_1_D4 || !img_mm) {
+        return no("no q8_1 image", nullptr);
+    }
+    const auto reads = [&](const ggml_tensor * n) {
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            if (n->src[j] && (n->src[j] == mul || n->src[j]->view_src == mul)) {
+                return true;
+            }
+        }
+        return false;
+    };
+    int k_pre = -1;
+    for (int k = first; k < cgraph->n_nodes; k++) {
+        const ggml_tensor * n = cgraph->nodes[k];
+        if (n == mul || ggml_cuda_is_view_or_noop(n) || !reads(n) || k == k_inject || n == img_mm) {
+            continue;
+        }
+        // a product of the image's group: the same activation, a Q8_0 matrix, batched (MMQ reads the q8_1 image)
+        if (k_pre < 0 && n->op == GGML_OP_MUL_MAT && n->src[0]->type == GGML_TYPE_Q8_0 && n->src[1] && n->src[1]->view_src == mul &&
+                img_mm->src[1] && n->src[1]->data == img_mm->src[1]->data && ggml_are_same_shape(n->src[1], img_mm->src[1]) &&
+                ggml_get_op_params_i32(n, 3) == GGML_PREC_DEFAULT && n->ne[1] > 8) {
+            continue;
+        }
+        if (n->op != GGML_OP_DSV4_HC_PRE || k_pre >= 0) {
+            return no("another reader", n);
+        }
+        k_pre = k;
+    }
+    if (k_pre < 0) {
+        return no("no mix", nullptr);
+    }
+    const ggml_tensor * gate = cgraph->nodes[k_pre]->src[1] ? cgraph->nodes[k_pre]->src[1]->view_src : nullptr;
+    for (int j = k_pre - 1; j >= std::max(first, k_pre - 4); j--) {
+        if (cgraph->nodes[j] == gate) {
+            return ggml_cuda_hc_upmix_match(cuda_ctx, cgraph, j) == k_pre ? true : no("the gate + mix kernel would not take it", gate);
+        }
+    }
+    return no("gate not found before the mix", gate);
+}
+
+// the combined streams of a hyper-connection write (DSV4_HC_POST, [n_embd, hc, T]) as FP16 in the first half of their
+// memory (GGML_CUDA_HC_RES16=0: F32): half the bytes the producer writes, the next producer and the gate + mix kernel
+// read. The streams a producer wrote so, until the next producer has read them
+static std::unordered_set<const void *> g_hc_res16;
+
+// whether the kernel of the gated hc_post, its norm and the next half's inject (ggml_cuda_op_rms_norm_mul_inject) takes
+// the nodes from the SCALE at i; *k_mm: the inject product's node
+static bool ggml_cuda_hc_producer_match(const ggml_cgraph * cgraph, const int i, int * k_mm) {
+    if (i < 0 || i + 5 >= cgraph->n_nodes || cgraph->nodes[i]->op != GGML_OP_SCALE || !ggml_cuda_hc_post_norm_fusable(cgraph, i)) {
+        return false;
+    }
+    const ggml_tensor * node = cgraph->nodes[i];
+    const ggml_tensor * post = cgraph->nodes[i + 3];
+    const ggml_tensor * rms  = cgraph->nodes[i + 4];
+    const ggml_tensor * mul  = cgraph->nodes[i + 5];
+    int k = i + 6;
+    while (k < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[k])) {
+        k++;
+    }
+    const ggml_tensor * mm = k < cgraph->n_nodes ? cgraph->nodes[k] : nullptr;
+    static const bool norm_inject = !getenv("GGML_CUDA_NORM_INJECT") || atoi(getenv("GGML_CUDA_NORM_INJECT")) != 0;
+    if (!(norm_inject && mm && mm->op == GGML_OP_MUL_MAT && mm->ne[1] > 8 && mm->src[0]->ne[1] == 4 &&
+            ggml_get_op_params_i32(mm, 3) == GGML_PREC_DEFAULT && ggml_cuda_rms_norm_mul_inject_supported(rms, mul, mm))) {
+        return false;
+    }
+    const ggml_tensor * residual = post->src[1];
+    const ggml_tensor * bo       = post->src[0];
+    const ggml_tensor * raw      = node->src[0];
+    const auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * a0 = (const char *) a->data, * a1 = a0 + ggml_nbytes(a);
+        const char * b0 = (const char *) b->data, * b1 = b0 + ggml_nbytes(b);
+        return a0 < b1 && b0 < a1;
+    };
+    const int nodes[7] = { i, i + 1, i + 2, i + 3, i + 4, i + 5, k };
+    const enum ggml_op ops[7] = { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST, GGML_OP_RMS_NORM,
+                                  GGML_OP_MUL, GGML_OP_MUL_MAT };
+    const int outputs[3] = { i + 3, i + 5, k };
+    if (k_mm) {
+        *k_mm = k;
+    }
+    return residual->type == GGML_TYPE_F32 && residual->nb[0] == sizeof(float) && ggml_cuda_is_aligned(residual, 16) &&
+        residual->nb[1] % 16 == 0 && residual->nb[2] % 16 == 0 && ggml_are_same_shape(residual, post) &&
+        ggml_can_fuse_subgraph_ext(cgraph, nodes, 7, ops, outputs, 3) &&
+        !overlaps(mm, residual) && !overlaps(mm, bo) && !overlaps(mm, raw) && !overlaps(mm, mul) && !overlaps(mm, post);
+}
+
+// whether the combined streams `post` that the producer at i writes (its inject product at k_mm) may be FP16: the gate +
+// mix kernel reads them (lazy), and their only other reader after k_mm is the next hyper-connection write, as its
+// residual, which the same producer kernel takes
+static bool ggml_cuda_hc_res16_ok(const ggml_cgraph * cgraph, const ggml_tensor * post, const int k_mm) {
+    static const bool on = !getenv("GGML_CUDA_HC_RES16") || atoi(getenv("GGML_CUDA_HC_RES16")) != 0;
+    if (!on || !ggml_is_contiguous(post) || post->ne[1] != 4) {
+        return false;
+    }
+    bool next = false;
+    for (int k = k_mm + 1; k < cgraph->n_nodes; k++) {
+        const ggml_tensor * n = cgraph->nodes[k];
+        bool reads = false;
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            reads = reads || (n->src[j] && (n->src[j] == post || n->src[j]->view_src == post));
+        }
+        if (!reads) {
+            continue;
+        }
+        if (next || n->op != GGML_OP_DSV4_HC_POST || n->src[1] != post || n->src[0] == post ||
+                !ggml_are_same_stride(n->src[1], post) || !ggml_cuda_hc_producer_match(cgraph, k - 3, nullptr)) {
+            return false;
+        }
+        next = true;
+    }
+    return next;
+}
+
+// The normalized streams of a hyper-connection read left unwritten (lazy): their one batched Q8_0 product from `first`
+// on (the down, 320 rows x 10240) on the FP16 kernel (dense-f16.cu), reading an FP16 image of the streams that the
+// producer writes in the streams' own memory, after the norm's scales, in the place of the q8_1 image in the products'
+// scratch: that memory is reserved for the F32 streams and holds 4 floats a token. The image then given to the
+// producer, and the product noted for ggml_cuda_mul_mat; else img as it is. GGML_CUDA_HC_DOWN16=0: the q8_1 image
+static bool ggml_cuda_hc_down16(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int first, const ggml_tensor * mul,
+        const int k_inject, ggml_cuda_img * img) {
+    static const bool on = !getenv("GGML_CUDA_HC_DOWN16") || atoi(getenv("GGML_CUDA_HC_DOWN16")) != 0;
+    cuda_ctx->x16_mm = nullptr;
+    if (!on || !img->p || img->kind != GGML_CUDA_IMG_Q8_1_D4) {
+        return false;
+    }
+    const ggml_tensor * down = nullptr;
+    for (int k = first; k < cgraph->n_nodes; k++) {
+        const ggml_tensor * n = cgraph->nodes[k];
+        if (n == mul || k == k_inject || ggml_cuda_is_view_or_noop(n) || n->op != GGML_OP_MUL_MAT || !n->src[1] || n->src[1]->view_src != mul) {
+            continue;
+        }
+        if (down) {
+            return false;   // two products read the image
+        }
+        down = n;
+    }
+    const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+    if (!down || !ggml_cuda_dense_f16_image_applies(cc, down->src[0], down->src[1], down) ||
+            down->src[1]->view_offs != 0 || ggml_nelements(down->src[1]) != ggml_nelements(mul)) {
+        return false;
+    }
+    const ggml_tensor * scratch_t = down->src[GGML_SCHED_SCRATCH_SRC];
+    const size_t scales = GGML_PAD((size_t) mul->ne[1]*mul->ne[2]*sizeof(float), 64);
+    if (!scratch_t || !scratch_t->data || (uintptr_t) scratch_t->data % 16 != 0 || ggml_nbytes(scratch_t) < ggml_nbytes(down->src[0])/34*64 ||
+            (uintptr_t) mul->data % 64 != 0 || scales + ggml_nelements(mul)*sizeof(half) > ggml_nbytes(mul)) {
+        return false;
+    }
+    img->p    = (char *) mul->data + scales;
+    img->kind = GGML_CUDA_IMG_F16;
+    cuda_ctx->x16_mm = down;
+    cuda_ctx->x16_p  = img->p;
+    return true;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -6569,6 +6816,40 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // (ggml_cuda_op_rms_norm_mul_inject), not a cuBLAS or MMQ launch over the whole activation for 4 outputs (4090,
     // 131k: 249 us per launch, 0.31 s). GGML_CUDA_NORM_INJECT=0: the product apart
     static const bool norm_inject = !getenv("GGML_CUDA_NORM_INJECT") || atoi(getenv("GGML_CUDA_NORM_INJECT")) != 0;
+    // the gate of a hyper-connection read and its mix in one kernel (ggml_cuda_hc_upmix_match);
+    // GGML_CUDA_HC_UPMIX_LOG=1 counts the blocks taken, those whose normalized streams were not written, and those left to the two kernels
+    if (node->op == GGML_OP_MUL_MAT) {
+        static const bool say = getenv("GGML_CUDA_HC_UPMIX_LOG") != nullptr;
+        static int64_t n_taken = 0, n_f16 = 0, n_left = 0;
+        const int k = ggml_cuda_hc_upmix_match(cuda_ctx, cgraph, i);
+        int kp = i + 1;
+        while (kp < cgraph->n_nodes && kp < i + 4 && ggml_cuda_is_view_or_noop(cgraph->nodes[kp])) {
+            kp++;
+        }
+        const bool is_gate = kp < cgraph->n_nodes && cgraph->nodes[kp]->op == GGML_OP_DSV4_HC_PRE && cgraph->nodes[kp]->src[1] &&
+            cgraph->nodes[kp]->src[1]->view_src == node;
+        if (k >= 0) {
+            ggml_tensor * pre = cgraph->nodes[k];
+            const bool lazy = g_hc_lazy.xn != nullptr && pre->src[0]->data == g_hc_lazy.xn;
+            ggml_cuda_hc_upmix(*cuda_ctx, node, pre, lazy ? g_hc_lazy.res : nullptr, lazy ? g_hc_lazy.w : nullptr,
+                    lazy && g_hc_res16.count(g_hc_lazy.res->data) > 0);
+            g_hc_lazy.xn = nullptr;
+            n_taken++;
+            n_f16 += lazy;
+        } else if (is_gate) {
+            // the producer left the streams unwritten only after the same test said the kernel takes this mix
+            GGML_ASSERT((g_hc_lazy.xn == nullptr || cgraph->nodes[kp]->src[0]->data != g_hc_lazy.xn) && "unwritten streams of a mix the one kernel does not take");
+            n_left += cgraph->nodes[kp]->src[0]->ne[2] >= 256;
+        }
+        if (say && k >= 0 && n_taken % 96 == 0) {
+            GGML_LOG_INFO("%s: hc gate + mix in one kernel: %lld blocks taken (%lld with unwritten streams), %lld left\n", __func__,
+                    (long long) n_taken, (long long) n_f16, (long long) n_left);
+        }
+        if (k >= 0) {
+            return k - i;
+        }
+    }
+
     if (norm_inject && node->op == GGML_OP_RMS_NORM && i + 2 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_MUL) {
         int k = i + 2;
         while (k < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[k])) {
@@ -6590,9 +6871,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             if (ggml_can_fuse_subgraph_ext(cgraph, nodes, 3, ops, outputs, 2) && !overlaps(mm, node->src[0]) &&
                     !overlaps(mm, mul) && !overlaps(mul, node->src[0])) {
                 const ggml_tensor * img_mm = nullptr;
-                const ggml_cuda_img img = ggml_cuda_f16_image_target(*cuda_ctx, cgraph, i, mul, &img_mm, node->src[0]->ne[0] % 128 == 0);
-                ggml_cuda_op_rms_norm_mul_inject(*cuda_ctx, node, mul, mm, img);
-                if (img.p) {
+                ggml_cuda_img img = ggml_cuda_f16_image_target(*cuda_ctx, cgraph, i, mul, &img_mm, node->src[0]->ne[0] % 128 == 0);
+                const bool lazy = ggml_cuda_hc_xn_lazy_ok(cuda_ctx, cgraph, i + 2, mul, k, img, img_mm) && node->src[0]->ne[1] == 4;
+                const bool down16 = lazy && ggml_cuda_hc_down16(cuda_ctx, cgraph, i + 2, mul, k, &img);
+                ggml_cuda_op_rms_norm_mul_inject(*cuda_ctx, node, mul, mm, img, nullptr, nullptr, lazy);
+                g_hc_lazy.xn = lazy ? mul->data : nullptr;
+                g_hc_lazy.res = node->src[0];
+                g_hc_lazy.w = mul->src[0] == node ? mul->src[1] : mul->src[0];
+                if (img.p && !down16) {
                     ggml_cuda_f16_image_written(*cuda_ctx, img_mm, img);
                 }
                 return k - i;
@@ -6682,15 +6968,37 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     ggml_can_fuse_subgraph_ext(cgraph, nodes, 7, ops, outputs, 3) &&
                     !overlaps(mm, residual) && !overlaps(mm, bo) && !overlaps(mm, raw) && !overlaps(mm, mul) && !overlaps(mm, post)) {
                 const ggml_tensor * img_mm = nullptr;
-                const ggml_cuda_img img = ggml_cuda_f16_image_if_free(cgraph, i, k,
+                ggml_cuda_img img = ggml_cuda_f16_image_if_free(cgraph, i, k,
                         ggml_cuda_f16_image_target(*cuda_ctx, cgraph, i + 4, mul, &img_mm, q8), mul);
-                ggml_cuda_op_rms_norm_mul_inject(*cuda_ctx, rms, mul, mm, img, node, cgraph->nodes[i + 2]);
-                if (img.p) {
+                const bool lazy = ggml_cuda_hc_xn_lazy_ok(cuda_ctx, cgraph, i + 6, mul, k, img, img_mm) && post->ne[1] == 4;
+                const bool down16 = lazy && ggml_cuda_hc_down16(cuda_ctx, cgraph, i + 6, mul, k, &img);
+                // the residual as the previous producer wrote it; the combined streams FP16 when their readers are known
+                const bool x16   = g_hc_res16.erase(residual->data) > 0;
+                const bool dst16 = lazy && ggml_cuda_hc_res16_ok(cgraph, post, k);
+                ggml_cuda_op_rms_norm_mul_inject(*cuda_ctx, rms, mul, mm, img, node, cgraph->nodes[i + 2], lazy, x16, dst16);
+                if (dst16) {
+                    g_hc_res16.insert(post->data);
+                }
+                {
+                    static const bool say = getenv("GGML_CUDA_HC_UPMIX_LOG") != nullptr;
+                    static int64_t n_w = 0, n_w16 = 0, n_r16 = 0;
+                    n_w++; n_w16 += dst16; n_r16 += x16;
+                    if (say && n_w % 96 == 0) {
+                        GGML_LOG_INFO("%s: hc streams: %lld writes, %lld as FP16, %lld read as FP16\n", __func__, (long long) n_w,
+                                (long long) n_w16, (long long) n_r16);
+                    }
+                }
+                g_hc_lazy.xn = lazy ? mul->data : nullptr;
+                g_hc_lazy.res = post;   // the combined streams, which the kernel writes
+                g_hc_lazy.w = mul->src[0] == rms ? mul->src[1] : mul->src[0];
+                if (img.p && !down16) {
                     ggml_cuda_f16_image_written(*cuda_ctx, img_mm, img);
                 }
                 return k - i;
             }
         }
+        // a residual written as FP16 is read by the kernel above only (ggml_cuda_hc_res16_ok made the same test)
+        GGML_ASSERT(g_hc_res16.count(post->src[1]->data) == 0 && "an FP16 residual the producer kernel does not take");
         const ggml_tensor * img_mm = nullptr;
         const ggml_cuda_img img = ggml_cuda_f16_image_if_free(cgraph, i, i + 5,
                 ggml_cuda_f16_image_target(*cuda_ctx, cgraph, i + 4, mul, &img_mm, q8), mul);
@@ -7639,6 +7947,8 @@ static size_t ggml_cuda_mul_mat_scratch_size(const ggml_tensor * dst, int device
 // nodes that quantize the same activation the same way (q/k/v, gate and up, hc down and inject) share
 // one scratch, filled by the first: as long as no node in between writes over that activation. The sharing continues
 // into a graph that continues the previous one (params->continues: the scheduler's next split on this backend).
+size_t ggml_cuda_moe_down_rows_gate_scratch(const ggml_tensor * gate, const ggml_tensor * down, int cc);   // mmq.cu
+
 static void ggml_cuda_add_mmq_scratch(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph,
         ggml_backend_graph_optimize_params * params) {
     if (params->add_scratch == nullptr) {
@@ -7731,6 +8041,10 @@ static void ggml_cuda_add_mmq_scratch(ggml_backend_cuda_context * cuda_ctx, ggml
         size_t  need = 0;
         if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->src[GGML_SCHED_SCRATCH_SRC] == nullptr) {
             need = ggml_cuda_mul_mat_scratch_size(node, cuda_ctx->device, key);
+            // the gate of a prompt's MoE block whose summed down computes its rows apart: its scratch holds some of them
+            for (int k = i + 1; need > 0 && node->op == GGML_OP_MUL_MAT_ID && k < cgraph->n_nodes && k <= i + 8; k++) {
+                need = std::max(need, ggml_cuda_moe_down_rows_gate_scratch(node, cgraph->nodes[k], ggml_cuda_info().devices[cuda_ctx->device].cc));
+            }
         } else if (node->op == GGML_OP_FLASH_ATTN_EXT && node->src[GGML_SCHED_SCRATCH_SRC] == nullptr) {
             ggml_cuda_set_device(cuda_ctx->device);
             need = ggml_cuda_flash_attn_ext_scratch_size(*cuda_ctx, node);
@@ -7848,6 +8162,23 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             keep(post->src[0], until);
             keep(post->src[1], until);   // the residual: otherwise partly under them
             keep(cgraph->nodes[i]->src[0], until);
+        }
+        // the gate + mix kernel (ggml_cuda_hc_upmix_match) reads the gate product's activation while it writes the mix:
+        // kept alive until the mix. ggml-alloc, which sees it dead once the product has read it, placed the mix over it
+        // in most layers of qwen4exp's prompt graph (and in the MTP draft's), and the kernel read rows already overwritten
+        for (int i = 0; i + 2 < cgraph->n_nodes; ++i) {
+            ggml_tensor * mm = cgraph->nodes[i];
+            if (mm->op != GGML_OP_MUL_MAT) {
+                continue;
+            }
+            int k = i + 1;
+            while (k < cgraph->n_nodes && k < i + 4 && ggml_cuda_is_view_or_noop(cgraph->nodes[k])) {
+                k++;
+            }
+            ggml_tensor * pre = k < cgraph->n_nodes ? cgraph->nodes[k] : nullptr;
+            if (pre && pre->op == GGML_OP_DSV4_HC_PRE && k > i + 1 && pre->src[1] && pre->src[1]->view_src == mm && mm->src[1]) {
+                keep(mm->src[1], pre);
+            }
         }
     }
     if (!disable_fusion) {

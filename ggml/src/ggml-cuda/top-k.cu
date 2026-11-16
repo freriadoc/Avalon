@@ -613,9 +613,11 @@ static bool top_k_radix_fused_cuda(int * histograms, size_t hist_count, const fl
 // An ordered selection without a barrier per 1024 inputs: each warp takes a contiguous segment of the n inputs; a first
 // pass counts each warp's selected of two kinds (a, b), one barrier and a prefix sum over the warps give each warp its
 // offsets, a second pass writes: positions in input order (the warps in order, each one's inputs in order)
+// masks (2 words per warp_size inputs, or null): the first pass leaves each warp's two selections there and the second
+// reads an input's key only when it is selected, instead of every key again
 template<class Key, class IsA, class IsB, class WriteA, class WriteB>
 static __device__ __forceinline__ void top_k_seg_select(const int n, int * warp_a, int * warp_b, int & total_a, int & total_b,
-        Key key_of, IsA is_a, IsB is_b, WriteA write_a, WriteB write_b) {
+        Key key_of, IsA is_a, IsB is_b, WriteA write_a, WriteB write_b, uint32_t * masks = nullptr) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int n_warps = TOP_K_ROW_THREADS / warp_size;
     const int lane = threadIdx.x % warp_size, warp = threadIdx.x / warp_size;
@@ -626,8 +628,13 @@ static __device__ __forceinline__ void top_k_seg_select(const int n, int * warp_
     for (int base = lo; base < hi; base += warp_size) {
         const int i = base + lane;
         const uint32_t key = i < hi ? key_of(i) : 0;
-        ca += __popcll(top_k_ballot(i < hi && is_a(key)));
-        cb += __popcll(top_k_ballot(i < hi && is_b(key)));
+        const uint64_t ma = top_k_ballot(i < hi && is_a(key)), mb = top_k_ballot(i < hi && is_b(key));
+        ca += __popcll(ma);
+        cb += __popcll(mb);
+        if (masks && lane == 0) {
+            masks[2*(base / warp_size)]     = (uint32_t) ma;
+            masks[2*(base / warp_size) + 1] = (uint32_t) mb;
+        }
     }
     if (lane == 0) {
         warp_a[warp] = ca;
@@ -643,7 +650,19 @@ static __device__ __forceinline__ void top_k_seg_select(const int n, int * warp_
         ta += warp_a[w];
         tb += warp_b[w];
     }
-    for (int base = lo; base < hi; base += warp_size) {
+    for (int base = lo; masks && base < hi; base += warp_size) {
+        const int i = base + lane;
+        const uint64_t ma = masks[2*(base / warp_size)], mb = masks[2*(base / warp_size) + 1];
+        if ((ma >> lane) & 1) {
+            write_a(pa + (int) __popcll(ma & below), i, key_of(i));
+        }
+        if ((mb >> lane) & 1) {
+            write_b(pb + (int) __popcll(mb & below), i, key_of(i));
+        }
+        pa += __popcll(ma);
+        pb += __popcll(mb);
+    }
+    for (int base = lo; !masks && base < hi; base += warp_size) {
         const int i = base + lane;
         const uint32_t key = i < hi ? key_of(i) : 0;
         const bool a = i < hi && is_a(key), b = i < hi && is_b(key);
@@ -664,7 +683,7 @@ static __device__ __forceinline__ void top_k_seg_select(const int n, int * warp_
 
 __launch_bounds__(TOP_K_ROW_THREADS, 1)
 static __global__ void top_k_radix_row(
-        const float * __restrict__ src, int * __restrict__ dst, int ncols, int k, const int * __restrict__ n_live) {
+        const float * __restrict__ src, int * __restrict__ dst, int ncols, int k, const int * __restrict__ n_live, const bool use_masks) {
     constexpr int NB = 2048, SUB = TOP_K_ROW_SUBHIST, T = TOP_K_ROW_THREADS, CAP = TOP_K_ROW_CAND;
     static_assert(NB == 2 * T, "two bins a thread");
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
@@ -757,7 +776,9 @@ static __global__ void top_k_radix_row(
                 [&](uint32_t key) { return (key & mask1) > prefix1; },
                 [&](uint32_t key) { return (key & mask1) == prefix1; },
                 [&](int pos, int i, uint32_t) { row_dst[pos] = i; },
-                [&](int pos, int i, uint32_t key) { c_key[pos] = key; c_col[pos] = i; });
+                [&](int pos, int i, uint32_t key) { c_key[pos] = key; c_col[pos] = i; },
+                // the histograms are free until the next pass clears them: the selection's masks go there
+                use_masks && 2*((live + warp_size - 1) / warp_size) <= SUB*NB ? (uint32_t *) &hist[0][0] : nullptr);
             compact = true;
         }
     }
@@ -791,7 +812,10 @@ static void top_k_radix_cuda(
     constexpr int NBINS = 1 << RADIX_BITS;
     static_assert(NBINS == top_k_radix_bins, "top-k radix bins");
     if (top_k_row_min_rows() > 0 && nrows >= top_k_row_min_rows()) {
-        top_k_radix_row<<<nrows, TOP_K_ROW_THREADS, 0, stream>>>(src, dst, ncols, k, n_live);
+        // GGML_CUDA_TOPK_MASKS=0: the selection reads every key twice. Alone, [32768, 4096], k = 512: 2.67 ms either way;
+        // in a server reading 131k tokens, 4 alternated pairs: 0.00 to -0.79 s of 48 s with the masks
+        static const bool use_masks = !getenv("GGML_CUDA_TOPK_MASKS") || atoi(getenv("GGML_CUDA_TOPK_MASKS")) != 0;
+        top_k_radix_row<<<nrows, TOP_K_ROW_THREADS, 0, stream>>>(src, dst, ncols, k, n_live, use_masks);
         CUDA_CHECK(cudaGetLastError());
         return;
     }

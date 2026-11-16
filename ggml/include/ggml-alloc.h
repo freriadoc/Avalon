@@ -76,6 +76,8 @@ GGML_API void ggml_gallocr_set_shrink(ggml_gallocr_t galloc, bool shrink);
 GGML_API void ggml_gallocr_set_shrink_fit(ggml_gallocr_t galloc, bool fit);
 // true if every device buffer allocated is borrowed from a MoE cache (and there is one)
 GGML_API bool ggml_gallocr_borrowed(ggml_gallocr_t galloc);
+// give the buffers borrowed from a cache back to it; the next graph reserves again
+GGML_API void ggml_gallocr_release_borrowed(ggml_gallocr_t galloc);
 // changes whenever a buffer is allocated again or freed (the tensors allocated before have moved)
 GGML_API uint64_t ggml_gallocr_get_generation(ggml_gallocr_t galloc);
 

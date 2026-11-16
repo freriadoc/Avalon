@@ -1046,7 +1046,10 @@ static void ggml_gallocr_plan(ggml_gallocr_t galloc) {
         }
         const bool memo_hit = n_chunks != -2;
         if (!memo_hit) {
-            n_chunks = ggml_alloc_plan(blocks, n, alloc->max_chunk_size, chunk_sizes, GGML_VBUFFER_MAX_CHUNKS);
+            // GGML_ALLOC_PLAN_BY_SIZE=1: the largest block first only, not the best of ggml_alloc_plan's orders
+            n_chunks = getenv("GGML_ALLOC_PLAN_BY_SIZE")
+                ? ggml_alloc_plan_order(blocks, n, alloc->max_chunk_size, chunk_sizes, GGML_VBUFFER_MAX_CHUNKS, 0)
+                : ggml_alloc_plan(blocks, n, alloc->max_chunk_size, chunk_sizes, GGML_VBUFFER_MAX_CHUNKS, alloc->live_max);
             struct ggml_alloc_plan_memo * pm = &galloc->plan_memo[galloc->plan_memo_next];
             galloc->plan_memo_next = (galloc->plan_memo_next + 1) % 8;
             struct ggml_alloc_plan_block * copy = (struct ggml_alloc_plan_block *) realloc(pm->blocks, n*sizeof(struct ggml_alloc_plan_block));
@@ -1343,6 +1346,31 @@ bool ggml_gallocr_borrowed(ggml_gallocr_t galloc) {
         any = true;
     }
     return any;
+}
+
+// the buffers borrowed from a cache go back to it now; the next graph reserves its own again (the generation changes:
+// no kept allocation is valid any more)
+void ggml_gallocr_release_borrowed(ggml_gallocr_t galloc) {
+    if (!ggml_moe_cache.borrows) {
+        return;
+    }
+    bool any = false;
+    for (int i = 0; i < galloc->n_buffers; i++) {
+        struct vbuffer * buf = galloc->buffers[i];
+        if (!buf || !ggml_moe_cache.borrows(galloc->bufts[i])) {
+            continue;
+        }
+        for (int j = 0; j < galloc->n_buffers; j++) {
+            if (galloc->buffers[j] == buf) {
+                galloc->buffers[j] = NULL;
+            }
+        }
+        ggml_vbuffer_free(buf);
+        any = true;
+    }
+    if (any) {
+        galloc->generation++;
+    }
 }
 
 void ggml_gallocr_set_shrink_fit(ggml_gallocr_t galloc, bool fit) {

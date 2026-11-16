@@ -724,6 +724,13 @@ struct rms_norm_inject_post {
     const float * raw = nullptr; int64_t sp0 = 0, sp1 = 0;   // the gate before SCALE -> SIGMOID -> SCALE [nrows, nt]
     float gin = 1.0f, gout = 1.0f;
     float * dst = nullptr;                              // the combined streams, contiguous [ncols, nrows, nt]
+    // the normalized streams not written: their memory gets the norm's scale of each (token, stream), nrows floats a
+    // token, and the hc gate + mix kernel (hc-mix.cu) computes them again from the streams (x, or the combined ones) and
+    // w; their other readers read the q8_1 image (ggml_cuda_hc_xn_lazy_ok)
+    bool lazy = false;
+    // the streams as FP16 in the first half of their tensor's memory: x (the residual read) and dst (the combined streams
+    // written); their readers are this kernel and the hc gate + mix one (ggml-cuda.cu, g_hc_res16)
+    bool x16 = false, dst16 = false;
 };
 
 template <int block_size, int n_out, bool post = false>
@@ -746,7 +753,13 @@ static __global__ void __launch_bounds__(block_size) rms_norm_mul_inject_f32(
         float4 xs  = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         float  tmp = 0.0f;
         if (tid < ncols4) {
-            xs  = x4[tid];
+            if (pp.x16) {
+                const half2 * xh = (const half2 *) ((const half *) x + t*sx2 + c*sx1);
+                const half2 a = xh[2*tid], b = xh[2*tid + 1];
+                xs = make_float4(__low2float(a), __high2float(a), __low2float(b), __high2float(b));
+            } else {
+                xs = x4[tid];
+            }
             if constexpr (post) {
                 float p = pp.raw[c*pp.sp0 + t*pp.sp1];
                 p = pp.gout * (1.0f / (1.0f + expf(-(pp.gin * p))));
@@ -756,7 +769,17 @@ static __global__ void __launch_bounds__(block_size) rms_norm_mul_inject_f32(
                 sum = b.y * p; sum += xs.y; xs.y = sum;
                 sum = b.z * p; sum += xs.z; xs.z = sum;
                 sum = b.w * p; sum += xs.w; xs.w = sum;
-                ((float4 *) (pp.dst + (t*nrows + c)*ncols))[tid] = xs;
+                if (pp.dst16) {
+                    // rounded here, so that the norm and the readers of the streams see the same values
+                    const half2 a = make_half2(ggml_cuda_cast<half>(fminf(fmaxf(xs.x, -65504.0f), 65504.0f)), ggml_cuda_cast<half>(fminf(fmaxf(xs.y, -65504.0f), 65504.0f)));
+                    const half2 b = make_half2(ggml_cuda_cast<half>(fminf(fmaxf(xs.z, -65504.0f), 65504.0f)), ggml_cuda_cast<half>(fminf(fmaxf(xs.w, -65504.0f), 65504.0f)));
+                    half2 * dh = (half2 *) ((half *) pp.dst + (t*nrows + c)*ncols);
+                    dh[2*tid]     = a;
+                    dh[2*tid + 1] = b;
+                    xs = make_float4(__low2float(a), __high2float(a), __low2float(b), __high2float(b));
+                } else {
+                    ((float4 *) (pp.dst + (t*nrows + c)*ncols))[tid] = xs;
+                }
             }
             tmp = xs.x*xs.x + xs.y*xs.y + xs.z*xs.z + xs.w*xs.w;
         }
@@ -770,7 +793,11 @@ static __global__ void __launch_bounds__(block_size) rms_norm_mul_inject_f32(
             r.z *= m.z;
             r.w *= m.w;
             const int64_t off = (t*nrows + c)*ncols + 4*tid;
-            *((float4 *) (dst + off)) = r;
+            if (!pp.lazy) {
+                *((float4 *) (dst + off)) = r;
+            } else if (tid == 0) {
+                dst[t*nrows + c] = scale;
+            }
             if (img.p) {
                 img.store4(off, r);   // q8_1: whole warps (ggml_cuda_rms_norm_mul_inject_supported: ncols % 128 == 0)
             }
@@ -819,11 +846,14 @@ bool ggml_cuda_rms_norm_mul_inject_supported(const ggml_tensor * rms_norm, const
 }
 
 void ggml_cuda_op_rms_norm_mul_inject(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, ggml_tensor * mul,
-        ggml_tensor * mm, ggml_cuda_img img, const ggml_tensor * gate_scale_in, const ggml_tensor * gate_scale_out) {
+        ggml_tensor * mm, ggml_cuda_img img, const ggml_tensor * gate_scale_in, const ggml_tensor * gate_scale_out, const bool lazy, const bool x16, const bool dst16) {
     const ggml_tensor * x  = rms_norm->src[0];
     // with the gate chain: rms_norm's source is the gated hc_post, computed here from its sources
     const bool post = gate_scale_in != nullptr;
     rms_norm_inject_post pp;
+    pp.lazy = lazy;
+    pp.x16 = x16;
+    pp.dst16 = dst16;
     if (post) {
         const ggml_tensor * hp  = x;
         const ggml_tensor * raw = gate_scale_in->src[0];
@@ -854,12 +884,12 @@ void ggml_cuda_op_rms_norm_mul_inject(ggml_backend_cuda_context & ctx, const ggm
         rms_norm_mul_inject_f32<block_size, 4><<<grid, block_size, 32 * sizeof(float), ctx.stream()>>>(
             (const float *) x->data, (const float *) w->data, (float *) mul->data, img, (const block_q8_0 *) wq->data, wq_s1,
             (float *) mm->data, (int) x->ne[0], (int) x->ne[1], (int64_t) (x->nb[1] / sizeof(float)),
-            (int64_t) (x->nb[2] / sizeof(float)), eps);
+            (int64_t) (x->nb[2] / sizeof(float)), eps, pp);
     } else {
         rms_norm_mul_inject_f32<block_size, 8><<<grid, block_size, 32 * sizeof(float), ctx.stream()>>>(
             (const float *) x->data, (const float *) w->data, (float *) mul->data, img, (const block_q8_0 *) wq->data, wq_s1,
             (float *) mm->data, (int) x->ne[0], (int) x->ne[1], (int64_t) (x->nb[1] / sizeof(float)),
-            (int64_t) (x->nb[2] / sizeof(float)), eps);
+            (int64_t) (x->nb[2] / sizeof(float)), eps, pp);
     }
     CUDA_CHECK(cudaGetLastError());
 }

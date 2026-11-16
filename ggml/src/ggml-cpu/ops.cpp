@@ -5483,11 +5483,59 @@ static void ggml_compute_forward_get_rows_f32(
     }
 }
 
+// Linux, a gather of 65536 rows or more (qwen4exp's PLE rows of a prompt batch): each thread advises the kernel of the
+// pages of its own slice of rows (sorted, merged) right before it copies them, in place of one hint for all the rows
+// given by the graph's builder before the launch (a sort of 524 288 ranges and their madvise on one thread: ~35 ms of
+// each ubatch of 32768 tokens, the GPU waiting; RX 7900 XT, 32k and 131k prompts, alternated: 2 895 / 2 889 and
+// 2 828 / 2 817 t/s against 2 859 and 2 796 / 2 799). GGML_CPU_GET_ROWS_ADVISE=0: the builder's hint
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+static void ggml_get_rows_advise(const ggml_compute_params * params, const ggml_tensor * dst) {
+#if defined(__linux__)
+    static const bool on = !getenv("GGML_CPU_GET_ROWS_ADVISE") || atoi(getenv("GGML_CPU_GET_ROWS_ADVISE")) != 0;
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const int64_t nr = ggml_nelements(src1);
+    if (!on || nr < 65536 || src1->type != GGML_TYPE_I32 || !src0->data) {
+        return;
+    }
+    static const uintptr_t page = (uintptr_t) sysconf(_SC_PAGESIZE);
+    const int ith = params->ith, nth = params->nth;
+    const int64_t dr = (nr + nth - 1)/nth, ir0 = dr*ith, ir1 = std::min<int64_t>(ir0 + dr, nr);
+    const size_t row_bytes = ggml_row_size(src0->type, src0->ne[0]);
+    std::vector<uintptr_t> pg;
+    pg.reserve((size_t) std::max<int64_t>(0, ir1 - ir0)*2);
+    for (int64_t i = ir0; i < ir1; i++) {
+        const uintptr_t a = (uintptr_t) src0->data + (size_t) ((const int32_t *) src1->data)[i]*src0->nb[1];
+        const uintptr_t p0 = a/page, p1 = (a + row_bytes - 1)/page;
+        for (uintptr_t p = p0; p <= p1; p++) {
+            pg.push_back(p);
+        }
+    }
+    std::sort(pg.begin(), pg.end());
+    for (size_t i = 0; i < pg.size();) {
+        size_t j = i + 1;
+        while (j < pg.size() && pg[j] <= pg[j - 1] + 1) {
+            j++;
+        }
+        madvise((void *) (pg[i]*page), (size_t) (pg[j - 1] - pg[i] + 1)*page, MADV_WILLNEED);
+        i = j;
+    }
+#else
+    GGML_UNUSED(params);
+    GGML_UNUSED(dst);
+#endif
+}
+
 void ggml_compute_forward_get_rows(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
 
     const ggml_tensor * src0 = dst->src[0];
+
+    ggml_get_rows_advise(params, dst);
 
     switch (src0->type) {
         case GGML_TYPE_Q1_0:

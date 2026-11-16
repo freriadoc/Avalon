@@ -223,6 +223,59 @@ static mmq_scratch_layout mmq_scratch_get_layout(const ggml_tensor * dst, int cc
     return l;
 }
 
+bool ggml_cuda_moe_f16_applies(int cc, const ggml_tensor * wg, const ggml_tensor * wd);
+size_t ggml_cuda_moe_f16_bytes(int64_t n_tok, int64_t rows, int64_t n_expert);
+void ggml_cuda_moe_f16_combine(float * const * pieces, const int64_t * piece_rows, const float * w, int64_t n_tok, int n_used, int64_t n,
+        float * out, int64_t out_stride, cudaStream_t stream);
+
+// GGML_CUDA_MOE_DOWN_ROWS=0: the summed down adds into the tokens' rows (atomic)
+static bool ggml_cuda_moe_down_rows_on() {
+    static const bool on = !getenv("GGML_CUDA_MOE_DOWN_ROWS") || atoi(getenv("GGML_CUDA_MOE_DOWN_ROWS")) != 0;
+    return on;
+}
+
+// the bytes of a summed down's separate rows, 0 when the block does not take them: the down of a gate / up / SwiGLU
+// block of a prompt batch on the FP16 kernels
+static size_t ggml_cuda_moe_down_rows_bytes(const ggml_tensor * down, int cc) {
+    if (!ggml_cuda_moe_down_rows_on() || down->op != GGML_OP_MUL_MAT_ID || !ggml_mul_mat_id_is_sum(down)) {
+        return 0;
+    }
+    const ggml_tensor * glu = down->src[1];
+    const ggml_tensor * ids = down->src[2];
+    if (!glu || glu->op != GGML_OP_GLU || !ids) {
+        return 0;
+    }
+    const ggml_tensor * gate = glu->src[0];
+    const ggml_tensor * up   = glu->src[1];
+    if (!gate || !up || gate->op != GGML_OP_MUL_MAT_ID || up->op != GGML_OP_MUL_MAT_ID || ids->ne[1] < 512 || ids->ne[0] > 16 ||
+            !ggml_cuda_moe_f16_applies(cc, gate->src[0], down->src[0])) {
+        return 0;
+    }
+    return (size_t) ids->ne[0]*ids->ne[1]*down->src[0]->ne[1]*sizeof(float);
+}
+
+// what gate's scratch must hold for them, 0 when `down` is not such a down of `gate`'s block: the FP16 kernels' buffers
+// in the place of gate's quantized activation, then the rows that the gate, up and SwiGLU outputs (never written by
+// those kernels) and down's own scratch (not used by them either) do not hold. In gate's scratch and not in a larger
+// scratch for down: qwen4exp's prompt graph at 32768 tokens then keeps its 7 029 MiB, against 7 156 to 7 349
+size_t ggml_cuda_moe_down_rows_gate_scratch(const ggml_tensor * gate, const ggml_tensor * down, int cc) {
+    if (down->op != GGML_OP_MUL_MAT_ID || !down->src[1] || down->src[1]->op != GGML_OP_GLU || down->src[1]->src[0] != gate) {
+        return 0;
+    }
+    const size_t rows_bytes = ggml_cuda_moe_down_rows_bytes(down, cc);
+    if (rows_bytes == 0) {
+        return 0;
+    }
+    const ggml_tensor * glu = down->src[1];
+    const size_t  row   = (size_t) down->src[0]->ne[1]*sizeof(float);
+    const int64_t rows  = (int64_t) (rows_bytes / row);
+    const int64_t n_tok = down->src[2]->ne[1];
+    const int64_t held  = (int64_t) (ggml_nbytes(glu->src[0]) / row) + (int64_t) (ggml_nbytes(glu->src[1]) / row) + (int64_t) (ggml_nbytes(glu) / row) +
+        (int64_t) (mmq_scratch_get_layout(down, cc).size / row);
+    return mmq_scratch_get_layout(gate, cc).src1_q8_1 + 64 + ggml_cuda_moe_f16_bytes(n_tok, rows, gate->src[0]->ne[2]) + 64 +
+        (size_t) std::max<int64_t>(rows - held, 0)*row;
+}
+
 size_t ggml_cuda_mmq_scratch_size(const ggml_tensor * dst, int cc, int64_t key[GGML_CUDA_MMQ_SCRATCH_KEY]) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -251,6 +304,11 @@ size_t ggml_cuda_mmq_scratch_size(const ggml_tensor * dst, int cc, int64_t key[G
     }
     return mmq_scratch_get_layout(dst, cc).size;
 }
+
+size_t ggml_cuda_dense_f16_min_bytes(const ggml_tensor * src0);
+bool ggml_cuda_dense_f16_applies(int cc, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
+void ggml_cuda_dense_f16(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, char * w16, size_t w16_bytes,
+        cudaStream_t stream, const void * x16 = nullptr);
 
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
@@ -363,6 +421,21 @@ void ggml_cuda_mul_mat_q(
         }
     }
     GGML_ASSERT(J_best > 0);
+
+    // RDNA3, a prompt batch against a 2D Q8_0 weight: the FP16 product (dense-f16.cu), its FP16 weight in the scratch in
+    // place of the quantized activation, which a next product of the group would then quantize again. Not when the
+    // quantized activation is already there: it costs nothing more, and its producer may have written nothing else
+    // (the normalized streams of the hyper-connections, ggml_cuda_hc_xn_lazy_ok)
+    if (!ids && !scratch_reuse && ggml_cuda_dense_f16_applies(cc, src0, src1, dst)) {
+        const size_t w16_min = ggml_cuda_dense_f16_min_bytes(src0);
+        const bool   in_scratch = scratch && ggml_nbytes(scratch_t) >= w16_min && (uintptr_t) scratch % 16 == 0;
+        ggml_cuda_pool_alloc<char> w16_pool(ctx.pool());
+        const size_t w16_bytes = in_scratch ? ggml_nbytes(scratch_t) : (size_t) ne01*ne00*sizeof(half);
+        char * w16 = in_scratch ? scratch : w16_pool.alloc(w16_bytes);
+        ctx.mmq_scratch_last = nullptr;
+        ggml_cuda_dense_f16(src0, src1, dst, w16, w16_bytes, stream);
+        return;
+    }
 
     if (!ids) {
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block +
@@ -790,6 +863,13 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
         const ggml_tensor * wg_dev, const ggml_tensor * wu_dev, const ggml_tensor * wd_dev, const std::vector<uint64_t> * xe_host,
         const moe_grouped_hooks * hooks = nullptr);
 
+// moe-f16.cu: the block's products in FP16 on the RDNA3 matrix cores (GGML_CUDA_MOE_F16=1)
+void ggml_cuda_moe_f16_begin(char * buf, const float * x, int64_t x_stride, int64_t n_tok, int64_t rows,
+        const std::vector<int32_t> & bounds, std::vector<int32_t> & tile_first, cudaStream_t stream);
+void ggml_cuda_moe_f16_group(char * buf, int64_t n_tok, int64_t rows, int64_t n_expert, const std::vector<int32_t> & tile_first,
+        int64_t e0, int64_t e1, ggml_type type_gu, ggml_type type_d, const uint64_t * xe, size_t row_gu, size_t row_d,
+        const int32_t * ids, int n_used, float * down, int64_t down_stride, const float * sum_w, cudaStream_t stream, float * const * down_pieces = nullptr, const int64_t * down_piece_rows = nullptr);
+
 int ggml_cuda_moe_block_grouped(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
     return moe_block_grouped_impl(ctx, cgraph, i, nullptr, nullptr, nullptr, nullptr);
 }
@@ -985,14 +1065,53 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
     ggml_cuda_pool_alloc<int32_t> prefix(ctx.pool(), 2*(n_expert / G)*(G + 1));   // GGML_CUDA_MOE_GROUPED_PREFIX: all groups'
 
     // the rows by expert (the inverse map for the broadcast activation), the activation quantized once for gate and up
-    ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(), n_expert, n_tok,
-        n_used, 1, ids->nb[1] / ggml_element_size(ids), x->nb[2] / x->nb[1], /*write_inverse =*/ true, stream);
-    quantize_scatter_mmq_q8_1_cuda((const float *) x->data, ids_src1.get(), q8_gu.get(), wg->type, n_embd,
-        x->nb[2] / sizeof(float), ne10p_gu, n_tok, rows, (int) n_used, stream);
-    ggml_cuda_pool_alloc<uint64_t> xe_dev(ctx.pool(), xe_host ? 3*n_expert : 1);
-    if (xe_host) {
+    // one pass over the ids from 4096 tokens on (GGML_CUDA_MM_IDS_SORTED=N: from N tokens on; 0: never, a scan of the
+    // tokens per expert as below it)
+    static const int64_t ids_sorted_min = getenv("GGML_CUDA_MM_IDS_SORTED") ? atoll(getenv("GGML_CUDA_MM_IDS_SORTED")) : 4096;
+    ggml_cuda_pool_alloc<int32_t> ids_scratch(ctx.pool());
+    if (ids_sorted_min > 0 && n_tok >= ids_sorted_min && n_expert <= 4096) {
+        ids_scratch.alloc(ggml_cuda_mm_ids_sorted_scratch((int) n_expert, (int) n_tok));
+        ggml_cuda_mm_ids_sorted((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(), ids_scratch.get(),
+            (int) n_expert, (int) n_tok, (int) n_used, (int) (ids->nb[1] / ggml_element_size(ids)), stream);
+    } else {
+        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(), n_expert, n_tok,
+            n_used, 1, ids->nb[1] / ggml_element_size(ids), x->nb[2] / x->nb[1], /*write_inverse =*/ true, stream);
+    }
+    // GGML_CUDA_MOE_F16=1 (RDNA3, moe-f16.cu): the block's products in FP16, its activation and H as FP16 rows in the
+    // place of gate's quantized activation; gate, up and the swiglu are then not written (down reads H)
+    std::vector<uint64_t> xe_own[3];
+    bool f16 = ggml_cuda_moe_f16_applies(cc, wg, wd) && wg->nb[1] == wu->nb[1] && ggml_cuda_moe_grouped_streams() != 2 &&
+        ggml_cuda_moe_f16_bytes(n_tok, rows, n_expert) + 64 <= q8_gu_bytes && x->nb[2] % (2*sizeof(float)) == 0;
+    if (f16) {
+        const ggml_tensor * w3[3] = { wg, wu, wd };
         for (int k = 0; k < 3; k++) {
-            CUDA_CHECK(cudaMemcpyAsync(xe_dev.get() + k*n_expert, xe_host[k].data(), n_expert*sizeof(uint64_t), cudaMemcpyHostToDevice, stream));
+            xe_own[k].resize(n_expert);
+            for (int64_t e = 0; e < n_expert; e++) {
+                xe_own[k][e] = xe_host ? xe_host[k][e] : (uint64_t) (uintptr_t) ((const char *) w3[k]->data + e*w3[k]->nb[2]);
+                f16 = f16 && xe_own[k][e] % 2 == 0;   // its blocks are read by 16-bit loads
+            }
+        }
+    }
+    char * f16_buf = f16 ? (char *) (((uintptr_t) q8_gu.get() + 63) & ~(uintptr_t) 63) : nullptr;
+    {
+        static int f16_said = 0;
+        if (getenv("GGML_CUDA_MOE_F16_LOG") && f16_said < 60) {
+            f16_said++;
+            GGML_LOG_INFO("%s: %s: FP16 %d (applies %d, types %s / %s, nb1 %zu / %zu / %zu, bytes %zu of %zu, x nb2 %zu, xe %d, addr %llx)\n", __func__, down->name,
+                (int) f16, (int) ggml_cuda_moe_f16_applies(cc, wg, wd), ggml_type_name(wg->type), ggml_type_name(wd->type), wg->nb[1], wu->nb[1], wd->nb[1],
+                ggml_cuda_moe_f16_bytes(n_tok, rows, n_expert), q8_gu_bytes, x->nb[2], (int) (xe_host != nullptr),
+                (unsigned long long) (xe_host ? xe_host[0][0] : 0));
+        }
+    }
+    if (!f16) {
+        quantize_scatter_mmq_q8_1_cuda((const float *) x->data, ids_src1.get(), q8_gu.get(), wg->type, n_embd,
+            x->nb[2] / sizeof(float), ne10p_gu, n_tok, rows, (int) n_used, stream);
+    }
+    ggml_cuda_pool_alloc<uint64_t> xe_dev(ctx.pool(), xe_host || f16 ? 3*n_expert : 1);
+    if (xe_host || f16) {
+        for (int k = 0; k < 3; k++) {
+            const uint64_t * src = f16 ? xe_own[k].data() : xe_host[k].data();
+            CUDA_CHECK(cudaMemcpyAsync(xe_dev.get() + k*n_expert, src, n_expert*sizeof(uint64_t), cudaMemcpyHostToDevice, stream));
         }
     }
     std::vector<int32_t> hb(n_expert + 1);
@@ -1031,7 +1150,63 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
     // (mmq_args::sum_w). One stream: each token's first product stored, the output not zeroed (k_moe_sum_first); two: zeroed, all added
     ggml_cuda_pool_alloc<uint8_t> sum_first(ctx.pool());
     ggml_cuda_pool_alloc<int> tok_first(ctx.pool());
-    if (dsum && two) {
+    // the summed down's rows apart, then combined (no atomic adds), in memory of the block the FP16 kernels leave unused:
+    // the gate, up and SwiGLU outputs, down's scratch and the end of gate's (ggml_cuda_moe_down_rows_gate_scratch sized
+    // it), a whole number of rows each. GGML_CUDA_MOE_DOWN_ROWS=0, or pieces that do not hold them all or lie over each
+    // other or over what the block reads: added in place
+    float * drows[5] = { nullptr, nullptr, nullptr, nullptr, nullptr };
+    int64_t drows_n[5] = { 0, 0, 0, 0, 0 };
+    bool drows_cap = false;
+    if (f16 && dsum && ggml_cuda_moe_down_rows_bytes(down, cc) > 0) {
+        const size_t row = (size_t) down->ne[0]*sizeof(float);
+        struct piece { char * p; size_t n; };
+        std::vector<piece> pc;
+        const auto add = [&](char * p, size_t n) {
+            char * q = (char *) (((uintptr_t) p + 15) & ~(uintptr_t) 15);
+            if (p && n >= (size_t) (q - p) + row) {
+                pc.push_back({ q, (n - (size_t) (q - p)) / row * row });
+            }
+        };
+        add((char *) gate->data, ggml_nbytes(gate));
+        add((char *) up->data,   ggml_nbytes(up));
+        add((char *) glu->data,  ggml_nbytes(glu));
+        if (sd_t && sd_t->data && (!sg_t || sd_t->data != sg_t->data)) {
+            add((char *) sd_t->data, ggml_nbytes(sd_t));
+        }
+        if (sg) {
+            char * tail = f16_buf + ggml_cuda_moe_f16_bytes(n_tok, rows, n_expert);
+            add(tail, (size_t) ((char *) sg_t->data + ggml_nbytes(sg_t) - tail));
+        }
+        int64_t held = 0;
+        bool ok = pc.size() == 5;
+        for (size_t a = 0; a < pc.size() && ok; a++) {
+            held += (int64_t) (pc[a].n / row);
+            for (size_t b = a + 1; b < pc.size(); b++) {
+                ok = ok && !(pc[a].p < pc[b].p + pc[b].n && pc[b].p < pc[a].p + pc[a].n);
+            }
+            for (const ggml_tensor * t : { (const ggml_tensor *) down, x, ids, (const ggml_tensor *) wr }) {
+                const char * t0 = (const char *) t->data;
+                ok = ok && !(t0 < pc[a].p + pc[a].n && pc[a].p < t0 + ggml_nbytes(t));
+            }
+        }
+        if (ok && held >= rows) {
+            for (int a = 0; a < 5; a++) {
+                drows[a]   = (float *) pc[a].p;
+                drows_n[a] = (int64_t) (pc[a].n / row);
+            }
+            drows_cap = true;
+        } else {
+            static bool said = false;
+            if (!said) {
+                said = true;
+                GGML_LOG_INFO("%s: %s: down's rows added in place (%d pieces holding %lld of %lld rows%s)\n", __func__, down->name,
+                    (int) pc.size(), (long long) held, (long long) rows, ok ? "" : ", or over live memory");
+            }
+        }
+    }
+    if (drows_cap) {
+        // every row is written apart, then the combine writes every token's row
+    } else if (dsum && (two || f16)) {
         CUDA_CHECK(cudaMemsetAsync(down->data, 0, ggml_nbytes(down), stream));
     } else if (dsum) {
         const int64_t ids_stride = (int64_t) (ids->nb[1]/sizeof(int32_t));
@@ -1042,8 +1217,12 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
         k_moe_sum_first_rows<<<(unsigned) ((rows + 255) / 256), 256, 0, stream>>>((const int32_t *) ids->data, ids_stride,
             (int) n_used, G, ids_dst.get(), tok_first.get(), sum_first.get(), rows);
     }
-    if (prefix_once) {
+    if (prefix_once && !f16) {
         k_mmq_tile_prefix_groups<<<(unsigned) (n_expert / G), 32, 0, stream>>>(bounds.get(), G, J_gu, J_d, prefix.get());
+    }
+    std::vector<int32_t> f16_tile_first;
+    if (f16) {
+        ggml_cuda_moe_f16_begin(f16_buf, (const float *) x->data, x->nb[2] / sizeof(float), n_tok, rows, hb, f16_tile_first, stream);
     }
     static cudaEvent_t ev_fork[GGML_CUDA_MAX_DEVICES] = {}, ev_join[GGML_CUDA_MAX_DEVICES] = {};
     cudaStream_t gs[2] = { stream, stream };
@@ -1123,6 +1302,16 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
             }
             continue;
         }
+        if (f16) {
+            ggml_cuda_moe_f16_group(f16_buf, n_tok, rows, n_expert, f16_tile_first, g0, g0 + G, wg->type, wd->type, xe_dev.get(),
+                wg->nb[1], wd->nb[1], ids_dst.get(), (int) n_used, (float *) down->data,
+                drows_cap ? down->ne[0] : (int64_t) ((dsum ? down->nb[2] : down->nb[1]) / sizeof(float)),
+                dsum && !drows_cap ? (const float *) wr->data : nullptr, sg, drows_cap ? drows : nullptr, drows_cap ? drows_n : nullptr);
+            if (hooks && hooks->after) {
+                (*hooks->after)(g0 / G);
+            }
+            continue;
+        }
         launch(wg, gate, q8_gu.get(), ne10p_gu, 1, J_gu, fb_gu, g0, r0, r1, 0, sg);
         if (!pair_ok) {
             launch(wu, up,   q8_gu.get(), ne10p_gu, 1, J_gu, fb_gu, g0, r0, r1, 1, sg);
@@ -1137,6 +1326,35 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
         launch(wd, down, q8_d.get(), ne10p_d, n_used, J_d, fb_d, g0, r0, r1, 2, sg, dsum);
         if (hooks && hooks->after) {
             (*hooks->after)(g0 / G);
+        }
+    }
+    if (drows_cap) {
+        ggml_cuda_moe_f16_combine(drows, drows_n, (const float *) wr->data, n_tok, (int) n_used, down->ne[0], (float *) down->data,
+            (int64_t) (down->nb[2] / sizeof(float)), stream);
+    }
+    // DIAGNOSTIC GGML_CUDA_MOE_F16_DEBUG=1 (synchronizes): the FP16 activation, H and the down read back, their
+    // largest magnitude and non-finite values
+    if (f16 && getenv("GGML_CUDA_MOE_F16_DEBUG")) {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        auto scan16 = [&](const char * what, const char * p, size_t n) {
+            std::vector<uint16_t> h(n);
+            CUDA_CHECK(cudaMemcpy(h.data(), p, n*2, cudaMemcpyDeviceToHost));
+            size_t bad = 0, first = (size_t) -1; double mx = 0.0;
+            for (size_t k = 0; k < n; k++) {
+                const float v = ggml_fp16_to_fp32(h[k]);
+                if (!std::isfinite(v)) { bad++; first = first == (size_t) -1 ? k : first; } else { mx = std::max(mx, (double) fabsf(v)); }
+            }
+            GGML_LOG_INFO("f16 debug %s: %zu values, %zu non-finite (first at %zu), max |v| %g\n", what, n, bad, first, mx);
+        };
+        scan16("x16", f16_buf, (size_t) n_tok*2560);
+        scan16("h16", f16_buf + (size_t) n_tok*2560*2, (size_t) rows*640);
+        {
+            const size_t n = ggml_nbytes(down)/sizeof(float);
+            std::vector<float> d(n);
+            CUDA_CHECK(cudaMemcpy(d.data(), down->data, n*sizeof(float), cudaMemcpyDeviceToHost));
+            size_t bad = 0; double mx = 0.0;
+            for (float v : d) { if (!std::isfinite(v)) bad++; else mx = std::max(mx, (double) fabsf(v)); }
+            GGML_LOG_INFO("f16 debug down: %zu values, %zu non-finite, max |v| %g\n", n, bad, mx);
         }
     }
     if (two) {   // the second stream's groups joined into the block's stream
@@ -1157,7 +1375,7 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
 
     // GGML_CUDA_MOE_GROUPED_CHECK=1: the block again the ungrouped way into copies of its outputs, compared bit for bit
     static const bool check = getenv("GGML_CUDA_MOE_GROUPED_CHECK") && atoi(getenv("GGML_CUDA_MOE_GROUPED_CHECK")) != 0;
-    if (check) {
+    if (check && !f16) {
         ggml_tensor tg = *gate, tu = *up, th = *glu, td = *down;
         if (dsum) {   // the reference's down: every (token, slot) product, summed below in the order of the slots
             td.ne[1] = n_used; td.nb[1] = td.ne[0]*sizeof(float); td.nb[2] = td.nb[1]*n_used; td.nb[3] = td.nb[2]*td.ne[2];

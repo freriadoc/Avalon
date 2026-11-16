@@ -327,6 +327,9 @@ extern "C" {
     // true if the scheduler's device compute buffers are borrowed from a MoE cache (GGML_SCHED_BORROW_COMPUTE): a graph
     // takes what it needs when it runs, a new worst case need not be allocated beforehand
     GGML_API bool                 ggml_backend_sched_compute_borrowed(ggml_backend_sched_t sched);
+    // give the compute buffers borrowed from a MoE cache back to it, once the graphs using them are done (a guest that
+    // will not compute before the owner borrows again); the next graph reserves its own
+    GGML_API void                 ggml_backend_sched_release_borrowed(ggml_backend_sched_t sched);
     // the bytes the MoE cache could lend this scheduler's device compute buffers now (what it lends and what they hold),
     // the least over the devices whose buffers it lends; 0 when none is borrowed or the cache does not know
     GGML_API size_t               ggml_backend_sched_compute_room(ggml_backend_sched_t sched);

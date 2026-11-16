@@ -563,6 +563,226 @@ static __global__ void lightning_indexer_kernel_tile(
     }
 }
 
+// RDNA3 (GGML_CUDA_INDEXER_F16=0: the tile kernel): the scores of a prompt batch on the matrix cores, FP16 operands
+// accumulated in FP32. 4 heads of 128 values: the queries of the 4 heads are staged in shared memory as FP16 (rows of
+// 136 halves), each wave reads the 8 fragments of its 16 keys from memory (an F32 or F16 K, converted in registers) and
+// runs them against the 4 heads' rows; then the ReLU and the heads' weights per (token, key), the mask added as the
+// scores are written by rows. RX 7900 XT, a slice of 4096 tokens against 32768 keys: 4.8 ms (28.6 TFLOPS), the tile
+// kernel (F32, a thread per token and 8 keys) 17.6 ms.
+#if defined(GGML_USE_HIP)
+#if defined(RDNA3)
+#define LIGHTNING_INDEXER_F16_DEVICE 1
+#endif
+typedef _Float16 li_h16 __attribute__((ext_vector_type(16)));
+typedef _Float16 li_h2  __attribute__((ext_vector_type(2)));
+typedef float    li_f8  __attribute__((ext_vector_type(8)));
+struct li_u4 { uint32_t x, y, z, w; };
+#define LIGHTNING_INDEXER_F16_TOK  32     // tokens and keys a block of lightning_indexer_kernel_f16
+#define LIGHTNING_INDEXER_F16_KEYS 1024
+
+static __device__ __forceinline__ li_f8 li_wmma(const li_h16 a, const li_h16 b, const li_f8 c) {
+#if defined(LIGHTNING_INDEXER_F16_DEVICE)
+    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
+#else
+    GGML_UNUSED_VARS(a, b);
+    return c;
+#endif // defined(LIGHTNING_INDEXER_F16_DEVICE)
+}
+
+// a block scores 32 tokens against up to 1024 keys, 128 keys a pass: a wave holds the 8 fragments of 16 keys and runs
+// them against the two groups of 16 tokens. A thread owns 16 consecutive keys of a token: it reads their mask first (a
+// pass whose keys no token of the block sees, the future of a prompt batch, only writes it), keeps it in registers
+// while the waves leave the scores in shared memory, then writes its 16 scores with the mask, 16 bytes at a time.
+struct __attribute__((packed, aligned(2))) li_u4m { uint32_t x, y, z, w; };   // 8 halves of a mask row (2-byte aligned)
+typedef _Float16 li_h8 __attribute__((ext_vector_type(8)));
+typedef float    li_f4 __attribute__((ext_vector_type(4)));
+
+template <bool K16>
+static __global__ void __launch_bounds__(256) lightning_indexer_kernel_f16(
+        const float * Q, const char * K, const float * W, const half * M, float * dst,
+        const int64_t n_batch, const int64_t n_kv,
+        const size_t nb1, const size_t nb3,
+        const size_t nbq1, const size_t nbq2, const size_t nbq3,
+        const size_t nbk2, const size_t nbk3,
+        const size_t nbw1, const size_t nbw3,
+        const size_t nbm1, const size_t nbm3,
+        const int64_t nem3, const int32_t * __restrict__ k_idx) {
+    constexpr int NH = 4, QLD = 136, TOK = 32, KT = 128, KP = 8;
+    __shared__ __align__(32) _Float16 qs[NH*TOK*QLD];
+    __shared__ float ws[NH][TOK];
+    __shared__ __align__(16) float sc[TOK][KT + 4];   // the pass's scores (4 floats of padding a row)
+    __shared__ int vis;                                 // pass + 1 once a thread found a visible key in it
+    const int lane = threadIdx.x, wave = threadIdx.y, tid = wave*32 + lane;
+    const int l16 = lane & 15, hi = lane >> 4;
+    const int64_t start_kv = (int64_t) blockIdx.x*(KP*KT), start_batch = (int64_t) blockIdx.y*TOK;
+    const int i_stream = blockIdx.z;
+
+    // the queries: row h*TOK + token, 32 values a thread, 64 rows a pass
+#pragma unroll
+    for (int p = 0; p < NH*TOK/64; p++) {
+        const int row = (tid >> 2) + 64*p, qd = (tid & 3)*32, h = row / TOK, r = row % TOK;
+        uint32_t hw[16];
+#pragma unroll
+        for (int q = 0; q < 8; q++) {
+            float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            if (start_batch + r < n_batch) {
+                v = *(const float4 *) ((const char *) Q + h*nbq1 + (start_batch + r)*nbq2 + i_stream*nbq3 + (qd + 4*q)*sizeof(float));
+            }
+            const li_h2 a = {(_Float16) v.x, (_Float16) v.y}, b = {(_Float16) v.z, (_Float16) v.w};
+            hw[2*q] = __builtin_bit_cast(uint32_t, a); hw[2*q + 1] = __builtin_bit_cast(uint32_t, b);
+        }
+        li_u4 * d = (li_u4 *) (qs + row*QLD + qd);
+#pragma unroll
+        for (int q = 0; q < 4; q++) {
+            d[q] = li_u4{hw[4*q], hw[4*q + 1], hw[4*q + 2], hw[4*q + 3]};
+        }
+    }
+    if (tid < NH*TOK) {
+        const int wh = tid / TOK, wr = tid % TOK;
+        ws[wh][wr] = start_batch + wr < n_batch ?
+            ((const float *) ((const char *) W + (start_batch + wr)*nbw1 + i_stream*nbw3))[wh] : 0.0f;
+    }
+    if (tid == 0) {
+        vis = 0;
+    }
+    __syncthreads();
+
+    // the heads' weights of the lane's tokens: element i of group g is token 16 g + 2 i + hi
+    li_f8 wr[TOK/16][NH];
+#pragma unroll
+    for (int g = 0; g < TOK/16; g++) {
+#pragma unroll
+        for (int h = 0; h < NH; h++) {
+#pragma unroll
+            for (int i = 0; i < 8; i++) {
+                wr[g][h][i] = ws[h][16*g + 2*i + hi];
+            }
+        }
+    }
+
+    // the thread's 16 consecutive keys of a token in a pass
+    const int o_r = tid >> 3, o_c = (tid & 7)*16;
+    const int64_t o_batch = start_batch + o_r;
+    const half * m_row = (const half *) ((const char *) M + o_batch*nbm1 + (i_stream % nem3)*nbm3);
+    float *      d_row = (float *) ((char *) dst + o_batch*nb1 + i_stream*nb3);
+#pragma unroll 1
+    for (int kp = 0; kp < KP; kp++) {
+        const int64_t base = start_kv + kp*KT;
+        if (base >= n_kv) {
+            break;
+        }
+        // the mask of the thread's keys: -inf past the batch or the keys
+        const bool whole = o_batch < n_batch && base + o_c + 16 <= n_kv;
+        li_f8 mk[2];
+        if (whole) {
+            const li_u4m * mp = (const li_u4m *) (m_row + base + o_c);
+#pragma unroll
+            for (int q = 0; q < 2; q++) {
+                mk[q] = __builtin_convertvector(__builtin_bit_cast(li_h8, mp[q]), li_f8);
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < 16; j++) {
+                mk[j >> 3][j & 7] = o_batch < n_batch && base + o_c + j < n_kv ? __half2float(m_row[base + o_c + j]) : -INFINITY;
+            }
+        }
+        {
+            bool any = false;
+#pragma unroll
+            for (int j = 0; j < 16; j++) {
+                any = any || mk[j >> 3][j & 7] > -INFINITY;
+            }
+            if (any) {
+                vis = kp + 1;
+            }
+        }
+        __syncthreads();
+        const bool scored = vis == kp + 1;
+        if (scored) {
+            const int64_t i_kv = base + 16*wave + l16;
+            const bool live = i_kv < n_kv;
+            // the key's 8 fragments of 16 values
+            li_h16 kf[8];
+            const char * k_row = K + (live ? (k_idx ? (int64_t) k_idx[i_kv] : i_kv) : 0)*nbk2 + i_stream*nbk3;
+#pragma unroll
+            for (int kk = 0; kk < 8; kk++) {
+                struct { li_u4 a, b; } t;
+                if constexpr (K16) {
+                    t.a = ((const li_u4 *) k_row)[2*kk];
+                    t.b = ((const li_u4 *) k_row)[2*kk + 1];
+                } else {
+                    uint32_t hw[8];
+#pragma unroll
+                    for (int q = 0; q < 4; q++) {
+                        const float4 v = ((const float4 *) k_row)[4*kk + q];
+                        const li_h2 a = {(_Float16) v.x, (_Float16) v.y}, b = {(_Float16) v.z, (_Float16) v.w};
+                        hw[2*q] = __builtin_bit_cast(uint32_t, a); hw[2*q + 1] = __builtin_bit_cast(uint32_t, b);
+                    }
+                    t.a = li_u4{hw[0], hw[1], hw[2], hw[3]};
+                    t.b = li_u4{hw[4], hw[5], hw[6], hw[7]};
+                }
+                if (!live) {
+                    t.a = t.b = li_u4{0, 0, 0, 0};
+                }
+                kf[kk] = __builtin_bit_cast(li_h16, t);
+            }
+#pragma unroll
+            for (int g = 0; g < TOK/16; g++) {
+                li_f8 acc[NH];
+#pragma unroll
+                for (int h = 0; h < NH; h++) {
+                    acc[h] = (li_f8) 0.0f;
+                }
+#pragma unroll
+                for (int kk = 0; kk < 8; kk++) {
+#pragma unroll
+                    for (int h = 0; h < NH; h++) {
+                        const li_u4 * q = (const li_u4 *) (qs + (h*TOK + 16*g + l16)*QLD + 16*kk);
+                        struct { li_u4 a, b; } t{q[0], q[1]};
+                        acc[h] = li_wmma(__builtin_bit_cast(li_h16, t), kf[kk], acc[h]);
+                    }
+                }
+                // element i of a lane: token 2 i + hi of the group, the lane's key
+#pragma unroll
+                for (int i = 0; i < 8; i++) {
+                    float score = 0.0f;
+#pragma unroll
+                    for (int h = 0; h < NH; h++) {
+                        score += fmaxf(acc[h][i], 0.0f)*wr[g][h][i];
+                    }
+                    sc[16*g + 2*i + hi][16*wave + l16] = score;
+                }
+            }
+        }
+        __syncthreads();
+        if (whole) {
+            li_u4 * dp = (li_u4 *) (d_row + base + o_c);
+#pragma unroll
+            for (int q = 0; q < 4; q++) {
+                li_f4 v = {mk[q >> 1][4*(q & 1)], mk[q >> 1][4*(q & 1) + 1], mk[q >> 1][4*(q & 1) + 2], mk[q >> 1][4*(q & 1) + 3]};
+                if (scored) {
+                    v += __builtin_bit_cast(li_f4, *(const li_u4 *) &sc[o_r][o_c + 4*q]);
+                }
+                dp[q] = __builtin_bit_cast(li_u4, v);
+            }
+        } else if (o_batch < n_batch) {
+#pragma unroll
+            for (int j = 0; j < 16; j++) {
+                if (base + o_c + j < n_kv) {
+                    d_row[base + o_c + j] = (scored ? sc[o_r][o_c + j] : 0.0f) + mk[j >> 3][j & 7];
+                }
+            }
+        }
+        __syncthreads();
+    }
+}
+
+static bool lightning_indexer_f16_on(const int cc) {
+    static const bool on = !getenv("GGML_CUDA_INDEXER_F16") || atoi(getenv("GGML_CUDA_INDEXER_F16")) != 0;
+    return on && GGML_CUDA_CC_IS_RDNA3(cc);
+}
+#endif // defined(GGML_USE_HIP)
+
 #define LIGHTNING_INDEXER_CASE(lightning_indexer_kernel, n_embd, n_head, K, type_K)         \
     if (K->type == (type_K)) {                                                              \
         lightning_indexer_kernel<WARPS_PER_BLOCK, K_VECS_PER_BLOCK, n_embd, n_head, type_K> \
@@ -730,6 +950,22 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
             LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 32, k, GGML_TYPE_F32)
             GGML_ABORT("fatal error");
         }
+#if defined(GGML_USE_HIP)
+    } else if (n_embd == 128 && n_head == 4 && n_batch >= 64 && (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16) &&
+            lightning_indexer_f16_on(ggml_cuda_info().devices[ctx.device].cc) && nbq2 % 16 == 0 && nbq1 % 16 == 0 &&
+            (uintptr_t) q_d % 16 == 0 && nbk2 % 16 == 0 && nbk3 % 16 == 0 && (uintptr_t) k_d % 16 == 0) {
+        // RDNA3: the matrix cores
+        const dim3 block(32, 8);
+        const dim3 grid((unsigned) ((n_kv + LIGHTNING_INDEXER_F16_KEYS - 1) / LIGHTNING_INDEXER_F16_KEYS),
+                        (unsigned) ((n_batch + LIGHTNING_INDEXER_F16_TOK - 1) / LIGHTNING_INDEXER_F16_TOK), (unsigned) n_stream);
+        if (k->type == GGML_TYPE_F16) {
+            lightning_indexer_kernel_f16<true><<<grid, block, 0, ctx.stream()>>>(q_d, k_d, w_d, m_d, dst_d, n_batch, n_kv, nb1, nb3,
+                nbq1, nbq2, nbq3, nbk2, nbk3, nbw1, nbw3, nbm1, nbm3, nem3, k_idx);
+        } else {
+            lightning_indexer_kernel_f16<false><<<grid, block, 0, ctx.stream()>>>(q_d, k_d, w_d, m_d, dst_d, n_batch, n_kv, nb1, nb3,
+                nbq1, nbq2, nbq3, nbk2, nbk3, nbw1, nbw3, nbm1, nbm3, nem3, k_idx);
+        }
+#endif // defined(GGML_USE_HIP)
     } else if (n_embd == 128 && n_head == 4 && n_batch >= LIGHTNING_INDEXER_TILE_TOKENS) {
         // too few heads for a wmma tile, the tile kernel shares the keys across the tokens
         constexpr int WARPS_PER_BLOCK = 8;

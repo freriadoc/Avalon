@@ -351,6 +351,282 @@ static __global__ void k_qattn_i8(const qattn_args a) {
 #endif // defined(AMD_WMMA_AVAILABLE)
 }
 
+// RDNA3 (k_qattn_f16, GGML_CUDA_QATTN_F16=1): the same attention with FP16 operands accumulated in FP32, after
+// Strata-rdna3's prompt_attn_wmma_kernel (src/kernels/cuda/qsa_prompt_attn.cu, MIT) on our K and V rows as stored. A
+// wave owns 64 values of the heads (two blocks of 32 of K's q8_0 rows and of V's q4_0 rows). K's codes go from memory
+// to registers as FP16 with their block's scale (a byte permute and a packed product, as the experts' kernels), so the
+// scores need no scale after their products and nothing of q or K is staged in shared memory; q is one FP16 image
+// scaled by a power of two. V's codes are staged as int8, p times V's scales is the FP16 row of the output's products.
+#if defined(GGML_USE_HIP) && defined(RDNA3)
+#define QATTN_F16_DEVICE 1
+#endif
+
+typedef _Float16 qattn_h16 __attribute__((ext_vector_type(16)));
+typedef _Float16 qattn_h2  __attribute__((ext_vector_type(2)));
+typedef float    qattn_f8  __attribute__((ext_vector_type(8)));
+
+static __device__ __forceinline__ qattn_f8 qattn_wmma(const qattn_h16 a, const qattn_h16 b, const qattn_f8 c) {
+#if defined(QATTN_F16_DEVICE)
+    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
+#else
+    GGML_UNUSED_VARS(a, b);
+    return c;
+#endif // defined(QATTN_F16_DEVICE)
+}
+
+struct qattn_f16_smem {
+    float   part[4][16][33];   // q.k of each wave's 64 values: [wave][head][cell]
+    float   p[16][33];         // the weights [head][cell]
+    float   vs[4][2][32];      // V's scales [wave][block][cell]
+    float   maskf[32];
+    uint8_t v[4][32][80];      // [wave][cell]: its 64 values of V as int8
+    float   qmax[4];
+    float   alpha[16];
+    float   lsum[16];
+    float   mrow[16];
+};
+
+static __global__ void __launch_bounds__(128) k_qattn_f16(const qattn_args a) {
+#if defined(GGML_USE_HIP)
+    __shared__ __align__(16) qattn_f16_smem S;
+    const int iq = blockIdx.x, kvh = blockIdx.y;
+    const int lane = threadIdx.x, warp = threadIdx.y, t = warp*32 + lane;
+    const int col = lane & 15, half_ = lane >> 4, dim0 = warp*64;
+    const int n_list = a.n_list, n_head = a.n_head;
+
+    const char    * Qq = a.Q + iq*a.sQ1 + (int64_t) kvh*n_head*a.sQ2;
+    float         * oq = a.out + ((int64_t) iq*n_head*a.n_head_kv + (int64_t) kvh*n_head)*256;
+    const char    * Kg = a.K + kvh*a.sK2;
+    const char    * Vg = a.V + kvh*a.sV2;
+    const int32_t * lq = a.lists + (int64_t) iq*n_list;
+    const half    * mq = a.mask + (int64_t) iq*n_list;
+    const int n_chunks = (a.lists[(int64_t) n_list*a.n_q + iq] + 31)/32;
+
+    // q as one FP16 image, scaled by a power of two
+    float qm = 0.0f;
+    for (int i = t; i < n_head*256; i += 128) {
+        qm = fmaxf(qm, fabsf(((const float *) (Qq + (i >> 8)*a.sQ2))[i & 255]));
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        qm = fmaxf(qm, __shfl_xor_sync(0xFFFFFFFFu, qm, o, 32));
+    }
+    if (lane == 0) {
+        S.qmax[warp] = qm;
+    }
+    if (t < 16) {
+        S.mrow[t] = -INFINITY;
+        S.lsum[t] = 0.0f;
+    }
+    __syncthreads();
+    qm = fmaxf(fmaxf(S.qmax[0], S.qmax[1]), fmaxf(S.qmax[2], S.qmax[3]));
+    int qe = 0;
+    if (qm > 0.0f) {
+        frexpf(qm, &qe);
+    }
+    const float qup = ldexpf(1.0f, 14 - qe), qdown = ldexpf(a.scale, qe - 14);
+    qattn_h16 qh[4];
+#pragma unroll
+    for (int kk = 0; kk < 4; ++kk) {
+        const float * src = (const float *) (Qq + col*a.sQ2) + dim0 + kk*16;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            qh[kk][i] = (_Float16) (col < n_head ? src[i]*qup : 0.0f);
+        }
+    }
+
+    qattn_f8 acc[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        acc[j] = (qattn_f8) 0.0f;
+    }
+    const qattn_h2 off = {(_Float16) -1152.0f, (_Float16) -1152.0f};
+
+    for (int ci = 0; ci < n_chunks; ++ci) {
+        // every read of the chunk first: the lane's cell (V's two blocks of this wave, the mask), then K's fragments
+        const int32_t index = lq[ci*32 + lane];
+        const int64_t row = index ^ (index >> 31);
+        uint32_t vr[2][4];
+        half vsc[2];
+        const half rm = mq[ci*32 + lane];
+#pragma unroll
+        for (int b = 0; b < 2; ++b) {
+            const char * vp = Vg + row*a.sV1 + (2*warp + b)*18;
+            vsc[b] = *(const half *) vp;
+            memcpy(vr[b], vp + 2, 16);
+        }
+        uint32_t kx[2][4][4];
+        half ksc[2][2];
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+            const int32_t ix = __shfl_sync(0xFFFFFFFFu, index, nt*16 + col, 32);
+            const char * kp = Kg + (int64_t) (ix ^ (ix >> 31))*a.sK1 + (2*warp)*34;
+            ksc[nt][0] = *(const half *) kp;
+            ksc[nt][1] = *(const half *) (kp + 34);
+#pragma unroll
+            for (int kk = 0; kk < 4; ++kk) {
+                memcpy(kx[nt][kk], kp + (kk >> 1)*34 + 2 + (kk & 1)*16, 16);
+            }
+        }
+        // V's codes as int8, its scales
+        {
+            uint4 * dst = (uint4 *) &S.v[warp][lane][0];
+#pragma unroll
+            for (int b = 0; b < 2; ++b) {
+                dst[2*b]     = make_uint4(qattn_q4( vr[b][0]       & 0x0F0F0F0Fu), qattn_q4( vr[b][1]       & 0x0F0F0F0Fu),
+                                          qattn_q4( vr[b][2]       & 0x0F0F0F0Fu), qattn_q4( vr[b][3]       & 0x0F0F0F0Fu));
+                dst[2*b + 1] = make_uint4(qattn_q4((vr[b][0] >> 4) & 0x0F0F0F0Fu), qattn_q4((vr[b][1] >> 4) & 0x0F0F0F0Fu),
+                                          qattn_q4((vr[b][2] >> 4) & 0x0F0F0F0Fu), qattn_q4((vr[b][3] >> 4) & 0x0F0F0F0Fu));
+                S.vs[warp][b][lane] = __half2float(vsc[b]);
+            }
+            if (warp == 0) {
+                S.maskf[lane] = __half2float(rm);
+            }
+        }
+        // q.k over the wave's 64 values, two tiles of 16 cells
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+            qattn_f8 s = (qattn_f8) 0.0f;
+#pragma unroll
+            for (int kk = 0; kk < 4; ++kk) {
+                const _Float16 d = __builtin_bit_cast(_Float16, ksc[nt][kk >> 1]);
+                const qattn_h2 sc = {d, d};
+                uint32_t hw[8];
+#pragma unroll
+                for (int w = 0; w < 4; ++w) {
+                    const uint32_t u = kx[nt][kk][w] ^ 0x80808080u;
+                    hw[2*w]     = __builtin_bit_cast(uint32_t, (__builtin_bit_cast(qattn_h2, __builtin_amdgcn_perm(0x64646464u, u, 0x07010700u)) + off)*sc);
+                    hw[2*w + 1] = __builtin_bit_cast(uint32_t, (__builtin_bit_cast(qattn_h2, __builtin_amdgcn_perm(0x64646464u, u, 0x07030702u)) + off)*sc);
+                }
+                struct { uint32_t w[8]; } tb;
+#pragma unroll
+                for (int w = 0; w < 8; ++w) {
+                    tb.w[w] = hw[w];
+                }
+                s = qattn_wmma(qh[kk], __builtin_bit_cast(qattn_h16, tb), s);
+            }
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                S.part[warp][2*i + half_][nt*16 + col] = s[i];
+            }
+        }
+        __syncthreads();
+        // the online softmax: 8 threads a head, 4 cells each
+        {
+            const int r = t >> 3, sub = t & 7;
+            float x[4], mx = -INFINITY;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int c = sub*4 + j;
+                x[j] = (((S.part[0][r][c] + S.part[1][r][c]) + S.part[2][r][c]) + S.part[3][r][c])*qdown + S.maskf[c];
+                mx = fmaxf(mx, x[j]);
+            }
+#pragma unroll
+            for (int o = 1; o < 8; o <<= 1) {
+                mx = fmaxf(mx, __shfl_xor_sync(0xFFFFFFFFu, mx, o, 32));
+            }
+            const float m_old = S.mrow[r];
+            const float m_new = fmaxf(m_old, mx);
+            float sum = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float e = x[j] == -INFINITY ? 0.0f : expf(x[j] - m_new);
+                S.p[r][sub*4 + j] = e;
+                sum += e;
+            }
+#pragma unroll
+            for (int o = 1; o < 8; o <<= 1) {
+                sum += __shfl_xor_sync(0xFFFFFFFFu, sum, o, 32);
+            }
+            if (sub == 0) {
+                const float al = m_old == -INFINITY ? 0.0f : expf(m_old - m_new);
+                S.alpha[r] = al;
+                S.lsum[r]  = fmaf(S.lsum[r], al, sum);
+                S.mrow[r]  = m_new;
+            }
+        }
+        __syncthreads();
+        // p.v over the wave's 64 values: 4 tiles of 16 values, 2 steps of 16 cells; p times the block's V scale is the row
+        {
+            float vmax = fmaxf(fabsf(S.vs[warp][0][lane]), fabsf(S.vs[warp][1][lane]));
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) {
+                vmax = fmaxf(vmax, __shfl_xor_sync(0xFFFFFFFFu, vmax, o, 32));
+            }
+            const float vup = vmax > 0.0f ? 16384.0f/vmax : 0.0f, vdown = vmax*(1.0f/16384.0f);
+            qattn_f8 tmp[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                tmp[j] = (qattn_f8) 0.0f;
+            }
+#pragma unroll
+            for (int ks = 0; ks < 2; ++ks) {
+                qattn_h16 ah[2];
+#pragma unroll
+                for (int b = 0; b < 2; ++b) {
+#pragma unroll
+                    for (int i = 0; i < 16; ++i) {
+                        ah[b][i] = (_Float16) (S.p[col][ks*16 + i]*(S.vs[warp][b][ks*16 + i]*vup));
+                    }
+                }
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    qattn_h16 bv;
+#pragma unroll
+                    for (int i = 0; i < 16; ++i) {
+                        bv[i] = (_Float16) (int) (int8_t) S.v[warp][ks*16 + i][j*16 + col];
+                    }
+                    tmp[j] = qattn_wmma(ah[j >> 1], bv, tmp[j]);
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    acc[j][i] = fmaf(acc[j][i], S.alpha[2*i + half_], tmp[j][i]*vdown);
+                }
+            }
+        }
+        // no barrier: v and vs are the wave's own, p, alpha and the mask are written again after the next chunk's first one
+    }
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int h = 2*i + half_;
+            if (h < n_head) {
+                const float l = S.lsum[h];
+                oq[h*256 + dim0 + j*16 + col] = l > 0.0f ? acc[j][i]/l : 0.0f;
+            }
+        }
+    }
+#else
+    GGML_UNUSED(a);
+    NO_DEVICE_CODE;
+#endif // defined(GGML_USE_HIP)
+}
+
+// RDNA3: k_qattn_f16, unless GGML_CUDA_QATTN_F16=0 (k_qattn_i8). RX 7900 XT, the node, 9536 queries of 2048 cells,
+// tiles of 16 / int8 / FP16 a query: 16.3 / 32.9 / 28.5 ms at 4.9k cells, 21.4 / 33.5 / 29.0 at 9.7k, 26.8 / 34.0 / 29.3
+// at 16k, 31.4 / 34.3 / 29.5 at 25k, 35.0 / 34.5 / 29.6 at 33k, 50.7 / 35.0 / 30.0 at 66k, 54.3 / 35.9 / 30.8 at 262k;
+// against FP64 the largest error 1e-5 (0.01 %) where the int8's is 1.8e-4 (0.20 %)
+static bool qattn_f16_on(const int cc) {
+    static const bool on = !getenv("GGML_CUDA_QATTN_F16") || atoi(getenv("GGML_CUDA_QATTN_F16")) != 0;
+    return on && GGML_CUDA_CC_IS_RDNA3(cc);
+}
+
+// the cells from which a list per query replaces the tiles of 16 (ggml_moe_cache.qsa_query_min_kv): 16384 when every
+// device runs k_qattn_f16 (the tiles are still 9 % faster there, the list 6 % at 25k), else the graph builder's limit
+int64_t ggml_cuda_qattn_query_min_kv() {
+    const ggml_cuda_device_info & info = ggml_cuda_info();
+    for (int i = 0; i < info.device_count; i++) {
+        if (!qattn_f16_on(info.devices[i].cc)) {
+            return 0;
+        }
+    }
+    return info.device_count > 0 ? 16384 : 0;
+}
+
 struct qattn_nv_smem {
     int   Kr[2][32*68];   // K's rows as stored: [stage][cell][272 bytes]; q's codes at first, in stage 1
     int   Vr[2][32*36];   // V's rows as stored: [stage][cell][144 bytes]
@@ -709,6 +985,8 @@ void ggml_cuda_qattn_i8(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const dim3 grid((unsigned) a.n_q, (unsigned) a.n_head_kv, 1), block(32, 4, 1);
     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
         k_qattn_i8_nv<<<grid, block, 0, ctx.stream()>>>(a);
+    } else if (qattn_f16_on(cc)) {
+        k_qattn_f16<<<grid, block, 0, ctx.stream()>>>(a);
     } else {
         k_qattn_i8<<<grid, block, 0, ctx.stream()>>>(a);
     }
@@ -816,9 +1094,12 @@ void ggml_cuda_qattn_i8_bench(int device) {
 
     const bool nv = GGML_CUDA_CC_IS_NVIDIA(cc);
     const dim3 grid((unsigned) n_q, (unsigned) n_head_kv, 1), block(32, 4, 1);
+    const bool f16 = qattn_f16_on(ggml_cuda_info().devices[device].cc);
     const auto run = [&]() {
         if (nv) {
             k_qattn_i8_nv<<<grid, block>>>(a);
+        } else if (f16) {
+            k_qattn_f16<<<grid, block>>>(a);
         } else {
             k_qattn_i8<<<grid, block>>>(a);
         }
@@ -830,8 +1111,9 @@ void ggml_cuda_qattn_i8_bench(int device) {
     }
     {
         cudaFuncAttributes attr = {};
-        if (cudaFuncGetAttributes(&attr, nv ? (const void *) k_qattn_i8_nv : (const void *) k_qattn_i8) == cudaSuccess) {
-            printf("qattn i8 kernel: %d registers, %zu bytes of scratch a thread, %zu bytes of shared memory\n",
+        if (cudaFuncGetAttributes(&attr, nv ? (const void *) k_qattn_i8_nv : f16 ? (const void *) k_qattn_f16 : (const void *) k_qattn_i8) == cudaSuccess) {
+            printf("qattn %s kernel:", f16 ? "f16" : "i8");
+            printf(" %d registers, %zu bytes of scratch a thread, %zu bytes of shared memory\n",
                 (int) attr.numRegs, (size_t) attr.localSizeBytes, (size_t) attr.sharedSizeBytes);
         }
     }

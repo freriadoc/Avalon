@@ -1547,6 +1547,10 @@ struct ggml_backend_cuda_context {
     // the MUL_MAT(_ID) scratch (GGML_SCHED_SCRATCH_SRC) last filled by mmq, and what it holds: a node
     // with the same scratch and key reads the quantized activation (and expert ids) as they are
     const ggml_tensor * mmq_scratch_last = nullptr;
+    // a product whose activation its producer wrote as an FP16 image (the hyper-connections' down, ggml_cuda_hc_down16):
+    // the product's node and the image, until the product has run
+    const ggml_tensor * x16_mm = nullptr;
+    const void *        x16_p  = nullptr;
     // the last scratch group of the previous graph given to graph_optimize (ggml_cuda_add_mmq_scratch), for a graph
     // that continues it (a prefill's gate in the split after its up, each split taking one prefetched weight)
     ggml_tensor *       mmq_carry_scratch = nullptr;

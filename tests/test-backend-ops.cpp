@@ -5072,8 +5072,11 @@ struct test_qwen4_hc_up_pre : public test_dsv4_hc {
     bool run_whole_graph() override { return true; }
     double max_nmse_err() override { return 5e-5; }   // the CPU quantizes lo to Q8_0 anyway (~1.3e-5)
 
-    test_qwen4_hc_up_pre(int64_t n_embd = 2560, int64_t n_lo = 320, int64_t n_tokens = 1, ggml_type wtype = GGML_TYPE_Q8_0)
-        : n_embd(n_embd), n_lo(n_lo), n_tokens(n_tokens), wtype(wtype) {}
+    const bool lo_computed;   // lo is a node's result, as in qwen4exp (its memory is free once the product has read it)
+
+    test_qwen4_hc_up_pre(int64_t n_embd = 2560, int64_t n_lo = 320, int64_t n_tokens = 1, ggml_type wtype = GGML_TYPE_Q8_0,
+            bool lo_computed = false)
+        : n_embd(n_embd), n_lo(n_lo), n_tokens(n_tokens), wtype(wtype), lo_computed(lo_computed) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * lo = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_lo, n_tokens);
@@ -5082,8 +5085,13 @@ struct test_qwen4_hc_up_pre : public test_dsv4_hc {
         ggml_set_name(xn, "residual");
         ggml_tensor * wu = ggml_new_tensor_2d(ctx, wtype, n_lo, n_embd*hc);
 
+        if (lo_computed) {
+            lo = ggml_silu(ctx, ggml_scale(ctx, lo, 1.0f/hc));
+        }
         ggml_tensor * mm = ggml_mul_mat(ctx, wu, lo);
-        ggml_prec_set_src(mm, GGML_PREC_F32, 1);   // as qwen4exp asks: lo not quantized
+        if (n_tokens <= 8) {
+            ggml_prec_set_src(mm, GGML_PREC_F32, 1);   // as qwen4exp asks while decoding: lo not quantized
+        }
         ggml_tensor * gate = ggml_reshape_3d(ctx, mm, n_embd, hc, n_tokens);
         out = ggml_dsv4_hc_pre_gated(ctx, xn, gate, 1.0f/hc);
         return out;
@@ -11429,6 +11437,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_qwen4_hc_up_pre(2560, 320, n_tokens));
         test_cases.emplace_back(new test_qwen4_hc_up_pre(2560, 320, n_tokens, GGML_TYPE_BF16));
     }
+    for (int64_t n_tokens : {256, 257, 300, 511, 513, 1024, 8188}) {   // the 512-thread blocks of 256 tokens
+        test_cases.emplace_back(new test_qwen4_hc_up_pre(2560, 320, n_tokens, GGML_TYPE_Q8_0, true));
+    }
     for (int64_t n_hc : {1, 2, 3, 5, 8, 65}) {
         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17));
         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17, true));
@@ -12486,6 +12497,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
+    // a prompt batch against a 2D Q8_0 weight (ggml-cuda on RDNA3: the FP16 product, dense-f16.cu): partial tiles of
+    // tokens and of weight rows, one stage of K and several
+    for (auto [m, n, k] : { std::tuple{256, 512, 64}, std::tuple{1000, 600, 1024}, std::tuple{300, 513, 2560}, std::tuple{2560, 1100, 640} }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+    }
+    // and against BF16 weights (the MoE router, the indexer's projections), narrower than a tile too
+    for (auto [m, n, k] : { std::tuple{512, 600, 2560}, std::tuple{128, 513, 640}, std::tuple{70, 1100, 64} }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+    }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
 
@@ -13261,6 +13281,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // the QSA indexer's prompt slices: many rows of pooled blocks, 512 kept (GGML_CUDA_TOPK_ROW's kernel)
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 32768, 40, 1, 1 }, 512));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 8195, 33, 1, 1 }, 512, true));
+    // a block per row (64 rows or more) on long rows: the selection's masks kept in shared memory (up to 65536 columns)
+    // and without them, with and without ties
+    for (int cols : { 32768, 65536, 70000 }) {
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { cols, 64, 1, 1 }, 512));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { cols, 64, 1, 1 }, 512, true));
+    }
 
     // qwen4exp QSA indexer top-k fusion (get_rows + f16 mask + top_k)
     test_cases.emplace_back(new test_topk_qsa(512,  2048,  1, 1, 1500));
@@ -13835,6 +13861,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_moe_block(t, GGML_TYPE_IQ4_NL, 64, 8, 256, 512, 256, true));
         test_cases.emplace_back(new test_moe_block(t, GGML_TYPE_IQ4_NL, 512, 10, 256, 640, 1024, true));
     }
+    // the FP16 products of the block on the RDNA3 matrix cores (GGML_CUDA_MOE_F16=1 with GGML_CUDA_MOE_GROUPED=G): every
+    // type they decode, at the sizes they are written for, the down plain and summed
+    for (ggml_type gu : {GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_K, GGML_TYPE_IQ3_KS, GGML_TYPE_IQ4_NL}) {
+        for (ggml_type d : {GGML_TYPE_IQ4_NL, GGML_TYPE_Q2_0}) {
+            test_cases.emplace_back(new test_moe_block(gu, d, 64, 8, 2560, 640, 192));
+            test_cases.emplace_back(new test_moe_block(gu, d, 64, 8, 2560, 640, 192, true));
+        }
+    }
+    test_cases.emplace_back(new test_moe_block(GGML_TYPE_IQ2_S, GGML_TYPE_IQ4_NL, 512, 10, 2560, 640, 1024, true));
     test_cases.emplace_back(new test_moe_reduce(63,  2, 17));
     test_cases.emplace_back(new test_moe_reduce(2048, 8, 128));
     test_cases.emplace_back(new test_moe_reduce(2048, 8, 128, false, true));
@@ -13988,6 +14023,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // 4 heads on a prompt batch: partial token tiles, several key passes and blocks, a partial last pass
+    for (auto [kv, bs] : { std::pair{100, 100}, std::pair{1500, 100}, std::pair{2051, 65}, std::pair{1024, 64} }) {
+        for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+            test_cases.emplace_back(new test_lightning_indexer(128, 4, kv, bs, 1, 1, type_K));
+        }
+    }
+
     for (int kv : { 1, 7, 8, 63, 64, 65 }) {
         for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0}) {
             test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, 32, 4, 1, type_K));
@@ -14042,6 +14084,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_qsa_select_tiles(65536, 512, 4, 9536, cols, true, true, GGML_TYPE_F16,  GGML_TYPE_F16,  2, false, 1.0f, 4.3f));
         test_cases.emplace_back(new test_qsa_select_tiles(32768, 512, 4, 9536, cols, true, true, GGML_TYPE_F16,  GGML_TYPE_F16,  2, false, 1.0f, 3.0f));
         test_cases.emplace_back(new test_qsa_select_tiles(9728, 512, 4, 9536, cols, true, true, GGML_TYPE_F16,  GGML_TYPE_F16,  2, false, 1.0f, 1.84f));
+    }
+    // the depth at which a list per query takes over from the tiles of 16: the cells of the KV cache, with the union of a
+    // tile's selections measured in the model there (1.84 selections at 9.7k cells, 3.0 at 32k, 4.3 from 57k on); the
+    // tiles read an f16 K/V below 65536 cells in the model (converted once a layer), the list per query the rows as stored
+    for (auto kv : std::vector<std::pair<int64_t, float>>{{4864, 1.4f}, {9728, 1.84f}, {16384, 2.3f}, {24576, 2.7f}, {32768, 3.0f},
+                                                           {49152, 3.9f}, {65536, 4.3f}, {131072, 4.3f}, {262144, 4.3f}}) {
+        test_cases.emplace_back(new test_qsa_select_tiles(kv.first, 512, 4, 9536, 16, true, true, GGML_TYPE_F16,  GGML_TYPE_F16,  2, false, 2.0f, kv.second));
+        test_cases.emplace_back(new test_qsa_select_tiles(kv.first, 512, 4, 9536, 16, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, false, 2.0f, kv.second));
+        test_cases.emplace_back(new test_qsa_select_tiles(kv.first, 512, 4, 9536, 1,  true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, false, 2.0f, kv.second));
     }
 
     // qwen4exp QSA attention while decoding / verifying: 2 KV heads x GQA 12, D 256; dense scan (quantized KV, 256
@@ -14514,6 +14565,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, nrows, 1, 1}, 2048));
         }
     }
+    // a slice of the qwen4exp indexer in a prompt batch: 4096 queries over the blocks of 131k cells, and one read of
+    // the same scores (ARGMAX) to compare
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {32768, 4096, 1, 1}, 512));
+    test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {32768, 4096, 1, 1}));
     // backend sampler: one row of the vocab (llama-sampler.cpp top_k)
     for (auto k : {20, 40}) {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {151936, 1, 1, 1}, k));
@@ -14575,6 +14630,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 512, 1));  // 4h PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
+
+    // 4 heads on a slice of a prompt batch
+    test_cases.emplace_back(new test_lightning_indexer(128, 4, 32768, 4096, 1, 1, GGML_TYPE_F32));
 
     // lightning_indexer
     for (int kv : { 256, 4096, 65536 }) {

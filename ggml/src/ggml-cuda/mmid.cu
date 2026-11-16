@@ -258,3 +258,95 @@ void ggml_cuda_launch_mm_ids_helper(
             break;
     }
 }
+
+
+// The rows of a prompt batch sorted by expert in one pass over the ids (ggml_cuda_mm_ids_sorted), where mm_ids_helper
+// scans every token once per expert (512 experts x 32768 tokens x 10: 3.6 ms a layer on an RX 7900 XT, in two scans
+// since its store no longer fits the shared memory). The same result: an expert's rows in the order of the tokens,
+// then of the slots; ids distinct within a token (a top-k routing). By chunks of 256 tokens:
+//   count:   the experts' rows in each chunk
+//   prefix:  per expert, its rows in the chunks before each chunk, and its total
+//   bounds:  the experts' first rows
+//   scatter: per chunk, each expert's next row from its bound and the rows before the chunk, in order
+#define MM_IDS_CHUNK 256
+
+static __global__ void k_mm_ids_count(const int32_t * __restrict__ ids, const int si1, const int n_used, const int n_tokens,
+        const int n_expert, int32_t * __restrict__ hist) {
+    extern __shared__ int s_hist[];
+    for (int e = threadIdx.x; e < n_expert; e += blockDim.x) {
+        s_hist[e] = 0;
+    }
+    __syncthreads();
+    const int it = blockIdx.x*MM_IDS_CHUNK + threadIdx.x;
+    if (it < n_tokens) {
+        for (int s = 0; s < n_used; s++) {
+            atomicAdd(&s_hist[ids[(int64_t) it*si1 + s]], 1);
+        }
+    }
+    __syncthreads();
+    for (int e = threadIdx.x; e < n_expert; e += blockDim.x) {
+        hist[(int64_t) blockIdx.x*n_expert + e] = s_hist[e];
+    }
+}
+
+// a thread per expert: hist[c][e] becomes the expert's rows in the chunks before c; total[e] its rows
+static __global__ void k_mm_ids_prefix(int32_t * __restrict__ hist, const int n_chunks, const int n_expert, int32_t * __restrict__ total) {
+    const int e = blockIdx.x*blockDim.x + threadIdx.x;
+    if (e >= n_expert) {
+        return;
+    }
+    int sum = 0;
+    for (int c = 0; c < n_chunks; c++) {
+        const int v = hist[(int64_t) c*n_expert + e];
+        hist[(int64_t) c*n_expert + e] = sum;
+        sum += v;
+    }
+    total[e] = sum;
+}
+
+static __global__ void k_mm_ids_bounds(const int32_t * __restrict__ total, const int n_expert, int32_t * __restrict__ bounds) {
+    int sum = 0;
+    for (int e = 0; e < n_expert; e++) {
+        bounds[e] = sum;
+        sum += total[e];
+    }
+    bounds[n_expert] = sum;
+}
+
+static __global__ void k_mm_ids_scatter(const int32_t * __restrict__ ids, const int si1, const int n_used, const int n_tokens,
+        const int n_expert, const int32_t * __restrict__ hist, const int32_t * __restrict__ bounds,
+        int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst) {
+    extern __shared__ int s_next[];
+    for (int e = threadIdx.x; e < n_expert; e += blockDim.x) {
+        s_next[e] = bounds[e] + hist[(int64_t) blockIdx.x*n_expert + e];
+    }
+    __syncthreads();
+    if (threadIdx.x != 0) {
+        return;
+    }
+    const int it0 = blockIdx.x*MM_IDS_CHUNK, it1 = min(n_tokens, it0 + MM_IDS_CHUNK);
+    for (int it = it0; it < it1; it++) {
+        for (int s = 0; s < n_used; s++) {
+            const int col = s_next[ids[(int64_t) it*si1 + s]]++;
+            ids_dst[col] = it*n_used + s;
+            ids_src1[it*n_used + s] = col;   // the inverse map
+        }
+    }
+}
+
+// ids_src1: the inverse map (the row of each (token, slot)); scratch: (n_chunks + 1) n_expert ints
+size_t ggml_cuda_mm_ids_sorted_scratch(const int n_experts, const int n_tokens) {
+    return ((size_t) (n_tokens + MM_IDS_CHUNK - 1) / MM_IDS_CHUNK + 1) * n_experts;
+}
+
+void ggml_cuda_mm_ids_sorted(const int32_t * ids, int32_t * ids_src1, int32_t * ids_dst, int32_t * expert_bounds, int32_t * scratch,
+        const int n_experts, const int n_tokens, const int n_expert_used, const int si1, cudaStream_t stream) {
+    const int n_chunks = (n_tokens + MM_IDS_CHUNK - 1) / MM_IDS_CHUNK;
+    int32_t * hist = scratch, * total = scratch + (size_t) n_chunks*n_experts;
+    const size_t smem = (size_t) n_experts*sizeof(int);
+    k_mm_ids_count<<<n_chunks, MM_IDS_CHUNK, smem, stream>>>(ids, si1, n_expert_used, n_tokens, n_experts, hist);
+    k_mm_ids_prefix<<<(n_experts + 255)/256, 256, 0, stream>>>(hist, n_chunks, n_experts, total);
+    k_mm_ids_bounds<<<1, 1, 0, stream>>>(total, n_experts, expert_bounds);
+    k_mm_ids_scatter<<<n_chunks, 64, smem, stream>>>(ids, si1, n_expert_used, n_tokens, n_experts, hist, expert_bounds, ids_src1, ids_dst);
+    CUDA_CHECK(cudaGetLastError());
+}

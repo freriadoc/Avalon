@@ -205,6 +205,11 @@ struct ggml_moe_cache_api {
     void (*kv_set_rows)(void * session, int64_t rows);
     int64_t (*kv_first_lent_row)(void * session);
 
+    // rewarm_now: the restoration of the entries the prefill's loans evicted starts now (the caller gave the loans
+    // back), not at the first hosted layer of the next graph that does not lend. rewarm_active: it is still going on
+    void (*rewarm_now)(void * session);
+    bool (*rewarm_active)(void * session);
+
     // Whole experts computed on the CPU, registered by ggml-cpu: for n_tokens tokens with
     // activations act [n_embd, n_tokens] and k experts each, experts [k, n_tokens],
     // out[(t*k + i)*n_embd ...] = down(swiglu(gate, up)) of expert experts[t*k + i] on token t.
@@ -230,6 +235,9 @@ struct ggml_moe_cache_api {
     // whether every GPU of the backend has a flash attention kernel that reads a QSA tile mask (ggml_qsa_select_tiles):
     // the graph builder keeps the dense slices otherwise (RDNA2 has none: the node ran on the CPU, #46); null: not known
     bool (*qsa_tiles)(void);
+    // the cells of the KV cache from which the backend's attention of a list per query (ggml_qsa_select_tiles of 1) is
+    // faster than its tiles of 16 queries; null or 0: not known (the graph builder's own limit)
+    int64_t (*qsa_query_min_kv)(void);
     // whether the prefill ring (GGML_CUDA_MOE_RING_PREFILL) can be used: false when only a part of the experts is in
     // registered RAM (the arena of a machine with less RAM than the experts take), where the ring would copy the others
     // through the page cache; the scheduler then keeps the prefetch and the graph builds no summed down. null: not known
@@ -262,6 +270,9 @@ GGML_API void * ggml_backend_sched_detach_moe_cache(ggml_backend_sched_t sched);
 GGML_API void    ggml_backend_sched_moe_cache_kv_register(ggml_backend_sched_t sched, const struct ggml_tensor * tensor, size_t row_bytes);
 GGML_API void    ggml_backend_sched_moe_cache_kv_set_rows(ggml_backend_sched_t sched, int64_t rows);
 GGML_API int64_t ggml_backend_sched_moe_cache_kv_first_lent_row(ggml_backend_sched_t sched);
+// ggml_moe_cache.rewarm_now / rewarm_active; no-ops (false) without a session or for a guest
+GGML_API void    ggml_backend_sched_moe_cache_rewarm_now(ggml_backend_sched_t sched);
+GGML_API bool    ggml_backend_sched_moe_cache_rewarm_active(ggml_backend_sched_t sched);
 // the model's host expert bytes (all cards) and the GPUs they are spread over (ggml_moe_cache.host_experts); a no-op
 // without a session
 GGML_API void    ggml_backend_sched_moe_cache_host_experts(ggml_backend_sched_t sched, size_t bytes, int n_devices);

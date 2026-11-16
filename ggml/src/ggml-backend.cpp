@@ -3639,6 +3639,17 @@ int64_t ggml_backend_sched_moe_cache_kv_first_lent_row(ggml_backend_sched_t sche
     return ggml_moe_cache.kv_first_lent_row(sched->moe_cache_session);
 }
 
+void ggml_backend_sched_moe_cache_rewarm_now(ggml_backend_sched_t sched) {
+    if (sched && sched->moe_cache_session && !sched->moe_cache_guest && ggml_moe_cache.rewarm_now) {
+        ggml_moe_cache.rewarm_now(sched->moe_cache_session);
+    }
+}
+
+bool ggml_backend_sched_moe_cache_rewarm_active(ggml_backend_sched_t sched) {
+    return sched && sched->moe_cache_session && !sched->moe_cache_guest && ggml_moe_cache.rewarm_active &&
+        ggml_moe_cache.rewarm_active(sched->moe_cache_session);
+}
+
 void * ggml_backend_sched_detach_moe_cache(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     ggml_backend_sched_prefetch_restore(sched);
@@ -3950,6 +3961,19 @@ static void ggml_backend_sched_prime_moe_cache(ggml_backend_sched_t sched, struc
 
 bool ggml_backend_sched_compute_borrowed(ggml_backend_sched_t sched) {
     return ggml_gallocr_borrowed(sched->galloc);
+}
+
+void ggml_backend_sched_release_borrowed(ggml_backend_sched_t sched) {
+    if (!ggml_gallocr_borrowed(sched->galloc)) {
+        return;
+    }
+    for (int i = 0; i < sched->n_backends; i++) {
+        ggml_backend_synchronize(sched->backends[i]);
+    }
+    // no cache entry may still be pinned by the graph that used the buffers
+    ggml_backend_sched_prefill_unpin(sched);
+    ggml_backend_sched_reset(sched);
+    ggml_gallocr_release_borrowed(sched->galloc);
 }
 
 size_t ggml_backend_sched_compute_room(ggml_backend_sched_t sched) {
