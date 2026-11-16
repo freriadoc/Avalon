@@ -146,6 +146,7 @@ from the tables above.
 | **RX 7900 XTX 24 GB**, Ryzen 9 5900X, PCIe 4.0 (X570), 64 GB DDR4-3200, Linux | 131k context, `-ub 19072`, `GGML_SCHED_PREFETCH_EXPERTS=6`: prefill 2,024 – 2,043 t/s, generation 112.9 – 122.8 t/s (median 116.5); a later version with `--moe-cache-cpu-overlap 2`: prefill 2,113 – 2,130 t/s |
 | **RX 7900 XTX 24 GB**, Ryzen 7 5800X3D, 64 GB RAM, **Windows 11** ([ppkrol's port](https://github.com/ppkrol/Avalon_windows)) | 32k context, MTP, the file cache warm: 83.6 – 92.2 t/s; the first requests after a start are slower while the 64 GB fill |
 | **Radeon Pro W7800 48 GB** (RDNA3, 70 CUs) | one card 58 t/s without MTP, 87 with; two cards (all experts in VRAM) 46 and 70: compute-bound once the experts no longer come from RAM, not tuned for it |
+| **RX 6800 XT 16 GB** (RDNA2, gfx1030), Ryzen 9 5950X, PCIe 4.0 (B550), 128 GB DDR4-3000, Linux | 262k context, adaptive MTP, no ngram, `-ub 4096`, with #64 and #65; generation over 163 requests replayed from two agent sessions (opencode, Rust code review): median 74 t/s at 16k – 32k, 65 at 32k – 64k, 60 at 64k – 96k, 59 at 96k – 128k, 57 at 128k – 160k; one synthetic 235k-token prompt (numbered lines): prefill 1,230 t/s, then generation 76 t/s (prefill 313 t/s without #64) |
 
 The R9700 row is the first one on RDNA4: Strata's own R9700 figures come from its maintainers' machine (DDR5, PCIe 5.0,
 125 – 251 GB of RAM), a different desk from this Xeon.
@@ -251,6 +252,7 @@ so far, the cost from the step's clock and the experts it runs on the CPU. Again
 kinds of text (Spec-Bench's six, essays in English and French, a code rewrite, a code edit): +5.2% on average, the worst
 −0.2%; +4 – 6% on the server's short answers. `LLAMA_MTP_ADAPT=0` drafts `--spec-draft-n-max` tokens every step, as
 before (2 was the advice).
+Images: add Unsloth's vision projector, see [docs/vision.md](docs/vision.md).
 On NVIDIA, backend sampling is on by default: the target's argmax runs on the GPU instead of over 248k logits on the
 CPU, 6% faster per step on the RTX 4090 (neutral on the RX 7900 XT, where it stays off; `-bs` / `-no-bs` force it).
 
@@ -304,7 +306,7 @@ More than two GPUs is untested.
 
 - **One model.** Avalon is tuned for Qwen3.8-Flash-Next; the GGUF files above use types and a layout stock llama.cpp
   does not have. Other models run as in llama.cpp, without the expert cache work.
-- **GPUs measured.** One AMD GPU (RDNA3, RDNA4 by users) and pairs of NVIDIA GPUs with the pipeline stages (see
+- **GPUs measured.** One AMD GPU (RDNA3; RDNA4 and RDNA2 by users) and pairs of NVIDIA GPUs with the pipeline stages (see
   above). Two AMD GPUs and more than two GPUs: untested.
 - **Tuned on RDNA3 with ROCm 7.2.** CUDA builds and was measured on rented RTX 4090s (see
   [NVIDIA](#nvidia-cuda-one-rented-rtx-4090)); its kernels are not tuned for NVIDIA yet, and the installer is ROCm only.
