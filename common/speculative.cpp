@@ -1617,9 +1617,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // TRIAL LLAMA_MTP_WINDOW=N (see process()): the draft decodes the last N rows of the batch only; the rows of this
         // ubatch before them are skipped, its last row still kept for the next ubatch (pending_h)
         // 32k prompts, N = 4096 (16 Nov.): -ub 32768 3109 / 3128 / 3090 / 3090 t/s -> 3173 / 3196 / 3135 / 3121, -ub 9536
-        // 2568 / 2548 / 2569 / 2501 -> 2572 / 2568 / 2537 / 2573. NOT TO BE TURNED ON as it is: at 251k (-b 32768) the
-        // fifth batch never ends, the host spinning in the draft's wait for its hosted experts (ggml_cuda_moe_hosted_wait);
-        // its effect on the acceptance at depth is not measured
+        // 2568 / 2548 / 2569 / 2501 -> 2572 / 2568 / 2537 / 2573. After a 251k prompt (-b 32768, an imposed text, 8 runs
+        // each, alternated): 501.4 tokens accepted of 600 against 503.5 (500 - 504 against 502 - 504), the step 29.85 ms
+        // against 29.56: the generation 1.2 % slower. Off by default
         static const int mtp_window_cb = getenv("LLAMA_MTP_WINDOW") ? atoi(getenv("LLAMA_MTP_WINDOW")) : 0;
         const int64_t win0    = mtp_window_cb > 0 && r.n_total > mtp_window_cb ? r.n_total - mtp_window_cb : 0;
         const int64_t k_first = std::min<int64_t>(std::max<int64_t>(win0 - r.row0, 0), r.n_rows);
