@@ -72,16 +72,25 @@ with that when RAM gets short:
   under the same limit, and a long prompt ends in a crash.
 
 So Avalon keeps its experts in RAM it owns, instead of the page cache, and the two are never mixed. At start it looks
-at the RAM it can take (and the driver's limit):
-- **every expert fits** (64 GB here): they are read once with O_DIRECT into Avalon's own memory, at the same
-  addresses, and registered in place. Nothing else can evict them, and the server is at full speed ~20 s after a start
-  from a cold disk;
+at the RAM it can take: the memory available at that moment (not the installed RAM), less a margin, and under the
+driver's limit:
+- **every expert fits**: they are read once with O_DIRECT into Avalon's own memory, at the same addresses, and
+  registered in place. Nothing else can evict them, and the server is at full speed ~20 s after a start from a cold
+  disk. This is the case of the 64 GB machine above when it starts with nearly all its RAM free; it is not the case of
+  every 64 GB machine: with ~51 GiB available at start (a desktop session, other programs), the experts (49.7 GiB) do
+  not fit and the arena below holds ~46 GiB of them ([#36](https://github.com/freriadoc/Avalon/issues/36): up in 34 s,
+  90 t/s on a short prompt);
 - **they do not fit**: an arena of slots, registered once, as large as the RAM allows (~23 GiB at 32 GB, ~9 GiB at
   16 GB), filled at start with the hottest experts of the shipped ranking and kept by LRU. An expert the CPU or a
   prompt needs that the arena does not hold is read into a slot from the disk with O_DIRECT; the GPU's expert cache is
   filled from the arena only. During a prompt, part of the arena is lent to the prefill's reads and restored before
   the answer starts, as the GPU cache lends VRAM to the compute buffers. The idea of a RAM tier of hot experts under
   the GPU cache comes from buun's expert store.
+
+`GGML_CUDA_MOE_ARENA_MARGIN_MB=N` is the RAM Avalon leaves free when it sizes itself at start (4096 by default): the
+experts, or the arena, take the available memory less this margin. Raise it (8192, more) when other programs need RAM
+while the server runs, or when the server slows down after a long session: what Avalon registered is not given back,
+and a machine short of free RAM pays for it in reclaim. `GGML_CUDA_MOE_ARENA_MB=N` fixes the arena's size instead.
 
 `GGML_CUDA_MOE_ARENA_MB=0` restores the old behavior (Linux; on Windows it is still the default).
 
