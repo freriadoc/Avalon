@@ -20,7 +20,7 @@
 // GGML_CUDA_QATTN_BENCH="n_kv[,n_queries[,runs[,skip]]]" runs the bench at the backend's creation and exits.
 // GGML_CUDA_QATTN_I8=0: off (the f16 kernel of one query instead). On by default for NVIDIA from Ampere on and for RDNA3 /
 // RDNA4 (7900 XT, 262k cells, 9536 queries, the node: 45.4 ms with the f16 kernel of one query, 37.1 with this one).
-// RDNA2 (no WMMA): k_qattn_rdna2, the same list per query in FP32, GGML_CUDA_QATTN_RDNA2=0: off (the dense slices).
+// RDNA2 (no WMMA): k_qattn_rdna2, the same list per query by dp4a, GGML_CUDA_QATTN_RDNA2=0: off (the dense slices).
 
 #include "common.cuh"
 #include "cp-async.cuh"
@@ -672,15 +672,18 @@ static __global__ void __launch_bounds__(128) k_qattn_f16(const qattn_args a) {
 }
 
 // RDNA2 (k_qattn_rdna2): no WMMA and no kernel for a tile mask there, the prompt's attention read every cell of the
-// cache (RX 6800 XT: 1.7 ns a query and cell, 75 % of a 250k prefill). The same attention of a list per query, in FP32:
-// a thread scores its cell for the heads of its wave (K's q8_0 row read once), the online softmax is k_qattn_f16's, a
-// thread then owns a head's 32 values of the output (one block of V's q4_0 rows). GGML_CUDA_QATTN_RDNA2=0: off (the
-// dense slices). A build with -DGGML_CUDA_QATTN_RDNA2_FAULT (the tests' negative controls, never a release) reads the
-// variable of that name: 1 drops each list's first cell, 2 scales V's first block of it
-// shortcut: scalar products and V's rows read once a head, slow; packed FP16 products once the results are settled
+// cache (RX 6800 XT: 1.7 ns a query and cell, 75 % of a 250k prefill). The same attention of a list per query, without
+// WMMA: q is quantized to int8 once a block (as k_qattn_i8), a thread scores its cell for the heads of its wave by dp4a
+// (K's q8_0 row read once a wave), the online softmax is k_qattn_f16's, a thread then owns 2 values of the output (a
+// byte of V's q4_0 blocks: its 2 codes) for the 12 heads in FP32, V decoded once a cell. 12 heads a KV head only
+// (qattn_rdna2_shapes, asserted at the launch); rows 12 to 15 of the shared arrays are padding. GGML_CUDA_QATTN_RDNA2=0:
+// off (the dense slices). A build with -DGGML_CUDA_QATTN_RDNA2_FAULT (the tests' negative controls, never a release)
+// reads the variable of that name: 1 drops each list's first cell, 2 scales V's first block of it
 struct qattn_rdna2_smem {
-    float x[16][32];   // the scores [head][cell], mask added
-    float p[16][32];   // the weights
+    int32_t qc[16][64];             // q's int8 codes [head][block*8 + word]
+    float   qs[16][8];              // their scales [head][block], times the attention's scale
+    float   x[16][32];              // the scores [head][cell], mask added
+    alignas(16) float p[32][16];    // the weights [cell][head]: a cell's heads in 3 reads of 16 bytes
     float alpha[16];
     float lsum[16];
     float mrow[16];
@@ -688,7 +691,7 @@ struct qattn_rdna2_smem {
 
 static __global__ void __launch_bounds__(128) k_qattn_rdna2(const qattn_args a) {
 #if defined(GGML_USE_HIP)
-    __shared__ qattn_rdna2_smem S;
+    __shared__ __align__(16) qattn_rdna2_smem S;
     const int iq = blockIdx.x, kvh = blockIdx.y;
     const int lane = threadIdx.x, warp = threadIdx.y, t = warp*32 + lane;
     const int n_list = a.n_list, n_head = a.n_head;
@@ -701,41 +704,61 @@ static __global__ void __launch_bounds__(128) k_qattn_rdna2(const qattn_args a) 
     const half    * mq = a.mask + (int64_t) iq*n_list;
     const int n_chunks = (a.lists[(int64_t) n_list*a.n_q + iq] + 31)/32;
 
-    const int ho = t >> 3, bo = t & 7;   // the thread's part of the output: a head, a block of 32 values
-    float acc[32];
+    constexpr int NH = 12;               // the heads of a KV head (qattn_rdna2_shapes)
+    const int bo = t >> 4, io = t & 15;  // the thread's part of the output: values bo*32 + io and + 16, every head
+    float acc[NH][2];
 #pragma unroll
-    for (int i = 0; i < 32; ++i) {
-        acc[i] = 0.0f;
+    for (int h = 0; h < NH; ++h) {
+        acc[h][0] = acc[h][1] = 0.0f;
     }
     if (t < 16) {
         S.mrow[t] = -INFINITY;
         S.lsum[t] = 0.0f;
     }
+    // q: int8 per (head, block of 32 values), as k_qattn_i8
+    {
+        const int h = t & 15, g = t >> 4;
+        float v[32];
+        float amax = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 32; ++j) {
+            v[j] = h < NH ? ((const float *) (Qq + h*a.sQ2))[g*32 + j] : 0.0f;   // not past Q's last KV head
+            amax = fmaxf(amax, fabsf(v[j]));
+        }
+        const float inv = amax > 0.0f ? 127.0f/amax : 0.0f;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            S.qc[h][g*8 + w] = (int32_t) qattn_pack(v[4*w], v[4*w + 1], v[4*w + 2], v[4*w + 3], inv);
+        }
+        S.qs[h][g] = amax/127.0f*a.scale;
+    }
     __syncthreads();
 
     for (int ci = 0; ci < n_chunks; ++ci) {
-        // the scores of the thread's cell for the heads warp, warp + 4, warp + 8 (, warp + 12)
+        // the scores of the thread's cell for the heads warp, warp + 4, warp + 8: int8 products (dp4a); row warp + 12
+        // of x is padding, written with the mask alone so that the softmax reads no uninitialized memory
         {
             const int32_t index = lq[ci*32 + lane];
             const char * kp = Kg + (int64_t) (index ^ (index >> 31))*a.sK1;   // a padded entry: ~cell, masked
             float s[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            // rolled: unrolled, the compiler keeps q's codes in registers (RX 6800 XT: 221 registers, 24.2 ms on the
+            // bench against 82 and 19.2)
+#pragma unroll 1
             for (int b = 0; b < 8; ++b) {
                 half d;
-                int8_t codes[32];
+                int32_t codes[8];
                 memcpy(&d, kp + b*34, sizeof(half));
-                memcpy(codes, kp + b*34 + 2, 32);
+                memcpy(codes, kp + b*34 + 2, sizeof(codes));
                 const float kd = __half2float(d);
 #pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    if (warp + 4*j < n_head) {
-                        const float * q = (const float *) (Qq + (warp + 4*j)*a.sQ2) + b*32;
-                        float sum = 0.0f;
+                for (int j = 0; j < NH/4; ++j) {
+                    const int h = warp + 4*j;
+                    int32_t sumi = 0;
 #pragma unroll
-                        for (int i = 0; i < 32; ++i) {
-                            sum = fmaf(q[i], (float) codes[i], sum);
-                        }
-                        s[j] = fmaf(sum, kd, s[j]);
+                    for (int w = 0; w < 8; ++w) {
+                        sumi = ggml_cuda_dp4a(codes[w], S.qc[h][b*8 + w], sumi);
                     }
+                    s[j] = fmaf((float) sumi*kd, S.qs[h][b], s[j]);
                 }
             }
             float m = __half2float(mq[ci*32 + lane]);
@@ -746,7 +769,7 @@ static __global__ void __launch_bounds__(128) k_qattn_rdna2(const qattn_args a) 
 #endif
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
-                S.x[warp + 4*j][lane] = s[j]*a.scale + m;
+                S.x[warp + 4*j][lane] = s[j] + m;
             }
         }
         __syncthreads();
@@ -769,7 +792,7 @@ static __global__ void __launch_bounds__(128) k_qattn_rdna2(const qattn_args a) 
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 const float e = x[j] == -INFINITY ? 0.0f : expf(x[j] - m_new);
-                S.p[r][sub*4 + j] = e;
+                S.p[sub*4 + j][r] = e;
                 sum += e;
             }
 #pragma unroll
@@ -784,46 +807,49 @@ static __global__ void __launch_bounds__(128) k_qattn_rdna2(const qattn_args a) 
             }
         }
         __syncthreads();
-        // the output: the head's weights times the block of V of each cell
-        if (ho < n_head) {
-            float tmp[32];
+        // the output: the running sums rescaled, then each cell's 2 values of V times its weight of every head
 #pragma unroll
-            for (int i = 0; i < 32; ++i) {
-                tmp[i] = 0.0f;
-            }
-            for (int c = 0; c < 32; ++c) {
-                const int32_t index = lq[ci*32 + c];
-                const char * vp = Vg + (int64_t) (index ^ (index >> 31))*a.sV1 + bo*18;
-                half d;
-                uint8_t qs[16];
-                memcpy(&d, vp, sizeof(half));
-                memcpy(qs, vp + 2, 16);
-                float w = S.p[ho][c]*__half2float(d);
+        for (int h = 0; h < NH; ++h) {
+            acc[h][0] *= S.alpha[h];
+            acc[h][1] *= S.alpha[h];
+        }
+        for (int c = 0; c < 32; ++c) {
+            const int32_t index = lq[ci*32 + c];
+            const char * vp = Vg + (int64_t) (index ^ (index >> 31))*a.sV1 + bo*18;
+            half d;
+            memcpy(&d, vp, sizeof(half));
+            const uint8_t q = (uint8_t) vp[2 + io];
+            const float vd = __half2float(d);
+            float v0 = vd*(float) ((q & 0x0F) - 8);
+            float v1 = vd*(float) ((q >> 4) - 8);
 #ifdef GGML_CUDA_QATTN_RDNA2_FAULT
-                if (a.skip == 2 && ci == 0 && c == 0 && bo == 0) {
-                    w *= 1.25f;
-                }
+            if (a.skip == 2 && ci == 0 && c == 0 && bo == 0) {
+                v0 *= 1.25f;
+                v1 *= 1.25f;
+            }
 #endif
+            const float4 * pc = (const float4 *) S.p[c];
 #pragma unroll
-                for (int i = 0; i < 16; ++i) {
-                    tmp[i]      = fmaf(w, (float) ((int) (qs[i] & 0x0F) - 8), tmp[i]);
-                    tmp[i + 16] = fmaf(w, (float) ((int) (qs[i] >> 4)   - 8), tmp[i + 16]);
-                }
-            }
-            const float al = S.alpha[ho];
-#pragma unroll
-            for (int i = 0; i < 32; ++i) {
-                acc[i] = fmaf(acc[i], al, tmp[i]);
+            for (int h4 = 0; h4 < NH/4; ++h4) {
+                const float4 w = pc[h4];
+                acc[4*h4 + 0][0] = fmaf(w.x, v0, acc[4*h4 + 0][0]);
+                acc[4*h4 + 0][1] = fmaf(w.x, v1, acc[4*h4 + 0][1]);
+                acc[4*h4 + 1][0] = fmaf(w.y, v0, acc[4*h4 + 1][0]);
+                acc[4*h4 + 1][1] = fmaf(w.y, v1, acc[4*h4 + 1][1]);
+                acc[4*h4 + 2][0] = fmaf(w.z, v0, acc[4*h4 + 2][0]);
+                acc[4*h4 + 2][1] = fmaf(w.z, v1, acc[4*h4 + 2][1]);
+                acc[4*h4 + 3][0] = fmaf(w.w, v0, acc[4*h4 + 3][0]);
+                acc[4*h4 + 3][1] = fmaf(w.w, v1, acc[4*h4 + 3][1]);
             }
         }
-        // no barrier: the next chunk's scores write x only, p and alpha are written again after its first barrier
+        // no barrier: the next chunk's scores write x only and read neither p nor alpha, which are written again only
+        // after the next chunk's first barrier, which every thread reaches after its reads here
     }
-    if (ho < n_head) {
-        const float l = S.lsum[ho];
 #pragma unroll
-        for (int i = 0; i < 32; ++i) {
-            oq[ho*256 + bo*32 + i] = l > 0.0f ? acc[i]/l : 0.0f;
-        }
+    for (int h = 0; h < NH; ++h) {
+        const float l = S.lsum[h];
+        oq[h*256 + bo*32 + io]      = l > 0.0f ? acc[h][0]/l : 0.0f;
+        oq[h*256 + bo*32 + io + 16] = l > 0.0f ? acc[h][1]/l : 0.0f;
     }
 #else
     GGML_UNUSED(a);
@@ -1287,6 +1313,7 @@ void ggml_cuda_qattn_i8(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     } else if (qattn_f16_on(cc)) {
         qattn_f16_launch(a, grid, block, ctx.stream());
     } else if (qattn_rdna2_arch(cc)) {
+        GGML_ASSERT(a.n_head == 12);   // k_qattn_rdna2 is written for 12 heads a KV head (qattn_rdna2_shapes)
 #ifdef GGML_CUDA_QATTN_RDNA2_FAULT
         static const int fault = [] { const char * e = getenv("GGML_CUDA_QATTN_RDNA2_FAULT"); return e ? atoi(e) : 0; }();
         a.skip = fault;
