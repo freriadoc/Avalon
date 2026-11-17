@@ -26,6 +26,7 @@
 #include <map>
 #include <memory>
 #include <cinttypes>
+#include <chrono>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_TRC(fmt, ...) LOG_TRC("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -2277,6 +2278,38 @@ struct common_speculative_impl_draft_syclonith : public common_speculative_impl 
 
     std::vector<bool> kv_hash_due;   // LLAMA_MTP_KV_HASH: a prompt batch was processed since the last draft
 
+    // Observable Syclonith diagnostics. These count executor operations; they do not
+    // imply numerical equivalence with the reference MTP graph.
+    uint64_t stats_draft_cycles = 0;
+    uint64_t stats_draft_graph_execs = 0;
+    uint64_t stats_candidates = 0;
+    uint64_t stats_drafted_tokens = 0;
+    uint64_t stats_accepted_tokens = 0;
+    uint64_t stats_rejected_tokens = 0;
+    uint64_t stats_confidence_drops = 0;
+    uint64_t stats_verification_calls = 0;
+    uint64_t stats_draft_exec_us = 0;
+    double   stats_top1_p_sum = 0.0;
+    std::vector<uint64_t> stats_pending_drafted;
+
+    void log_syclonith_stats(const char * reason) const {
+        const uint64_t decided = stats_accepted_tokens + stats_rejected_tokens;
+        const double acceptance = decided == 0 ? 0.0 :
+                100.0 * (double) stats_accepted_tokens / (double) decided;
+        const double avg_exec_us = stats_draft_graph_execs == 0 ? 0.0 :
+                (double) stats_draft_exec_us / (double) stats_draft_graph_execs;
+        const double avg_top1_p = stats_candidates == 0 ? 0.0 :
+                stats_top1_p_sum / (double) stats_candidates;
+        SPC_INF("Syclonith stats (%s): cycles=%" PRIu64 ", draft_graph_execs=%" PRIu64
+                ", candidates=%" PRIu64 ", drafted=%" PRIu64 ", accepted=%" PRIu64
+                ", rejected=%" PRIu64 ", confidence_drops=%" PRIu64 ", verify_calls=%" PRIu64
+                ", acceptance=%.1f%%, avg_top1_p=%.4f, draft_exec_total=%.3f ms, draft_exec_avg=%.1f us\n",
+                reason, stats_draft_cycles, stats_draft_graph_execs, stats_candidates,
+                stats_drafted_tokens, stats_accepted_tokens, stats_rejected_tokens,
+                stats_confidence_drops, stats_verification_calls, acceptance, avg_top1_p,
+                (double) stats_draft_exec_us / 1000.0, avg_exec_us);
+    }
+
     common_speculative_impl_draft_syclonith(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_SYCLONITH, n_seq, std::min(1, params.draft.n_max))
         , params(params.draft)
@@ -2406,6 +2439,7 @@ struct common_speculative_impl_draft_syclonith : public common_speculative_impl 
         verify_h_rows.assign(n_seq, 0);
 
         kv_hash_due.assign(n_seq, false);
+        stats_pending_drafted.assign(n_seq, 0);
         defer_tok.assign(n_seq, {});
         defer_pos.assign(n_seq, {});
         defer_h.assign(n_seq, {});
@@ -2489,6 +2523,9 @@ struct common_speculative_impl_draft_syclonith : public common_speculative_impl 
     }
 
     ~common_speculative_impl_draft_syclonith() override {
+        if (stats_draft_cycles > 0 || stats_draft_graph_execs > 0) {
+            log_syclonith_stats("shutdown");
+        }
         auto * ctx_dft = this->params.ctx_dft;
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
             if (backend_chains[seq_id] == nullptr) {
@@ -2772,6 +2809,8 @@ struct common_speculative_impl_draft_syclonith : public common_speculative_impl 
             }
 
             n_drafting++;
+            stats_draft_cycles++;
+            stats_pending_drafted[seq_id] = 0;
             drafting[seq_id] = true;
             n_draft_max[seq_id] = draft_controller.choose_draft_length(seq_id,
                     dp.n_max > 0 ? std::min(params.n_max, dp.n_max) : params.n_max, params.n_min);
@@ -2823,12 +2862,16 @@ struct common_speculative_impl_draft_syclonith : public common_speculative_impl 
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
+            const auto graph_t0 = std::chrono::steady_clock::now();
             int ret = execution_backend.process(ctx_dft, batch);
             if (ret != 0) {
                 SPC_ERR("llama_process[%d] returned %d\n", i, ret);
                 break;
             }
             execution_backend.synchronize(ctx_dft);
+            const auto graph_t1 = std::chrono::steady_clock::now();
+            stats_draft_graph_execs++;
+            stats_draft_exec_us += (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(graph_t1 - graph_t0).count();
 
             if (i == 0) {
                 for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -2854,6 +2897,10 @@ struct common_speculative_impl_draft_syclonith : public common_speculative_impl 
                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
+                stats_candidates += cur_p->size;
+                if (cur_p->size > 0) {
+                    stats_top1_p_sum += cur_p->data[0].p;
+                }
 
                 for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
                     SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
@@ -2866,6 +2913,7 @@ struct common_speculative_impl_draft_syclonith : public common_speculative_impl 
 
                 // only collect very high-confidence draft tokens
                 if (cur_p->data[0].p < params.p_min) {
+                    stats_confidence_drops++;
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -2878,6 +2926,8 @@ struct common_speculative_impl_draft_syclonith : public common_speculative_impl 
                 auto & result = *dp.result;
 
                 result.push_back(id);
+                stats_drafted_tokens++;
+                stats_pending_drafted[seq_id]++;
 
                 if (dp.result_q) {
                     dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
@@ -2944,6 +2994,16 @@ struct common_speculative_impl_draft_syclonith : public common_speculative_impl 
         const int32_t n_rows = verify_h_rows[seq_id];
         if (n_rows <= 0) {
             return;
+        }
+
+        const uint64_t drafted = stats_pending_drafted[seq_id];
+        const uint64_t accepted = std::min<uint64_t>(n_accepted, drafted);
+        stats_accepted_tokens += accepted;
+        stats_rejected_tokens += drafted - accepted;
+        stats_pending_drafted[seq_id] = 0;
+        stats_verification_calls++;
+        if (stats_verification_calls % 32 == 0) {
+            log_syclonith_stats("periodic");
         }
 
         const int32_t i_h = qwen35moe_runtime
