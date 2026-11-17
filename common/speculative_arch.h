@@ -88,7 +88,7 @@ public:
 
     // Execute a llama batch in the supplied context. Implementations may route
     // through llama_process() and the selected ggml backend.
-    virtual int process(llama_context * ctx, const common_batch & batch) = 0;
+    virtual int process(llama_context * ctx, common_batch & batch) = 0;
 
     virtual void synchronize(llama_context * ctx) = 0;
 
