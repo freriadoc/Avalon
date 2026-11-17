@@ -170,6 +170,20 @@ llama_build(test-recurrent-state-rollback.cpp)
 llama_build(test-save-load-state.cpp)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+    # Architecture-independent speculative draft-length policy (header-only).
+    add_executable(test_speculative_controller test_speculative_controller.cpp)
+    target_compile_features(test_speculative_controller PRIVATE cxx_std_17)
+    add_test(NAME test_speculative_controller COMMAND test_speculative_controller)
+
+    # Qwen35MoE runtime hidden-state frontier and verifier-row semantics.
+    add_executable(test_speculative_qwen35moe_runtime test_speculative_qwen35moe_runtime.cpp)
+    target_compile_features(test_speculative_qwen35moe_runtime PRIVATE cxx_std_17)
+    target_include_directories(test_speculative_qwen35moe_runtime PRIVATE
+        ${PROJECT_SOURCE_DIR}/include
+        ${PROJECT_SOURCE_DIR}/ggml/include
+        ${PROJECT_SOURCE_DIR}/common)
+    add_test(NAME test_speculative_qwen35moe_runtime COMMAND test_speculative_qwen35moe_runtime)
+
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-unicode.cpp LINK llama)
     llama_build_and_test(test-sampling.cpp LINK llama)

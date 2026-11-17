@@ -1,4 +1,7 @@
 #include "speculative.h"
+#include "speculative_controller.h"
+#include "speculative_adapter_registry.h"
+#include "speculative_qwen35moe_adapter.h"
 
 #include "common.h"
 #include "ggml.h"
@@ -13,12 +16,14 @@
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cmath>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <map>
+#include <memory>
 #include <cinttypes>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -199,51 +204,12 @@ struct common_speculative_impl {
     int64_t t_draft_us  = 0; // total time spent in generating drafts in this implementation in microseconds.
     int64_t t_accept_us = 0; // total time spent in accumulation of this implementation in microseconds.
 
-    // Per-sequence adaptive draft-length controller. A full acceptance is a censored
-    // observation (the target may have accepted more), so probe upward; a partial
-    // acceptance gives an exact stopping point and is incorporated through an EMA.
-    std::vector<float>   acc_ema;
-    std::vector<int32_t> n_last_draft;
-    bool adaptive_n = false;
+    // Generic per-sequence draft-length policy. Kept independent of the
+    // architecture-specific implementation and backend execution details.
+    common_speculative_draft_controller draft_controller;
 
-    static constexpr float acc_ema_alpha = 0.25f;
-    static constexpr float acc_ema_probe = 1.0f;
-    static constexpr float acc_ema_init = 2.0f;
-
-    void update_acc_ema(llama_seq_id seq_id, uint16_t n_accepted) {
-        if (seq_id < 0 || (size_t) seq_id >= acc_ema.size()) {
-            return;
-        }
-        const int32_t n_drafted = n_last_draft[seq_id];
-        if (n_drafted > 0 && (int32_t) n_accepted >= n_drafted) {
-            acc_ema[seq_id] += acc_ema_probe;
-        } else {
-            acc_ema[seq_id] = (1.0f - acc_ema_alpha) * acc_ema[seq_id] + acc_ema_alpha * (float) n_accepted;
-        }
-        n_last_draft[seq_id] = 0;
-    }
-
-    void reset_acc_ema(llama_seq_id seq_id) {
-        if (seq_id >= 0 && (size_t) seq_id < acc_ema.size()) {
-            acc_ema[seq_id] = acc_ema_init;
-            n_last_draft[seq_id] = 0;
-        }
-    }
-
-    int32_t adaptive_n_draft(llama_seq_id seq_id, int32_t n_cfg, int32_t n_min) {
-        if (!adaptive_n || seq_id < 0 || (size_t) seq_id >= acc_ema.size()) {
-            return n_cfg;
-        }
-        const int32_t n_want = (int32_t) std::lround(acc_ema[seq_id]);
-        const int32_t n = std::max(std::max(1, n_min), std::min(n_cfg, n_want));
-        acc_ema[seq_id] = std::min(acc_ema[seq_id], (float) n_cfg);
-        n_last_draft[seq_id] = n;
-        return n;
-    }
-
-    common_speculative_impl(common_speculative_type type, uint32_t n_seq, int32_t n_max) : type(type), n_seq(n_seq), n_max(n_max) {
-        acc_ema.assign(n_seq, acc_ema_init);
-        n_last_draft.assign(n_seq, 0);
+    common_speculative_impl(common_speculative_type type, uint32_t n_seq, int32_t n_max)
+        : type(type), n_seq(n_seq), n_max(n_max), draft_controller(n_seq) {
     }
 
     virtual ~common_speculative_impl() = default;
@@ -288,7 +254,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
         zeros.assign(llama_model_n_embd_inp(llama_get_model(ctx_dft)), 0.0f);
 
         SPC_TRC("%s", "adding speculative implementation 'draft-simple'\n");
-        adaptive_n = this->params.adaptive;
+        draft_controller.set_enabled(this->params.adaptive);
         SPC_TRC("- n_max=%d, n_min=%d, p_min=%f\n", this->params.n_max, this->params.n_min, this->params.p_min);
         SPC_TRC("- gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s, devices=[%s]\n",
                 this->params.n_gpu_layers,
@@ -344,7 +310,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & /*prompt*/) override {
-        reset_acc_ema(seq_id);
+        draft_controller.reset(seq_id);
         // reset here rather than per round, or two identical requests differ
         common_sampler_reset(smpls[seq_id].get());
     }
@@ -414,7 +380,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
 
             n_drafting++;
             drafting[seq_id] = true;
-            n_draft_max[seq_id] = adaptive_n_draft(seq_id,
+            n_draft_max[seq_id] = draft_controller.choose_draft_length(seq_id,
                     dp.n_max > 0 ? std::min(params.n_max, dp.n_max) : params.n_max, params.n_min);
             // greedy drafting leaves no candidates behind, so the verifier falls back to sample-and-match
             if (!params.probabilistic) {
@@ -597,7 +563,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         , params(params.draft)
     {
         SPC_TRC("%s", "adding speculative implementation 'draft-eagle3'\n");
-        adaptive_n = this->params.adaptive;
+        draft_controller.set_enabled(this->params.adaptive);
         SPC_TRC("- n_max=%d, n_min=%d, p_min=%f, backend_sampling=%d\n", params.draft.n_max, params.draft.n_min, params.draft.p_min, (int) params.draft.backend_sampling);
 
         auto * ctx_tgt = this->params.ctx_tgt;
@@ -685,7 +651,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
-        reset_acc_ema(seq_id);
+        draft_controller.reset(seq_id);
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
@@ -872,7 +838,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
             n_drafting++;
             drafting[seq_id] = true;
-            n_draft_max[seq_id] = adaptive_n_draft(seq_id, params.n_max, params.n_min);
+            n_draft_max[seq_id] = draft_controller.choose_draft_length(seq_id, params.n_max, params.n_min);
             common_sampler_reset(smpls[seq_id].get());
 
             llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, pending_pos_last[seq_id], -1);
@@ -1120,7 +1086,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         LOG_INF("%s: adding speculative implementation '%s'\n", __func__, common_speculative_type_to_str(type).c_str());
-        adaptive_n = this->params.adaptive;
+        draft_controller.set_enabled(this->params.adaptive);
         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);
         LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u, sample_from_anchor=%s\n", __func__,
                 block_size, mask_token_id, target_layer_ids_n, sample_from_anchor ? "true" : "false");
@@ -1192,7 +1158,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
-        reset_acc_ema(seq_id);
+        draft_controller.reset(seq_id);
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
@@ -1315,7 +1281,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             const int32_t n = (int32_t) dp.pos0;
 
-            const int32_t n_draft = adaptive_n_draft(seq_id, params.n_max, params.n_min);
+            const int32_t n_draft = draft_controller.choose_draft_length(seq_id, params.n_max, params.n_min);
 
             const int32_t n_block_tokens = n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.size();
@@ -1464,6 +1430,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     int32_t n_mtp_layers  = 1;
     bool    is_mem_shared = false;   // gemma4
     bool    chain_heads   = false;   // derived in the ctor: n_mtp_layers > 1 && !is_mem_shared
+    bool    architecture_adapter_selected = false;
+    std::unique_ptr<syclonith::speculative::Qwen35MoEMTPRuntime> qwen35moe_runtime;
 
     // Per-sequence cross-batch carryover: pair (h_p, x_{p+1}) at MTP pos p+1.
     // The last h-row of one process() call needs the first token of the NEXT
@@ -1513,10 +1481,36 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         n_embd = llama_model_n_embd_out(llama_get_model(ctx_dft));
         GGML_ASSERT(n_embd == llama_model_n_embd_out(llama_get_model(ctx_tgt)) &&
                 "MTP input row width must match the target h_nextn width");
+
+        // Resolve a registered Layer-2 architecture inspector. This registry
+        // selects and validates model semantics only; the existing MTP executor
+        // remains responsible for graph execution until the Layer-3 migration.
+        const auto adapter_selection = syclonith::speculative::select_adapter(
+                llama_get_model(ctx_tgt), llama_get_model(ctx_dft));
+        architecture_adapter_selected = adapter_selection.selected();
+        if (adapter_selection.selected()) {
+            SPC_INF("architecture adapter '%s' selected after structural checks: hidden=%d, prediction_layers=%d, tensors=%u; existing MTP executor remains active pending runtime validation\\n",
+                    adapter_selection.adapter->id,
+                    adapter_selection.inspection.hidden_size,
+                    adapter_selection.inspection.prediction_layers,
+                    adapter_selection.inspection.validated_tensor_count);
+        } else if (adapter_selection.status == syclonith::speculative::AdapterSelectionStatus::rejected) {
+            SPC_WRN("architecture adapter '%s' rejected model pair: %s; retaining existing MTP path\\n",
+                    adapter_selection.adapter ? adapter_selection.adapter->id : "unknown",
+                    adapter_selection.reason.c_str());
+        } else if (adapter_selection.status == syclonith::speculative::AdapterSelectionStatus::no_registered_adapter) {
+            SPC_TRC("no Layer-2 adapter registered for architecture '%s'; retaining existing MTP path\\n",
+                    adapter_selection.architecture.c_str());
+        }
+
+        if (architecture_adapter_selected) {
+            qwen35moe_runtime = std::make_unique<syclonith::speculative::Qwen35MoEMTPRuntime>(n_seq, n_embd);
+        }
+
         n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
 
         SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
-        adaptive_n = this->params.adaptive;
+        draft_controller.set_enabled(this->params.adaptive);
         SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
         SPC_TRC("- gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s, devices=[%s]\n",
                 this->params.n_gpu_layers,
@@ -1596,6 +1590,45 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         n_defer_max = (int32_t) n_seq * (this->params.n_max + 1);
     }
 
+    float * pending_h_data(llama_seq_id seq_id) {
+        return qwen35moe_runtime ? qwen35moe_runtime->pending_data(seq_id) : pending_h[seq_id].data();
+    }
+
+    const float * pending_h_data(llama_seq_id seq_id) const {
+        return qwen35moe_runtime ? qwen35moe_runtime->pending_data(seq_id) : pending_h[seq_id].data();
+    }
+
+    int32_t verification_rows(llama_seq_id seq_id) const {
+        return qwen35moe_runtime ? qwen35moe_runtime->verification_rows(seq_id) : verify_h_rows[seq_id];
+    }
+
+    float * prepare_verification(llama_seq_id seq_id, int32_t n_rows) {
+        if (qwen35moe_runtime) return qwen35moe_runtime->prepare_verification(seq_id, n_rows);
+        verify_h[seq_id].resize((size_t) n_rows * n_embd);
+        verify_h_rows[seq_id] = n_rows;
+        return verify_h[seq_id].data();
+    }
+
+    bool finish_verification(llama_seq_id seq_id) {
+        if (qwen35moe_runtime) return qwen35moe_runtime->finish_verification(seq_id);
+        const int32_t n_rows = verification_rows(seq_id);
+        if (n_rows <= 0) return false;
+        std::memcpy(pending_h[seq_id].data(),
+                verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd,
+                (size_t) n_embd * sizeof(float));
+        return true;
+    }
+
+    const float * paired_target_row(llama_seq_id seq_id, int32_t batch_index,
+            int32_t sequence_begin, const float * target_rows) const {
+        if (qwen35moe_runtime) {
+            return qwen35moe_runtime->paired_target_row(seq_id, batch_index, sequence_begin, target_rows);
+        }
+        return batch_index == sequence_begin
+            ? pending_h_data(seq_id)
+            : target_rows + (size_t) (batch_index - 1) * n_embd;
+    }
+
     int32_t n_deferred() const {
         int32_t n = 0;
         for (const auto & t : defer_tok) {
@@ -1670,7 +1703,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
             }
         }
-        if (!llama_set_mtp_h_rows_ev(ctx_dft, r.rows, r.n_rows, r.backend, pending_h[seq_id].data(), r.ev_ready)) {
+        if (!llama_set_mtp_h_rows_ev(ctx_dft, r.rows, r.n_rows, r.backend, pending_h_data(seq_id), r.ev_ready)) {
             SPC_ERR("%s", "the draft has no backend on the device of the target's rows\n");
             return false;
         }
@@ -1691,11 +1724,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 SPC_ERR("%s", "the draft has no backend on the device of the target's rows\n");
                 return false;
             }
-            memcpy(pending_h[seq_id].data(), r.last_row, (size_t) n_embd * sizeof(float));
+            memcpy(pending_h_data(seq_id), r.last_row, (size_t) n_embd * sizeof(float));
         } else {
             // its copies from the target's rows done before the target's next ubatch overwrites them
             llama_synchronize(ctx_dft);
-            ggml_backend_tensor_get(r.rows, pending_h[seq_id].data(), (size_t) (r.n_rows - 1) * r.rows->nb[1],
+            ggml_backend_tensor_get(r.rows, pending_h_data(seq_id), (size_t) (r.n_rows - 1) * r.rows->nb[1],
                     (size_t) n_embd * sizeof(float));
         }
         rows_cb_n += r.n_rows;
@@ -1723,7 +1756,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
-        reset_acc_ema(seq_id);
+        draft_controller.reset(seq_id);
+        if (qwen35moe_runtime) qwen35moe_runtime->begin_sequence(seq_id);
         // reset here rather than per round, or two identical requests differ
         common_sampler_reset(smpls[seq_id].get());
 
@@ -1789,8 +1823,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             const int64_t done = rows_cb_done;
             rows_cb_done = -1;
             if (done == n_tokens && rows_cb_seq >= 0 && i_batch_beg[rows_cb_seq] == 0 && i_batch_end[rows_cb_seq] == n_tokens - 1) {
-                verify_h_rows[rows_cb_seq] = 1;
-                verify_h[rows_cb_seq] = pending_h[rows_cb_seq];
+                float * rows = prepare_verification(rows_cb_seq, 1);
+                std::memcpy(rows, pending_h_data(rows_cb_seq), row_bytes);
                 return true;
             }
         }
@@ -1825,9 +1859,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 for (int k = 0; k < n_tokens; ++k) {
                     const llama_seq_id seq_id = batch_in.tokens[k].seq_id;
 
-                    const float * h_row = k == i_batch_beg[seq_id]
-                        ? pending_h[seq_id].data()
-                        : h_tgt + (size_t) (k - 1) * n_embd;
+                    const float * h_row = paired_target_row(seq_id, k, i_batch_beg[seq_id], h_tgt);
 
                     defer_tok[seq_id].push_back(batch_in.tokens[k].id);
                     defer_pos[seq_id].push_back(batch_in.tokens[k].pos[0]);
@@ -1866,7 +1898,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
                 static const bool h_dev_off = getenv("LLAMA_MTP_H_DEVICE") && atoi(getenv("LLAMA_MTP_H_DEVICE")) == 0;
                 const bool h_dev = !h_dev_off && !chain_heads && n_mtp_layers == 1 && n_seq_in == 1 && n_deferred() == 0 &&
-                    llama_set_mtp_h_from(ctx_dft, ctx_tgt, pending_h[seq_in].data());
+                    llama_set_mtp_h_from(ctx_dft, ctx_tgt, pending_h_data(seq_in));
 
                 // deferred rows first, they precede this batch
                 if (!h_dev) {
@@ -1883,9 +1915,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                         continue;
                     }
 
-                    const float * h_row = k == i_batch_beg[seq_id]
-                        ? pending_h[seq_id].data()
-                        : h_tgt + (size_t) (k - 1) * n_embd;
+                    const float * h_row = paired_target_row(seq_id, k, i_batch_beg[seq_id], h_tgt);
 
                     batch.set_embd(idx, { h_row, 1, (size_t) n_embd });
                 }
@@ -1936,16 +1966,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             const int32_t n_all  = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
             const int32_t n_rows = n_all > this->params.n_max + 1 ? 1 : n_all;
             const int32_t i_beg  = i_batch_end[seq_id] - n_rows + 1;
-            verify_h_rows[seq_id] = n_rows;
-            verify_h[seq_id].resize((size_t) n_rows * n_embd);
-
+            float * rows = prepare_verification(seq_id, n_rows);
             for (int32_t i = 0; i < n_rows; ++i) {
                 const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_beg + i);
-                std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
+                std::memcpy(rows + (size_t) i * n_embd, h, row_bytes);
             }
-
-            std::memcpy(pending_h[seq_id].data(),
-                    verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+            finish_verification(seq_id);
         }
 
         return true;
@@ -2008,7 +2034,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             n_drafting++;
             drafting[seq_id] = true;
-            n_draft_max[seq_id] = adaptive_n_draft(seq_id,
+            n_draft_max[seq_id] = draft_controller.choose_draft_length(seq_id,
                     dp.n_max > 0 ? std::min(params.n_max, dp.n_max) : params.n_max, params.n_min);
             // greedy drafting leaves no candidates behind, so the verifier falls back to sample-and-match
             if (!params.probabilistic) {
@@ -2030,12 +2056,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             defer_add(seq_id);
 
             const int32_t idx = batch.add(dp.id_last, dp.pos0, seq_id, true);
-            batch.set_embd(idx, { pending_h[seq_id].data(), 1, (size_t) n_embd });
+            batch.set_embd(idx, { pending_h_data(seq_id), 1, (size_t) n_embd });
 
             i_last[seq_id] = idx;
 
             if (chain_heads) {
-                chain_h[seq_id].assign(pending_h[seq_id].begin(), pending_h[seq_id].end());
+                chain_h[seq_id].assign(pending_h_data(seq_id), pending_h_data(seq_id) + n_embd);
             }
         }
 
@@ -2180,9 +2206,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return;
         }
 
-        const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
+        const int32_t i_h = qwen35moe_runtime
+            ? qwen35moe_runtime->accepted_row(seq_id, n_accepted)
+            : std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
-        std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+        if (qwen35moe_runtime) {
+            qwen35moe_runtime->accept(seq_id, n_accepted);
+        } else {
+            std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+        }
 
         // the deferred rows of the rejected draft tokens (the last rows of the verification) are never decoded
         const size_t n_keep = defer_tok[seq_id].size() - std::min<size_t>(defer_tok[seq_id].size(), n_rows - 1 - i_h);
@@ -3379,7 +3411,7 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
             impl->n_acc_tokens += n_accepted;
         }
 
-        impl->update_acc_ema(seq_id, n_accepted);
+        impl->draft_controller.observe_acceptance(seq_id, n_accepted);
         impl->accept(seq_id, n_accepted, false);
         impl->n_call_accept++;
     }
