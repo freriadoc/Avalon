@@ -2769,6 +2769,13 @@ struct llama_model_qwen35moe : public llama_model_base {
         graph_mtp(const llama_model & model, const llm_graph_params & params);
     };
 
+    // Syclonith owns a separate graph type and context lifecycle. The graph
+    // currently mirrors the trained Qwen35MoE MTP computation, independently
+    // of the legacy draft-mtp speculative executor.
+    struct graph_syclonith : public llm_graph_context {
+        graph_syclonith(const llama_model & model, const llm_graph_params & params);
+    };
+
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 

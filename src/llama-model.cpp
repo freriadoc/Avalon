@@ -2843,8 +2843,12 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         default:
             {
                 // Dense MTP heads use a plain attention KV cache instead of the hybrid wrapper.
+                const bool is_mtp_context =
+                    params.ctx_type == LLAMA_CONTEXT_TYPE_MTP ||
+                    params.ctx_type == LLAMA_CONTEXT_TYPE_SYCLONITH;
+
                 const bool mtp_on_hybrid_qwen =
-                    params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
+                    is_mtp_context &&
                     (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
                      arch == LLM_ARCH_BAILINGMOE3);
 
@@ -3006,7 +3010,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     // don't filter when n_layer_nextn is repurposed for a router layer the trunk attends
                     // or when a model is entirely n_layer_nextn layers and has no trunk
                     if (hparams.n_layer_nextn > 0 && hparams.n_layer() > 0 && hparams.router_layer < 0) {
-                        if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+                        if (is_mtp_context) {
                             filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
                         } else {
                             filter = [&](uint32_t il) { return il <  hparams.n_layer(); };

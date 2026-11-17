@@ -223,8 +223,10 @@ extern "C" {
     };
 
     enum llama_context_type {
-        LLAMA_CONTEXT_TYPE_DEFAULT = 0,
-        LLAMA_CONTEXT_TYPE_MTP     = 1,
+        LLAMA_CONTEXT_TYPE_DEFAULT  = 0,
+        LLAMA_CONTEXT_TYPE_MTP      = 1,
+        // Dedicated Qwen35MoE context for Syclonith's independent MTP graph.
+        LLAMA_CONTEXT_TYPE_SYCLONITH = 2,
     };
 
     enum llama_moe_cache_mode {

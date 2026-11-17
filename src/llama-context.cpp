@@ -34,8 +34,9 @@
 
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
-        case LLAMA_CONTEXT_TYPE_DEFAULT: return LLM_GRAPH_TYPE_DEFAULT;
-        case LLAMA_CONTEXT_TYPE_MTP    : return LLM_GRAPH_TYPE_DECODER_MTP;
+        case LLAMA_CONTEXT_TYPE_DEFAULT  : return LLM_GRAPH_TYPE_DEFAULT;
+        case LLAMA_CONTEXT_TYPE_MTP      : return LLM_GRAPH_TYPE_DECODER_MTP;
+        case LLAMA_CONTEXT_TYPE_SYCLONITH: return LLM_GRAPH_TYPE_DECODER_SYCLONITH;
     }
     throw std::runtime_error("Unsupported ctx type");
 }
@@ -510,7 +511,9 @@ llama_context::llama_context(
                 // again for every piece of a prefill, they must stay in the caches
                 auto set_weights_read_once_fn = (void (*)(ggml_backend_t, bool)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_weights_read_once");
                 if (set_weights_read_once_fn) {
-                    set_weights_read_once_fn(backend.get(), cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP);
+                    set_weights_read_once_fn(backend.get(),
+            cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP &&
+            cparams.ctx_type != LLAMA_CONTEXT_TYPE_SYCLONITH);
                 }
             }
         }
@@ -5351,9 +5354,15 @@ llama_context * llama_init_from_model(
     }
 
     // router_layer >= 0 means n_layer_nextn is repurposed for a router layer, not real MTP
-    if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
+    if ((params.ctx_type == LLAMA_CONTEXT_TYPE_MTP ||
+         params.ctx_type == LLAMA_CONTEXT_TYPE_SYCLONITH) &&
         (model->hparams.n_layer_nextn == 0 || model->hparams.router_layer >= 0)) {
         LLAMA_LOG_WARN("%s: context type MTP requested but model doesn't contain MTP layers\n", __func__);
+        return nullptr;
+    }
+
+    if (params.ctx_type == LLAMA_CONTEXT_TYPE_SYCLONITH && model->arch != LLM_ARCH_QWEN35MOE) {
+        LLAMA_LOG_WARN("%s: Syclonith context currently supports Qwen35MoE only\n", __func__);
         return nullptr;
     }
 

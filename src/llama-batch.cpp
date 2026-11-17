@@ -1151,7 +1151,7 @@ void llama_batch_free(struct llama_batch batch) {
 // llama_batch_ext
 
 size_t llama_batch_ext_select_n_embd_inp(llama_context_type ctx_type, llm_arch arch, const llama_hparams & hparams) {
-    if (ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+    if (ctx_type == LLAMA_CONTEXT_TYPE_MTP || ctx_type == LLAMA_CONTEXT_TYPE_SYCLONITH) {
         return hparams.n_embd_out();
     }
     if (arch == LLM_ARCH_DFLASH) {

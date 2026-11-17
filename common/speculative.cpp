@@ -2287,7 +2287,7 @@ struct common_speculative_impl_draft_syclonith : public common_speculative_impl 
         this->params.n_min = 1;
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
-        GGML_ASSERT(ctx_tgt && ctx_dft && "draft-syclonith requires target and MTP contexts");
+        GGML_ASSERT(ctx_tgt && ctx_dft && "draft-syclonith requires target and Syclonith contexts");
         if (n_seq != 1) {
             SPC_ERR("draft-syclonith first milestone supports one sequence; configured n_seq=%u\n", n_seq);
             this->params.n_max = 0;
@@ -3771,8 +3771,10 @@ common_speculative_init_result::common_speculative_init_result(
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
-    if (spec_mtp || spec_syclonith) {
+    if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+    } else if (spec_syclonith) {
+        cparams.ctx_type = LLAMA_CONTEXT_TYPE_SYCLONITH;
     }
 
     // the draft context holds as many tokens per sequence as the target context, and takes its batches whole
@@ -3821,7 +3823,7 @@ common_speculative_init_result::common_speculative_init_result(
 
         llama_context * ctx_dft = llama_init_from_model(model_dft, cparams);
         if (ctx_dft == nullptr) {
-            LOG_ERR("%s: failed to create MTP context\n", __func__);
+            LOG_ERR("%s: failed to create draft context\n", __func__);
             return;
         }
 
@@ -3829,11 +3831,15 @@ common_speculative_init_result::common_speculative_init_result(
     } else if (spec_mtp || spec_syclonith) {
         model_path = params.model.path;
 
-        LOG_INF("%s: creating MTP draft context against the target model '%s'\n", __func__, model_path.c_str());
+        if (spec_syclonith) {
+            LOG_INF("%s: creating native Syclonith graph context against the target model '%s'\n", __func__, model_path.c_str());
+        } else {
+            LOG_INF("%s: creating MTP draft context against the target model '%s'\n", __func__, model_path.c_str());
+        }
 
         llama_context * ctx_dft = llama_init_from_model(model_tgt, cparams);
         if (ctx_dft == nullptr) {
-            LOG_ERR("%s: failed to create MTP context\n", __func__);
+            LOG_ERR("%s: failed to create %s context\n", __func__, spec_syclonith ? "Syclonith" : "MTP");
             return;
         }
 
