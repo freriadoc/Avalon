@@ -1217,7 +1217,10 @@ private:
         const bool spec_mtp = std::find(params_base.speculative.types.begin(),
                                         params_base.speculative.types.end(),
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
-        const bool has_spec = has_draft || spec_mtp;
+        const bool spec_syclonith = std::find(params_base.speculative.types.begin(),
+                                        params_base.speculative.types.end(),
+                                        COMMON_SPECULATIVE_TYPE_DRAFT_SYCLONITH) != params_base.speculative.types.end();
+        const bool has_spec = has_draft || spec_mtp || spec_syclonith;
 
         if (callback_state) {
             std::vector<std::string> stages = {"text_model"};

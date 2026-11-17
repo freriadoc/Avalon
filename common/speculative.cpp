@@ -1,6 +1,7 @@
 #include "speculative.h"
 #include "speculative_controller.h"
 #include "speculative_adapter_registry.h"
+#include "speculative_backend_llama.h"
 #include "speculative_qwen35moe_adapter.h"
 
 #include "common.h"
@@ -80,6 +81,7 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"draft-simple",  COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE},
     {"draft-eagle3",  COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3},
     {"draft-mtp",     COMMON_SPECULATIVE_TYPE_DRAFT_MTP},
+    {"draft-syclonith", COMMON_SPECULATIVE_TYPE_DRAFT_SYCLONITH},
     {"draft-dflash",  COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH},
     {"draft-dspark",  COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK},
     {"ngram-simple",  COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE},
@@ -2224,6 +2226,744 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 };
 
+
+// Independent Syclonith implementation. draft-mtp above remains unchanged.
+struct common_speculative_impl_draft_syclonith : public common_speculative_impl {
+    common_params_speculative_draft params; // reuses the draft-context configuration slot (ctx_tgt/ctx_dft)
+
+    common_batch batch;
+    syclonith::speculative::LlamaExecutionBackend execution_backend;
+
+    std::vector<common_sampler_ptr> smpls;
+
+    std::vector<common_params_sampling> smpls_cfg;
+
+    // backend sampler chain per seq, attached to ctx_dft
+    std::vector<llama_sampler *> backend_chains;
+
+    int32_t n_embd = 0;
+
+    // First Syclonith milestone is intentionally limited to Qwen35MoE's
+    // single trained MTP head and one draft token per cycle.
+    int32_t n_mtp_layers  = 1;
+    bool    is_mem_shared = false;   // gemma4
+    bool    chain_heads   = false;   // derived in the ctor: n_mtp_layers > 1 && !is_mem_shared
+    bool    architecture_adapter_selected = false;
+    std::unique_ptr<syclonith::speculative::Qwen35MoEMTPRuntime> qwen35moe_runtime;
+
+    // Per-sequence cross-batch carryover: pair (h_p, x_{p+1}) at MTP pos p+1.
+    // The last h-row of one process() call needs the first token of the NEXT
+    // call to pair with, so it's stashed here until that next call fires.
+    std::vector<std::vector<float>> pending_h;   // [n_seq][n_embd]
+
+    std::vector<int32_t> i_batch_beg;
+    std::vector<int32_t> i_batch_end;
+
+    // Hidden rows from the most recent target verification batch, grouped by seq.
+    // Row 0 corresponds to the sampled token, row N to the Nth accepted draft token.
+    std::vector<std::vector<float>> verify_h;
+    std::vector<int32_t> verify_h_rows;
+
+    // catch-up rows of small batches (a verification) not decoded yet, per seq: each token with the hidden row it
+    // pairs with. accept() drops the rejected ones and the next draft() decodes the rest in its first pass, one
+    // graph instead of two; any other process() call decodes them first
+    std::vector<std::vector<llama_token>> defer_tok;
+    std::vector<std::vector<llama_pos>>   defer_pos;
+    std::vector<std::vector<float>>       defer_h;
+    int32_t n_defer_max = 0;
+
+    std::vector<int>                i_last;
+    std::vector<std::vector<float>> chain_h;
+
+    std::vector<bool> kv_hash_due;   // LLAMA_MTP_KV_HASH: a prompt batch was processed since the last draft
+
+    common_speculative_impl_draft_syclonith(const common_params_speculative & params, uint32_t n_seq)
+        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_SYCLONITH, n_seq, std::min(1, params.draft.n_max))
+        , params(params.draft)
+    {
+        // First Syclonith milestone: a single sequence-local MTP prediction per
+        // verification cycle. Draft length policy remains in the generic controller.
+        this->params.n_max = std::min(1, std::max(0, this->params.n_max));
+        this->params.n_min = 1;
+        auto * ctx_tgt = this->params.ctx_tgt;
+        auto * ctx_dft = this->params.ctx_dft;
+        GGML_ASSERT(ctx_tgt && ctx_dft && "draft-syclonith requires target and MTP contexts");
+        if (n_seq != 1) {
+            SPC_ERR("draft-syclonith first milestone supports one sequence; configured n_seq=%u\n", n_seq);
+            this->params.n_max = 0;
+            this->n_max = 0;
+        }
+
+        n_embd = llama_model_n_embd_out(llama_get_model(ctx_dft));
+        GGML_ASSERT(n_embd == llama_model_n_embd_out(llama_get_model(ctx_tgt)) &&
+                "MTP input row width must match the target h_nextn width");
+
+        // Resolve and validate the Qwen35MoE target's own trained MTP head.
+        // This implementation owns its execution loop and uses the Syclonith
+        // backend bridge; draft-mtp remains a separate implementation.
+        const auto adapter_selection = syclonith::speculative::select_adapter(
+                llama_get_model(ctx_tgt), llama_get_model(ctx_tgt));
+        architecture_adapter_selected = adapter_selection.selected();
+        if (adapter_selection.selected()) {
+            SPC_INF("Syclonith adapter '%s' selected: hidden=%d, prediction_layers=%d, tensors=%u\n",
+                    adapter_selection.adapter->id,
+                    adapter_selection.inspection.hidden_size,
+                    adapter_selection.inspection.prediction_layers,
+                    adapter_selection.inspection.validated_tensor_count);
+        } else if (adapter_selection.status == syclonith::speculative::AdapterSelectionStatus::rejected) {
+            SPC_WRN("Syclonith adapter '%s' rejected target model: %s\n",
+                    adapter_selection.adapter ? adapter_selection.adapter->id : "unknown",
+                    adapter_selection.reason.c_str());
+        } else if (adapter_selection.status == syclonith::speculative::AdapterSelectionStatus::no_registered_adapter) {
+            SPC_TRC("no Syclonith adapter registered for architecture '%s'\n",
+                    adapter_selection.architecture.c_str());
+        }
+
+        if (architecture_adapter_selected) {
+            qwen35moe_runtime = std::make_unique<syclonith::speculative::Qwen35MoEMTPRuntime>(n_seq, n_embd);
+        } else {
+            SPC_ERR("draft-syclonith currently supports only a structurally valid Qwen35MoE target: %s\n",
+                    adapter_selection.reason.c_str());
+            this->params.n_max = 0;
+            this->n_max = 0;
+        }
+
+        n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
+
+        SPC_TRC("%s", "adding speculative implementation 'draft-syclonith'\n");
+        draft_controller.set_enabled(this->params.adaptive);
+        SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
+        SPC_TRC("- gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s, devices=[%s]\n",
+                this->params.n_gpu_layers,
+                ggml_type_name(this->params.cache_type_k),
+                ggml_type_name(this->params.cache_type_v),
+                ctx_tgt ? "yes" : "no",
+                ctx_dft ? "yes" : "no",
+                common_speculative_get_devices_str(this->params.devices).c_str());
+
+        batch = common_batch(ctx_dft);
+
+        smpls.resize(n_seq);
+        for (auto & s : smpls) {
+            common_params_sampling sparams;
+            sparams.no_perf  = false;
+            sparams.top_k    = 10;
+            sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
+            s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
+        }
+
+        // offload draft sampling to the backend
+        backend_chains.assign(n_seq, nullptr);
+        if (this->params.backend_sampling) {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+                llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
+
+                if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
+                    SPC_WRN("backend offload failed for seq_id=%d; using CPU sampler\n", (int) seq_id);
+                    llama_sampler_free(chain);
+                    chain = nullptr;
+                }
+                backend_chains[seq_id] = chain;
+            }
+        }
+
+        llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
+        llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
+
+        is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
+        chain_heads   = false; // Qwen35MoE adapter validates exactly one prediction layer
+
+        // pipeline stages (the only targets that call it): a prompt batch taken ubatch by ubatch during the target's
+        // decode; its host buffer then holds no nextn rows of a whole -b (raised to the context with the stages)
+        static const bool h_dev_off = getenv("LLAMA_MTP_H_DEVICE") && atoi(getenv("LLAMA_MTP_H_DEVICE")) == 0;
+        static const bool rows_off  = getenv("LLAMA_MTP_ROWS_CB") && atoi(getenv("LLAMA_MTP_ROWS_CB")) == 0;
+        // Syclonith initially uses the explicit host-visible batch path.
+        // The device-row callback can be added later behind ExecutionBackend.
+        (void) h_dev_off;
+        (void) rows_off;
+        // the target's output buffer at its final size now (nextn rows of a whole batch, the outputs of
+        // a verification: n_max drafted tokens + 1 per sequence), not grown at the first requests
+        llama_output_reserve(ctx_tgt, (int32_t) n_seq * (this->params.n_max + 1));
+
+        if (chain_heads) {
+            this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
+
+            chain_h.assign(n_seq, {});
+            for (auto & c : chain_h) {
+                c.reserve((size_t) (this->params.n_max + 1) * n_embd);
+            }
+        }
+        this->n_max = this->params.n_max;
+
+        pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
+
+        i_last.assign(n_seq, -1);
+        i_batch_beg.assign(n_seq, -1);
+        i_batch_end.assign(n_seq, -1);
+
+        verify_h.assign(n_seq, {});
+        verify_h_rows.assign(n_seq, 0);
+
+        kv_hash_due.assign(n_seq, false);
+        defer_tok.assign(n_seq, {});
+        defer_pos.assign(n_seq, {});
+        defer_h.assign(n_seq, {});
+        n_defer_max = (int32_t) n_seq * (this->params.n_max + 1);
+    }
+
+    float * pending_h_data(llama_seq_id seq_id) {
+        return qwen35moe_runtime ? qwen35moe_runtime->pending_data(seq_id) : pending_h[seq_id].data();
+    }
+
+    const float * pending_h_data(llama_seq_id seq_id) const {
+        return qwen35moe_runtime ? qwen35moe_runtime->pending_data(seq_id) : pending_h[seq_id].data();
+    }
+
+    int32_t verification_rows(llama_seq_id seq_id) const {
+        return qwen35moe_runtime ? qwen35moe_runtime->verification_rows(seq_id) : verify_h_rows[seq_id];
+    }
+
+    float * prepare_verification(llama_seq_id seq_id, int32_t n_rows) {
+        if (qwen35moe_runtime) return qwen35moe_runtime->prepare_verification(seq_id, n_rows);
+        verify_h[seq_id].resize((size_t) n_rows * n_embd);
+        verify_h_rows[seq_id] = n_rows;
+        return verify_h[seq_id].data();
+    }
+
+    bool finish_verification(llama_seq_id seq_id) {
+        if (qwen35moe_runtime) return qwen35moe_runtime->finish_verification(seq_id);
+        const int32_t n_rows = verification_rows(seq_id);
+        if (n_rows <= 0) return false;
+        std::memcpy(pending_h[seq_id].data(),
+                verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd,
+                (size_t) n_embd * sizeof(float));
+        return true;
+    }
+
+    const float * paired_target_row(llama_seq_id seq_id, int32_t batch_index,
+            int32_t sequence_begin, const float * target_rows) const {
+        if (qwen35moe_runtime) {
+            return qwen35moe_runtime->paired_target_row(seq_id, batch_index, sequence_begin, target_rows);
+        }
+        return batch_index == sequence_begin
+            ? pending_h_data(seq_id)
+            : target_rows + (size_t) (batch_index - 1) * n_embd;
+    }
+
+    int32_t n_deferred() const {
+        int32_t n = 0;
+        for (const auto & t : defer_tok) {
+            n += (int32_t) t.size();
+        }
+        return n;
+    }
+
+    void defer_clear(llama_seq_id seq_id) {
+        defer_tok[seq_id].clear();
+        defer_pos[seq_id].clear();
+        defer_h[seq_id].clear();
+    }
+
+    // the deferred rows of a seq are valid only right before pos: they are the positions just before the next row of
+    // the seq. Rows left by another request (one slot served in turn, the other request's state reloaded from the
+    // prompt cache) or by a cancelled prefill sit elsewhere and would be decoded at the head of the next batch: the
+    // draft's M-RoPE check then fails (#5). Those are dropped
+    void defer_keep_before(llama_seq_id seq_id, llama_pos pos) {
+        while (!defer_pos[seq_id].empty() && defer_pos[seq_id].back() >= pos) {
+            defer_tok[seq_id].pop_back();
+            defer_pos[seq_id].pop_back();
+            defer_h[seq_id].resize(defer_h[seq_id].size() - n_embd);
+        }
+        if (!defer_pos[seq_id].empty() && defer_pos[seq_id].back() + 1 != pos) {
+            defer_clear(seq_id);
+        }
+    }
+
+    // add the deferred rows of a seq to the batch (no output)
+    void defer_add(llama_seq_id seq_id) {
+        for (size_t r = 0; r < defer_tok[seq_id].size(); ++r) {
+            const int32_t idx = batch.add(defer_tok[seq_id][r], defer_pos[seq_id][r], seq_id, false);
+            batch.set_embd(idx, { defer_h[seq_id].data() + r * n_embd, 1, (size_t) n_embd });
+        }
+    }
+
+    ~common_speculative_impl_draft_syclonith() override {
+        auto * ctx_dft = this->params.ctx_dft;
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
+            if (backend_chains[seq_id] == nullptr) {
+                continue;
+            }
+            if (ctx_dft) {
+                llama_set_sampler(ctx_dft, seq_id, nullptr);
+            }
+            llama_sampler_free(backend_chains[seq_id]);
+        }
+        backend_chains.clear();
+    }
+
+    void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        draft_controller.reset(seq_id);
+        if (qwen35moe_runtime) qwen35moe_runtime->begin_sequence(seq_id);
+        // reset here rather than per round, or two identical requests differ
+        common_sampler_reset(smpls[seq_id].get());
+
+        const int32_t N = (int32_t) prompt.size();
+        if (N <= 0) {
+            return;
+        }
+
+        auto * ctx_dft = this->params.ctx_dft;
+        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
+
+        if (pos_max < N - 1 && !is_mem_shared) {
+            SPC_WRN("ctx_dft pos_max=%d < N-1=%d - "
+                    "process() hook may not have run on every prefill ubatch "
+                    "(need_embd / output flag on every prompt position?). "
+                    "Drafts may degrade.\n",
+                    (int) pos_max, N - 1);
+        }
+    }
+
+    bool process(const common_batch & batch_in) override {
+        if (batch_in.size() <= 0) {
+            return true;
+        }
+
+        // TODO: how to make it work with vision tokens?
+        if (!batch_in.has_token() || batch_in.has_embd()) {
+            return true;
+        }
+
+        const int32_t n_tokens = batch_in.size();
+        if (n_tokens > 64) {   // LLAMA_MTP_KV_HASH: a prompt batch
+            for (int k = 0; k < n_tokens; ++k) {
+                const llama_seq_id sq = batch_in.tokens[k].seq_id;
+                if (sq >= 0 && sq < (llama_seq_id) n_seq) {
+                    kv_hash_due[sq] = true;
+                }
+            }
+        }
+
+        // remember the first and last batch index for each sequence
+        std::fill(i_batch_beg.begin(), i_batch_beg.end(), -1);
+        std::fill(i_batch_end.begin(), i_batch_end.end(), -1);
+
+        for (int k = 0; k < n_tokens; ++k) {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (batch_in.tokens[k].seq_id == seq_id) {
+                    i_batch_end[seq_id] = k;
+                    if (i_batch_beg[seq_id] < 0) {
+                        i_batch_beg[seq_id] = k;
+                    }
+                }
+            }
+        }
+
+        auto * ctx_tgt = this->params.ctx_tgt;
+        auto * ctx_dft = this->params.ctx_dft;
+
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+
+        // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
+        if (!is_mem_shared) {
+            // draft() wrote its own cells from the verified frontier on (the drafted positions,
+            // with the draft's hidden rows): drop them before replaying the target rows there,
+            // or the draft attention reads both the stale and the replayed cell of a position
+            if (!chain_heads) {
+                auto * mem_dft = llama_get_memory(ctx_dft);
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    if (i_batch_beg[seq_id] >= 0) {
+                        const llama_pos pos_beg = batch_in.tokens[i_batch_beg[seq_id]].pos[0];
+                        llama_memory_seq_rm(mem_dft, seq_id, pos_beg, -1);
+                        // so is a deferred row there, and one not right before this batch is stale
+                        defer_keep_before(seq_id, pos_beg);
+                    }
+                }
+            }
+
+            // pair each token with the tgt embedding shifted right by one position, and
+            // the first token of each sequence with the pending embedding from a previous run
+            // assumes that the tokens in the batch are sequential for each sequence
+            // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
+            //                                                       ^--- this is a problem
+            // TODO:this is generally true, but would be nice to assert it
+            execution_backend.synchronize(ctx_tgt);
+            const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+
+            // a small batch (a verification) is decoded with the next draft's first pass
+            if (!chain_heads && n_deferred() + n_tokens <= n_defer_max) {
+                for (int k = 0; k < n_tokens; ++k) {
+                    const llama_seq_id seq_id = batch_in.tokens[k].seq_id;
+
+                    const float * h_row = paired_target_row(seq_id, k, i_batch_beg[seq_id], h_tgt);
+
+                    defer_tok[seq_id].push_back(batch_in.tokens[k].id);
+                    defer_pos[seq_id].push_back(batch_in.tokens[k].pos[0]);
+                    defer_h[seq_id].insert(defer_h[seq_id].end(), h_row, h_row + n_embd);
+                }
+            } else {
+                // the deferred rows and a full ubatch do not fit in one batch of the draft (n_batch): the deferred rows
+                // are decoded first on their own (#7: a 9536-token ubatch after a verification aborted the process)
+                if (!chain_heads && n_deferred() > 0 && n_deferred() + n_tokens > (int32_t) llama_n_batch(ctx_dft)) {
+                    batch.clear();
+                    for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                        defer_add(seq_id);
+                    }
+                    const int32_t rc = execution_backend.process(ctx_dft, batch);
+                    if (rc != 0) {
+                        SPC_ERR("llama_process(ctx_dft) of the deferred rows failed rc=%d\n", (int) rc);
+                        return false;
+                    }
+                    for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                        defer_clear(seq_id);
+                    }
+                }
+
+                batch.clear();
+
+                // Syclonith deliberately uses host-visible target rows in this first
+                // correctness pass; device-native row transfer is a later optimisation.
+                int n_seq_in = 0;
+                llama_seq_id seq_in = 0;
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    if (i_batch_beg[seq_id] >= 0) {
+                        n_seq_in++;
+                        seq_in = seq_id;
+                    }
+                }
+                static const bool h_dev_off = getenv("LLAMA_MTP_H_DEVICE") && atoi(getenv("LLAMA_MTP_H_DEVICE")) == 0;
+                const bool h_dev = false; // first Syclonith pass: explicit host-visible row transfer
+                (void) h_dev_off;
+                (void) n_seq_in;
+                (void) seq_in;
+
+                // deferred rows first, they precede this batch
+                if (!h_dev) {
+                    for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                        defer_add(seq_id);
+                    }
+                }
+
+                for (int k = 0; k < n_tokens; ++k) {
+                    const llama_seq_id seq_id = batch_in.tokens[k].seq_id;
+
+                    const int32_t idx = batch.add(batch_in.tokens[k].id, batch_in.tokens[k].pos[0], seq_id, false);
+                    if (h_dev) {
+                        continue;
+                    }
+
+                    const float * h_row = paired_target_row(seq_id, k, i_batch_beg[seq_id], h_tgt);
+
+                    batch.set_embd(idx, { h_row, 1, (size_t) n_embd });
+                }
+
+                auto * mem_dft = llama_get_memory(ctx_dft);
+
+                bool ok = true;
+                for (int head = 0; head < n_mtp_layers; ++head) {
+                    if (chain_heads) {
+                        // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
+                        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                            if (i_batch_beg[seq_id] < 0) {
+                                continue;
+                            }
+                            llama_memory_seq_rm(mem_dft, seq_id, batch_in.tokens[i_batch_beg[seq_id]].pos[0], -1);
+                        }
+                        llama_set_nextn_layer_offset(ctx_dft, head);
+                    }
+
+                    const int32_t rc = execution_backend.process(ctx_dft, batch);
+                    if (rc != 0) {
+                        SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
+                                head, (int) rc, (int) batch_in.tokens[0].pos[0]);
+                        ok = false;
+                        break;
+                    }
+                }
+
+                if (chain_heads) {
+                    llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
+                }
+                if (!ok) {
+                    return false;
+                }
+                execution_backend.synchronize(ctx_dft);
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    defer_clear(seq_id);
+                }
+            }
+        }
+
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            if (i_batch_end[seq_id] < 0) {
+                continue;
+            }
+
+            // a verification keeps every row for accept(); a prompt batch only its last one (pending_h): copying
+            // the 8192 rows of a prompt batch took ~50 ms of host time between two ubatches of the prefill
+            const int32_t n_all  = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+            const int32_t n_rows = n_all > this->params.n_max + 1 ? 1 : n_all;
+            const int32_t i_beg  = i_batch_end[seq_id] - n_rows + 1;
+            float * rows = prepare_verification(seq_id, n_rows);
+            for (int32_t i = 0; i < n_rows; ++i) {
+                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_beg + i);
+                std::memcpy(rows + (size_t) i * n_embd, h, row_bytes);
+            }
+            finish_verification(seq_id);
+        }
+
+        return true;
+    }
+
+    void draft(common_speculative_draft_params_vec & dparams) override {
+        auto & ctx_dft = params.ctx_dft;
+
+        // DIAGNOSTIC (LLAMA_MTP_KV_HASH=1): the draft's state of each drafting sequence at the first draft after a
+        // prompt batch (its K/V of the prompt) and its deferred rows, hashed: the paths that feed it (host rows, device
+        // rows per ubatch) compare on it
+        {
+            static const bool kv_hash = getenv("LLAMA_MTP_KV_HASH") && atoi(getenv("LLAMA_MTP_KV_HASH")) != 0;
+            if (kv_hash) {
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    if (!dparams[seq_id].drafting || !kv_hash_due[seq_id]) {
+                        continue;
+                    }
+                    kv_hash_due[seq_id] = false;
+                    std::vector<uint8_t> st(llama_state_seq_get_size(ctx_dft, seq_id));
+                    const size_t n = llama_state_seq_get_data(ctx_dft, st.data(), st.size(), seq_id);
+                    uint64_t h = 1469598103934665603ull;
+                    for (size_t i = 0; i < n; ++i) {
+                        h = (h ^ st[i]) * 1099511628211ull;
+                    }
+                    uint64_t hd = 1469598103934665603ull;
+                    for (float v : defer_h[seq_id]) {
+                        uint32_t u; memcpy(&u, &v, 4);
+                        hd = (hd ^ u) * 1099511628211ull;
+                    }
+                    if (const char * dump = getenv("LLAMA_MTP_KV_DUMP")) {   // the state itself, to compare offsets
+                        static int n_dump = 0;
+                        const std::string path = std::string(dump) + "." + std::to_string(n_dump++);
+                        if (FILE * f = fopen(path.c_str(), "wb")) {
+                            fwrite(st.data(), 1, n, f);
+                            fclose(f);
+                        }
+                    }
+                    LOG_INF("%s: MTP KV hash seq %d: state %zu bytes %016llx, pos_max %d, %zu deferred rows %016llx\n",
+                            __func__, (int) seq_id, n, (unsigned long long) h,
+                            (int) llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id), defer_tok[seq_id].size(),
+                            (unsigned long long) hd);
+                }
+            }
+        }
+
+        batch.clear();
+
+        // keep track of which sequences are still drafting
+        int n_drafting = 0;
+        std::vector<bool> drafting(n_seq);
+        std::vector<int32_t> n_draft_max(n_seq, params.n_max);
+
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & dp = dparams[seq_id];
+
+            if (!dp.drafting) {
+                continue;
+            }
+
+            n_drafting++;
+            drafting[seq_id] = true;
+            n_draft_max[seq_id] = draft_controller.choose_draft_length(seq_id,
+                    dp.n_max > 0 ? std::min(params.n_max, dp.n_max) : params.n_max, params.n_min);
+            // greedy drafting leaves no candidates behind, so the verifier falls back to sample-and-match
+            if (!params.probabilistic) {
+                dp.result_q = nullptr;
+            }
+
+            // result_q is only set when the caller wants rejection, so it also gates the retune
+            if (dp.result_q) {
+                spec_retune(smpls, smpls_cfg, llama_get_model(ctx_dft), seq_id, dp.temp, dp.seed);
+            }
+
+            // a reset reseeds the chain, which breaks probabilistic drafting
+            if (!dp.result_q) {
+                common_sampler_reset(smpls[seq_id].get());
+            }
+
+            // the catch-up rows process() deferred, in the same pass
+            defer_keep_before(seq_id, dp.pos0);
+            defer_add(seq_id);
+
+            const int32_t idx = batch.add(dp.id_last, dp.pos0, seq_id, true);
+            batch.set_embd(idx, { pending_h_data(seq_id), 1, (size_t) n_embd });
+
+            i_last[seq_id] = idx;
+
+            if (chain_heads) {
+                chain_h[seq_id].assign(pending_h_data(seq_id), pending_h_data(seq_id) + n_embd);
+            }
+        }
+
+        int i = 0;
+
+        while (n_drafting > 0) {
+            // each step decodes under a different head, i.e. a different decoder layer, and
+            // KV is per layer. process() filled this layer's KV only for positions < pos0
+            // (prompt + accepted prefix) — nothing in the draft region yet. so reset the
+            // draft region (the seq_rm lower bound is pos0, leaving the prompt KV intact)
+            // and select head i so it rebuilds its own layer's KV there; decoding just the
+            // latest token would leave its attention reading cells only another head wrote.
+            if (chain_heads) {
+                auto * mem_dft = llama_get_memory(ctx_dft);
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    if (drafting[seq_id]) {
+                        llama_memory_seq_rm(mem_dft, seq_id, dparams[seq_id].pos0, -1);
+                    }
+                }
+                llama_set_nextn_layer_offset(ctx_dft, i);
+            }
+
+            int ret = execution_backend.process(ctx_dft, batch);
+            if (ret != 0) {
+                SPC_ERR("llama_process[%d] returned %d\n", i, ret);
+                break;
+            }
+            execution_backend.synchronize(ctx_dft);
+
+            if (i == 0) {
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    if (drafting[seq_id]) {
+                        defer_clear(seq_id);
+                    }
+                }
+            }
+
+            // rebuild the batch for the next step: the growing-KV paths re-add only the
+            // new token (the KV already holds the prefix), while chained heads re-add the
+            // whole prefix at the next head. dropped sequences are simply not re-added.
+            batch.clear();
+
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (!drafting[seq_id]) {
+                    continue;
+                }
+
+                auto * smpl = smpls[seq_id].get();
+
+                const llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
+
+                const auto * cur_p = common_sampler_get_candidates(smpl, true);
+
+                for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
+                    SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
+                            seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
+                            common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                }
+
+                // add drafted token for each sequence
+                const llama_token id = dparams.at(seq_id).result_q ? id_sampled : cur_p->data[0].id;
+
+                // only collect very high-confidence draft tokens
+                if (cur_p->data[0].p < params.p_min) {
+                    drafting[seq_id] = false;
+                    n_drafting--;
+
+                    continue;
+                }
+
+                common_sampler_accept(smpl, id, true);
+
+                auto & dp = dparams.at(seq_id);
+                auto & result = *dp.result;
+
+                result.push_back(id);
+
+                if (dp.result_q) {
+                    dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
+                }
+
+                if (n_draft_max[seq_id] <= (int) result.size()) {
+                    drafting[seq_id] = false;
+                    n_drafting--;
+                    continue;
+                }
+
+                if (chain_heads) {
+                    // ref: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448031546
+                    chain_h[seq_id].insert(chain_h[seq_id].end(), h_row, h_row + n_embd);
+
+                    const int n_rows = (int) result.size() + 1; // id_last + tokens drafted so far
+                    for (int t = 0; t < n_rows; ++t) {
+                        const llama_token tok = (t == 0) ? dp.id_last : result[t - 1];
+                        const int32_t idx = batch.add(tok, dp.pos0 + t, seq_id, t == n_rows - 1);
+                        batch.set_embd(idx, { chain_h[seq_id].data() + (size_t) t * n_embd, 1, (size_t) n_embd });
+                        i_last[seq_id] = idx;
+                    }
+                } else if (is_mem_shared) {
+                    // note: with shared memory (e.g. Gemma4 assistants) we use the same position for all draft tokens
+                    // ref: https://github.com/huggingface/transformers/blob/effde20942e3f82a1b97449f60b3a48c5ff96145/docs/source/en/model_doc/gemma4_assistant.md?plain=1#L36-L37
+                    const int32_t idx = batch.add(id, dp.pos0, seq_id, true);
+                    batch.set_embd(idx, { h_row, 1, (size_t) n_embd });
+                    i_last[seq_id] = idx;
+                } else {
+                    const int32_t idx = batch.add(id, dp.pos0 + i + 1, seq_id, true);
+                    batch.set_embd(idx, { h_row, 1, (size_t) n_embd });
+                    i_last[seq_id] = idx;
+                }
+            }
+
+            if (batch.size() == 0) {
+                break;
+            }
+
+            ++i;
+        }
+
+        if (chain_heads) {
+            llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
+        }
+
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & dp = dparams[seq_id];
+            if (!dp.drafting) {
+                continue;
+            }
+
+            if (dp.result->size() < (size_t) params.n_min) {
+                dp.result->clear();
+            }
+        }
+    }
+
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+
+        const int32_t n_rows = verify_h_rows[seq_id];
+        if (n_rows <= 0) {
+            return;
+        }
+
+        const int32_t i_h = qwen35moe_runtime
+            ? qwen35moe_runtime->accepted_row(seq_id, n_accepted)
+            : std::min<int32_t>(n_accepted, n_rows - 1);
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        if (qwen35moe_runtime) {
+            qwen35moe_runtime->accept(seq_id, n_accepted);
+        } else {
+            std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+        }
+
+        // the deferred rows of the rejected draft tokens (the last rows of the verification) are never decoded
+        const size_t n_keep = defer_tok[seq_id].size() - std::min<size_t>(defer_tok[seq_id].size(), n_rows - 1 - i_h);
+        defer_tok[seq_id].resize(n_keep);
+        defer_pos[seq_id].resize(n_keep);
+        defer_h[seq_id].resize(n_keep * n_embd);
+    }
+};
+
 // state of self-speculation (simple implementation, not ngram-map)
 struct common_speculative_impl_ngram_simple : public common_speculative_impl {
     common_params_speculative_ngram_map params;
@@ -2708,6 +3448,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:  return "draft-simple";
         case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:  return "draft-eagle3";
         case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:     return "draft-mtp";
+        case COMMON_SPECULATIVE_TYPE_DRAFT_SYCLONITH: return "draft-syclonith";
         case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:  return "draft-dflash";
         case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:  return "draft-dspark";
         case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  return "ngram-simple";
@@ -2802,6 +3543,9 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
             case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
                 n_max = std::max(n_max, std::max(0, spec->draft.n_max));
+                break;
+            case COMMON_SPECULATIVE_TYPE_DRAFT_SYCLONITH:
+                n_max = std::max(n_max, std::min(1, std::max(0, spec->draft.n_max)));
                 break;
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
                 n_max = std::max(n_max, (int32_t) spec->ngram_simple.size_m);
@@ -3012,11 +3756,22 @@ common_speculative_init_result::common_speculative_init_result(
     const bool spec_mtp = std::find(params.speculative.types.begin(),
                                     params.speculative.types.end(),
                                     COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    const bool spec_syclonith = std::find(params.speculative.types.begin(),
+                                    params.speculative.types.end(),
+                                    COMMON_SPECULATIVE_TYPE_DRAFT_SYCLONITH) != params.speculative.types.end();
+    if (spec_syclonith && has_draft) {
+        LOG_ERR("%s: draft-syclonith currently uses the target model's own MTP head; do not specify --model-draft/-md\n", __func__);
+        return;
+    }
+    if (spec_syclonith && spec_mtp) {
+        LOG_ERR("%s: choose either draft-syclonith or draft-mtp; they cannot share one MTP context\n", __func__);
+        return;
+    }
 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
-    if (spec_mtp) {
+    if (spec_mtp || spec_syclonith) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
     }
 
@@ -3035,7 +3790,7 @@ common_speculative_init_result::common_speculative_init_result(
     // Attached only later, they made the context reserve again with a compute buffer a few KiB larger: freed and
     // allocated again (694 MiB at 256k) after the expert cache was sized, a step above the VRAM peak.
     std::vector<llama_sampler_seq_config> sampler_configs;
-    if (spec_mtp && params.speculative.draft.backend_sampling) {
+    if ((spec_mtp || spec_syclonith) && params.speculative.draft.backend_sampling) {
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) cparams.n_seq_max; ++seq_id) {
             llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
             llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
@@ -3071,7 +3826,7 @@ common_speculative_init_result::common_speculative_init_result(
         }
 
         pimpl->context.reset(ctx_dft);
-    } else if (spec_mtp) {
+    } else if (spec_mtp || spec_syclonith) {
         model_path = params.model.path;
 
         LOG_INF("%s: creating MTP draft context against the target model '%s'\n", __func__, model_path.c_str());
@@ -3126,7 +3881,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         };
 
         // when adding a new type - update here the logic above
-        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 11);
+        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 12);
 
         // this list here defines the priority of the speculators
         // the one with highest priority are listed first
@@ -3139,6 +3894,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, params.draft.ctx_dft != nullptr);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_MTP,    params.draft.ctx_dft != nullptr);
+        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_SYCLONITH, params.draft.ctx_dft != nullptr);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, params.draft.ctx_dft != nullptr);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK, params.draft.ctx_dft != nullptr);
     }
@@ -3159,6 +3915,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
             }
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {
                 impls.push_back(std::make_unique<common_speculative_impl_draft_mtp>(config.params, n_seq));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_DRAFT_SYCLONITH: {
+                impls.push_back(std::make_unique<common_speculative_impl_draft_syclonith>(config.params, n_seq));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH: {

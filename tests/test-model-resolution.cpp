@@ -2783,6 +2783,13 @@ static void test_task_assembly() {
         REQUIRE_EQ(params.speculative.draft.mparams.path, cached("test/main", "mtp-model-Q8_0.gguf"));
     }
     {
+        // draft-syclonith uses the target model's own MTP head, not a sidecar draft model
+        common_params params;
+        assemble({"server", "-hf", "test/main:Q8_0", "--spec-type", "draft-syclonith"}, params);
+        REQUIRE(params.speculative.types == std::vector<enum common_speculative_type>{COMMON_SPECULATIVE_TYPE_DRAFT_SYCLONITH});
+        REQUIRE(params.speculative.draft.mparams.path.empty());
+    }
+    {
         // -hfd with a spec type wires the draft repo sidecar at its tag,
         // not its full model, and suppresses the main repo fallback
         common_params params;
