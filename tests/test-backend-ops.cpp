@@ -6040,8 +6040,9 @@ struct test_qsa_select_tiles : public test_case {
 
     std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return flash ? "FLASH_ATTN_QSA_TILES" : "QSA_SELECT_TILES"; }
 
-    // GGML_TEST_QSA_LIST_NMSE: a tighter bound for a list per query of up to 64 queries. RDNA2's kernel (FP32) is at
-    // 1.6e-6 of the CPU on an RX 6800 XT: at 4e-6 one cell dropped or one block of V off by 25 % in one cell fails
+    // GGML_TEST_QSA_LIST_NMSE: a tighter bound for a list per query of up to 64 queries. RDNA2's kernel is at 4e-9 of
+    // the CPU on an RX 6800 XT (q in int8 as the CPU's q8_0 dot product; 1.6e-6 with FP32 scores): at 4e-6 one cell
+    // dropped or one block of V off by 25 % in one cell fails
     double max_nmse_err() override {
         static const double tight = [] { const char * e = getenv("GGML_TEST_QSA_LIST_NMSE"); return e ? atof(e) : 0.0; }();
         return tight > 0.0 && flash && ncols == 1 && n_t <= 64 ? tight : 2e-2;
