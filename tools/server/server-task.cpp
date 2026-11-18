@@ -10,6 +10,9 @@
 #include "speculative.h"
 #include "server-common.h"
 
+#include <cmath>
+#include <cstdio>
+#include <set>
 #include <sstream>
 
 //
@@ -1543,6 +1546,67 @@ json server_task_result_metrics::to_json() {
     return json{};
 }
 
+// the expert cache's device index (the order ggml-cuda registers the GPUs) as a device name
+static std::string avalon_device_name(int logical) {
+    int n = 0;
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            continue;
+        }
+        if (n++ == logical) {
+            return ggml_backend_dev_name(dev);
+        }
+    }
+    return "gpu" + std::to_string(logical);
+}
+
+static const char * avalon_tier(const char * name) {
+    ggml_backend_dev_t dev = ggml_backend_dev_by_name(name);
+    return dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU ? "host" : "gpu";
+}
+
+// one sample, with the family's HELP and TYPE printed once (seen holds the families of this render)
+static void add_avalon(std::stringstream & ss, std::set<std::string> & seen, const char * type, const char * name,
+                       const char * help, const std::string & labels, double value) {
+    if (seen.insert(name).second) {
+        ss << "# HELP avalon:" << name << " " << help << "\n"
+           << "# TYPE avalon:" << name << " " << type << "\n";
+    }
+    char val[32];
+    if (std::isfinite(value) && value == std::floor(value) && std::fabs(value) < 1e15) {
+        snprintf(val, sizeof(val), "%.0f", value); // bytes and counts keep all their digits
+    } else {
+        snprintf(val, sizeof(val), "%g", value);
+    }
+    ss << "avalon:" << name << labels << " " << val << "\n";
+}
+
+// one device of a miss-latency histogram, in the cumulative form (skipped when nothing was measured)
+static void add_avalon_histogram(std::stringstream & ss, std::set<std::string> & seen, const char * name,
+                                 const char * help, const char * device, const struct ggml_moe_cache_latency & lat) {
+    if (lat.n == 0) {
+        return;
+    }
+    if (seen.insert(name).second) {
+        ss << "# HELP avalon:" << name << " " << help << "\n"
+           << "# TYPE avalon:" << name << " histogram\n";
+    }
+    char le[32];
+    const uint64_t * grid = lat.io ? ggml_moe_lat_bucket_us_io : ggml_moe_lat_bucket_us;
+    uint64_t cum = 0;
+    for (int i = 0; i < GGML_MOE_LAT_BUCKETS; i++) {
+        cum += lat.bucket[i];
+        snprintf(le, sizeof(le), "%g", (double) grid[i] / 1e6);
+        ss << "avalon:" << name << "_bucket{device=\"" << device << "\",le=\"" << le << "\"} " << cum << "\n";
+    }
+    cum += lat.bucket[GGML_MOE_LAT_BUCKETS];
+    ss << "avalon:" << name << "_bucket{device=\"" << device << "\",le=\"+Inf\"} " << cum << "\n"
+       << "avalon:" << name << "_sum{device=\""   << device << "\"} " << (double) lat.sum_us / 1e6 << "\n"
+       << "avalon:" << name << "_count{device=\"" << device << "\"} " << lat.n << "\n";
+}
+
+
 // metrics definition: https://prometheus.io/docs/practices/naming/#metric-names
 std::string server_task_result_metrics::to_metrics() {
     const std::vector<metric_item> counters = {
@@ -1634,6 +1698,101 @@ std::string server_task_result_metrics::to_metrics() {
         for (size_t i = 0; i < metrics.n_accepted_per_pos.size(); i++) {
             prometheus << "llamacpp:spec_decode_num_accepted_tokens_per_pos_total{position=\""
                        << i << "\"} " << metrics.n_accepted_per_pos[i] << "\n";
+        }
+    }
+
+    // the memory composition and the expert cache: absent when neither reports anything
+    if (report.has_moe || !report.rows.empty()) {
+        std::stringstream        & ss   = prometheus;
+        std::set<std::string>      seen;
+        char                       labels[192];
+
+        for (const auto & row : report.rows) {
+            snprintf(labels, sizeof(labels), "{tier=\"%s\",device=\"%s\",kind=\"%s\"}", row.tier, row.device, row.kind);
+            add_avalon(ss, seen, "gauge", "memory_bytes",
+                    "Memory held by each part of the model and the expert cache, in bytes", labels, (double) row.bytes);
+        }
+
+        for (const auto & cap : report.capacity) {
+            const std::string tier = avalon_tier(cap.device);
+            if (tier == "host") {
+                continue;   // ggml-cpu reports free == total; host RAM is host_memory_available_bytes
+            }
+            snprintf(labels, sizeof(labels), "{tier=\"%s\",device=\"%s\",state=\"total\"}", tier.c_str(), cap.device);
+            add_avalon(ss, seen, "gauge", "device_memory_bytes",
+                    "Total and free memory of a device, in bytes", labels, (double) cap.total);
+            snprintf(labels, sizeof(labels), "{tier=\"%s\",device=\"%s\",state=\"free\"}", tier.c_str(), cap.device);
+            add_avalon(ss, seen, "gauge", "device_memory_bytes",
+                    "Total and free memory of a device, in bytes", labels, (double) cap.free);
+        }
+
+        add_avalon(ss, seen, "gauge", "host_memory_available_bytes",
+                "Host RAM available to the process (MemAvailable or the cgroup limit)", "", (double) report.host_available);
+
+        const double n_prompt_all = (double) metrics.n_prompt_cached + (double) metrics.prompt.count;
+        add_avalon(ss, seen, "gauge", "prompt_cache_hit_ratio",
+                "Prompt tokens reused from the cache, over all prompt tokens", "",
+                n_prompt_all > 0.0 ? (double) metrics.n_prompt_cached / n_prompt_all : 0.0);
+
+        for (int i = 0; i < report.moe.n_devices; i++) {
+            const struct ggml_moe_cache_device_stats & ds  = report.moe.devices[i];
+            const std::string                          dev = avalon_device_name(ds.logical);
+            const std::string                          dl  = "{device=\"" + dev + "\"}";
+
+            const auto gauge = [&](const char * name, const char * help, double v) {
+                add_avalon(ss, seen, "gauge", name, help, dl, v);
+            };
+            const auto counter = [&](const char * name, const char * help, uint64_t v) {
+                add_avalon(ss, seen, "counter", name, help, dl, (double) v);
+            };
+            const auto labeled = [&](const char * name, const char * help, const char * key, const char * value, uint64_t v) {
+                add_avalon(ss, seen, "counter", name, help, "{device=\"" + dev + "\"," + key + "=\"" + value + "\"}", (double) v);
+            };
+            const auto labeled_gauge = [&](const char * name, const char * help, const char * key, const char * value, uint64_t v) {
+                add_avalon(ss, seen, "gauge", name, help, "{device=\"" + dev + "\"," + key + "=\"" + value + "\"}", (double) v);
+            };
+
+            labeled_gauge("moe_pool_experts", "Expert slots of the GPU expert cache", "state", "used",  ds.pool_used_slots);
+            labeled_gauge("moe_pool_experts", "Expert slots of the GPU expert cache", "state", "total", ds.pool_slots);
+
+            labeled("moe_probes_total", "Expert lookups in the GPU expert cache, by result", "result", "hit",  ds.hits);
+            labeled("moe_probes_total", "Expert lookups in the GPU expert cache, by result", "result", "miss", ds.misses);
+
+            gauge("moe_hit_ratio", "Share of expert lookups served from the GPU expert cache since start",
+                    ds.hits + ds.misses > 0 ? (double) ds.hits / (double) (ds.hits + ds.misses) : 0.0);
+
+            counter("moe_fills_total",               "Experts copied into the GPU expert cache", ds.fills);
+            counter("moe_fill_failures_total",       "Expert copies that failed", ds.fill_failures);
+            counter("moe_evictions_total",           "Experts evicted from the GPU expert cache", ds.evictions);
+            counter("moe_insert_skips_total",        "Expert admissions skipped because the entry vanished", ds.insert_skips);
+            counter("moe_admission_skips_total",     "Expert admissions skipped by the admission policy", ds.admission_skips);
+            counter("moe_dispatch_failures_total",   "Expert dispatches that failed", ds.dispatch_failures);
+            counter("moe_collect_failures_total",    "Expert results that could not be collected", ds.collect_failures);
+
+            labeled("moe_kv_rows_total", "KV row ranges taken, moved or evicted by the expert cache", "event", "take",   ds.kv_takes);
+            labeled("moe_kv_rows_total", "KV row ranges taken, moved or evicted by the expert cache", "event", "move",   ds.kv_moves);
+            labeled("moe_kv_rows_total", "KV row ranges taken, moved or evicted by the expert cache", "event", "evict",  ds.kv_evictions);
+
+            gauge("moe_queue_bytes", "Bytes queued for the expert cache's fill worker", (double) ds.queue_bytes);
+            gauge("moe_queue_jobs",  "Expert fill jobs queued",                         (double) ds.queue_jobs);
+
+            labeled("arena_reads_path_total", "Arena reads by path (CPU experts, prefill)", "path", "cpu",     ds.arena_reads_cpu);
+            labeled("arena_reads_path_total", "Arena reads by path (CPU experts, prefill)", "path", "prefill", ds.arena_reads_prefill);
+            counter("arena_read_failures_total", "Arena reads that failed", ds.arena_read_failures);
+            counter("arena_cpu_hits_total",      "CPU expert computations served from the expert arena", ds.arena_cpu_hits);
+            counter("arena_evictions_total",     "Arena slots evicted", ds.arena_evictions);
+            counter("arena_refused_total",       "Experts refused because they are not in the arena", ds.arena_refused);
+            counter("arena_zone_full_total",     "Arena reads attempted while the prefill zone was full", ds.arena_zone_full);
+            gauge("arena_usage_bytes", "Bytes of the expert arena holding an expert", (double) ds.arena_used_bytes);
+
+            add_avalon_histogram(ss, seen, "moe_miss_fill_seconds", "Time to copy a missed expert into the GPU expert cache",
+                    dev.c_str(), ds.fill);
+            add_avalon_histogram(ss, seen, "moe_miss_wait_seconds", "Time a missed expert spent queued before its copy started",
+                    dev.c_str(), ds.wait);
+            add_avalon_histogram(ss, seen, "moe_disk_read_seconds", "Time to read one expert from the model file into the arena",
+                    dev.c_str(), ds.disk);
+            counter("moe_miss_fill_bytes_total", "Bytes of experts copied into the GPU expert cache", ds.fill.bytes);
+            counter("moe_disk_read_bytes_total", "Bytes of experts read from the model file",         ds.disk.bytes);
         }
     }
 

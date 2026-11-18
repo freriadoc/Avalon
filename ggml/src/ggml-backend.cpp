@@ -3650,6 +3650,13 @@ bool ggml_backend_sched_moe_cache_rewarm_active(ggml_backend_sched_t sched) {
         ggml_moe_cache.rewarm_active(sched->moe_cache_session);
 }
 
+bool ggml_backend_sched_moe_cache_stats(ggml_backend_sched_t sched, struct ggml_moe_cache_stats * out) {
+    if (!sched || !sched->moe_cache_session || sched->moe_cache_guest || !ggml_moe_cache.stats) {
+        return false;
+    }
+    return ggml_moe_cache.stats(sched->moe_cache_session, out);
+}
+
 void * ggml_backend_sched_detach_moe_cache(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     ggml_backend_sched_prefetch_restore(sched);

@@ -3,6 +3,8 @@
 #include "ggml.h"
 #include "llama.h"
 
+#include "../src/llama-ext.h" // llama_memory_report
+
 #include <vector>
 
 enum common_params_fit_status {
@@ -44,6 +46,9 @@ void common_fit_print(
                llama_context_params * cparams);
 
 void common_memory_breakdown_print(const llama_context * ctx);
+
+// compact [mem] summary of the memory composition and the expert cache, printed after a turn (llama_get_memory_report)
+void common_memory_report_print(const struct llama_memory_report & report);
 
 struct common_device_memory_data {
     int64_t total;

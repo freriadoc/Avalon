@@ -87,6 +87,69 @@ enum ggml_moe_cache_mode {
     GGML_MOE_CACHE_MODE_ON = 2,
 };
 
+// Miss latency buckets, in microseconds. Index GGML_MOE_LAT_BUCKETS counts everything above the last bound.
+// a queue wait spans microseconds to a full refill, a fill or a disk read stays in the millisecond range
+#define GGML_MOE_LAT_BUCKETS 9
+static const uint64_t ggml_moe_lat_bucket_us[GGML_MOE_LAT_BUCKETS] = {
+    32, 64, 128, 512, 4096, 16384, 65536, 262144, 1048576
+};
+static const uint64_t ggml_moe_lat_bucket_us_io[GGML_MOE_LAT_BUCKETS] = {
+    128, 256, 512, 1024, 2048, 5120, 10240, 20480, 65536
+};
+static inline int ggml_moe_lat_bucket(uint64_t us, bool io) {
+    const uint64_t * b = io ? ggml_moe_lat_bucket_us_io : ggml_moe_lat_bucket_us;
+    for (int i = 0; i < GGML_MOE_LAT_BUCKETS; i++) {
+        if (us <= b[i]) {
+            return i;
+        }
+    }
+    return GGML_MOE_LAT_BUCKETS;
+}
+
+struct ggml_moe_cache_latency {
+    uint64_t n;
+    uint64_t sum_us;
+    uint64_t max_us;
+    uint64_t bytes;
+    int32_t io;             // 1: fill / disk grid, 0: queue wait grid
+    uint64_t bucket[GGML_MOE_LAT_BUCKETS + 1];
+};
+
+#define GGML_MOE_CACHE_MAX_DEVICES 16
+
+struct ggml_moe_cache_device_stats {
+    int32_t logical;        // the ggml CUDA device index of the card
+    int32_t host_shared;    // EXPERT SPLIT: the host pin/arena belongs to another card
+
+    size_t budget_bytes;    // the cache's budget on this card
+    size_t allocated_bytes; // what the cache took from the device
+    size_t pool_bytes;      // expert entries the pools hold (slots x expert_size)
+    size_t pool_slots;
+    size_t pool_used_slots;
+    size_t zone_bytes;      // prefetch zones (lent or not)
+    size_t loan_bytes;      // entries the compute buffers borrowed
+    size_t arena_bytes;     // mapped expert arena
+    size_t arena_used_bytes;
+    size_t queue_bytes;
+    size_t queue_jobs;
+
+    uint64_t hits, misses, inserts, fills, fill_failures, evictions, insert_skips,
+             admission_skips, dispatch_failures, collect_failures;
+    uint64_t kv_takes, kv_moves, kv_evictions;
+    uint64_t arena_reads_cpu, arena_reads_prefill, arena_read_failures,
+             arena_cpu_hits, arena_evictions, arena_refused, arena_zone_full;
+
+    struct ggml_moe_cache_latency fill; // host -> device copy of one missed expert
+    struct ggml_moe_cache_latency wait; // job queued -> fill started
+    struct ggml_moe_cache_latency disk; // O_DIRECT read of one expert into the arena
+};
+
+struct ggml_moe_cache_stats {
+    int32_t n_devices;       // devices reported in out->devices
+    int32_t n_devices_more;  // devices of the session beyond the array
+    struct ggml_moe_cache_device_stats devices[GGML_MOE_CACHE_MAX_DEVICES];
+};
+
 struct ggml_moe_cache_api {
     const void * owner;
 
@@ -193,6 +256,10 @@ struct ggml_moe_cache_api {
     // them when a graph needs less, so that the cache gets the memory back
     bool (*borrows)(ggml_backend_buffer_type_t buft);
 
+    // the cache's memory, counters and miss latency per device, for the server's metrics and log; false when the
+    // session reports none (no device yet, or a provider without stats)
+    bool (*stats)(void * session, struct ggml_moe_cache_stats * out);
+
     // The end of the KV cache lent to the expert cache. A KV tensor whose rows are cells (one row per cell, the
     // cells in order) is registered once, before the pools are built: the rows past the first step are lent to the
     // pools, which take them as ranges when they are built (before any graph: their virtual base never moves again).
@@ -276,6 +343,9 @@ GGML_API bool    ggml_backend_sched_moe_cache_rewarm_active(ggml_backend_sched_t
 // the model's host expert bytes (all cards) and the GPUs they are spread over (ggml_moe_cache.host_experts); a no-op
 // without a session
 GGML_API void    ggml_backend_sched_moe_cache_host_experts(ggml_backend_sched_t sched, size_t bytes, int n_devices);
+// the cache's memory, counters and miss latency per device, for the server's metrics and log; false when the scheduler
+// has no session, is a guest, or the provider reports none
+GGML_API bool    ggml_backend_sched_moe_cache_stats(ggml_backend_sched_t sched, struct ggml_moe_cache_stats * out);
 GGML_API void   ggml_backend_sched_attach_moe_cache(ggml_backend_sched_t sched, void * session);
 // the session of a scheduler (NULL without one), to share it with another
 GGML_API void * ggml_backend_sched_get_moe_cache(ggml_backend_sched_t sched);

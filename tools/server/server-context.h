@@ -189,6 +189,7 @@ private:
     json           cached_models  = nullptr;
     json           cached_props   = nullptr;
     server_metrics cached_metrics;
+    llama_memory_report cached_report;
     // set when a scrape during sleep already reported the throughput buckets
     bool           should_reset_buckets = false;
     // call right before sleep to update the cached responses

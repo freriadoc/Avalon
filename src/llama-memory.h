@@ -118,6 +118,7 @@ struct llama_memory_i {
     // and the row from which they may be lent (0: none), past which the cache's own writes (clear, shift) must stop
     virtual void get_lendable_kv(std::vector<std::pair<const ggml_tensor *, size_t>> & out) const { (void) out; }
     virtual void set_kv_lent_from(uint32_t rows) { (void) rows; }
+    virtual uint32_t get_kv_lent_from() const { return 0; }
 
     // device copies of host state that graphs read (qwen4exp: the cells' positions), brought up to date on the backend
     // that runs the graph, in its order: called before each graph, after its inputs are set

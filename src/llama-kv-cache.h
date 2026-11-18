@@ -138,6 +138,7 @@ public:
 
     void get_lendable_kv(std::vector<std::pair<const ggml_tensor *, size_t>> & out) const override;
     void set_kv_lent_from(uint32_t rows) override;
+    uint32_t get_kv_lent_from() const override { return kv_lent_from; }
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;

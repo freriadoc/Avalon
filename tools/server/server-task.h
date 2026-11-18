@@ -3,6 +3,8 @@
 #include "common.h"
 #include "llama.h"
 
+#include "../../src/llama-ext.h" // llama_memory_report
+
 #include <string>
 #include <unordered_set>
 #include <list>
@@ -542,6 +544,9 @@ struct server_task_result_metrics : server_task_result {
     int n_tasks_deferred = 0;
 
     server_metrics metrics;
+
+    // the memory composition and the expert cache's counters, taken when the request was served
+    llama_memory_report report;
 
     virtual json to_json() override;
 

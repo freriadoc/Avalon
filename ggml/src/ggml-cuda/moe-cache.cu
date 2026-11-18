@@ -361,6 +361,8 @@ struct moe_cache_job {
     // the arena is off or the expert is registered in place
     int arena_hold = -1;
     moe_expert_arena * arena = nullptr;   // the arena of arena_hold
+    // when the job entered the queue (ggml_time_us), for the queue-wait latency; 0 when unset
+    int64_t t_enqueued = 0;
 };
 
 // SPLIT: one tensor of the moved expert done (copied, failed or cancelled): the last one raises the flag
@@ -457,6 +459,23 @@ struct moe_cache_scratch {
     size_t input = 0;
     size_t q8 = 0;
     size_t out = 0;
+};
+
+// one miss-latency histogram, recorded by the fill worker and the arena's reads
+struct moe_lat {
+    const bool io;   // fill / disk grid, else the queue wait grid
+    std::atomic<uint64_t> n{0}, sum_us{0}, max_us{0}, bytes{0};
+    std::atomic<uint64_t> bucket[GGML_MOE_LAT_BUCKETS + 1];
+    moe_lat(bool io_) : io(io_) { for (auto & b : bucket) { b.store(0); } }
+    void add(uint64_t us, uint64_t b) {
+        n++; sum_us += us; bytes += b; bucket[ggml_moe_lat_bucket(us, io)]++;
+        uint64_t m = max_us.load();
+        while (us > m && !max_us.compare_exchange_weak(m, us)) {}
+    }
+    void copy_to(struct ggml_moe_cache_latency * out) const {
+        out->n = n; out->sum_us = sum_us; out->max_us = max_us; out->bytes = bytes; out->io = io ? 1 : 0;
+        for (int i = 0; i <= GGML_MOE_LAT_BUCKETS; i++) { out->bucket[i] = bucket[i]; }
+    }
 };
 
 // device-to-device moves when lending: issued then waited for at once, so they go to the null stream,
@@ -696,6 +715,11 @@ struct moe_cache_device {
     size_t d_out_cap = 0;
     float * h_out = nullptr;
     size_t h_out_cap = 0;
+
+    // miss latency: the copy of a missed expert, the time its job waited in the queue, and the arena's O_DIRECT reads
+    // (mutable: moe_arena_load takes the device as const)
+    moe_lat lat_fill{true}, lat_wait{false};
+    mutable moe_lat lat_disk{true};
 
     // hits and misses count tensor-expert probes; fusion counters count row pairs.
     long long hits = 0;
@@ -2225,6 +2249,7 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
             arena_slot = job.arena ? job.arena_hold : -1;
             arena_read = arena_slot >= 0;
             const char * const * parts = arena_slot >= 0 ? job.arena->slots[arena_slot].part : nullptr;
+            const int64_t t_fill0 = ggml_time_us();
             if (error == cudaSuccess && (arena_slot >= 0 || (stage && stage_capacity >= job.bytes))) {
                 // DIAGNOSTIC (GGML_CUDA_MOE_FILL_STATS=1): per 2000 fills, time in the copy to the staging
                 // buffer, in the copy to the device and its wait (of which the call), between fills
@@ -2253,8 +2278,12 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
 #endif
                     }
                 }
+                const int64_t t2 = ggml_time_us();
+                device->lat_fill.add((uint64_t) (t2 - t_fill0), error == cudaSuccess ? job.bytes : 0);
+                if (job.t_enqueued > 0) {
+                    device->lat_wait.add((uint64_t) (t_fill0 - job.t_enqueued), error == cudaSuccess ? job.bytes : 0);
+                }
                 if (ft) {
-                    const int64_t t2 = ggml_time_us();
                     f_call += t1b - t1;
                     f_cpy += t1 - t0; f_dma += t2 - t1;
                     if (f_last > 0 && t0 - f_last < 5000) f_idle += t0 - f_last;
@@ -3814,8 +3843,8 @@ static int moe_arena_ranges(const moe_cache_job & j, const moe_cache_pool & p, c
 
 // ARENA: a job's expert read from the model file with O_DIRECT into arena slot s (taken, being written): each range as
 // the page-aligned span around it, the slot's part[] at its first byte. False on any failure (the slot is then aborted)
-static bool moe_arena_load(const moe_cache_device & d, moe_expert_arena & ar, int s, const moe_cache_job & j,
-                           const moe_cache_pool & p) {
+static bool moe_arena_load_impl(const moe_cache_device & d, moe_expert_arena & ar, int s, const moe_cache_job & j,
+                                const moe_cache_pool & p) {
 #if defined(__linux__)
     const char * src[MOE_ROLES];
     size_t n[MOE_ROLES];
@@ -3884,6 +3913,15 @@ static bool moe_arena_load(const moe_cache_device & d, moe_expert_arena & ar, in
     GGML_UNUSED(d); GGML_UNUSED(ar); GGML_UNUSED(s); GGML_UNUSED(j); GGML_UNUSED(p);
     return false;
 #endif
+}
+
+// the read, timed into the device's disk histogram
+static bool moe_arena_load(const moe_cache_device & d, moe_expert_arena & ar, int s, const moe_cache_job & j,
+                           const moe_cache_pool & p) {
+    const int64_t t0 = ggml_time_us();
+    const bool ok = moe_arena_load_impl(d, ar, s, j, p);
+    d.lat_disk.add((uint64_t) (ggml_time_us() - t0), ok ? ar.slot_bytes : 0);
+    return ok;
 }
 
 static size_t moe_cache_env_mb(const char * name, size_t dflt) {
@@ -4271,6 +4309,97 @@ static void moe_cache_log_stats(moe_cache_device & device) {
                 device.zone_restores, device.zone_moves, device.zone_evictions,
                 device.zone_lend_ms, device.zone_checked, device.zone_check_failed);
     }
+}
+
+// the device's memory, counters and miss latency, for the server's metrics and log (ggml_backend_sched_moe_cache_stats)
+static bool moe_cache_stats(void * opaque, struct ggml_moe_cache_stats * out) {
+    if (!opaque || !out) {
+        return false;
+    }
+    moe_cache_session & session = *(moe_cache_session *) opaque;
+    memset(out, 0, sizeof(*out));
+
+    std::lock_guard<std::mutex> lock(session.mu);
+    for (const auto & d : session.devices) {
+        if (!d) {
+            continue;
+        }
+        if (out->n_devices >= GGML_MOE_CACHE_MAX_DEVICES) {
+            out->n_devices_more++;
+            continue;
+        }
+        struct ggml_moe_cache_device_stats * ds = &out->devices[out->n_devices++];
+        const moe_cache_device & device = *d;
+
+        ds->logical        = device.logical;
+        ds->host_shared    = device.host_shared ? 1 : 0;
+        ds->budget_bytes   = device.budget_limit;
+        ds->allocated_bytes = device.allocated_bytes;
+
+        moe_expert_arena arena_tot = {};
+        for (const auto & pool_ptr : device.pools) {
+            const moe_cache_pool & pool = *pool_ptr;
+            const size_t used = (size_t) pool.n_slots - pool.free_slots.size();
+            ds->pool_slots      += (size_t) pool.n_slots;
+            ds->pool_used_slots += used;
+            ds->pool_bytes      += (size_t) pool.n_slots * pool.expert_size;
+            if (moe_cache_pool_has_zone(pool)) {
+                ds->zone_bytes += (size_t)(pool.zone_end - pool.zone_begin) /
+                    (pool.zone_slice ? pool.zone_slice : 1) * pool.expert_size;
+            }
+            for (const moe_cache_lent_block & block : pool.lent) {
+                ds->loan_bytes += (size_t) block.count * pool.expert_size;
+            }
+        }
+        for (const auto & loan : device.band_loans) {
+            ds->loan_bytes += loan.second - loan.first;   // the banded slab's loans, disjoint from pool.lent
+        }
+
+        if (!device.host_shared) {   // another card took the host memory: its ranges must not be counted twice
+            ds->arena_bytes = device.arena_mapped;
+        }
+        for (const auto & a : device.arenas) {
+            if (!a) {
+                continue;
+            }
+            ds->arena_used_bytes += ((size_t) a->n_slots - a->free_list.size()) * a->slot_bytes;
+            arena_tot.cpu_loads += a->cpu_loads;   arena_tot.prefill_loads += a->prefill_loads;
+            arena_tot.load_failures += a->load_failures;
+            arena_tot.cpu_hits += a->cpu_hits;     arena_tot.evictions += a->evictions;
+            arena_tot.refused += a->refused;       arena_tot.zone_busy += a->zone_busy;
+        }
+
+        ds->queue_bytes = device.queued_bytes;
+        ds->queue_jobs  = device.queue.size();
+
+        ds->hits                = device.hits;
+        ds->misses              = device.misses;
+        ds->inserts             = device.inserts;
+        ds->fills               = device.fills;
+        ds->fill_failures       = device.fill_failures;
+        ds->evictions           = device.evictions;
+        ds->insert_skips        = device.insert_skips;
+        ds->admission_skips     = device.admission_skips;
+        ds->dispatch_failures   = device.dispatch_failures;
+        ds->collect_failures    = device.collect_failures;
+        ds->kv_takes            = device.kv_takes;
+        ds->kv_moves            = device.kv_moves;
+        ds->kv_evictions        = device.kv_evictions;
+
+        ds->arena_reads_cpu     = arena_tot.cpu_loads;
+        ds->arena_reads_prefill = arena_tot.prefill_loads;
+        ds->arena_read_failures = arena_tot.load_failures;
+        ds->arena_cpu_hits      = arena_tot.cpu_hits;
+        ds->arena_evictions     = arena_tot.evictions;
+        ds->arena_refused       = arena_tot.refused;
+        ds->arena_zone_full     = arena_tot.zone_busy;
+
+        device.lat_fill.copy_to(&ds->fill);
+        device.lat_wait.copy_to(&ds->wait);
+        device.lat_disk.copy_to(&ds->disk);
+    }
+
+    return out->n_devices > 0;
 }
 
 static void moe_cache_log_configuration(moe_cache_session & session) {
@@ -4977,6 +5106,7 @@ static bool moe_cache_enqueue_locked(
         job.rewarm = rewarm;
         job.arena_hold = hold;
         job.arena = hold >= 0 ? ar : nullptr;
+        job.t_enqueued = ggml_time_us();
         (pregate ? device.pregate_queue : device.queue).push_back(job);
         device.queued_bytes += pool.expert_size;
     } catch (...) {
@@ -12304,6 +12434,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.compute_buffer_type = moe_cache_compute_buffer_type;
     ggml_moe_cache.plan_borrows = moe_cache_plan_borrows;
     ggml_moe_cache.borrows = moe_cache_borrows;
+    ggml_moe_cache.stats = moe_cache_stats;
 }
 
 #endif

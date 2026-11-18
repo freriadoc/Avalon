@@ -5033,6 +5033,189 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
     return ret;
 }
 
+// who holds what, by device and owner, plus the expert cache's own counters (llama_get_memory_report)
+llama_memory_report llama_context::memory_report() const {
+    llama_memory_report report;
+
+    const auto set_name = [](char * dst, size_t n, const std::string & s) {
+        const size_t len = std::min(n - 1, s.size());
+        memcpy(dst, s.c_str(), len);
+        dst[len] = 0;
+    };
+
+    std::string host_name = "cpu";
+    if (ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) {
+        host_name = ggml_backend_dev_name(cpu);
+    }
+
+    // one entry per (tier, device, kind); rows are emitted once everything is summed
+    std::map<std::string, size_t> acc;
+    const auto add = [&](const char * tier, const std::string & device, const char * kind, size_t bytes) {
+        acc[std::string(tier) + '\n' + device + '\n' + kind] += bytes;
+    };
+    // the tier and name of a buffer type: is_host, else the owning device's type (a CPU buffer type shared between
+    // backends stays under host); legacy host types have no device
+    const auto buft_name = [&](ggml_backend_buffer_type_t buft, const char ** tier) {
+        const bool host = buft ? ggml_backend_buft_is_host(buft) : false;
+        ggml_backend_dev_t dev = buft ? ggml_backend_buft_get_device(buft) : nullptr;
+        if (host || (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU)) {
+            *tier = "host";
+            return host_name;
+        }
+        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            *tier = "gpu";
+            return std::string(ggml_backend_dev_name(dev));
+        }
+        *tier = "meta";
+        return std::string("meta");
+    };
+
+    const auto add_capacity = [&](ggml_backend_dev_t dev) {
+        size_t free = 0, total = 0;
+        ggml_backend_dev_memory(dev, &free, &total);
+        llama_device_capacity cap{};
+        set_name(cap.device, sizeof(cap.device), ggml_backend_dev_name(dev));
+        cap.total = total;
+        cap.free  = free;
+        report.capacity.push_back(cap);
+    };
+
+    for (int i = 0; i < llama_model_n_devices(&model); i++) {
+        ggml_backend_dev_t dev = llama_model_get_device(&model, i);
+        if (dev && !model.devices[i].is_meta) {
+            add_capacity(dev);
+        }
+    }
+    if (ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) {
+        bool listed = false;
+        for (int i = 0; i < llama_model_n_devices(&model); i++) {
+            listed |= llama_model_get_device(&model, i) == cpu;
+        }
+        if (!listed) {
+            add_capacity(cpu);
+        }
+    }
+    const size_t room = llama_host_room_bytes();   // SIZE_MAX when unknown (not Linux)
+    report.host_available = room == SIZE_MAX ? 0 : room;
+
+    // the weights, by tensor: experts are the 3-D _exps / _chexps tensors (llama_model_host_expert_bytes' test)
+    for (const auto & entry : model.tensors_by_name) {
+        const std::string & name = entry.first;
+        const ggml_tensor * t = entry.second;
+        if (!t) {
+            continue;
+        }
+        const bool expert = (name.find("_exps") != std::string::npos ||
+                             name.find("_chexps") != std::string::npos) && ggml_n_dims(t) == 3;
+        ggml_backend_buffer_t buffer = t->view_src ? t->view_src->buffer : t->buffer;
+        if (!buffer || ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            continue;   // a no_alloc model has no buffers: its weights show up as compute only
+        }
+        const size_t bytes = ggml_nbytes(t);
+        if (ggml_backend_buffer_is_host(buffer)) {
+            if (!expert) {
+                add("host", host_name, "dense_weights", bytes);
+            }
+            continue;
+        }
+        const char * tier = nullptr;
+        const std::string dev = buft_name(ggml_backend_buffer_get_type(buffer), &tier);
+        add(tier, dev, expert ? "expert_weights" : "dense_weights", bytes);
+    }
+
+    if (memory) {
+        for (const auto & entry : memory->memory_breakdown()) {
+            const char * tier = nullptr;
+            const std::string dev = buft_name(entry.first, &tier);
+            add(tier, dev, "kv_cache", entry.second);
+        }
+        // the KV's rows below the step boundary are the KV's, the ones past it are the cache's (ranges it lends to its pools)
+        // kv_lent_from 0 means nothing is lent (see llama_kv_cache's clear/shift guards)
+        std::vector<std::pair<const ggml_tensor *, size_t>> lendable;
+        memory->get_lendable_kv(lendable);
+        const uint32_t lent_from = memory->get_kv_lent_from();
+        for (const auto & entry : lendable) {
+            const ggml_tensor * t = entry.first;
+            if (!t || !t->buffer) {
+                continue;
+            }
+            const char * tier = nullptr;
+            const std::string dev = buft_name(ggml_backend_buffer_get_type(t->buffer), &tier);
+            const uint64_t rows      = t->ne[1];
+            const uint64_t lent_rows = lent_from > 0 && rows > lent_from ? rows - lent_from : 0;
+            if (rows > lent_rows) {
+                add(tier, dev, "kv_cache_hosted", entry.second * (rows - lent_rows));
+            }
+            if (lent_rows > 0) {
+                add(tier, dev, "kv_cache_lent", entry.second * lent_rows);
+            }
+        }
+    }
+
+    if (sched.get()) {
+        for (size_t i = 0; i < backends.size(); ++i) {
+            ggml_backend_t             backend = backends[i].get();
+            ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
+            const char * tier = nullptr;
+            const std::string dev = buft_name(buft, &tier);
+            const size_t bytes = model.hparams.no_alloc ? backend_buf_exp_size[i] :
+                ggml_backend_sched_get_buffer_size(sched.get(), backend);
+            add(tier, dev, "compute", bytes);
+        }
+    }
+
+    report.has_moe = ggml_backend_sched_moe_cache_stats(sched.get(), &report.moe);
+    if (report.has_moe) {
+        // the cache's devices are the CUDA ones, in the order ggml-cuda registers them
+        const auto gpu_name = [&](int logical) {
+            int n = 0;
+            for (int i = 0; i < llama_model_n_devices(&model); i++) {
+                ggml_backend_dev_t dev = llama_model_get_device(&model, i);
+                if (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    continue;
+                }
+                if (n++ == logical) {
+                    return std::string(ggml_backend_dev_name(dev));
+                }
+            }
+            return std::string("gpu") + std::to_string(logical);
+        };
+        for (int i = 0; i < report.moe.n_devices; i++) {
+            const struct ggml_moe_cache_device_stats & ds = report.moe.devices[i];
+            const std::string name = gpu_name(ds.logical);
+            add("gpu", name, "experts_pool",  ds.pool_bytes);
+            add("gpu", name, "experts_zones", ds.zone_bytes);
+            add("gpu", name, "experts_loans", ds.loan_bytes);
+            if (ds.host_shared) {
+                continue;   // EXPERT SPLIT: another card holds this card's host memory
+            }
+            // every card maps its own arena, so the host rows are per card
+            add("host", name, "experts_arena",      ds.arena_bytes);
+            add("host", name, "experts_arena_used", ds.arena_used_bytes);
+        }
+    }
+
+    const size_t file_bytes = model.size();
+    // a packed layer's expert tensors alias one host range, so take the dedup'd extent, not the sum of their nbytes
+    const size_t expert_bytes = llama_model_host_expert_bytes(model);
+    add("disk", "file", "expert_weights", expert_bytes);
+    add("disk", "file", "dense_weights", expert_bytes < file_bytes ? file_bytes - expert_bytes : 0);
+
+    for (const auto & entry : acc) {
+        const std::string & key = entry.first;
+        const size_t p0 = key.find('\n');
+        const size_t p1 = key.find('\n', p0 + 1);
+        llama_memory_row row{};
+        set_name(row.tier,   sizeof(row.tier),   key.substr(0, p0));
+        set_name(row.device, sizeof(row.device), key.substr(p0 + 1, p1 - p0 - 1));
+        set_name(row.kind,   sizeof(row.kind),   key.substr(p1 + 1));
+        row.bytes = entry.second;
+        report.rows.push_back(row);
+    }
+
+    return report;
+}
+
 //
 // training
 //
@@ -6115,6 +6298,10 @@ int32_t llama_process(llama_context * ctx, llama_process_type type, llama_batch_
 
 llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx) {
     return ctx->memory_breakdown();
+}
+
+llama_memory_report llama_get_memory_report(const struct llama_context * ctx) {
+    return ctx->memory_report();
 }
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {

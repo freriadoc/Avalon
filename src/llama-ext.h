@@ -7,7 +7,9 @@
 #include "llama.h"
 
 #include <cstdint>
+#include <cstddef>
 #include <map>
+#include <vector>
 
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
@@ -89,6 +91,34 @@ LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
+
+#include "../ggml/src/ggml-backend-moe-cache.h"
+
+// One row of the memory composition: bytes of one kind, on one tier.
+struct llama_memory_row {
+    char   tier[8];    // "host", "gpu", "disk"
+    char   device[32]; // the ggml device name; "file" for the disk tier
+    char   kind[32];   // see the kinds in llama_context::memory_report
+    size_t bytes;
+};
+
+struct llama_device_capacity {
+    char   device[32];
+    size_t total;
+    size_t free;
+};
+
+// what the process holds by owner and device, plus the MoE expert cache's counters (all since start)
+struct llama_memory_report {
+    std::vector<llama_memory_row>      rows;
+    std::vector<llama_device_capacity> capacity;
+    size_t host_available = 0;
+    bool   has_moe = false;
+    struct ggml_moe_cache_stats moe = {};
+};
+
+// The memory composition and the expert-cache counters of ctx. Read-only, safe between decodes.
+LLAMA_API llama_memory_report llama_get_memory_report(const struct llama_context * ctx);
 
 // Set whether the context outputs nextn embeddings or not
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0

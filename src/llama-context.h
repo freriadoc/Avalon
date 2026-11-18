@@ -225,6 +225,7 @@ struct llama_context {
     void perf_reset();
 
     llama_memory_breakdown memory_breakdown() const;
+    llama_memory_report    memory_report() const;
 
     //
     // training

@@ -1011,6 +1011,10 @@ public:
         return metrics;
     }
 
+    llama_memory_report get_report() const {
+        return ctx_tgt ? llama_get_memory_report(ctx_tgt) : llama_memory_report{};
+    }
+
     void reset_metrics_bucket() {
         metrics.reset_bucket();
     }
@@ -2421,6 +2425,10 @@ private:
         res->generation_params = slot.task->params; // copy the parameters
 
         queue_results.send(std::move(res));
+
+        if (ctx_tgt) {
+            common_memory_report_print(get_report()); // the turn is over: one report, no timer
+        }
     }
 
     void send_embedding(const server_slot & slot, const common_batch & batch) {
@@ -3098,6 +3106,9 @@ private:
                     res->n_processing_slots  = n_processing_slots;
                     res->n_tasks_deferred    = queue_tasks.queue_tasks_deferred_size();
                     res->metrics             = metrics;
+                    if (ctx_tgt) {
+                        res->report = llama_get_memory_report(ctx_tgt);
+                    }
 
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
@@ -5588,6 +5599,7 @@ void server_routes::init_routes() {
             res->headers["Process-Start-Time-Unix"] = std::to_string(cached_metrics.t_start);
             server_task_result_metrics tmp;
             tmp.metrics = cached_metrics;
+            tmp.report  = cached_report;
             res->content_type = "text/plain; version=0.0.4";
             res->status = 200;
             res->data = tmp.to_metrics();
@@ -6583,6 +6595,7 @@ void server_routes::update_cached_responses(bool is_sleeping) {
         cached_models  = get_res_models(*meta);
         cached_props   = get_res_props(*meta, params, true);
         cached_metrics = ctx_server.get_metrics();
+        cached_report  = ctx_server.get_report();
 
         should_reset_buckets = false;
 

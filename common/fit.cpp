@@ -1,12 +1,15 @@
 #include "fit.h"
 
+#include "common.h"
 #include "json.h"
 #include "log.h"
 
 #include "../src/llama-ext.h"
 
 #include <array>
+#include <algorithm>
 #include <cassert>
+#include <cstring>
 #include <stdexcept>
 #include <cinttypes>
 #include <set>
@@ -1140,4 +1143,133 @@ void common_fit_print(
     printf("%zu ", dmd.back().mb.context/1024/1024);
     printf("%zu ", dmd.back().mb.compute/1024/1024);
     printf("\n");
+}
+
+// the expert cache's device index (the order ggml-cuda registers the GPUs) as a device name
+static std::string common_moe_device_name(int logical) {
+    int n = 0;
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            continue;
+        }
+        if (n++ == logical) {
+            return ggml_backend_dev_name(dev);
+        }
+    }
+    return "gpu" + std::to_string(logical);
+}
+
+void common_memory_report_print(const struct llama_memory_report & report) {
+    constexpr size_t MiB = 1024 * 1024;
+
+    const auto find_row = [&](const char * tier, const std::string & device, const char * kind) -> const llama_memory_row * {
+        for (const auto & row : report.rows) {
+            if (!strcmp(row.tier, tier) && !strcmp(row.device, device.c_str()) && !strcmp(row.kind, kind)) {
+                return &row;
+            }
+        }
+        return nullptr;
+    };
+    const auto mib = [&](const char * tier, const std::string & device, const char * kind) -> double {
+        const llama_memory_row * row = find_row(tier, device, kind);
+        return row ? (double) row->bytes / MiB : 0.0;
+    };
+    std::string host_line = string_format(
+            "[mem] host avail %.0f MiB | model %.0f MiB (dense %.0f, experts %.0f)",
+            (double) report.host_available / MiB,
+            mib("disk", "file", "dense_weights") + mib("disk", "file", "expert_weights"),
+            mib("disk", "file", "dense_weights"),
+            mib("disk", "file", "expert_weights"));
+    LOG_INF("%s\n", host_line.c_str());
+
+    // the GPUs of the report: the model's devices, then the cache's own devices (a device the model does not use)
+    std::vector<std::string> gpus;
+    for (const auto & cap : report.capacity) {
+        ggml_backend_dev_t dev = ggml_backend_dev_by_name(cap.device);
+        if (!dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            gpus.push_back(cap.device);
+        }
+    }
+    for (int i = 0; i < report.moe.n_devices; i++) {
+        const std::string name = common_moe_device_name(report.moe.devices[i].logical);
+        if (std::find(gpus.begin(), gpus.end(), name) == gpus.end()) {
+            gpus.push_back(name);
+        }
+    }
+
+    for (const std::string & name : gpus) {
+        double free_mib = 0.0;
+        for (const auto & cap : report.capacity) {
+            if (strcmp(cap.device, name.c_str()) == 0) {
+                free_mib = (double) cap.free / MiB;
+                break;
+            }
+        }
+
+        std::string line = string_format("[mem] gpu %s: free %.0f MiB, kv %.0f MiB",
+                name.c_str(), free_mib, mib("gpu", name, "kv_cache"));
+
+        const struct ggml_moe_cache_device_stats * ds = nullptr;
+        for (int i = 0; i < report.moe.n_devices; i++) {
+            if (report.moe.devices[i].logical >= 0 && common_moe_device_name(report.moe.devices[i].logical) == name) {
+                ds = &report.moe.devices[i];
+                break;
+            }
+        }
+        if (ds) {
+            line += string_format(", pool %llu/%llu experts (%.0f MiB)",
+                    (unsigned long long) ds->pool_used_slots,
+                    (unsigned long long) ds->pool_slots,
+                    (double) ds->pool_bytes / MiB);
+        }
+        if (find_row("host", name, "experts_arena")) {
+            line += string_format(", arena %.0f/%.0f MiB",
+                    mib("host", name, "experts_arena_used"), mib("host", name, "experts_arena"));
+        }
+        if (ds && ds->hits + ds->misses) {
+            line += string_format(", hit %.1f%% of %llu probes",
+                    (double) ds->hits / (ds->hits + ds->misses) * 100.0,
+                    (unsigned long long) (ds->hits + ds->misses));
+        }
+        if (ds && ds->fill.n) {
+            line += string_format(", fill %llu avg %.0f max %llu us",
+                    (unsigned long long) ds->fill.n,
+                    (double) ds->fill.sum_us / ds->fill.n,
+                    (unsigned long long) ds->fill.max_us);
+        }
+        if (ds && ds->wait.n) {
+            line += string_format(", wait avg %.0f max %llu us",
+                    (double) ds->wait.sum_us / ds->wait.n,
+                    (unsigned long long) ds->wait.max_us);
+        }
+        if (ds && ds->disk.n) {
+            line += string_format(", disk %llu reads avg %.0f max %llu us",
+                    (unsigned long long) ds->disk.n,
+                    (double) ds->disk.sum_us / ds->disk.n,
+                    (unsigned long long) ds->disk.max_us);
+        }
+        if (ds && ds->queue_jobs) {
+            line += string_format(", queue %zu jobs/%zu MiB", ds->queue_jobs, (size_t) (ds->queue_bytes / MiB));
+        }
+        LOG_INF("%s\n", line.c_str());
+
+        // these only matter when they are not 0
+        if (ds && ds->fill_failures + ds->dispatch_failures + ds->collect_failures + ds->evictions +
+                ds->insert_skips + ds->admission_skips + ds->arena_read_failures + ds->arena_refused +
+                ds->arena_zone_full) {
+            LOG_INF("[mem] gpu %s: fill-fail %llu, dispatch-fail %llu, collect-fail %llu, evictions %llu,"
+                    " skips %llu/%llu, arena fail/refused/zone-full %llu/%llu/%llu\n",
+                    name.c_str(),
+                    (unsigned long long) ds->fill_failures,
+                    (unsigned long long) ds->dispatch_failures,
+                    (unsigned long long) ds->collect_failures,
+                    (unsigned long long) ds->evictions,
+                    (unsigned long long) ds->insert_skips,
+                    (unsigned long long) ds->admission_skips,
+                    (unsigned long long) ds->arena_read_failures,
+                    (unsigned long long) ds->arena_refused,
+                    (unsigned long long) ds->arena_zone_full);
+        }
+    }
 }
