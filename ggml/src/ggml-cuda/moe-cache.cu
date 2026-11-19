@@ -573,6 +573,7 @@ struct moe_cache_device {
     // weights by the SDMA engine, without the memcpy to the stage
     std::vector<std::pair<uintptr_t, uintptr_t>> pinned;
     bool pin_full = false;   // KFD's limit was reached: nothing more is registered
+    cudaError_t pin_err = cudaSuccess;   // the refusal's error (Windows: the driver's, there is no KFD)
     // PIN, direct load (moe_cache_pin_load_direct): the expert ranges made anonymous memory filled from the files with
     // O_DIRECT before they are registered; each one's file and offset, to map it back if KFD refuses it
     bool pin_direct = false;
@@ -3111,6 +3112,16 @@ static bool moe_cache_remap_any(const moe_cache_device & device, uintptr_t ib, u
     return moe_cache_remap_range(ib, ie);
 }
 
+// the reason of the first refused registration, for the log: KFD's system memory limit on Linux; on Windows the driver
+// refuses it (there is no KFD; a read-only file mapping is refused, Avalon#47), with its error
+static std::string moe_cache_pin_refusal(const moe_cache_device & device) {
+#if defined(_WIN32)
+    return std::string(" (registration refused by the driver: ") + cudaGetErrorString(device.pin_err) + ")";
+#else
+    return std::string(" (KFD's system memory limit reached: ") + cudaGetErrorString(device.pin_err) + ")";
+#endif
+}
+
 // one expert tensor registered in place (its range rounded outwards to pages), false if ROCm refuses it. Portable: with
 // several GPUs a range registered for one device's cache is also copied by another (the first GPU's prefetch copies
 // every layer); a range another device of the session registered is not registered again
@@ -3139,6 +3150,7 @@ static bool moe_cache_pin_tensor(const moe_cache_session & session, moe_cache_de
         (void) cudaGetLastError();
         (void) moe_cache_remap_any(device, ib, ie);   // the half-done registration goes with the old mapping
         device.pin_full = true;
+        device.pin_err = err;
         return false;
     }
     device.pinned.push_back({ib, ie});
@@ -3361,7 +3373,7 @@ static void moe_cache_pin_experts(const moe_cache_session & session, moe_cache_d
             device.physical, device.pinned.size(), bytes >> 20, (ggml_time_us() - t0) / 1e6, fail,
             budget_left_out ? (" (" + std::to_string(budget_left_out) + " over the RAM budget, " +
                 std::to_string(budget_left_bytes >> 20) + " MiB in the page cache)").c_str() : "",
-            device.pin_full ? " (KFD's system memory limit reached)" : "",
+            device.pin_full ? moe_cache_pin_refusal(device).c_str() : "",
             device.pin_direct ? (" (read with O_DIRECT: " + std::to_string(direct_bytes >> 20) + " MiB)").c_str() : "");
 }
 
