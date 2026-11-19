@@ -1586,7 +1586,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     this->ml = &ml; // to be used by create_tensor() and load_arch_tensors()
 
-    if (ml.use_mmap && params.load_mode == LLAMA_LOAD_MODE_AUTO) {
+    // packed expert layers are read through the mapping (their experts an entry apart in the file): kept with a device
+    // that reports no mmap support (ROCm on Windows APUs, Avalon#22; GGML_ASSERT(use_mmap) in load_all_data before)
+    if (ml.use_mmap && params.load_mode == LLAMA_LOAD_MODE_AUTO && !ml.packed_experts) {
         for (const auto & dev : devices) {
             ggml_backend_dev_props props;
             ggml_backend_dev_get_props(dev.dev, &props);

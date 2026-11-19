@@ -728,6 +728,7 @@ llama_model_loader::llama_model_loader(
             }
         }
         if (!packed.empty()) {
+            packed_experts = true;
             if (!use_mmap && !no_alloc) {   // the memory-fit pass (no_alloc) reads no weight
                 throw std::runtime_error("packed expert layers need the model to be memory mapped (no --no-mmap / --load-mode)");
             }
