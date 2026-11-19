@@ -2293,6 +2293,7 @@ struct common_speculative_impl_draft_syclonith : public common_speculative_impl 
     uint64_t stats_verification_calls = 0;
     uint64_t stats_draft_exec_us = 0;
     double   stats_top1_p_sum = 0.0;
+    uint64_t stats_top1_p_count = 0;
     std::vector<uint64_t> stats_pending_drafted;
 
     // First-event diagnostics distinguish graph execution, candidate generation,
@@ -2308,8 +2309,8 @@ struct common_speculative_impl_draft_syclonith : public common_speculative_impl 
                 100.0 * (double) stats_accepted_tokens / (double) decided;
         const double avg_exec_us = stats_draft_graph_execs == 0 ? 0.0 :
                 (double) stats_draft_exec_us / (double) stats_draft_graph_execs;
-        const double avg_top1_p = stats_candidates == 0 ? 0.0 :
-                stats_top1_p_sum / (double) stats_candidates;
+        const double avg_top1_p = stats_top1_p_count == 0 ? 0.0 :
+                stats_top1_p_sum / (double) stats_top1_p_count;
         SPC_INF("Syclonith stats (%s): cycles=%" PRIu64 ", draft_graph_execs=%" PRIu64
                 ", candidates=%" PRIu64 ", drafted=%" PRIu64 ", accepted=%" PRIu64
                 ", rejected=%" PRIu64 ", confidence_drops=%" PRIu64
@@ -2919,6 +2920,7 @@ struct common_speculative_impl_draft_syclonith : public common_speculative_impl 
                 stats_candidates += cur_p->size;
                 if (cur_p->size > 0) {
                     stats_top1_p_sum += cur_p->data[0].p;
+                    stats_top1_p_count++;
                     if (!stats_logged_candidate_once) {
                         stats_logged_candidate_once = true;
                         SPC_INF("[Syclonith] first draft candidate: seq=%d, token=%d, top1_p=%.6f, candidate_count=%zu\n",
@@ -3025,7 +3027,7 @@ struct common_speculative_impl_draft_syclonith : public common_speculative_impl 
         // Count callback delivery before inspecting row capture. This separates
         // "verifier never called" from "verifier called without captured rows".
         stats_accept_callbacks++;
-        const int32_t n_rows = verify_h_rows[seq_id];
+        const int32_t n_rows = verification_rows(seq_id);
         if (!stats_logged_verify_once) {
             stats_logged_verify_once = true;
             SPC_INF("[Syclonith] first verifier callback: seq=%d, accepted=%u, pending_drafted=%" PRIu64 ", verify_rows=%d\n",
