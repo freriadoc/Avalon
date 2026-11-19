@@ -168,7 +168,7 @@ say "Installing the launcher $BIN_DIR/avalon-server"
 mkdir -p "$BIN_DIR"
 cat > "$BIN_DIR/avalon-server" <<EOF
 #!/usr/bin/env bash
-# Avalon: Qwen3.8-Flash-Next with MTP, 256k context, OpenAI-compatible API on http://\${HOST:-127.0.0.1}:\${PORT:-8080}
+# Avalon: Qwen3.8-Flash-Next with MTP + ngram-simple, 256k context, OpenAI-compatible API on http://\${HOST:-127.0.0.1}:\${PORT:-8080}
 # Extra arguments go to llama-server (e.g. -c 65536 for a smaller context).
 cd "$MODEL_DIR"
 exec "$SERVER" -m Qwen3.8-Flash-Next-Avalon-IQ3KS-00001-of-00033.gguf \\
