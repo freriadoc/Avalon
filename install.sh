@@ -29,7 +29,8 @@ fail() {
 say "Checking the machine"
 
 [ "$(uname -s)" = Linux ] || fail "Linux only (found $(uname -s))"
-grep -qw avx2 /proc/cpuinfo || fail "the CPU has no AVX2: the experts computed on the CPU need it"
+# without AVX2 the experts computed on the CPU take generic kernels (AVX-only build on a Zen 2: 76 against 98 t/s, MTP)
+grep -qw avx2 /proc/cpuinfo || warn "the CPU has no AVX2: the experts computed on the CPU take slower generic kernels"
 for tool in git cmake python3; do
     command -v $tool >/dev/null || fail "$tool not found: install it with your package manager"
 done
