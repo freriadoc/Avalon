@@ -235,7 +235,7 @@ hf download freriadoc/Qwen3.8-Flash-Next-Avalon-GGUF --local-dir Qwen3.8-Flash-N
 cd Qwen3.8-Flash-Next-Avalon-GGUF
 ../Avalon/build/bin/llama-server -m Qwen3.8-Flash-Next-Avalon-IQ3KS-00001-of-00033.gguf \
   -c 262144 -b 32768 -ub 32768 -fa on -ctk q8_0 -ctv q4_0 --jinja --parallel 1 \
-  -md MTP/mtp-Qwen3.8-Flash-Next-shared-IQ3K-IQ4NL-FR65k.gguf --spec-type draft-mtp \
+  -md MTP/mtp-Qwen3.8-Flash-Next-shared-IQ3K-IQ4NL-FR65k.gguf --spec-type ngram-simple,draft-mtp \
   --spec-draft-n-max 2 -ubd 256 -ctkd q8_0 -ctvd q8_0
 ```
 
@@ -256,7 +256,7 @@ its environment), list the model where it is with `lemonade config set extra_mod
 are one model; `lemonade list` gives its name), and give it Avalon's settings in `recipe_options.json`: `"ctx_size":
 262144`, `"llamacpp_backend": "rocm"` and `"llamacpp_args": "-b 32768 -ub 32768 -fa on -ctk q8_0 -ctv q4_0 -md
 /path/to/models/Qwen3.8-Flash-Next-Avalon-GGUF/MTP/mtp-Qwen3.8-Flash-Next-shared-IQ3K-IQ4NL-FR65k.gguf --spec-type
-draft-mtp --spec-draft-n-max 2 -ubd 256 -ctkd q8_0 -ctvd q8_0"`. Lemonade adds the model, the context, the port,
+ngram-simple,draft-mtp --spec-draft-n-max 2 -ubd 256 -ctkd q8_0 -ctvd q8_0"`. Lemonade adds the model, the context, the port,
 `--jinja` and `--parallel 1` itself and no `-ngl`, so `--fit` keeps placing the model. Not tried yet: if you do, please
 open an issue with what worked or not.
 
