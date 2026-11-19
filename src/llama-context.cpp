@@ -2050,7 +2050,12 @@ static bool llama_ubatch_timing() {
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret, bool launch) {
-    const bool ut = llama_ubatch_timing() && ubatch.n_tokens > 1024;
+    const bool ut = llama_ubatch_timing() && (
+            ubatch.n_tokens > 1024 ||
+            (gtype == LLM_GRAPH_TYPE_DECODER &&
+             ubatch.n_tokens <= 8 &&
+             getenv("LLAMA_UBATCH_TIMING_SMALL") &&
+             atoi(getenv("LLAMA_UBATCH_TIMING_SMALL")) != 0));
     int64_t ut_t[8] = {};
     if (ut) { ut_t[0] = ggml_time_us(); }
     if (mctx && !mctx->apply()) {
@@ -2160,9 +2165,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ggml_backend_sched_synchronize(sched.get());
         ut_t[7] = ggml_time_us();
         const auto ms = [&](int a, int b) { return ut_t[a] && ut_t[b] ? (ut_t[b] - ut_t[a]) / 1e3 : 0.0; };
-        LLAMA_LOG_INFO("%s: ubatch timing (%u tokens%s): since the previous one's end %.1f, apply %.1f, build %.1f, alloc %.1f, "
+        LLAMA_LOG_INFO("%s: ubatch timing (graph=%d, %u tokens%s): since the previous one's end %.1f, apply %.1f, build %.1f, alloc %.1f, "
                 "inputs %.1f, kv %.1f, launch %.1f, gpu wait %.1f ms\n",
-                __func__, ubatch.n_tokens, ut_t[1] ? "" : ", graph reused", ut_after_us ? (ut_t[0] - ut_after_us) / 1e3 : 0.0,
+                __func__, (int) gtype, ubatch.n_tokens, ut_t[1] ? "" : ", graph reused", ut_after_us ? (ut_t[0] - ut_after_us) / 1e3 : 0.0,
                 ut_t[1] ? ms(0, 1) : ms(0, 3), ms(1, 2), ms(2, 3), ms(3, 4), ms(4, 5), ms(5, 6), ms(6, 7));
         ut_after_us = ut_t[7];
     }
