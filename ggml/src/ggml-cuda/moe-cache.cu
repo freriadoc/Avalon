@@ -72,6 +72,7 @@ bool ggml_cuda_host_rows_node(ggml_backend_cuda_context & ctx, ggml_tensor * nod
 
 // EXL3 weights are not part of this tree: every path below that tests for them is dead.
 int64_t ggml_cuda_qattn_query_min_kv();   // qattn-i8.cu
+bool ggml_cuda_qsa_list(int type_k, int type_v, int d_head, int n_head_q, int n_head_kv);   // qattn-i8.cu
 
 static inline bool ggml_type_is_exl3(ggml_type) { return false; }
 
@@ -12261,6 +12262,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.hosted_cost = moe_hosted_cost;
     ggml_moe_cache.qsa_tiles = ggml_cuda_fattn_tile_mask_supported;
     ggml_moe_cache.qsa_query_min_kv = ggml_cuda_qattn_query_min_kv;
+    ggml_moe_cache.qsa_list = ggml_cuda_qsa_list;
     ggml_moe_cache.ring_usable = moe_cache_ring_usable;
     ggml_moe_cache.plan = nullptr;   // nodes are served by the hosted MoE only (moe_cache_begin)
     ggml_moe_cache.dispatch = nullptr;   // nodes are served by the hosted MoE only (moe_cache_begin)
