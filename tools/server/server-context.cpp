@@ -47,32 +47,33 @@ struct spec_timing {
     bool on = getenv("LLAMA_SPEC_TIMING") != nullptr;
     // a step's phases are counted with its length at the next step's start, and dropped when the slot is released
     // (the time to the next request is not a step)
-    // x: accept, checkpoints after the draft, the target's seq_rm, the accepted tokens' output (process_token)
-    int64_t work[3] = {}, yield[3] = {}, step = 0, t_last = 0, x[6] = {}, px[6] = {}; int n = 0;
+    // x: accept, checkpoints, target seq_rm, accepted-token output, sampling, spec accept, decode process, decode sync
+    int64_t work[3] = {}, yield[3] = {}, step = 0, t_last = 0, x[8] = {}, px[8] = {}; int n = 0;
     int64_t pw[3] = {}, py[3] = {};
     void add(int k, int64_t t0, int64_t w0, int64_t w1) {
         pw[k] += w1 - w0; py[k] += ggml_time_us() - t0 - (w1 - w0);
     }
     void add_x(int k, int64_t t0) { px[k] += ggml_time_us() - t0; }
+    void add_x_us(int k, int64_t elapsed_us) { px[k] += elapsed_us; }
     void release() {
         t_last = 0;
-        for (int k = 0; k < 6; k++) { px[k] = 0; }
+        for (int k = 0; k < 8; k++) { px[k] = 0; }
         for (int k = 0; k < 3; k++) { pw[k] = py[k] = 0; }
     }
     void step_start() {
         const int64_t t = ggml_time_us();
         if (t_last) {
             step += t - t_last; n++;
-            for (int k = 0; k < 6; k++) { x[k] += px[k]; }
+            for (int k = 0; k < 8; k++) { x[k] += px[k]; }
             for (int k = 0; k < 3; k++) { work[k] += pw[k]; yield[k] += py[k]; }
         }
-        for (int k = 0; k < 6; k++) { px[k] = 0; }
+        for (int k = 0; k < 8; k++) { px[k] = 0; }
         for (int k = 0; k < 3; k++) { pw[k] = py[k] = 0; }
         t_last = t;
         if (n && n % 200 == 0) {
             const double f = 1e-3 / n;
-            SRV_INF("spec timing: %d steps, %.2f ms/step: draft %.2f (+%.2f yield), decode %.2f (+%.2f), process %.2f (+%.2f), accept %.2f (sample %.2f, spec accept %.2f), ckpt %.2f, seq_rm %.2f, output %.2f, rest %.2f\n",
-                    n, step*f, work[0]*f, yield[0]*f, work[1]*f, yield[1]*f, work[2]*f, yield[2]*f, x[0]*f, x[4]*f, x[5]*f, x[1]*f, x[2]*f, x[3]*f,
+            SRV_INF("spec timing: %d steps, %.2f ms/step: draft %.2f (+%.2f yield), decode %.2f (+%.2f; process %.2f, sync %.2f), process %.2f (+%.2f), accept %.2f (sample %.2f, spec accept %.2f), ckpt %.2f, seq_rm %.2f, output %.2f, rest %.2f\n",
+                    n, step*f, work[0]*f, yield[0]*f, work[1]*f, yield[1]*f, x[6]*f, x[7]*f, work[2]*f, yield[2]*f, x[0]*f, x[4]*f, x[5]*f, x[1]*f, x[2]*f, x[3]*f,
                     (step - work[0]-work[1]-work[2]-yield[0]-yield[1]-yield[2]-x[0]-x[1]-x[2]-x[3])*f);
         }
     }
@@ -4516,16 +4517,26 @@ private:
         }
 
         int ret = 0;
-        const int64_t dt0 = ggml_time_us(); int64_t dw0 = 0, dw1 = 0;
+        const int64_t dt0 = ggml_time_us();
+        int64_t dw0 = 0, dw1 = 0;
+        int64_t decode_process_us = 0, decode_sync_us = 0;
         queue_tasks.yield_to_queue([&]() {
             dw0 = ggml_time_us();
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
+            const int64_t dp1 = ggml_time_us();
+            decode_process_us = dp1 - dw0;
             if (ret == 0 && has_output) {
+                const int64_t ds0 = ggml_time_us();
                 llama_synchronize(ctx_tgt);
+                decode_sync_us = ggml_time_us() - ds0;
             }
             dw1 = ggml_time_us();
         });
-        if (g_spec_timing.on && batch.view.size() <= 8) g_spec_timing.add(1, dt0, dw0, dw1);
+        if (g_spec_timing.on && batch.view.size() <= 8) {
+            g_spec_timing.add(1, dt0, dw0, dw1);
+            g_spec_timing.add_x_us(6, decode_process_us);
+            g_spec_timing.add_x_us(7, decode_sync_us);
+        }
 
         if (ret != 0) {
             snap_reqs.clear();
