@@ -1,0 +1,125 @@
+name: Avalon container
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Build target
+        type: choice
+        default: rocm-gfx1100
+        options:
+          - rocm-gfx1100
+          - rocm-gfx1101
+          - rocm-gfx1102
+          - rocm-gfx1200
+          - rocm-gfx1201
+          - cuda-89
+          - cuda-120
+      rocm_version:
+        description: ROCm version for ROCm targets
+        type: string
+        default: "7.2.4"
+      push:
+        description: Push the image to GHCR
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: avalon-container-${{ github.ref }}-${{ inputs.target }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Check out the repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Resolve settings
+        id: cfg
+        shell: bash
+        env:
+          TARGET: ${{ inputs.target }}
+          ROCM_VERSION: ${{ inputs.rocm_version }}
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse --short=7 HEAD)"
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          repo="${GITHUB_REPOSITORY#*/}"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/$owner/${repo,,}" >> "$GITHUB_OUTPUT"
+          echo "target=$TARGET" >> "$GITHUB_OUTPUT"
+
+          case "$TARGET" in
+            rocm-*)
+              echo "dockerfile=.devops/rocm.Dockerfile" >> "$GITHUB_OUTPUT"
+              {
+                echo "args<<__EOF__"
+                echo "ROCM_VERSION=$ROCM_VERSION"
+                echo "ROCM_DOCKER_ARCH=${TARGET#rocm-}"
+                echo "__EOF__"
+              } >> "$GITHUB_OUTPUT"
+              ;;
+            cuda-*)
+              echo "dockerfile=.devops/cuda.Dockerfile" >> "$GITHUB_OUTPUT"
+              {
+                echo "args<<__EOF__"
+                echo "CUDA_VERSION=12.8.1"
+                echo "CUDA_DOCKER_ARCH=${TARGET#cuda-}"
+                echo "__EOF__"
+              } >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "unsupported target: $TARGET" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        if: ${{ inputs.push }}
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ github.workspace }}
+          file: ${{ github.workspace }}/${{ steps.cfg.outputs.dockerfile }}
+          target: server
+          platforms: linux/amd64
+          push: ${{ inputs.push }}
+          provenance: false
+          build-args: ${{ steps.cfg.outputs.args }}
+          tags: |
+            ${{ steps.cfg.outputs.image }}:${{ steps.cfg.outputs.target }}
+            ${{ steps.cfg.outputs.image }}:${{ steps.cfg.outputs.target }}-${{ steps.cfg.outputs.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.version=${{ steps.cfg.outputs.sha }}
+            org.opencontainers.image.description=Avalon llama-server, ${{ steps.cfg.outputs.target }}
