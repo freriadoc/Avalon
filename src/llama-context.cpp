@@ -2052,7 +2052,8 @@ static bool llama_ubatch_timing() {
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret, bool launch) {
     const bool ut = llama_ubatch_timing() && (
             ubatch.n_tokens > 1024 ||
-            (gtype == LLM_GRAPH_TYPE_DECODER &&
+            ((gtype == LLM_GRAPH_TYPE_DECODER ||
+              gtype == LLM_GRAPH_TYPE_DECODER_SYCLONITH) &&
              ubatch.n_tokens <= 8 &&
              getenv("LLAMA_UBATCH_TIMING_SMALL") &&
              atoi(getenv("LLAMA_UBATCH_TIMING_SMALL")) != 0));
