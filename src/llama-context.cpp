@@ -3326,10 +3326,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     }
     // a guest of another context's MoE cache (the MTP draft) that only stored a prompt batch: its compute buffer goes back
     // to the cache now, before the owner's next ubatch borrows its own (a draft's loan of 1.1 GiB left there, -ubd 4096,
-    // made the owner's 7.6 GiB fail at 131k); LLAMA_GUEST_RELEASE=0 keeps it
+    // made the owner's 7.6 GiB fail at 131k); LLAMA_GUEST_RELEASE=0 keeps it. Only after a batch of over 128 tokens: the
+    // draft's catch-up on the tokens accepted from an n-gram draft (store only; 48 to 64 drafted tokens by default) keeps
+    // its buffer, else it gave it back and rebuilt its graph at every such step (ngram + MTP code edits -5 %, Avalon#62)
     {
         static const bool keep = getenv("LLAMA_GUEST_RELEASE") && atoi(getenv("LLAMA_GUEST_RELEASE")) == 0;
-        if (!keep && moe_cache_shared && n_outputs_all == 0 && n_tokens_all > 8 && ggml_backend_sched_compute_borrowed(sched.get())) {
+        if (!keep && moe_cache_shared && n_outputs_all == 0 && n_tokens_all > 128 && ggml_backend_sched_compute_borrowed(sched.get())) {
             ggml_backend_sched_release_borrowed(sched.get());
             gf_res_prev_active = nullptr;
         }
