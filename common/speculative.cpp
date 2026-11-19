@@ -2287,6 +2287,9 @@ struct common_speculative_impl_draft_syclonith : public common_speculative_impl 
     uint64_t stats_accepted_tokens = 0;
     uint64_t stats_rejected_tokens = 0;
     uint64_t stats_confidence_drops = 0;
+    uint64_t stats_accept_callbacks = 0;
+    uint64_t stats_accept_without_rows = 0;
+    uint64_t stats_accept_overflow_tokens = 0;
     uint64_t stats_verification_calls = 0;
     uint64_t stats_draft_exec_us = 0;
     double   stats_top1_p_sum = 0.0;
@@ -2309,11 +2312,14 @@ struct common_speculative_impl_draft_syclonith : public common_speculative_impl 
                 stats_top1_p_sum / (double) stats_candidates;
         SPC_INF("Syclonith stats (%s): cycles=%" PRIu64 ", draft_graph_execs=%" PRIu64
                 ", candidates=%" PRIu64 ", drafted=%" PRIu64 ", accepted=%" PRIu64
-                ", rejected=%" PRIu64 ", confidence_drops=%" PRIu64 ", verify_calls=%" PRIu64
+                ", rejected=%" PRIu64 ", confidence_drops=%" PRIu64
+                ", accept_callbacks=%" PRIu64 ", accept_without_rows=%" PRIu64
+                ", accept_overflow=%" PRIu64 ", verify_calls=%" PRIu64
                 ", acceptance=%.1f%%, avg_top1_p=%.4f, draft_exec_total=%.3f ms, draft_exec_avg=%.1f us\n",
                 reason, stats_draft_cycles, stats_draft_graph_execs, stats_candidates,
                 stats_drafted_tokens, stats_accepted_tokens, stats_rejected_tokens,
-                stats_confidence_drops, stats_verification_calls, acceptance, avg_top1_p,
+                stats_confidence_drops, stats_accept_callbacks, stats_accept_without_rows,
+                stats_accept_overflow_tokens, stats_verification_calls, acceptance, avg_top1_p,
                 (double) stats_draft_exec_us / 1000.0, avg_exec_us);
     }
 
@@ -3016,24 +3022,38 @@ struct common_speculative_impl_draft_syclonith : public common_speculative_impl 
             return;
         }
 
+        // Count callback delivery before inspecting row capture. This separates
+        // "verifier never called" from "verifier called without captured rows".
+        stats_accept_callbacks++;
         const int32_t n_rows = verify_h_rows[seq_id];
-        if (n_rows <= 0) {
-            return;
-        }
-
         if (!stats_logged_verify_once) {
             stats_logged_verify_once = true;
             SPC_INF("[Syclonith] first verifier callback: seq=%d, accepted=%u, pending_drafted=%" PRIu64 ", verify_rows=%d\n",
-                    (int) seq_id, (unsigned) n_accepted, stats_pending_drafted[seq_id], verify_h_rows[seq_id]);
+                    (int) seq_id, (unsigned) n_accepted, stats_pending_drafted[seq_id], n_rows);
+        }
+
+        if (n_rows <= 0) {
+            stats_accept_without_rows++;
+            SPC_WRN("[Syclonith] verifier callback without captured rows: seq=%d, accepted=%u, pending_drafted=%" PRIu64 ", callbacks=%" PRIu64 "\n",
+                    (int) seq_id, (unsigned) n_accepted, stats_pending_drafted[seq_id], stats_accept_callbacks);
+            if (stats_accept_callbacks % 32 == 0) {
+                log_syclonith_stats("periodic");
+            }
+            return;
         }
 
         const uint64_t drafted = stats_pending_drafted[seq_id];
         const uint64_t accepted = std::min<uint64_t>(n_accepted, drafted);
+        if ((uint64_t) n_accepted > drafted) {
+            stats_accept_overflow_tokens += (uint64_t) n_accepted - drafted;
+            SPC_WRN("[Syclonith] verifier accepted count exceeds pending draft: seq=%d, accepted=%u, pending_drafted=%" PRIu64 "\n",
+                    (int) seq_id, (unsigned) n_accepted, drafted);
+        }
         stats_accepted_tokens += accepted;
         stats_rejected_tokens += drafted - accepted;
         stats_pending_drafted[seq_id] = 0;
         stats_verification_calls++;
-        if (stats_verification_calls % 32 == 0) {
+        if (stats_accept_callbacks % 32 == 0) {
             log_syclonith_stats("periodic");
         }
 
