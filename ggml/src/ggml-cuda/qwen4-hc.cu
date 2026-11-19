@@ -469,7 +469,7 @@ static void qwen4_hc_down_inject_launch(ggml_type wt,
 // tests/waitbench). The last workgroup to finish resets the counters.
 static constexpr int QWEN4_HC_K12_ROWS = QWEN4_HC_K1_THREADS / (QWEN4_HC_K2_WARPS*WARP_SIZE);
 
-static __device__ __attribute__((aligned(256))) unsigned g_qwen4_hc_k12[128];   // K1 done [0], finished [64]
+static __device__ __align__(256) unsigned g_qwen4_hc_k12[128];   // K1 done [0], finished [64]
 
 template <int T, ggml_type WT>
 __launch_bounds__(QWEN4_HC_K1_THREADS, 1)
