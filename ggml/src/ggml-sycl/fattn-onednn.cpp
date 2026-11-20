@@ -165,6 +165,11 @@ struct sdpa_partition {
     bool   ok = false;
 };
 
+// Last oneDNN SDPA stage reached on this host thread. Kept thread-local so
+// concurrent server requests cannot overwrite one another's diagnostics.
+static thread_local char ggml_sycl_sdpa_diag[256] = "not started";
+static thread_local const char * ggml_sycl_sdpa_stage = "not started";
+
 // Build + compile the contiguous-input GQA SDPA graph (MatMul->Divide->Add->SoftMax->MatMul), f32 out.
 // Mirrors the hardware-verified scratch/onednn_sdpa_probe.cpp build_gqa (partitions=1, sdp_primitive_kernel_t).
 static sdpa_partition build_sdpa(const engine & eng, int H, int Hkv, int q, int seq, int d,
@@ -249,15 +254,26 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
     const int64_t q   = Q->ne[1];   // n_tok
     const int64_t mb  = Q->ne[3];   // batch (== 1, gated)
 
+    snprintf(ggml_sycl_sdpa_diag, sizeof(ggml_sycl_sdpa_diag),
+             "Q=[%lld,%lld,%lld,%lld]/%s K=[%lld,%lld,%lld,%lld]/%s "
+             "V=[%lld,%lld,%lld,%lld]/%s mask=%s",
+             (long long) Q->ne[0], (long long) Q->ne[1], (long long) Q->ne[2], (long long) Q->ne[3], ggml_type_name(Q->type),
+             (long long) K->ne[0], (long long) K->ne[1], (long long) K->ne[2], (long long) K->ne[3], ggml_type_name(K->type),
+             (long long) V->ne[0], (long long) V->ne[1], (long long) V->ne[2], (long long) V->ne[3], ggml_type_name(V->type),
+             mask ? ggml_type_name(mask->type) : "null");
+    ggml_sycl_sdpa_stage = "entry";
+
     float kq_scale = 1.0f;
     memcpy(&kq_scale, (const float *) dst->op_params + 0, sizeof(float));
 
+    ggml_sycl_sdpa_stage = "engine/stream creation";
     dpct::queue_ptr stream = ctx.stream();
     dnnl::engine    eng    = ctx.engine_dnnl(stream);
     dnnl::stream    strm   = ctx.stream_dnnl(stream);
 
     const ggml_sycl_fattn_extra extra = ggml_sycl_fattn_get_extra(dst);
 
+    ggml_sycl_sdpa_stage = "Q conversion";
     // Q: always f32 -- copy to dense f16.
     std::optional<ggml_sycl_pool_alloc<sycl::half>> Qf_pool;
     sycl::half * Qf_ptr = (sycl::half *) extra.Q_buffer_ptr;
@@ -290,6 +306,7 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
         return std::array<int64_t, 5>{ s3, s2, s2, s1, 1 };
     };
 
+    ggml_sycl_sdpa_stage = "K/V binding or staging";
     if (ggml_sycl_fattn_onednn_binds_kv(K, V)) {
         K_ptr = (sycl::half *) K->data;
         V_ptr = (sycl::half *) V->data;
@@ -347,6 +364,7 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
                                 V->nb[1], V->nb[2], V->nb[3], stream);
     }
 
+    ggml_sycl_sdpa_stage = "scale preparation";
     // divide-by-(1/scale) reproduces ggml's score *= kq_scale on the proven probe graph.
     //
     // The scale must not be uploaded with an async memcpy from a stack local: on the in-order
@@ -380,6 +398,7 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
              (long long) H, (long long) Hkv, (long long) q, (long long) seq, (long long) d,
              (long long) k_str[0], (long long) k_str[1], (long long) k_str[3],
              (long long) v_str[0], (long long) v_str[1], (long long) v_str[3]);
+    ggml_sycl_sdpa_stage = "partition lookup/build";
     auto it = cache.find(keyb);
     if (it == cache.end()) {
         it = cache.emplace(keyb, build_sdpa(eng, (int) H, (int) Hkv, (int) q, (int) seq, (int) d, k_str, v_str)).first;
@@ -405,8 +424,10 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
         ti.emplace_back(lt, eng, id2ptr(lt.get_id()));
     }
     tensor to(E.out, eng, outf_ptr);
+    ggml_sycl_sdpa_stage = "compiled partition execute";
     E.cp.execute(strm, ti, {to});
 
+    ggml_sycl_sdpa_stage = "output permutation";
     permute_sdpa_out_sycl(outf_ptr, (float *) dst->data, mb, H, q, d, stream);
     // Single device needs no sync: the dnnl stream wraps this same in-order queue, so the SDPA
     // serializes with the staging kernels before it and the permute/pool reuse after it. The
@@ -414,12 +435,14 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
     // fixed above. Keep the conservative wait for multi-GPU, where other devices' streams can
     // race the pool:
     if (ggml_sycl_info().device_count > 1) {
+    ggml_sycl_sdpa_stage = "multi-device synchronization";
         stream->wait_and_throw();
     }
 }
 catch (const std::exception & e) {
     // any oneDNN/SYCL failure is non-fatal: fall back to the existing kernel (strictly additive).
-    GGML_LOG_WARN("%s: oneDNN SDPA failed (%s); falling back to TILE kernel\n", __func__, e.what());
+    GGML_LOG_WARN("%s: oneDNN SDPA failed at stage '%s' (%s); tensors: %s; falling back to TILE kernel\n",
+                  __func__, ggml_sycl_sdpa_stage, e.what(), ggml_sycl_sdpa_diag);
     ggml_sycl_flash_attn_ext_tile(ctx, dst);
 }
 
