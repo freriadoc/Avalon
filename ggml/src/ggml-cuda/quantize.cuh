@@ -77,6 +77,13 @@ const void * ggml_cuda_q8_1_reuse(ggml_backend_cuda_context & ctx, const float *
         int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
         int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
 
+// the reuse buffer registered as holding the activation that ggml_cuda_q8_1_reuse would quantize with these arguments,
+// for a kernel that writes it itself (the hosted MoE block's entry); nullptr if the buffer cannot serve. shared: stream 1
+// may read it too (it waits for the kernel's counter before its products)
+void * ggml_cuda_q8_1_claim(ggml_backend_cuda_context & ctx, const float * x,
+        int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
+        int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, bool shared);
+
 // a node wrote dst: drop the reused quantization if dst overlaps its activation
 void ggml_cuda_q8_1_reuse_written(ggml_backend_cuda_context & ctx, const ggml_tensor * dst);
 

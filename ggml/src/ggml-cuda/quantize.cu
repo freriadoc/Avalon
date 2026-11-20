@@ -734,20 +734,43 @@ const void * ggml_cuda_q8_1_reuse(ggml_backend_cuda_context & ctx, const float *
         int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream) {
     auto & r = ctx.q8_1_reuse;
     const size_t bytes = (size_t) (ne0*ne1*ne2*ne3) * sizeof(block_q8_1) / QK8_1;
-    if (!r.buf || bytes > r.size || ctx.curr_stream_no != 0) {
+    if (!r.buf || bytes > r.size) {
         return nullptr;
     }
     // strides of a dimension of size 1 do not change the layout
     const int64_t key[8] = {ne00, ne1 > 1 ? s01 : 0, ne2 > 1 ? s02 : 0, ne3 > 1 ? s03 : 0, ne0, ne1, ne2, ne3};
-    if (r.valid && r.x == x && memcmp(key, r.key, sizeof(key)) == 0) {
+    const bool match = r.valid && r.x == x && memcmp(key, r.key, sizeof(key)) == 0;
+    if (ctx.curr_stream_no != 0) {   // stream 1: only a quantization shared with it (ggml_cuda_q8_1_claim)
+        return match && r.shared ? r.buf : nullptr;
+    }
+    if (match) {
         return r.buf;
     }
     quantize_row_q8_1_cuda(x, nullptr, r.buf, GGML_TYPE_Q8_0, ne00, s01, s02, s03, ne0, ne1, ne2, ne3, stream);
+    r.shared = false;
     r.valid = true;
     r.x     = x;
     memcpy(r.key, key, sizeof(key));
     r.lo    = (const char *) x;
     r.hi    = (const char *) (x + (ne00 - 1) + (ne1 - 1)*s01 + (ne2 - 1)*s02 + (ne3 - 1)*s03 + 1);
+    return r.buf;
+}
+
+void * ggml_cuda_q8_1_claim(ggml_backend_cuda_context & ctx, const float * x,
+        int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
+        int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, bool shared) {
+    auto & r = ctx.q8_1_reuse;
+    const size_t bytes = (size_t) (ne0*ne1*ne2*ne3) * sizeof(block_q8_1) / QK8_1;
+    if (!r.buf || bytes > r.size || ctx.curr_stream_no != 0) {
+        return nullptr;
+    }
+    const int64_t key[8] = {ne00, ne1 > 1 ? s01 : 0, ne2 > 1 ? s02 : 0, ne3 > 1 ? s03 : 0, ne0, ne1, ne2, ne3};
+    r.valid  = true;
+    r.shared = shared;
+    r.x      = x;
+    memcpy(r.key, key, sizeof(key));
+    r.lo     = (const char *) x;
+    r.hi     = (const char *) (x + (ne00 - 1) + (ne1 - 1)*s01 + (ne2 - 1)*s02 + (ne3 - 1)*s03 + 1);
     return r.buf;
 }
 
@@ -779,6 +802,7 @@ void * ggml_cuda_q8_1_produce(ggml_backend_cuda_context & ctx, const ggml_cgraph
         }
         // the key ggml_cuda_q8_1_reuse builds for this product
         const int64_t key[8] = {ne10, ne11 > 1 ? ne10 : 0, 0, 0, ne10, ne11, 1, 1};
+        r.shared   = false;
         r.valid    = true;
         r.x        = (const float *) out->data;
         memcpy(r.key, key, sizeof(key));

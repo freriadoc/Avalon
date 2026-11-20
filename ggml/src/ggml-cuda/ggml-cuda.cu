@@ -308,18 +308,22 @@ static int ggml_cuda_parse_id(const char * devName) {
 // limit is full (a 32 or 48 GB machine, or another process), the pin waits forever (ROCm/legacy-rocm-build#6582).
 // Never pinning sends those copies through ROCclr's staging buffer. An explicit GPU_PINNED_MIN_XFER_SIZE is kept.
 __attribute__((constructor)) static void ggml_hip_set_hw_queues() {
+    // the shared expert on a second stream (GGML_CUDA_MOE_SHEXP_STREAM) takes the process from 6 to 9 compute queues, and
+    // from 8 MES keeps the GPU busy while idle (MTP: a cap of 4 was not enough): 3 queues then
+    const char * sx = getenv("GGML_CUDA_MOE_SHEXP_STREAM");
+    const char * hw_queues = sx && atoi(sx) != 0 ? "3" : "8";
 #ifdef _WIN32
     const auto set_default = [](const char * name, const char * value) {
         if (!getenv(name)) {
             _putenv_s(name, value);
         }
     };
-    set_default("GPU_MAX_HW_QUEUES", "8");
+    set_default("GPU_MAX_HW_QUEUES", hw_queues);
     set_default("ROCBLAS_DEVICE_MEMORY_SIZE", "65536");
     set_default("HSA_SCRATCH_SINGLE_LIMIT", "1048576");
     set_default("GPU_PINNED_MIN_XFER_SIZE", "1048576");
 #else
-    setenv("GPU_MAX_HW_QUEUES", "8", /*overwrite =*/ 0);
+    setenv("GPU_MAX_HW_QUEUES", hw_queues, /*overwrite =*/ 0);
     setenv("ROCBLAS_DEVICE_MEMORY_SIZE", "65536", /*overwrite =*/ 0);
     setenv("HSA_SCRATCH_SINGLE_LIMIT", "1048576", /*overwrite =*/ 0);
     setenv("GPU_PINNED_MIN_XFER_SIZE", "1048576", /*overwrite =*/ 0);
@@ -8398,6 +8402,49 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 params->add_alloc_dep(params->user_data, t, until);
             }
         };
+        // GGML_CUDA_MOE_SHEXP_STREAM=1: the nodes between a hosted MoE block and the first reader of its output
+        // (the shared expert) run on a second stream from the block's publication (moe-cache.cu): what the block's kernels
+        // read or write meanwhile (glu, the activations, the ids and the routing they come from) is kept alive until that
+        // reader, ggml-alloc would give their memory to those nodes
+        static const bool shexp_stream = getenv("GGML_CUDA_MOE_SHEXP_STREAM") && atoi(getenv("GGML_CUDA_MOE_SHEXP_STREAM")) != 0;
+        for (int i = 0; shexp_stream && i + 4 < cgraph->n_nodes; ++i) {
+            ggml_tensor * n0 = cgraph->nodes[i], * n1 = cgraph->nodes[i + 1], * glu = cgraph->nodes[i + 2], * down = cgraph->nodes[i + 3];
+            if (n0->op != GGML_OP_MUL_MAT_ID || n1->op != GGML_OP_MUL_MAT_ID || glu->op != GGML_OP_GLU ||
+                    down->op != GGML_OP_MUL_MAT_ID || down->src[1] != glu || !n0->src[2] ||
+                    n0->src[2]->ne[1] > GGML_CUDA_MOE_SIDE_MAX_TOKENS) {
+                continue;
+            }
+            for (int k = i + 4; k < std::min(i + 4 + 48, cgraph->n_nodes); k++) {
+                ggml_tensor * node = cgraph->nodes[k];
+                bool reads = false;
+                for (int j = 0; j < GGML_MAX_SRC && !reads; j++) {
+                    const ggml_tensor * src = node->src[j];
+                    reads = src && (src == down || src->view_src == down);
+                }
+                if (reads) {
+                    if (k > i + 4) {
+                        keep(glu, node);
+                        keep(n0->src[1], node);
+                        // the ids and their ancestors (top-k, softmax, the router's logits), read by the publication
+                        std::vector<ggml_tensor *> todo = { n0->src[2] };
+                        for (int d = 0; d < 5 && !todo.empty(); d++) {
+                            std::vector<ggml_tensor *> next;
+                            for (ggml_tensor * t : todo) {
+                                keep(t, node);
+                                ggml_tensor * b = t->view_src ? t->view_src : t;
+                                for (int j = 0; j < GGML_MAX_SRC; j++) {
+                                    if (b->src[j] && b->src[j]->op != GGML_OP_NONE) {
+                                        next.push_back(b->src[j]);
+                                    }
+                                }
+                            }
+                            todo.swap(next);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
         for (int i = 0; i + 5 < cgraph->n_nodes; ++i) {
             ggml_tensor * post = cgraph->nodes[i + 3];
             ggml_tensor * rms  = cgraph->nodes[i + 4];

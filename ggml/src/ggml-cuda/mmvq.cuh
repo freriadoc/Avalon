@@ -29,7 +29,7 @@ void ggml_cuda_op_mul_mat_vec_q(
 void ggml_cuda_moe_cache_mmv(
     ggml_type type0, const char * act_q8, const uint64_t * entries_dev, const int32_t * act_ids_dev,
     float * dst_dev, int64_t n_in, int64_t n_out, int64_t n_hits, int64_t act_rows, cudaStream_t stream,
-    const int32_t * groups = nullptr, int max_group = 1);
+    const int32_t * groups = nullptr, int max_group = 1, bool dense = false, uint32_t * side = nullptr);
 
 // up * GLU(gate) for rows whose up and gate experts (two cache entries) are both resident.
 void ggml_cuda_moe_cache_mmv_fused(
@@ -38,7 +38,15 @@ void ggml_cuda_moe_cache_mmv_fused(
     float * dst_dev, int64_t n_in, int64_t n_out, int64_t n_hits, int64_t act_rows,
     float up_min, float up_max, float gate_min, float gate_max,
     cudaStream_t stream, void * q8_dst = nullptr, int64_t q8_stride = 0, unsigned * q8_count = nullptr,
-    const int32_t * groups = nullptr, int max_group = 1);
+    const int32_t * groups = nullptr, int max_group = 1, bool dense = false, uint32_t * side = nullptr);
+
+// GGML_CUDA_MOE_GU_DOWN (default on with HIP; 0: off): up / gate / SwiGLU, the q8_1 of the result and down of a hosted plan
+// (entries {up, gate, down} x n_hits, then its chunk list at plan + 3 n_hits) in one launch; false when it does not apply
+// (the caller launches the two kernels). chunk_cnt: 2 MOE_GROUP_MAX_ROWS words, zero.
+bool ggml_cuda_moe_cache_mmv_gu_down(
+    ggml_type gtype, ggml_type dtype, const char * act_q8, const uint64_t * plan, const int32_t * act_ids_dev, float * glu_dev,
+    int64_t n_embd, int64_t n_ff, int64_t n_hits, int64_t act_rows, void * q8_mid, int64_t q8_stride, unsigned * q8_count,
+    float * dst_dev, const int32_t * groups, int max_group, unsigned * chunk_cnt, cudaStream_t stream);
 
 // The chunk list of a hosted MoE plan (written by the kernel that copies the plan to the device, read by the grouped
 // kernels): [0] the chunk count, [1 + c] chunk c's row count (1 to MOE_GROUP_COLS), [1 + MOE_GROUP_MAX_ROWS +
@@ -47,3 +55,10 @@ void ggml_cuda_moe_cache_mmv_fused(
 #define MOE_GROUP_MAX_ROWS 64
 #define MOE_GROUP_COLS     4
 #define MOE_GROUP_WORDS    (1 + MOE_GROUP_MAX_ROWS + MOE_GROUP_COLS * MOE_GROUP_MAX_ROWS)
+// after the chunk list of a plan (8-byte aligned, in 32-bit words from its start): each chunk's entries {up, gate, down}
+// (the plan's entries of its first row), written with the list: the kernels read a chunk's entry with the chunk, not
+// after it (one dependent load less before the weights)
+#define MOE_GROUP_ENTRIES_OFF ((MOE_GROUP_WORDS + 1) & ~1)
+#define MOE_GROUP_WORDS_ALL   (MOE_GROUP_ENTRIES_OFF + 6 * MOE_GROUP_MAX_ROWS)
+// written by moe_group_list in the padding word MOE_GROUP_WORDS when the entries follow the list
+#define MOE_GROUP_ENT_MAGIC   0x544e45   // "ENT\0"

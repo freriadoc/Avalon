@@ -1549,19 +1549,113 @@ static __device__ __forceinline__ float vec_dot_iq3_k_q8_1(
 #define VDR_IQ3_KS_Q8_1_MMVQ 4
 #define VDR_IQ3_KS_Q8_1_MMQ  4
 
-static __device__ __forceinline__ float vec_dot_iq3_ks_q8_1(
-    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iiqs) {
-    const block_iq3_ks * bq3 = (const block_iq3_ks *) vbq + kbx;
+// the weight words one vec_dot_iq3_ks_q8_1 reads (a block is 104 bytes: d, extra and the scales in one 8-byte load, qs
+// and qh in 4-byte loads), for a loop that loads them an iteration ahead of their dot products
+struct iq3_ks_words {
+    uint2 head;
+    int   ql[2];
+    int   qh[2];
+};
 
+static __device__ __forceinline__ iq3_ks_words iq3_ks_load(const void * __restrict__ vbq, const int & kbx, const int & iiqs) {
+    const block_iq3_ks * bq3 = (const block_iq3_ks *) vbq + kbx;
+    const int iqs   = iiqs/4;
+    const int ib128 = iqs/4;
+    const int il8   = iqs%4;
+    const int * ql = (const int *) bq3->qs + 8*ib128 + 2*il8;
+    const int * qh = (const int *) bq3->qh + 2*il8;
+    iq3_ks_words w;
+    w.head  = *(const uint2 *) bq3;
+    w.ql[0] = ql[0];
+    w.ql[1] = ql[1];
+    w.qh[0] = qh[0];
+    w.qh[1] = qh[1];
+    return w;
+}
+
+// the activation words of the same dot product: q8[i] of the 4 blocks of 32 (i = 0, 1) and their d
+struct iq3_ks_act {
+    int   q[2][4];
+    float d[4];
+};
+
+static __device__ __forceinline__ iq3_ks_act iq3_ks_act_load(const block_q8_1 * __restrict__ bq8_1, const int & iiqs) {
+    const int iqs   = iiqs/4;
+    const int ib128 = iqs/4;
+    const int il8   = iqs%4;
+    iq3_ks_act a;
+#pragma unroll
+    for (int b = 0; b < 4; ++b) {
+        const int * q8 = (const int *) bq8_1[4*ib128+b].qs + 2*il8;
+#if defined(GGML_USE_HIP)
+        // the two words in one 8-byte load (4-byte aligned: AMD's global loads take it)
+        int2 q2;
+        __builtin_memcpy(&q2, q8, sizeof(q2));
+        a.q[0][b] = q2.x;
+        a.q[1][b] = q2.y;
+#else
+        a.q[0][b] = q8[0];
+        a.q[1][b] = q8[1];
+#endif
+        a.d[b] = __low2float(bq8_1[4*ib128+b].ds);
+    }
+    return a;
+}
+
+// vec_dot_iq3_ks_q8_1 on words already loaded (same operations, same order)
+template <bool iscale = false>
+static __device__ __forceinline__ float vec_dot_iq3_ks_words_act(const iq3_ks_words & w, const iq3_ks_act & a, const int & iiqs) {
+    const int iqs   = iiqs/4;
+    const int ib128 = iqs/4;
+    const uint2 head = w.head;
+    const uint32_t extra = (head.x >> 16) >> 4*ib128;
+    const uint32_t * tab = (const uint32_t *) iq3nl_values;
+    const uint32_t t0 = tab[0], t1 = tab[1], t2 = tab[2], t3 = tab[3];
+    uint32_t lo[4], hi[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const bool g = (extra >> (8 + j)) & 1;
+        lo[j] = g ? t2 : t0;
+        hi[j] = g ? t3 : t1;
+    }
+    int sumi[4] = {0, 0, 0, 0};
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const uint32_t vl = w.ql[i];
+        const uint32_t vh = (uint32_t) w.qh[i] >> 4*ib128;
+        const uint32_t i0 = ((vl >> 0) & 0x03030303) | ((vh << 2) & 0x04040404);
+        const uint32_t i1 = ((vl >> 2) & 0x03030303) | ((vh << 1) & 0x04040404);
+        const uint32_t i2 = ((vl >> 4) & 0x03030303) | ((vh >> 0) & 0x04040404);
+        const uint32_t i3 = ((vl >> 6) & 0x03030303) | ((vh >> 1) & 0x04040404);
+        sumi[0] = ggml_cuda_dp4a(ggml_cuda_perm8(hi[0], lo[0], i0), a.q[i][0], sumi[0]);
+        sumi[1] = ggml_cuda_dp4a(ggml_cuda_perm8(hi[1], lo[1], i1), a.q[i][1], sumi[1]);
+        sumi[2] = ggml_cuda_dp4a(ggml_cuda_perm8(hi[2], lo[2], i2), a.q[i][2], sumi[2]);
+        sumi[3] = ggml_cuda_dp4a(ggml_cuda_perm8(hi[3], lo[3], i3), a.q[i][3], sumi[3]);
+    }
+    const float d = __half2float(__ushort_as_half((unsigned short) (head.x & 0xffff)));
+    const uint32_t sc = ((head.y >> 4*ib128) & 0x0f0f0f0f) | ((((extra & 0x0f) * 0x00204081) & 0x01010101) << 4);
+    const int ls0 = (int) ((sc >>  0) & 0xff) - 16;
+    const int ls1 = (int) ((sc >>  8) & 0xff) - 16;
+    const int ls2 = (int) ((sc >> 16) & 0xff) - 16;
+    const int ls3 = (int) ((sc >> 24) & 0xff) - 16;
+    if constexpr (iscale) {   // the weight scale times the block's sum in integers (exact: |ls * sumi| < 2^24)
+        // 24-bit products (one full-rate instruction; |ls| <= 16, |sumi| < 2^18)
+        return d * (a.d[0] * (float) __mul24(ls0, sumi[0]) + a.d[1] * (float) __mul24(ls1, sumi[1]) +
+                    a.d[2] * (float) __mul24(ls2, sumi[2]) + a.d[3] * (float) __mul24(ls3, sumi[3]));
+    }
+    return d * (a.d[0] * ls0 * sumi[0] + a.d[1] * ls1 * sumi[1] + a.d[2] * ls2 * sumi[2] + a.d[3] * ls3 * sumi[3]);
+}
+
+static __device__ __forceinline__ float vec_dot_iq3_ks_q8_1_words(
+    const iq3_ks_words & w, const block_q8_1 * __restrict__ bq8_1, const int & iiqs) {
     const int iqs   = iiqs/4;
     const int ib128 = iqs/4;  // 0 or 1: weights 0...127 or 128...255
     const int il8   = iqs%4;  // 0...3: weights 8*il8...8*il8+7 of each block of 32
 
-    // a block is 104 bytes: d, extra and the scales in one 8-byte load, qs and qh in 4-byte loads
-    const uint2 head = *(const uint2 *) bq3;
+    const uint2 head = w.head;
     const uint32_t extra = (head.x >> 16) >> 4*ib128;
-    const int * ql = (const int *) bq3->qs + 8*ib128 + 2*il8;
-    const int * qh = (const int *) bq3->qh + 2*il8;
+    const int * ql = w.ql;
+    const int * qh = w.qh;
 
     // the grid bit is the same for the 32 weights of a block, and each 4 weights a thread takes lie in one block: the
     // half of the table (grid or shifted grid) is chosen once per block, then one byte permute per 4 weights on the
@@ -1612,4 +1706,9 @@ static __device__ __forceinline__ float vec_dot_iq3_ks_q8_1(
                 __low2float(bq8_1[4*ib128+1].ds) * ls1 * sumi[1] +
                 __low2float(bq8_1[4*ib128+2].ds) * ls2 * sumi[2] +
                 __low2float(bq8_1[4*ib128+3].ds) * ls3 * sumi[3]);
+}
+
+static __device__ __forceinline__ float vec_dot_iq3_ks_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iiqs) {
+    return vec_dot_iq3_ks_q8_1_words(iq3_ks_load(vbq, kbx, iiqs), bq8_1, iiqs);
 }

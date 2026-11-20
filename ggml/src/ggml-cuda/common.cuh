@@ -1506,6 +1506,11 @@ struct ggml_cuda_stream_context {
 // capacity of the q8_1 reuse buffer (ggml_cuda_q8_1_reuse): larger activations are quantized elsewhere
 #define GGML_CUDA_Q8_1_REUSE_BYTES (1u << 20)
 
+// GGML_CUDA_MOE_SHEXP_STREAM=1: the hosted MoE blocks whose nodes up to the merge run on a second stream, up to
+// this many tokens (generation, MTP verification); graph_optimize keeps their inputs alive for those only (a prompt's
+// graphs keep their allocation)
+#define GGML_CUDA_MOE_SIDE_MAX_TOKENS 8
+
 struct ggml_backend_cuda_context;
 // live backend contexts, for ggml_cuda_prime_queues
 // a product converting its src1 although a producer was given its scratch to write the image there (ggml-cuda.cu)
@@ -1565,6 +1570,7 @@ struct ggml_backend_cuda_context {
         char *        buf   = nullptr;   // allocated once, outside a graph capture
         size_t        size  = 0;
         bool          valid = false;
+        bool          shared = false;    // written by a kernel stream 1 waits for (ggml_cuda_q8_1_claim)
         const float * x     = nullptr;
         int64_t       key[8] = {0};
         const char *  lo    = nullptr;   // bytes of the activation
@@ -1700,7 +1706,17 @@ struct ggml_backend_cuda_context {
     cudaStream_t stream(int device, int stream) {
         if (streams[device][stream] == nullptr) {
             ggml_cuda_set_device(device);
-            CUDA_CHECK(cudaStreamCreateWithFlags(&streams[device][stream], cudaStreamNonBlocking));
+            // with GGML_CUDA_MOE_SHEXP_STREAM: the main stream at the highest priority. HIP gives each instantiated graph a stream for its parallel branches, of normal priority,
+            // bound to the least used hardware queue of that priority: with the launch stream in another priority's pool
+            // they never share its queue (a branch behind the main one would never see the main branch's merge wait end)
+            static const bool high = getenv("GGML_CUDA_MOE_SHEXP_STREAM") && atoi(getenv("GGML_CUDA_MOE_SHEXP_STREAM")) != 0;
+            int least = 0, greatest = 0;
+            if (stream == 0 && high && cudaDeviceGetStreamPriorityRange(&least, &greatest) == cudaSuccess) {
+                CUDA_CHECK(cudaStreamCreateWithPriority(&streams[device][stream], cudaStreamNonBlocking, greatest));
+            } else {
+                (void) cudaGetLastError();
+                CUDA_CHECK(cudaStreamCreateWithFlags(&streams[device][stream], cudaStreamNonBlocking));
+            }
         }
         return streams[device][stream];
     }
@@ -1797,6 +1813,12 @@ struct ggml_cuda_mm_fusion_args_device {
     void *       q8_dst    = nullptr;
     uint32_t     q8_stride = 0;
     unsigned *   q8_count  = nullptr;   // warps done per q8_1 block (zero between launches)
+    // the hosted MoE's shared expert on a stream of its own (mul_mat_vec_q_moe_grouped_ks): its counters {publications,
+    // done, taken, -, blocks done}; down's last block marks the publication k_side_wait took done
+    uint32_t *   side = nullptr;
+    // the grouped kernels: each chunk's entry of the matrix computed (and of its gate), stride 3 (MOE_GROUP_ENTRIES_OFF in
+    // mmvq.cuh), or null: read through the chunk's first row
+    const uint64_t * chunk_ent = nullptr;
 };
 
 struct ggml_cuda_kernel_launch_params {
