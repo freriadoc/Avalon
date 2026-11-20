@@ -2936,16 +2936,21 @@ struct test_rms_norm_mul_rope : public test_case {
 struct test_rms_norm_rope_fwht : public test_case {
     const std::array<int64_t, 4> ne;
     const int mode;
+    const bool gated;   // x a view of rows twice as wide (qwen4exp's Q, each head followed by its gate)
 
     std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "RMS_NORM_ROPE_FWHT"; }
     bool run_whole_graph() override { return true; }
-    std::string vars() override { return VARS_TO_STR2(ne, mode); }
+    std::string vars() override { return VARS_TO_STR3(ne, mode, gated); }
 
-    test_rms_norm_rope_fwht(std::array<int64_t, 4> ne = { 256, 24, 1, 1 }, int mode = GGML_ROPE_TYPE_IMROPE)
-        : ne(ne), mode(mode) {}
+    test_rms_norm_rope_fwht(std::array<int64_t, 4> ne = { 256, 24, 1, 1 }, int mode = GGML_ROPE_TYPE_IMROPE, bool gated = false)
+        : ne(ne), mode(mode), gated(gated) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]);
+        if (gated) {
+            ggml_tensor * qg = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2*ne[0]*ne[1], ne[2], ne[3], 1);
+            x = ggml_view_4d(ctx, qg, ne[0], ne[1], ne[2], ne[3], qg->nb[0]*2*ne[0], qg->nb[1], qg->nb[2], 0);
+        }
         ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
         ggml_tensor * rot = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[0]);
         ggml_set_name(rot, "hadamard");
@@ -11424,6 +11429,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_fwht_gate(n_tokens));
         test_cases.emplace_back(new test_set_rows_padded(n_tokens));
         test_cases.emplace_back(new test_rms_norm_rope_fwht({ 256, 24, n_tokens, 1 }));
+        test_cases.emplace_back(new test_rms_norm_rope_fwht({ 256, 24, n_tokens, 1 }, GGML_ROPE_TYPE_IMROPE, true));
         test_cases.emplace_back(new test_rms_norm_rope_fwht({ 256, 2, n_tokens, 1 }, GGML_ROPE_TYPE_NEOX));
         test_cases.emplace_back(new test_rms_norm_rope_set_rows_q8({ 256, 2, n_tokens, 1 }, GGML_ROPE_TYPE_IMROPE, true, 0));
         test_cases.emplace_back(new test_rms_norm_rope_set_rows_q8({ 128, 1, n_tokens, 1 }, GGML_ROPE_TYPE_IMROPE, false, 128));

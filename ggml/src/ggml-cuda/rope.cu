@@ -700,6 +700,151 @@ static __global__ void rms_norm_mul_rope_f32(const rms_norm_mul_rope_args a) {
     rms_norm_mul_rope_f32_body<block_size, has_ff, D>(a, blockIdx.x, blockIdx.y, blockIdx.z);
 }
 
+// the same with a wave a row, 8 rows a block, for rows of EL*32 floats whose rope pairs values n_dims/2 = JH*32 apart
+// (NeoX, M-RoPE): lane l holds the values j*32 + l, both values of a pair in the lane, the norm summed by shuffles, the
+// rotation and the Q8_0 rows as the block kernel's warp makes them (its register layout), nothing in shared memory.
+// The block kernel takes 256 threads a row, half of them idle in the rope and all but a warp in the rotation (~12 ns a
+// row). RX 7900 XT, a prompt of 19k, qwen4exp's Q, K and indexer query in its QSA layers: 91 -> 21 ms (Q had gone by a
+// norm, rope_multi and fwht_cuda: 0.28 + 0.86 + 0.26 ms a slice of 3.8k queries). GGML_CUDA_ROPE_WAVE=0: the block kernel.
+template <int EL, int JH, bool has_ff>
+static __global__ void __launch_bounds__(256) rms_norm_mul_rope_f32_wave(const rms_norm_mul_rope_args a) {
+    static_assert(2*JH <= EL, "the pairs inside the row");
+    ggml_cuda_pdl_lc();
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int64_t r = (int64_t) blockIdx.x*(blockDim.x/WARP_SIZE) + threadIdx.x/WARP_SIZE;
+    if (r >= (int64_t) a.n_rows*a.n_channels*a.n_samples) {
+        return;
+    }
+    const int row     = r % a.n_rows;
+    const int channel = (r / a.n_rows) % a.n_channels;
+    const int sample  = r / ((int64_t) a.n_rows*a.n_channels);
+
+    const float * x   = a.x + sample*a.s03 + channel*a.s02 + row*a.s01;
+    const float * mul = a.mul + fastmodulo(sample, a.mul_nsamples_packed)*a.mul_s03 +
+        fastmodulo(channel, a.mul_nchannels_packed)*a.mul_s02 + fastmodulo(row, a.mul_nrows_packed)*a.mul_s01;
+
+    ggml_cuda_pdl_sync();
+    float v[EL];
+    float tmp = 0.0f;
+#pragma unroll
+    for (int j = 0; j < EL; ++j) {
+        v[j] = x[j*WARP_SIZE + lane];
+        tmp += v[j]*v[j];
+    }
+    tmp = warp_reduce_sum(tmp);
+    const float scale = rsqrtf(tmp/(EL*WARP_SIZE) + a.eps);
+#pragma unroll
+    for (int j = 0; j < EL; ++j) {
+        v[j] = scale*v[j]*mul[fastmodulo(j*WARP_SIZE + lane, a.mul_ncols_packed)];
+    }
+
+    // pair p = j*32 + lane (j < JH): values p and p + n_dims/2, as the block kernel's i0 = 2p
+#pragma unroll
+    for (int j = 0; j < JH; ++j) {
+        const int p = j*WARP_SIZE + lane;
+        int ip = channel;
+        if (a.mrope != 0) {
+            const int sect_dims = a.sections.v[0] + a.sections.v[1] + a.sections.v[2] + a.sections.v[3];
+            const int sec_w     = a.sections.v[1] + a.sections.v[0];
+            const int sector    = p % sect_dims;
+            int k = 0;
+            if (a.mrope == 2) {
+                k = sector % 3 == 1 && sector < 3 * a.sections.v[1] ? 1 :
+                    sector % 3 == 2 && sector < 3 * a.sections.v[2] ? 2 :
+                    sector % 3 == 0 && sector < 3 * a.sections.v[0] ? 0 : 3;
+            } else {
+                k = sector < a.sections.v[0] ? 0 : sector < sec_w ? 1 : sector < sec_w + a.sections.v[2] ? 2 : 3;
+            }
+            ip = channel + a.n_channels * k;
+        }
+        const float theta_base  = a.pos[ip]*powf(a.theta_scale, (2*p)/2.0f);
+        const float freq_factor = has_ff ? a.freq_factors[p] : 1.0f;
+        float cos_theta;
+        float sin_theta;
+        rope_yarn<true>(theta_base/freq_factor, a.freq_scale, a.corr_dims, 2*p, a.ext_factor, a.attn_factor, cos_theta, sin_theta);
+        const float x0 = v[j];
+        const float x1 = v[j + JH];
+        v[j]      = x0*cos_theta - x1*sin_theta;
+        v[j + JH] = x0*sin_theta + x1*cos_theta;
+    }
+
+    if (a.fwht_scale != 0.0f) {
+        if constexpr (EL == 8) {   // fwht_cuda<256>'s arithmetic, as the block kernel's warp
+#pragma unroll
+            for (int i = 0; i < EL; ++i) {
+                v[i] *= a.fwht_scale;
+            }
+#pragma unroll
+            for (int h = 1; h < WARP_SIZE; h *= 2) {
+#pragma unroll
+                for (int j = 0; j < EL; j++) {
+                    const float val  = v[j];
+                    const float val2 = __shfl_xor_sync(0xFFFFFFFF, val, h, WARP_SIZE);
+                    v[j] = (lane & h) == 0 ? val + val2 : val2 - val;
+                }
+            }
+#pragma unroll
+            for (int h = WARP_SIZE; h < EL*WARP_SIZE; h *= 2) {
+                const int step = h / WARP_SIZE;
+#pragma unroll
+                for (int j = 0; j < EL; j += 2 * step) {
+#pragma unroll
+                    for (int k = 0; k < step; k++) {
+                        const float p0 = v[j + k];
+                        const float p1 = v[j + k + step];
+                        v[j + k]        = p0 + p1;
+                        v[j + k + step] = p0 - p1;
+                    }
+                }
+            }
+        }
+    }
+    if (a.dst_q8 != nullptr) {
+        quantize_warp_q8_0_n<EL>(v, a.dst_q8 + row*EL + a.row_indices[channel]*a.set_rows_stride, lane, EL);
+        return;
+    }
+    float * dst = (float *) a.dst;
+    int64_t idst = sample*a.s3 + channel*a.s2 + row*a.s1;
+    if (a.set_rows_stride != 0) {
+        idst = row*a.s1 + a.row_indices[channel]*a.set_rows_stride;
+    }
+#pragma unroll
+    for (int j = 0; j < EL; ++j) {
+        dst[idst + j*WARP_SIZE + lane] = v[j];
+    }
+}
+
+// the wave kernel for these rows, or false (GGML_CUDA_ROPE_WAVE=0: never)
+template <int EL, int JH>
+static bool rms_norm_mul_rope_wave_launch(const rms_norm_mul_rope_args & a, const int ncols, cudaStream_t stream) {
+    if (ncols != EL*WARP_SIZE || a.n_dims != 2*JH*WARP_SIZE) {
+        return false;
+    }
+    const int64_t n = (int64_t) a.n_rows*a.n_channels*a.n_samples;
+    const int rows_per_block = 256/WARP_SIZE;
+    const int64_t nb = (n + rows_per_block - 1)/rows_per_block;
+    if (nb > INT_MAX) {
+        return false;
+    }
+    const ggml_cuda_kernel_launch_params launch_params = {dim3((unsigned) nb, 1, 1), dim3(256, 1, 1), 0, stream};
+    if (a.freq_factors == nullptr) {
+        ggml_cuda_kernel_launch(rms_norm_mul_rope_f32_wave<EL, JH, false>, launch_params, a);
+    } else {
+        ggml_cuda_kernel_launch(rms_norm_mul_rope_f32_wave<EL, JH, true>, launch_params, a);
+    }
+    return true;
+}
+
+static bool rms_norm_mul_rope_wave(const rms_norm_mul_rope_args & a, const int ncols, cudaStream_t stream) {
+    static const bool on = !getenv("GGML_CUDA_ROPE_WAVE") || atoi(getenv("GGML_CUDA_ROPE_WAVE")) != 0;
+    if (!on || !a.is_neox || (a.fwht_scale != 0.0f && ncols != 256)) {
+        return false;
+    }
+    return rms_norm_mul_rope_wave_launch<8, 1>(a, ncols, stream) || rms_norm_mul_rope_wave_launch<8, 2>(a, ncols, stream) ||
+           rms_norm_mul_rope_wave_launch<8, 4>(a, ncols, stream) || rms_norm_mul_rope_wave_launch<4, 1>(a, ncols, stream) ||
+           rms_norm_mul_rope_wave_launch<4, 2>(a, ncols, stream);
+}
+
 template <typename D>
 static void rms_norm_mul_rope_cuda(
         const float * x, D * dst,
@@ -747,6 +892,12 @@ static void rms_norm_mul_rope_cuda(
         return;
     }
     ggml_cuda_mk_direct(mk, stream);
+
+    if constexpr (std::is_same_v<D, float>) {
+        if (rms_norm_mul_rope_wave(a, ncols, stream)) {
+            return;
+        }
+    }
 
     if (ncols < 1024) {
         const dim3 block_dims(256, 1, 1);

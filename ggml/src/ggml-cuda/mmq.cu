@@ -276,6 +276,8 @@ size_t ggml_cuda_moe_down_rows_gate_scratch(const ggml_tensor * gate, const ggml
         (size_t) std::max<int64_t>(rows - held, 0)*row;
 }
 
+bool ggml_cuda_dense_f16_applies(int cc, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
+
 size_t ggml_cuda_mmq_scratch_size(const ggml_tensor * dst, int cc, int64_t key[GGML_CUDA_MMQ_SCRATCH_KEY]) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -302,11 +304,17 @@ size_t ggml_cuda_mmq_scratch_size(const ggml_tensor * dst, int cc, int64_t key[G
         key[8] = ids->ne[1];
         key[9] = src0->ne[2];
     }
-    return mmq_scratch_get_layout(dst, cc).size;
+    const size_t act = mmq_scratch_get_layout(dst, cc).size;
+    // the FP16 product decodes the whole weight into the scratch in place of the quantized activation: one launch
+    // instead of slices of rows (the QSA layer's Q of a slice of 3.8k queries, 12288 rows, went by 6 of 2048; RX 7900 XT,
+    // a prompt of 19k: its products 330 -> 320 ms, the compute buffer unchanged)
+    if (!ids && ggml_cuda_dense_f16_applies(cc, src0, src1, dst)) {
+        return std::max(act, (size_t) src0->ne[0]*src0->ne[1]*sizeof(half));
+    }
+    return act;
 }
 
 size_t ggml_cuda_dense_f16_min_bytes(const ggml_tensor * src0);
-bool ggml_cuda_dense_f16_applies(int cc, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
 void ggml_cuda_dense_f16(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, char * w16, size_t w16_bytes,
         cudaStream_t stream, const void * x16 = nullptr);
 

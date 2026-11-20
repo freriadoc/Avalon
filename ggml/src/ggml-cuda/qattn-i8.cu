@@ -386,6 +386,19 @@ struct qattn_f16_smem {
     float   mrow[16];
 };
 
+// KSC (GGML_CUDA_QATTN_KSC=0: off): K's codes go to the products as they are (exact in FP16), each product over one q8_0
+// block in its own accumulator, the cell's scale applied after them in FP32 (the lane's column is its cell), as the
+// fork's int8 K does; off, the codes enter with their block's scale (a packed product per two values).
+// ALN (GGML_CUDA_QATTN_ALN=0: off): K's and V's rows read as the 4-byte aligned words they are, when the rows and their
+// strides are (qattn_f16_launch): a wave's two blocks of K are the 68 bytes from byte 68w of the row, of V the 36 bytes
+// from 36w, read by 16-byte loads of 4-byte alignment, the codes then realigned by a byte shift. Off, 16-byte copies
+// the compiler only knows 2-byte aligned (a block is 34 or 18 bytes), which it splits into 4-byte loads: 68 of them
+// against the fork's 28 of 16 bytes. RX 7900 XT, 9536 queries of 2048 cells over 24576, standalone bench: 29.8 ms, KSC
+// 29.3, KSC + ALN 26.5 (the fork's kernel on its int8 K / V: 29.3), the same output bit for bit with and without ALN;
+// a prompt of 19k: the attention 660 -> 589 ms (the fork's: 616).
+typedef uint32_t qattn_u4a __attribute__((ext_vector_type(4), aligned(4)));
+
+template <bool KSC, bool ALN>
 static __global__ void __launch_bounds__(128) k_qattn_f16(const qattn_args a) {
 #if defined(GGML_USE_HIP)
     __shared__ __align__(16) qattn_f16_smem S;
@@ -449,23 +462,60 @@ static __global__ void __launch_bounds__(128) k_qattn_f16(const qattn_args a) {
         uint32_t vr[2][4];
         half vsc[2];
         const half rm = mq[ci*32 + lane];
+        if constexpr (ALN) {
+            // 9 words from byte 36w: block 2w's scale in the low half of word 0, its codes from byte 2 (shifted), block
+            // 2w+1's scale in the high half of word 4, its codes the words 5 .. 8
+            const uint32_t * vp = (const uint32_t *) (Vg + row*a.sV1 + warp*36);
+            const qattn_u4a v0 = *(const qattn_u4a *) vp, v1 = *(const qattn_u4a *) (vp + 4);
+            const uint32_t d[9] = {v0[0], v0[1], v0[2], v0[3], v1[0], v1[1], v1[2], v1[3], vp[8]};
+            vsc[0] = __builtin_bit_cast(half, (uint16_t) (d[0] & 0xFFFFu));
+            vsc[1] = __builtin_bit_cast(half, (uint16_t) (d[4] >> 16));
 #pragma unroll
-        for (int b = 0; b < 2; ++b) {
-            const char * vp = Vg + row*a.sV1 + (2*warp + b)*18;
-            vsc[b] = *(const half *) vp;
-            memcpy(vr[b], vp + 2, 16);
+            for (int j = 0; j < 4; ++j) {
+                vr[0][j] = __builtin_amdgcn_alignbyte(d[j + 1], d[j], 2);
+                vr[1][j] = d[5 + j];
+            }
+        } else {
+#pragma unroll
+            for (int b = 0; b < 2; ++b) {
+                const char * vp = Vg + row*a.sV1 + (2*warp + b)*18;
+                vsc[b] = *(const half *) vp;
+                memcpy(vr[b], vp + 2, 16);
+            }
         }
         uint32_t kx[2][4][4];
         half ksc[2][2];
 #pragma unroll
         for (int nt = 0; nt < 2; ++nt) {
             const int32_t ix = __shfl_sync(0xFFFFFFFFu, index, nt*16 + col, 32);
-            const char * kp = Kg + (int64_t) (ix ^ (ix >> 31))*a.sK1 + (2*warp)*34;
-            ksc[nt][0] = *(const half *) kp;
-            ksc[nt][1] = *(const half *) (kp + 34);
+            if constexpr (ALN) {
+                // 17 words from byte 68w: block 2w's scale in the low half of word 0, its codes from byte 2 (shifted),
+                // block 2w+1's scale in the high half of word 8, its codes the words 9 .. 16
+                const uint32_t * kp = (const uint32_t *) (Kg + (int64_t) (ix ^ (ix >> 31))*a.sK1 + warp*68);
+                uint32_t d[17];
 #pragma unroll
-            for (int kk = 0; kk < 4; ++kk) {
-                memcpy(kx[nt][kk], kp + (kk >> 1)*34 + 2 + (kk & 1)*16, 16);
+                for (int q = 0; q < 4; ++q) {
+                    const qattn_u4a w4 = *(const qattn_u4a *) (kp + 4*q);
+                    d[4*q] = w4[0]; d[4*q + 1] = w4[1]; d[4*q + 2] = w4[2]; d[4*q + 3] = w4[3];
+                }
+                d[16] = kp[16];
+                ksc[nt][0] = __builtin_bit_cast(half, (uint16_t) (d[0] & 0xFFFFu));
+                ksc[nt][1] = __builtin_bit_cast(half, (uint16_t) (d[8] >> 16));
+#pragma unroll
+                for (int w = 0; w < 4; ++w) {
+                    kx[nt][0][w] = __builtin_amdgcn_alignbyte(d[w + 1], d[w], 2);
+                    kx[nt][1][w] = __builtin_amdgcn_alignbyte(d[w + 5], d[w + 4], 2);
+                    kx[nt][2][w] = d[9 + w];
+                    kx[nt][3][w] = d[13 + w];
+                }
+            } else {
+                const char * kp = Kg + (int64_t) (ix ^ (ix >> 31))*a.sK1 + (2*warp)*34;
+                ksc[nt][0] = *(const half *) kp;
+                ksc[nt][1] = *(const half *) (kp + 34);
+#pragma unroll
+                for (int kk = 0; kk < 4; ++kk) {
+                    memcpy(kx[nt][kk], kp + (kk >> 1)*34 + 2 + (kk & 1)*16, 16);
+                }
             }
         }
         // V's codes as int8, its scales
@@ -487,6 +537,7 @@ static __global__ void __launch_bounds__(128) k_qattn_f16(const qattn_args a) {
 #pragma unroll
         for (int nt = 0; nt < 2; ++nt) {
             qattn_f8 s = (qattn_f8) 0.0f;
+            qattn_f8 sb[2] = {(qattn_f8) 0.0f, (qattn_f8) 0.0f};
 #pragma unroll
             for (int kk = 0; kk < 4; ++kk) {
                 const _Float16 d = __builtin_bit_cast(_Float16, ksc[nt][kk >> 1]);
@@ -495,15 +546,28 @@ static __global__ void __launch_bounds__(128) k_qattn_f16(const qattn_args a) {
 #pragma unroll
                 for (int w = 0; w < 4; ++w) {
                     const uint32_t u = kx[nt][kk][w] ^ 0x80808080u;
-                    hw[2*w]     = __builtin_bit_cast(uint32_t, (__builtin_bit_cast(qattn_h2, __builtin_amdgcn_perm(0x64646464u, u, 0x07010700u)) + off)*sc);
-                    hw[2*w + 1] = __builtin_bit_cast(uint32_t, (__builtin_bit_cast(qattn_h2, __builtin_amdgcn_perm(0x64646464u, u, 0x07030702u)) + off)*sc);
+                    const qattn_h2 c0 = __builtin_bit_cast(qattn_h2, __builtin_amdgcn_perm(0x64646464u, u, 0x07010700u)) + off;
+                    const qattn_h2 c1 = __builtin_bit_cast(qattn_h2, __builtin_amdgcn_perm(0x64646464u, u, 0x07030702u)) + off;
+                    hw[2*w]     = __builtin_bit_cast(uint32_t, KSC ? c0 : c0*sc);
+                    hw[2*w + 1] = __builtin_bit_cast(uint32_t, KSC ? c1 : c1*sc);
                 }
                 struct { uint32_t w[8]; } tb;
 #pragma unroll
                 for (int w = 0; w < 8; ++w) {
                     tb.w[w] = hw[w];
                 }
-                s = qattn_wmma(qh[kk], __builtin_bit_cast(qattn_h16, tb), s);
+                if constexpr (KSC) {
+                    sb[kk >> 1] = qattn_wmma(qh[kk], __builtin_bit_cast(qattn_h16, tb), sb[kk >> 1]);
+                } else {
+                    s = qattn_wmma(qh[kk], __builtin_bit_cast(qattn_h16, tb), s);
+                }
+            }
+            if constexpr (KSC) {
+                const float d0 = __half2float(ksc[nt][0]), d1 = __half2float(ksc[nt][1]);
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    s[i] = sb[0][i]*d0 + sb[1][i]*d1;
+                }
             }
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
@@ -610,6 +674,31 @@ static __global__ void __launch_bounds__(128) k_qattn_f16(const qattn_args a) {
 // tiles of 16 / int8 / FP16 a query: 16.3 / 32.9 / 28.5 ms at 4.9k cells, 21.4 / 33.5 / 29.0 at 9.7k, 26.8 / 34.0 / 29.3
 // at 16k, 31.4 / 34.3 / 29.5 at 25k, 35.0 / 34.5 / 29.6 at 33k, 50.7 / 35.0 / 30.0 at 66k, 54.3 / 35.9 / 30.8 at 262k;
 // against FP64 the largest error 1e-5 (0.01 %) where the int8's is 1.8e-4 (0.20 %)
+static bool qattn_ksc() {
+    static const bool on = !getenv("GGML_CUDA_QATTN_KSC") || atoi(getenv("GGML_CUDA_QATTN_KSC")) != 0;
+    return on;
+}
+
+// the k_qattn_f16 variant for these rows: KSC (qattn_ksc), ALN when the rows are 4-byte aligned (GGML_CUDA_QATTN_ALN=0: never)
+static void qattn_f16_launch(const qattn_args & a, const dim3 grid, const dim3 block, cudaStream_t stream) {
+    static const bool aln_on = !getenv("GGML_CUDA_QATTN_ALN") || atoi(getenv("GGML_CUDA_QATTN_ALN")) != 0;
+    const bool aln = aln_on && (uintptr_t) a.K % 4 == 0 && (uintptr_t) a.V % 4 == 0 && a.sK1 % 4 == 0 && a.sK2 % 4 == 0 &&
+        a.sV1 % 4 == 0 && a.sV2 % 4 == 0;
+    if (qattn_ksc()) {
+        if (aln) {
+            k_qattn_f16<true, true><<<grid, block, 0, stream>>>(a);
+        } else {
+            k_qattn_f16<true, false><<<grid, block, 0, stream>>>(a);
+        }
+    } else {
+        if (aln) {
+            k_qattn_f16<false, true><<<grid, block, 0, stream>>>(a);
+        } else {
+            k_qattn_f16<false, false><<<grid, block, 0, stream>>>(a);
+        }
+    }
+}
+
 static bool qattn_f16_on(const int cc) {
     static const bool on = !getenv("GGML_CUDA_QATTN_F16") || atoi(getenv("GGML_CUDA_QATTN_F16")) != 0;
     return on && GGML_CUDA_CC_IS_RDNA3(cc);
@@ -986,7 +1075,7 @@ void ggml_cuda_qattn_i8(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
         k_qattn_i8_nv<<<grid, block, 0, ctx.stream()>>>(a);
     } else if (qattn_f16_on(cc)) {
-        k_qattn_f16<<<grid, block, 0, ctx.stream()>>>(a);
+        qattn_f16_launch(a, grid, block, ctx.stream());
     } else {
         k_qattn_i8<<<grid, block, 0, ctx.stream()>>>(a);
     }
@@ -1099,7 +1188,7 @@ void ggml_cuda_qattn_i8_bench(int device) {
         if (nv) {
             k_qattn_i8_nv<<<grid, block>>>(a);
         } else if (f16) {
-            k_qattn_f16<<<grid, block>>>(a);
+            qattn_f16_launch(a, grid, block, 0);
         } else {
             k_qattn_i8<<<grid, block>>>(a);
         }
@@ -1111,7 +1200,7 @@ void ggml_cuda_qattn_i8_bench(int device) {
     }
     {
         cudaFuncAttributes attr = {};
-        if (cudaFuncGetAttributes(&attr, nv ? (const void *) k_qattn_i8_nv : f16 ? (const void *) k_qattn_f16 : (const void *) k_qattn_i8) == cudaSuccess) {
+        if (cudaFuncGetAttributes(&attr, nv ? (const void *) k_qattn_i8_nv : f16 ? (qattn_ksc() ? (const void *) k_qattn_f16<true, true> : (const void *) k_qattn_f16<false, true>) : (const void *) k_qattn_i8) == cudaSuccess) {
             printf("qattn %s kernel:", f16 ? "f16" : "i8");
             printf(" %d registers, %zu bytes of scratch a thread, %zu bytes of shared memory\n",
                 (int) attr.numRegs, (size_t) attr.localSizeBytes, (size_t) attr.sharedSizeBytes);

@@ -1754,22 +1754,23 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_qsa_sliced(
         return ggml_reshape_1d(ctx0, ggml_cont(ctx0, p), n*n_pos);
     };
 
-    std::vector<ggml_tensor *> outs;
+    // the slices' outputs: the first one padded to the whole length, the others copied in place into it (each output
+    // copied once, the pad's zeros written once; joined by pairs, the outputs were copied log2(slices) times)
+    ggml_tensor * out = nullptr;
     for (int64_t t0 = 0; t0 < n_tokens; t0 += sel.n_att_slice) {
         const int64_t n   = std::min(sel.n_att_slice, n_tokens - t0);
         ggml_tensor * cur_s = ggml_view_2d(ctx0, cur, cur->ne[0], n, cur->nb[1], t0*cur->nb[1]);
         ggml_tensor * Qf = build_lora_mm(model.layers[il].wq, cur_s, model.layers[il].wq_s); // [n_embd_head * 2 * n_head, n]
         cb(Qf, "Qcur_full", il);
+        // the norm, the rope and the rotation of Q next to each other in the graph (the positions before, the gate
+        // after): a backend fuses them into one pass over Q
+        ggml_tensor * pos_s = pos_of(t0, n);
+        ggml_build_forward_expand(gf, pos_s);
         ggml_tensor * Q = ggml_view_3d(ctx0, Qf, n_embd_head, n_head, n,
             ggml_element_size(Qf) * n_embd_head * 2, ggml_element_size(Qf) * n_embd_head * 2 * n_head, 0);
         Q = build_norm(Q, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
         cb(Q, "Qcur_normed", il);
-        ggml_tensor * gate = ggml_view_3d(ctx0, Qf, n_embd_head, n_head, n,
-            ggml_element_size(Qf) * n_embd_head * 2, ggml_element_size(Qf) * n_embd_head * 2 * n_head,
-            ggml_element_size(Qf) * n_embd_head);
-        gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n);
-        cb(gate, "gate_reshaped", il);
-        Q = ggml_rope_multi(ctx0, Q, pos_of(t0, n), nullptr,
+        Q = ggml_rope_multi(ctx0, Q, pos_s, nullptr,
                 n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
                 ext_factor, attn_factor, beta_fast, beta_slow);
         cb(Q, "Qcur", il);
@@ -1777,6 +1778,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_qsa_sliced(
             Q = llama_mul_mat_hadamard(ctx0, Q, mctx_cur->layer_rot(inp->self_k_rot, il));
         }
         ggml_build_forward_expand(gf, Q);
+        ggml_tensor * gate = ggml_view_3d(ctx0, Qf, n_embd_head, n_head, n,
+            ggml_element_size(Qf) * n_embd_head * 2, ggml_element_size(Qf) * n_embd_head * 2 * n_head,
+            ggml_element_size(Qf) * n_embd_head);
+        gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n);
+        cb(gate, "gate_reshaped", il);
         ggml_tensor * tiles = sel.tiles_slice(t0, n);
         ggml_tensor * o = build_attn_mha(Q, k, v, nullptr, tiles, nullptr, nullptr, n_sel, kq_scale, il);
         cb(o, "kqv_out", il);
@@ -1792,20 +1798,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_qsa_sliced(
         cb(o, "attn_output", il);
         // queued now: the next slice reuses this one's memory
         ggml_build_forward_expand(gf, o);
-        outs.push_back(o);
-    }
-    // joined by pairs: each output copied log2(slices) times instead of up to slices times
-    while (outs.size() > 1) {
-        std::vector<ggml_tensor *> next;
-        for (size_t i = 0; i + 1 < outs.size(); i += 2) {
-            next.push_back(ggml_concat(ctx0, outs[i], outs[i + 1], 1));
+        if (out == nullptr) {
+            out = n < n_tokens ? ggml_pad(ctx0, o, 0, (int) (n_tokens - n), 0, 0) : o;
+        } else {
+            out = ggml_set_2d_inplace(ctx0, out, o, out->nb[1], t0*out->nb[1]);
         }
-        if (outs.size() % 2) {
-            next.push_back(outs.back());
-        }
-        outs.swap(next);
+        ggml_build_forward_expand(gf, out);
     }
-    return outs[0];
+    return out;
 }
 
 ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
