@@ -3587,6 +3587,7 @@ struct ggml_cuda_host_bounce {
     char *     host = nullptr; // the slots, pinned
     void *     dev = nullptr;  // the same, as the device sees it
     cudaEvent_t done[ggml_cuda_host_bounce_slots] = {};
+    cudaEvent_t entry = nullptr;   // the caller's stream at the call: the kernels start after its earlier work
     cudaStream_t stream = nullptr; // the kernels' own: never a graph, so a slot's event tracks its kernel alone
     std::mutex mu;
     int next = 0; // the slot the next copy takes, round-robin
@@ -3634,15 +3635,32 @@ bool ggml_cuda_host_copy_bounce(char * dst, size_t dpitch, const char * src, siz
                 return false;
             }
         }
-        if (hipStreamCreate(&b.stream) != hipSuccess) {
+        if (hipStreamCreate(&b.stream) != hipSuccess ||
+            cudaEventCreateWithFlags(&b.entry, cudaEventDisableTiming) != cudaSuccess) {
             (void) cudaGetLastError();
             for (int i = 0; i < ggml_cuda_host_bounce_slots; ++i) {
                 (void) cudaEventDestroy(b.done[i]);
                 b.done[i] = nullptr;
             }
+            b.entry = nullptr;
             b.host = nullptr;
             return false;
         }
+    }
+    // The kernels write dst from their own stream, so they must first wait for what the caller's stream queued before
+    // this copy: a cudaMemcpyAsync on that stream did. Without it they overwrote memory still being read: a prefill ring
+    // entry (its copy stream had waited for the group that reads it last) or a prefetch slot (the previous layer's
+    // kernels): on an RX 7800 XT under Windows, where every expert is copied from the mapping, 100k-token prompts
+    // answered "!!!!..." and generation at that depth fell from ~67 to ~42 t/s with the MTP draft's acceptance from 0.77
+    // to 0.15. A capturing caller cannot hand an event to another stream: its copy stays with cudaMemcpyAsync
+    {
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess || capture != cudaStreamCaptureStatusNone) {
+            (void) cudaGetLastError();
+            return false;
+        }
+        CUDA_CHECK(cudaEventRecord(b.entry, stream));
+        CUDA_CHECK(cudaStreamWaitEvent(b.stream, b.entry, 0));
     }
     const bool flat = height <= 1 || (dpitch == width && spitch == width);
     const size_t total = flat ? width * height : 0;
