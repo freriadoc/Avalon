@@ -7969,7 +7969,7 @@ struct moe_hosted_state {
     // DIAGNOSTIC (GGML_CUDA_MOE_TIMELINE): host times per layer (seq % MOE_TL_RING): publication seen, plan flag
     // written, CPU rows' flag written (ns); sums of the derived intervals; the host's stream queries
     std::vector<int64_t> tl_host;
-    double tl_sum[20] = {0};
+    double tl_sum[28] = {0};
     double tlk_sum[8][10] = {};   // EXPERT SPLIT: per other card, its chain (moe_tl_account)
     int64_t tl_n = 0, tl_nw = 0, tl_q_n = 0, tl_q_ns = 0;
     double tl_tick_ns = 0;
@@ -8047,6 +8047,7 @@ static T * moe_hosted_device_ptr(T * host) {
 // flag written, CPU rows' flag written. No clock synchronization: the relays (GPU -> host -> GPU) come out of
 // differences of durations measured on one side each.
 #define MOE_TL_RING 1024
+#define MOE_TL_W 16   // the stamps of a layer in g_tl_h ([8] plan copied, [9] chunk list written: the entry kernel)
 static unsigned long long * g_tl_h = nullptr;   // host view
 static unsigned long long * g_tl_m = nullptr;   // device view of the same memory
 // EXPERT SPLIT: each other card's chain, per publication (seq % MOE_TL_RING) x 8, its own clock: [0] the chain reached the
@@ -8444,6 +8445,29 @@ static __device__ void moe_group_list(const uint64_t * up, int rows, int32_t * g
     }
 }
 
+// GGML_CUDA_MOE_HOST_LIST=0: the plan's chunk list made on the device, by one block of the entry kernel after the plan's copy
+// (3.6 us per layer on its path, timeline) instead of by the host with the plan (moe_group_list_host) and copied with it.
+// RX 7900 XT, 20 Nov.: replay 19k T=3 20.120 against 20.244 ms per pass (-0.6 %, 8 pairs of 8); tg-bench MTP step equal
+// (22.58 against 22.55 ms, 4 + 4, the two pairs of runs in opposite directions)
+static bool moe_host_list() {
+    static const bool on = !getenv("GGML_CUDA_MOE_HOST_LIST") || atoi(getenv("GGML_CUDA_MOE_HOST_LIST")) != 0;
+    return on;
+}
+// the plan (n_plan words) and, from the host (list), its chunk list up to the entries of rows = n_plan / 3 chunks, by 16
+// bytes a thread (both buffers 16-byte aligned); else the plan alone. The block's threads
+static __device__ void moe_plan_copy(const volatile uint64_t * m_plan, uint64_t * d_plan, int n_plan, bool list) {
+    const int n = list ? n_plan + (MOE_GROUP_ENTRIES_OFF + 6 * (n_plan / 3) + 1) / 2 : n_plan;
+    // plain loads (the caller acquired the flag and synchronized the block): in flight together
+    const uint4 * src = (const uint4 *) m_plan;
+    uint4 * dst = (uint4 *) d_plan;
+    for (int i = threadIdx.x; i < n / 2; i += blockDim.x) {
+        dst[i] = src[i];
+    }
+    if ((n & 1) && threadIdx.x == 0) {
+        d_plan[n - 1] = ((const uint64_t *) m_plan)[n - 1];
+    }
+}
+
 static __global__ void k_moe_hosted_enter(const float * act, float * h_act, block_q8_0 * h_act8, int64_t n_act,
                                           const float * tk_logits, float * tk_weights, float tk_clamp, float tk_scale,
                                           int32_t * ids, int64_t ids_nb1, int32_t * h_ids, int n_used, int n_tokens,
@@ -8452,13 +8476,20 @@ static __global__ void k_moe_hosted_enter(const float * act, float * h_act, bloc
                                           const volatile uint64_t * m_plan, uint64_t * d_plan, int n_plan,
                                           volatile unsigned long long * tl, const moe_router_args rt,
                                           const float * w_src, float * h_w, uint32_t * side,
-                                          block_q8_1 * d_act8, int64_t n_embd, int64_t padded_embd) {
+                                          block_q8_1 * d_act8, int64_t n_embd, int64_t padded_embd, bool host_list) {
     if (side && !d_act8 && blockIdx.x == 0 && threadIdx.x == 0) {
         atomicAdd(side, 1u);   // SHEXP_STREAM: stream 1 may start the nodes after this block (its activations are ready)
     }
     // this layer's publication number (d_seq[0] moves at the publication, after block 0 has read the router's rows): the
     // tag of the router's rows
     const uint32_t pub_tag = d_seq[0] + 1;
+    // DIAGNOSTIC (GGML_CUDA_MOE_TIMELINE): block 0's start [5], the router's rows ready [6], the top-k and its ids done [7]
+    volatile unsigned long long * tl0 = tl && blockIdx.x == 0 && threadIdx.x == 0 ? tl + (pub_tag % MOE_TL_RING) * MOE_TL_W : nullptr;
+    if (tl0) {
+        tl0[6] = 0;   // set below only on the in-kernel top-k's path
+        tl0[7] = 0;
+        tl0[5] = moe_tl_clock();
+    }
     // the router's workgroups after the entry's MOE_HOSTED_ENTER_BLOCKS
     if ((int) blockIdx.x >= MOE_HOSTED_ENTER_BLOCKS) {
         moe_router_row(rt, (int) blockIdx.x - MOE_HOSTED_ENTER_BLOCKS, pub_tag);
@@ -8563,6 +8594,9 @@ static __global__ void k_moe_hosted_enter(const float * act, float * h_act, bloc
                 __syncthreads();
                 ggml_cuda_fence_acquire_device();
             }
+            if (tl0) {
+                tl0[6] = moe_tl_clock();
+            }
             const int warp = threadIdx.x / WARP_SIZE;
             const int t    = warp < n_tokens ? warp : n_tokens - 1;
             topk_moe_config config;
@@ -8581,6 +8615,9 @@ static __global__ void k_moe_hosted_enter(const float * act, float * h_act, bloc
                 if (h_w) {
                     h_w[i] = tk_weights[i];   // PSUM: the weights the top-k just wrote, for the other cards
                 }
+            }
+            if (tl0) {
+                tl0[7] = moe_tl_clock();
             }
         }
     } else {
@@ -8612,9 +8649,9 @@ static __global__ void k_moe_hosted_enter(const float * act, float * h_act, bloc
         mail->slot     = slot;
         mail->n_tokens = (uint32_t) n_tokens;
         if (tl) {
-            tl[(value % MOE_TL_RING) * 8 + 2] = 0;
-            tl[(value % MOE_TL_RING) * 8 + 3] = 0;
-            tl[(value % MOE_TL_RING) * 8 + 0] = moe_tl_clock();
+            tl[(value % MOE_TL_RING) * MOE_TL_W + 2] = 0;
+            tl[(value % MOE_TL_RING) * MOE_TL_W + 3] = 0;
+            tl[(value % MOE_TL_RING) * MOE_TL_W + 0] = moe_tl_clock();
         }
         __threadfence_system();
         mail->seq = value;
@@ -8624,18 +8661,30 @@ static __global__ void k_moe_hosted_enter(const float * act, float * h_act, bloc
         }
         __threadfence_system();
         if (tl) {
-            tl[(value % MOE_TL_RING) * 8 + 1] = moe_tl_clock();
+            tl[(value % MOE_TL_RING) * MOE_TL_W + 1] = moe_tl_clock();
         }
     }
     __syncthreads();
-    for (int i = threadIdx.x; i < n_plan; i += blockDim.x) {
-        d_plan[i] = m_plan[i];
-    }
-    // the plan's chunk list after it, for the grouped kernels (verification: several tokens)
+    // the plan's chunk list after it, for the grouped kernels (verification: several tokens): the host's, or made here
     const int rows = n_plan / 3;
-    if (n_tokens >= 2 && rows <= MOE_GROUP_MAX_ROWS) {
+    const bool listed = n_tokens >= 2 && rows <= MOE_GROUP_MAX_ROWS;
+    moe_plan_copy(m_plan, d_plan, n_plan, listed && host_list);
+    volatile unsigned long long * tle = tl && threadIdx.x == 0 ? tl + (pub_tag % MOE_TL_RING) * MOE_TL_W : nullptr;
+    if (tl) {   // uniform in the block
+        __syncthreads();
+        if (tle) {
+            tle[8] = moe_tl_clock();
+        }
+    }
+    if (listed && !host_list) {
         __syncthreads();
         moe_group_list(d_plan, rows, (int32_t *) (d_plan + n_plan));
+    }
+    if (tl) {
+        __syncthreads();
+        if (tle) {
+            tle[9] = moe_tl_clock();
+        }
     }
 }
 
@@ -8656,7 +8705,7 @@ static __global__ void k_moe_split_wait(const uint32_t * d_expect, const volatil
         }
         __threadfence_system();
         if (tl) {
-            tl[(expect % MOE_TL_RING) * 8 + 3] = moe_tl_clock() - t0;   // the wait for the moved expert
+            tl[(expect % MOE_TL_RING) * MOE_TL_W + 3] = moe_tl_clock() - t0;   // the wait for the moved expert
         }
     }
     __syncthreads();
@@ -8991,8 +9040,8 @@ static __global__ void k_moe_hosted_merge(const uint32_t * d_expect, const volat
             __threadfence_system();
         }
         if (tl) {
-            tl[(expect % MOE_TL_RING) * 8 + 4] = t0;   // the merge reached (one of its waiting blocks)
-            tl[(expect % MOE_TL_RING) * 8 + 2] = moe_tl_clock();
+            tl[(expect % MOE_TL_RING) * MOE_TL_W + 4] = t0;   // the merge reached (one of its waiting blocks)
+            tl[(expect % MOE_TL_RING) * MOE_TL_W + 2] = moe_tl_clock();
         }
     }
     __syncthreads();
@@ -9437,6 +9486,36 @@ static void moe_hosted_plan_tail(moe_hosted_state & st) {
 static double moe_pp[8];
 static long   moe_pp_n = 0;
 static bool moe_pp_on() { static const bool on = getenv("GGML_CUDA_MOE_PLAN_PROF") != nullptr; return on; }
+// moe_group_list's chunk list, made by the host after the plan's up entries (GGML_CUDA_MOE_HOST_LIST): the same words
+static void moe_group_list_host(const uint64_t * up, int rows, int32_t * grp) {
+    bool head[MOE_GROUP_MAX_ROWS];
+    int n_head = 0;
+    for (int t = 0; t < rows; t++) {
+        int rank = 0;
+        for (int j = 0; j < t; j++) {
+            rank += up[j] == up[t];
+        }
+        head[t] = up[t] != 0 && rank % MOE_GROUP_COLS == 0;
+        if (!head[t]) {
+            continue;
+        }
+        const int c = n_head++;
+        int n = 0;
+        for (int j = t; j < rows && n < MOE_GROUP_COLS; j++) {
+            if (up[j] == up[t]) {
+                grp[1 + MOE_GROUP_MAX_ROWS + MOE_GROUP_COLS * c + n++] = j;
+            }
+        }
+        grp[1 + c] = n;
+        uint64_t * ent = (uint64_t *) (grp + MOE_GROUP_ENTRIES_OFF) + 3 * c;
+        ent[0] = up[t];
+        ent[1] = up[rows + t];
+        ent[2] = up[2 * rows + t];
+    }
+    grp[0] = n_head;
+    grp[MOE_GROUP_WORDS] = MOE_GROUP_ENT_MAGIC;
+}
+
 static int moe_hosted_plan(moe_hosted_state & st, moe_hosted_layer & layer, const int32_t * ids, int rows,
                            uint64_t * out, int32_t * cpu_rows, uint32_t * flag, uint32_t seq) {
     moe_hosted_plan_tail(st);   // the previous layer's, if a path left it pending
@@ -9550,6 +9629,10 @@ static int moe_hosted_plan(moe_hosted_state & st, moe_hosted_layer & layer, cons
                 st.pins.push_back({&pk, remote_slot[row]});
                 remote_run[row] = true;
             }
+        }
+        // the chunk list after the plan (the GPU copies both once it sees the flag)
+        if (moe_host_list() && rows <= MOE_GROUP_MAX_ROWS && layer.n_used > 0 && rows / layer.n_used >= 2) {
+            moe_group_list_host(out, rows, (int32_t *) (out + 3 * rows));
         }
         __atomic_store_n(flag, seq, __ATOMIC_RELEASE);
         pp2 = moe_pp_on() ? ggml_time_us() : 0;
@@ -10242,7 +10325,7 @@ static void moe_tl_account(moe_hosted_state * st, uint32_t seq) {
     int64_t * h  = st->tl_host.data();
     int64_t * hp = h + (p % MOE_TL_RING) * 3, * hs = h + (seq % MOE_TL_RING) * 3;
     hs[2] = moe_tl_now_ns();
-    const volatile unsigned long long * gp = g_tl_h + (p % MOE_TL_RING) * 8, * gs = g_tl_h + (seq % MOE_TL_RING) * 8;
+    const volatile unsigned long long * gp = g_tl_h + (p % MOE_TL_RING) * MOE_TL_W, * gs = g_tl_h + (seq % MOE_TL_RING) * MOE_TL_W;
     const double k = st->tl_tick_ns;
     const unsigned long long ge1 = gp[0], ge2 = gp[1], gm = gp[2], gs1 = gs[0];
     const int64_t gap_host = hs[0] - hp[2];
@@ -10250,6 +10333,18 @@ static void moe_tl_account(moe_hosted_state * st, uint32_t seq) {
         return;
     }
     const double plan_rt   = (double) (ge2 - ge1) * k;       // GPU: publication -> plan seen
+    // the entry kernel's block 0 (stamps [5] - [7], the top-k in the kernel): start -> router rows ready -> top-k done ->
+    // publication (the other blocks' copies and quantizations, the system fences)
+    if (gp[5] && gp[6] >= gp[5] && gp[7] >= gp[6] && ge1 >= gp[7]) {
+        st->tl_sum[18] += (double) (gp[6] - gp[5]) * k;
+        st->tl_sum[19] += (double) (gp[7] - gp[6]) * k;
+        st->tl_sum[20] += (double) (ge1 - gp[7]) * k;
+        st->tl_sum[21] += 1;
+        if (gp[8] >= ge2 && gp[9] >= gp[8]) {
+            st->tl_sum[22] += (double) (gp[8] - ge2) * k;
+            st->tl_sum[23] += (double) (gp[9] - gp[8]) * k;
+        }
+    }
     const double plan_host = (double) (hp[1] - hp[0]);       // host: publication seen -> plan flag
     st->tl_sum[0] += plan_rt;
     st->tl_sum[1] += plan_host;
@@ -10324,6 +10419,12 @@ static void moe_tl_account(moe_hosted_state * st, uint32_t seq) {
                 "> 10 us: waiting for the moved expert %.1f %% (late %.1f us, copy wait %.1f us), otherwise %.1f %% (late %.1f us)\n",
                 a[12] / nw / 1e3, a[13] / nw / 1e3, 100 * a[6] / nw, a[6] ? a[8] / a[6] / 1e3 : 0.0, a[6] ? a[10] / a[6] / 1e3 : 0.0,
                 100 * a[7] / nw, a[7] ? a[9] / a[7] / 1e3 : 0.0);
+        if (a[21] > 0) {
+            GGML_LOG_INFO("moe timeline: entry kernel, us per layer (%lld): start -> router rows ready %.1f; top-k and ids to the "
+                    "host %.1f; -> publication %.1f; publication -> plan seen %.1f; plan copied %.1f; chunk list %.1f\n",
+                    (long long) a[21], a[18] / a[21] / 1e3, a[19] / a[21] / 1e3, a[20] / a[21] / 1e3, plan_rt / 1e3,
+                    a[22] / a[21] / 1e3, a[23] / a[21] / 1e3);
+        }
         GGML_LOG_INFO("moe timeline: GPU work in the window (plan seen -> merge, without the moved expert wait) %.1f us, "
                 "CPU window %.1f us; in the late layers without copy wait: GPU work %.1f us\n",
                 a[16] / nw / 1e3, a[17] / nw / 1e3, a[7] ? a[15] / a[7] / 1e3 : 0.0);
@@ -11090,7 +11191,7 @@ static moe_hosted_state * moe_hosted_state_for(moe_cache_session & session, moe_
 #elif !defined(GGML_USE_MUSA)
         rate_khz = 1000000;   // %globaltimer counts nanoseconds
 #endif
-        if (rate_khz > 0 && (g_tl_h || moe_hosted_host_alloc((void **) &g_tl_h, MOE_TL_RING * 8 * sizeof(unsigned long long)))) {
+        if (rate_khz > 0 && (g_tl_h || moe_hosted_host_alloc((void **) &g_tl_h, MOE_TL_RING * MOE_TL_W * sizeof(unsigned long long)))) {
             g_tl_m = moe_hosted_device_ptr(g_tl_h);
             st->tl_tick_ns = 1e6 / rate_khz;
             st->tl_host.assign(MOE_TL_RING * 3, 0);
@@ -12601,7 +12702,7 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
                                               st->d_seq, layer->d_expect, st->m_mail, (uint32_t) slot, layer->m_flags,
                                               layer->m_plan, layer->d_plan, 3 * rows, g_tl_m, rta,
                                               w_src, w_src ? layer->m_w : nullptr, side4 ? d_side : nullptr,
-                                              d_act8, n_embd, padded_embd);
+                                              d_act8, n_embd, padded_embd, moe_host_list());
     // a block launched now (not recorded into a graph) waits for its mailbox: the server thread serves it
     {
         cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
