@@ -5639,7 +5639,18 @@ __dpct_inline__ static void k_zero_dst_rows(
     }
 }
 
-// returns true when ggml_sycl_mul_mat_id takes the fallback path that requires stream synchronization
+// Maximum token batch handled by the per-token fused MUL_MAT_ID path.
+// Read once, matching the execution-path configuration.
+static int64_t ggml_sycl_mmid_small_batch_limit() {
+    static const int64_t limit = [] {
+        const char * e = getenv("GGML_SYCL_MMID_SMALL_BATCH");
+        return e ? (int64_t) atoi(e) : (int64_t) 0;
+    }();
+
+    return limit;
+}
+
+// Returns true when ggml_sycl_mul_mat_id takes the fallback path that requires stream synchronization.
 static bool ggml_sycl_mul_mat_id_needs_sync(const ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -5648,6 +5659,29 @@ static bool ggml_sycl_mul_mat_id_needs_sync(const ggml_tensor * dst) {
     const int64_t ne10 = src1->ne[0];
     const int64_t ne11 = src1->ne[1];
     const int64_t ne12 = src1->ne[2];
+
+    // For an enabled small batch, execution slices the operation into one-token
+    // views and invokes the existing fused path once per token. Check the same
+    // eligibility conditions against that one-token view before allowing graph capture.
+    if (ne12 > 1) {
+        if (ne12 > ggml_sycl_mmid_small_batch_limit() || ids->ne[1] != ne12) {
+            return true;
+        }
+
+        ggml_tensor src1_t = *src1;
+        src1_t.ne[2] = 1;
+
+        ggml_tensor ids_t = *ids;
+        ids_t.ne[1] = 1;
+
+        ggml_tensor dst_t = *dst;
+        dst_t.ne[2] = 1;
+        dst_t.src[1] = &src1_t;
+        dst_t.src[2] = &ids_t;
+
+        // The one-token predicate validates type, shape, layout and kernel support.
+        return ggml_sycl_mul_mat_id_needs_sync(&dst_t);
+    }
 
     if (ne12 != 1) return true;
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return true;
@@ -5810,10 +5844,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     // goes through exactly the one-token kernel, so it is bit-identical to a single-token step.
     // Off unless GGML_SYCL_MMID_SMALL_BATCH=N (max tokens) is set.
     {
-        static const int64_t mmid_small_batch = [] {
-            const char * e = getenv("GGML_SYCL_MMID_SMALL_BATCH");
-            return e ? (int64_t) atoi(e) : (int64_t) 0;
-        }();
+        const int64_t mmid_small_batch = ggml_sycl_mmid_small_batch_limit();
         if (ne12 > 1 && ne12 <= mmid_small_batch && ids->ne[1] == ne12) {
             bool ok = true;
             for (int64_t t = 0; t < ne12 && ok; ++t) {
