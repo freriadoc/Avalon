@@ -8070,6 +8070,18 @@ static __device__ __forceinline__ unsigned long long moe_tl_clock() {
 #endif
 }
 
+// the entry kernel's wait for the host's plan (short, ~9 us): ~100 ns between two reads of the flag, as Strata-rdna3's
+// __nanosleep(100), instead of moe_hosted_pause's ~3 us (the other waits: the CPU rows', ~100 us, read the flag over PCIe
+// that much less often). RX 7900 XT, 20 Nov.: publication -> plan seen 8.6 against 9.4 us (timeline); replay 19k T=3
+// 20.108 against 20.140 ms per pass (8 pairs: 4 faster on the means, 5 of 8 on the medians, -0.2 %)
+static __device__ __forceinline__ void moe_plan_pause() {
+#if defined(GGML_USE_HIP)
+    __builtin_amdgcn_s_sleep(2);
+#elif __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+    __nanosleep(100);
+#endif
+}
+
 static __device__ __forceinline__ void moe_hosted_pause() {
 #if defined(GGML_USE_HIP)
     __builtin_amdgcn_s_sleep(127);
@@ -8657,7 +8669,7 @@ static __global__ void k_moe_hosted_enter(const float * act, float * h_act, bloc
         mail->seq = value;
         __threadfence_system();
         while ((int32_t) (*flag - value) < 0) {
-            moe_hosted_pause();
+            moe_plan_pause();
         }
         __threadfence_system();
         if (tl) {
