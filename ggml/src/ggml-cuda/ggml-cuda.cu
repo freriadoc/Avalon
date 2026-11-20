@@ -1088,10 +1088,11 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
     ggml_cuda_memset_by_kernel((char *) tensor->data + offset, value, size, ctx->device);
 }
 
-// hipMemcpy2DAsync copies zeros from a memory-mapped file on Windows: one copy per row there
+// hipMemcpy2DAsync copies zeros from a memory-mapped file on Windows: one copy per row there (elsewhere the pageable
+// sources go through the bounce buffer before this)
 static cudaError_t ggml_cuda_memcpy_2d_h2d_async(void * dst, size_t dpitch, const void * src, size_t spitch,
         size_t width, size_t height, cudaStream_t stream) {
-#if defined(GGML_USE_HIP)
+#if defined(GGML_USE_HIP) && defined(_WIN32)
     for (size_t i = 0; i < height; i++) {
         const cudaError_t err = cudaMemcpyAsync((char *) dst + i*dpitch, (const char *) src + i*spitch, width, cudaMemcpyHostToDevice, stream);
         if (err != cudaSuccess) {
@@ -3527,13 +3528,16 @@ static bool ggml_cuda_host_copy_by_kernel(void * dst, const void * src, size_t s
     CUDA_CHECK(cudaGetLastError());
     return true;
 }
+// rows of width bytes, src's spitch apart, to dst's dpitch apart (src read with its pitch: the experts of a packed
+// layer are an entry apart in the file, and an expert copied as if they were contiguous came back as other bytes)
 static __global__ void k_ggml_cuda_host_copy_rows(const char * __restrict__ src, char * __restrict__ dst,
-                                                  size_t width, size_t dpitch, size_t rows) {
+                                                  size_t width, size_t spitch, size_t dpitch, size_t rows) {
     const size_t n = rows * width;
     const size_t stride = (size_t) gridDim.x * blockDim.x;
     for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
         const size_t r = i / width;
-        dst[r * dpitch + (i - r * width)] = src[i];
+        const size_t c = i - r * width;
+        dst[r * dpitch + c] = src[r * spitch + c];
     }
 }
 
@@ -3552,7 +3556,7 @@ static bool ggml_cuda_host_copy_rows_by_kernel(char * dst, size_t dpitch, const 
             (const char *) dev, dst, width * height);
     } else {
         k_ggml_cuda_host_copy_rows<<<ggml_cuda_host_copy_kernel_blocks, 256, 0, stream>>>(
-            (const char *) dev, dst, width, dpitch, height);
+            (const char *) dev, dst, width, spitch, dpitch, height);
     }
     CUDA_CHECK(cudaGetLastError());
     return true;
@@ -3660,7 +3664,7 @@ bool ggml_cuda_host_copy_bounce(char * dst, size_t dpitch, const char * src, siz
                        src + (off + i) * spitch, width);
             }
             k_ggml_cuda_host_copy_rows<<<ggml_cuda_host_copy_kernel_blocks, 256, 0, b.stream>>>(
-                (const char *) s, d, width, dpitch, rows);
+                (const char *) s, d, width, width, dpitch, rows);   // the slot's rows packed
         }
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaEventRecord(b.done[slot], b.stream));
@@ -3733,8 +3737,11 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
 #if defined(GGML_USE_HIP)
+    // a pinned source by a kernel only while a hosted MoE block is queued (a DMA would wait behind its kernels on the
+    // SDMA ring), else the DMA engine, faster; a pageable source by the bounce buffer (ROCclr would stage it on the ring)
     ggml_cuda_set_device(cuda_ctx->device);   // the kernel paths launch on this device's stream
-    if (ggml_cuda_host_copy_by_kernel((char *) tensor->data + offset, data, size, false, cuda_ctx->stream()) ||
+    if ((cuda_ctx->split_wait_queued &&
+         ggml_cuda_host_copy_by_kernel((char *) tensor->data + offset, data, size, false, cuda_ctx->stream())) ||
         ggml_cuda_host_copy_bounce((char *) tensor->data + offset, 0, (const char *) data, 0, size, 1,
                                    cuda_ctx->stream())) {
         return;
@@ -3766,9 +3773,13 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
 #if defined(GGML_USE_HIP)
+    // as ggml_backend_cuda_set_tensor_async: a pinned source by a kernel only while a hosted MoE block is queued (the
+    // experts of a packed layer, an entry apart: by kernel 1723 t/s against 2652 by DMA, a 19k prompt without the
+    // prefill ring on an RX 7900 XT), a pageable one by the bounce buffer
     ggml_cuda_set_device(cuda_ctx->device);   // the kernel paths launch on this device's stream
-    if (ggml_cuda_host_copy_rows_by_kernel((char *) tensor->data + offset, stride_tensor, data, stride_data,
-                                           size, n_copies, cuda_ctx->stream()) ||
+    if ((cuda_ctx->split_wait_queued &&
+         ggml_cuda_host_copy_rows_by_kernel((char *) tensor->data + offset, stride_tensor, data, stride_data,
+                                            size, n_copies, cuda_ctx->stream())) ||
         ggml_cuda_host_copy_bounce((char *) tensor->data + offset, stride_tensor, (const char *) data, stride_data,
                                    size, n_copies, cuda_ctx->stream())) {
         return;
