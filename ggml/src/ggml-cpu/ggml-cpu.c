@@ -4612,6 +4612,23 @@ static inline int ggml_cpu_moe_l3_next(int * const * cnt, int g, int n_pairs, in
     return -1;
 }
 
+// a q8_0 block's scale as a float and its sum of values times it (the IQ3_KS kernel's offset table: see multi_f)
+static inline void ggml_cpu_moe_block_stats(const block_q8_0 * b, float * d, float * sum) {
+    const float df = GGML_CPU_FP16_TO_FP32(b->d);
+#if defined(__AVX2__)
+    const __m256i p = _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_set1_epi8(1), _mm256_loadu_si256((const __m256i *) b->qs)), _mm256_set1_epi16(1));
+    __m128i t = _mm_add_epi32(_mm256_castsi256_si128(p), _mm256_extracti128_si256(p, 1));
+    t = _mm_add_epi32(t, _mm_shuffle_epi32(t, 0x4e));
+    t = _mm_add_epi32(t, _mm_shuffle_epi32(t, 0xb1));
+    const int si = _mm_cvtsi128_si32(t);
+#else
+    int si = 0;
+    for (int i = 0; i < QK8_0; i++) si += b->qs[i];
+#endif
+    *d = df;
+    *sum = df * (float) si;
+}
+
 static bool ggml_cpu_moe_experts_multi(const struct ggml_tensor * gate_w, const struct ggml_tensor * up_w,
                                        const struct ggml_tensor * down_w, const float * act, const void * act_q8,
                                        const int32_t * experts, const void * const * src, int n, float * out,
@@ -4623,18 +4640,20 @@ static bool ggml_cpu_moe_experts_multi(const struct ggml_tensor * gate_w, const 
     // the gate / up and down kernels with q8_0 activations, a weight block decoded once for every row
     void (*multi_k)(int, float *, const void *, const void * const *, int) = NULL;
     switch (tk) {
-        case GGML_TYPE_IQ2_S:   multi_k = ggml_vec_dot_iq2_s_q8_0_multi;   break;
         case GGML_TYPE_IQ3_K:   multi_k = ggml_vec_dot_iq3_k_q8_0_multi;   break;
-        case GGML_TYPE_IQ3_KS:  multi_k = ggml_vec_dot_iq3_ks_q8_0_multi;  break;
         case GGML_TYPE_IQ3_XXS: multi_k = ggml_vec_dot_iq3_xxs_q8_0_multi; break;
         case GGML_TYPE_IQ3_S:   multi_k = ggml_vec_dot_iq3_s_q8_0_multi;   break;
         case GGML_TYPE_IQ4_XS:  multi_k = ggml_vec_dot_iq4_xs_q8_0_multi;  break;
         default: break;
     }
+    // IQ2_S, IQ3_KS: the activation block scales as floats and their scaled sums, computed once per call (both kernels
+    // are bound by their own work, not by the RAM: -8 % per row each)
+    void (*multi_kf)(int, float *, const void *, const void * const *, const float * const *, const float * const *, int) =
+        tk == GGML_TYPE_IQ2_S ? ggml_vec_dot_iq2_s_q8_0_multi_f : tk == GGML_TYPE_IQ3_KS ? ggml_vec_dot_iq3_ks_q8_0_multi_f : NULL;
     const enum ggml_type td = down_w->type;
     void (*multi_d)(int, float *, const void *, const void * const *, int) =
         td == GGML_TYPE_IQ4_NL ? ggml_vec_dot_iq4_nl_q8_0_multi : td == GGML_TYPE_Q2_0 ? ggml_vec_dot_q2_0_q8_0_multi : NULL;
-    if (!multi_k || !multi_d || up_w->type != tk ||
+    if ((!multi_k && !multi_kf) || !multi_d || up_w->type != tk ||
         n_embd % QK_K != 0 || n_ff % ggml_blck_size(td) != 0 || down_w->ne[0] != n_ff || down_w->ne[1] != n_embd || n <= 0 || n > 256) {
         return false;
     }
@@ -4642,7 +4661,8 @@ static bool ggml_cpu_moe_experts_multi(const struct ggml_tensor * gate_w, const 
     static _Thread_local size_t buf_size = 0;
     const size_t a_row = (size_t) (n_embd / QK8_0) * sizeof(block_q8_0);
     const size_t h_row = (size_t) (n_ff / QK8_0) * sizeof(block_q8_0);
-    const size_t need = (size_t) n * (a_row + h_row + 2 * n_ff * sizeof(float)) + (size_t) 3 * n * sizeof(int32_t) + 256;
+    const size_t need = (size_t) n * (a_row + h_row + 2 * n_ff * sizeof(float) + (size_t) (n_embd / QK8_0) * 2 * sizeof(float)) +
+                        (size_t) 3 * n * sizeof(int32_t) + 256;
     if (buf_size < need) {
         free(buf);
         buf = malloc(need);
@@ -4659,6 +4679,8 @@ static bool ggml_cpu_moe_experts_multi(const struct ggml_tensor * gate_w, const 
     int32_t * uniq  = (int32_t *) (u + (size_t) n * n_ff);   // distinct experts
     int32_t * first = uniq + n;                               // their rows, as a list: first row, next row
     int32_t * next  = first + n;
+    float   * ad    = (float *) (next + n);                   // multi_kf: the activation block scales as floats
+    float   * as    = ad + (size_t) n * (n_embd / QK8_0);     // and the block sums times them
     int n_uniq = 0;
     for (int j = 0; j < n; j++) {
         next[j] = -1;
@@ -4682,13 +4704,28 @@ static bool ggml_cpu_moe_experts_multi(const struct ggml_tensor * gate_w, const 
     if (l3_split < 0) {
         l3_split = !(getenv("GGML_CPU_MOE_SCHED") && strcmp(getenv("GGML_CPU_MOE_SCHED"), "dynamic") == 0);
     }
+    // the activations given by the GPU: their block scales and sums here (a few hundred blocks, no barrier)
+    if (multi_kf && act_q8) {
+        for (int it = 0; it < n * nb_a; it++) {
+            ggml_cpu_moe_block_stats((const block_q8_0 *) a8 + it, ad + it, as + it);
+        }
+    }
     // a cache line per counter
     _Alignas(64) int cnt_lines[4][16] = {{0}};
     int * cnt_gu[2] = { cnt_lines[0], cnt_lines[1] }, * cnt_d[2] = { cnt_lines[2], cnt_lines[3] };
+    // DIAGNOSTIC GGML_CPU_MOE_PHASES=1: time of each phase (thread 0 after each barrier), printed every 4000 calls
+    static int phases = -1;
+    if (phases < 0) phases = getenv("GGML_CPU_MOE_PHASES") != NULL;
+    double ph_t[6];
+    static double ph_sum[5]; static long ph_n = 0;
+    ph_t[0] = phases ? omp_get_wtime() : 0;
     #pragma omp parallel num_threads(n_threads)
     {
+        if (phases && omp_get_thread_num() == 0) ph_t[1] = omp_get_wtime();
         float   hrow[QK8_0];
         const void * ys[8];
+        const float * ds[8];
+        const float * ss[8];
         int          rs[8];
         float        res[8];
         // the activations, quantized as the GPU's q8_1 (blocks of 32, the same bytes: an expert computed by the CPU or
@@ -4699,7 +4736,14 @@ static bool ggml_cpu_moe_experts_multi(const struct ggml_tensor * gate_w, const 
             for (int it = 0; it < n * nb_a; it++) {
                 const int j = it / nb_a, b = it % nb_a;
                 quantize_row_q8_0_gpu(act + (size_t) j * n_embd + (size_t) b * QK8_0, a8 + (size_t) j * a_row + (size_t) b * sizeof(block_q8_0), QK8_0);
+                if (multi_kf) {
+                    ggml_cpu_moe_block_stats((const block_q8_0 *) (a8 + (size_t) j * a_row) + b, ad + it, as + it);
+                }
             }
+        }
+        if (phases) {
+            #pragma omp barrier
+            if (omp_get_thread_num() == 0) ph_t[2] = omp_get_wtime();
         }
         const int l3_g = l3_split ? ggml_cpu_moe_l3_group() : 0;
         // gate and up
@@ -4717,8 +4761,14 @@ static bool ggml_cpu_moe_experts_multi(const struct ggml_tensor * gate_w, const 
                     for (; r >= 0 && nc < 8; r = next[r], nc++) { \
                         rs[nc] = r; \
                         ys[nc] = a8 + (size_t) r * a_row; \
+                        ds[nc] = ad + (size_t) r * nb_a; \
+                        ss[nc] = as + (size_t) r * nb_a; \
                     } \
-                    multi_k((int) n_embd, res, wr, ys, nc); \
+                    if (multi_kf) { \
+                        multi_kf((int) n_embd, res, wr, ys, ds, ss, nc); \
+                    } else { \
+                        multi_k((int) n_embd, res, wr, ys, nc); \
+                    } \
                     for (int c = 0; c < nc; c++) dst[(size_t) rs[c] * n_ff + row] = res[c]; \
                 } \
             } \
@@ -4737,6 +4787,10 @@ static bool ggml_cpu_moe_experts_multi(const struct ggml_tensor * gate_w, const 
             for (int it = 0; it < n_uniq * 2 * n_ch1; it++) MOE_GU_BODY(it)
         }
         #undef MOE_GU_BODY
+        if (phases) {
+            #pragma omp barrier
+            if (omp_get_thread_num() == 0) ph_t[3] = omp_get_wtime();
+        }
         // swiglu, then the activations of down, a q8_0 block per item (every thread works, not one per row)
         #pragma omp for
         for (int it = 0; it < n * nb_0; it++) {
@@ -4748,6 +4802,7 @@ static bool ggml_cpu_moe_experts_multi(const struct ggml_tensor * gate_w, const 
             }
             quantize_row_q8_0_gpu(hrow, h8 + (size_t) j * h_row + (size_t) b * sizeof(block_q8_0), QK8_0);
         }
+        if (phases && omp_get_thread_num() == 0) ph_t[4] = omp_get_wtime();
         // down
         #define MOE_D_BODY(it) { \
             const int ue = it / n_ch3, ch = it % n_ch3; \
@@ -4784,6 +4839,22 @@ static bool ggml_cpu_moe_experts_multi(const struct ggml_tensor * gate_w, const 
             for (int it = 0; it < n_uniq * n_ch3; it++) MOE_D_BODY(it)
         }
         #undef MOE_D_BODY
+    }
+    if (phases) {
+        ph_t[5] = omp_get_wtime();
+        for (int k = 0; k < 5; k++) ph_sum[k] += ph_t[k + 1] - ph_t[k];
+        // gate/up and down per (gate type IQ2_S or other, distinct experts 1..4)
+        static double pt_gu[2][5], pt_d[2][5]; static long pt_n[2][5];
+        const int ti = tk == GGML_TYPE_IQ2_S, ui = n_uniq < 4 ? n_uniq : 4;
+        pt_gu[ti][ui] += ph_t[3] - ph_t[2]; pt_d[ti][ui] += ph_t[5] - ph_t[4]; pt_n[ti][ui]++;
+        if (++ph_n % 4000 == 0) {
+            fprintf(stderr, "moe cpu phases (us/call, n=%d last): start %.1f quant %.1f gate/up %.1f swiglu %.1f down %.1f\n", n,
+                    ph_sum[0] / ph_n * 1e6, ph_sum[1] / ph_n * 1e6, ph_sum[2] / ph_n * 1e6, ph_sum[3] / ph_n * 1e6, ph_sum[4] / ph_n * 1e6);
+            memset(ph_sum, 0, sizeof(ph_sum)); ph_n = 0;
+            for (int a = 0; a < 2; a++) for (int u = 1; u < 5; u++) if (pt_n[a][u])
+                fprintf(stderr, "moe cpu by type: %s experts=%d calls=%ld gate/up %.1f down %.1f us\n", a ? "iq2_s" : "other", u,
+                        pt_n[a][u], pt_gu[a][u] / pt_n[a][u] * 1e6, pt_d[a][u] / pt_n[a][u] * 1e6);
+        }
     }
     return true;
 #else

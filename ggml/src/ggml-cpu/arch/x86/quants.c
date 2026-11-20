@@ -4403,10 +4403,41 @@ static inline __attribute__((always_inline)) void ggml_vec_dot_iq4_nl_q8_0_multi
 #endif
 }
 
+#if defined(__AVX2__)
+// IQ2_S grid indices (8 low bits from qs, 2 high bits from qh) of a block of 256, built as 16-bit lanes in vectors
+// (~14 ops instead of ~5 scalar ops per lookup) and stored; the kernels build those of the next block before
+// computing the current one, so that the 16-bit reloads hit L1 instead of waiting on store forwarding (-21 % per row
+// with the paired grid loads below, ~/prefetch-experts/cpuopt/kb-iq2s.c V12)
+static inline void ggml_iq2s_idx16(const block_iq2_s * GGML_RESTRICT b, uint16_t * GGML_RESTRICT ix) {
+    int64_t qh64; memcpy(&qh64, b->qh, 8);
+    const __m256i qh = _mm256_set1_epi64x(qh64);
+    const __m256i sh0 = _mm256_setr_epi8(0,-1,0,-1,0,-1,0,-1,1,-1,1,-1,1,-1,1,-1, 2,-1,2,-1,2,-1,2,-1,3,-1,3,-1,3,-1,3,-1);
+    const __m256i sh1 = _mm256_setr_epi8(4,-1,4,-1,4,-1,4,-1,5,-1,5,-1,5,-1,5,-1, 6,-1,6,-1,6,-1,6,-1,7,-1,7,-1,7,-1,7,-1);
+    const __m256i mul = _mm256_setr_epi16(256, 64, 16, 4, 256, 64, 16, 4, 256, 64, 16, 4, 256, 64, 16, 4);
+    const __m256i m300 = _mm256_set1_epi16(0x300);
+    const __m256i lo0 = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *) b->qs));
+    const __m256i lo1 = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *) (b->qs + 16)));
+    _mm256_store_si256((__m256i *) ix,     _mm256_or_si256(lo0, _mm256_and_si256(_mm256_mullo_epi16(_mm256_shuffle_epi8(qh, sh0), mul), m300)));
+    _mm256_store_si256((__m256i *) ix + 1, _mm256_or_si256(lo1, _mm256_and_si256(_mm256_mullo_epi16(_mm256_shuffle_epi8(qh, sh1), mul), m300)));
+}
+// 4 grid entries paired by movhpd (a load and a shuffle in one op, instead of two loads and vpunpcklqdq)
+static inline __m128i ggml_iq2s_grid2(uint32_t a, uint32_t b) {
+    return _mm_castpd_si128(_mm_loadh_pd(_mm_castsi128_pd(_mm_loadl_epi64((const __m128i *) (iq2s_grid + a))), (const double *) (iq2s_grid + b)));
+}
+static inline __m256i ggml_iq2s_grid4(const uint16_t * k) {
+    return _mm256_inserti128_si256(_mm256_castsi128_si256(ggml_iq2s_grid2(k[0], k[1])), ggml_iq2s_grid2(k[2], k[3]), 1);
+}
+#if defined(__GNUC__)
+#define GGML_IQ2S_IDX_FENCE() __asm__ volatile("" ::: "memory")
+#else
+#define GGML_IQ2S_IDX_FENCE() _ReadWriteBarrier()
+#endif
+
+#endif
 // The same with q8_0 activations (ggml_cpu_moe_experts: quantized as the GPU's q8_1, blocks of 32, so that an expert
 // computed by the CPU or by the GPU starts from the same activation bytes): an activation scale per block of 32, the
 // integer sums of each block scaled by it.
-static inline __attribute__((always_inline)) void ggml_vec_dot_iq2_s_q8_0_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const int nc) {
+static inline __attribute__((always_inline)) void ggml_vec_dot_iq2_s_q8_0_multi_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const float * const * vd, const int nc) {
 #if defined(__AVX2__)
     static const uint8_t k_mask1[32] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
                                         0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03};
@@ -4419,13 +4450,15 @@ static inline __attribute__((always_inline)) void ggml_vec_dot_iq2_s_q8_0_multi_
     const __m256i mask1 = _mm256_loadu_si256((const __m256i*)k_mask1);
     const __m256i mask2 = _mm256_loadu_si256((const __m256i*)k_mask2);
     uint64_t aux64;
-#define IQ2S_GRID(qs, h, k) iq2s_grid[ggml_iq2s_pin_index((qs)[k] | ((((uint32_t) (h)) << (8 - 2*(k))) & 0x300))]
+    union { __m256i v[2]; uint16_t u[QK_K/8]; } ixb[2]; // a union for the alignment (MSVC has no _Alignas in C)
+    ggml_iq2s_idx16(x, ixb[0].u);
     __m256 accumf[8];
     for (int c = 0; c < nc; c++) accumf[c] = _mm256_setzero_ps();
     for (int i = 0; i < nb; ++i) {
+        if (i + 1 < nb) ggml_iq2s_idx16(x + i + 1, ixb[(i + 1) & 1].u);
+        GGML_IQ2S_IDX_FENCE();
+        const uint16_t * ix = ixb[i & 1].u;
         const float xd = GGML_CPU_FP16_TO_FP32(x[i].d);
-        const uint8_t * GGML_RESTRICT qs = x[i].qs;
-        const uint8_t * GGML_RESTRICT qh = x[i].qh;
         const uint16_t * GGML_RESTRICT signs = (const uint16_t *)(x[i].qs + QK_K/8);
         memcpy(&aux64, x[i].scales, 8);
         const __m128i scales8 = _mm_add_epi8(_mm_slli_epi16(_mm_and_si128(_mm_set_epi64x(aux64 >> 4, aux64), m4), 1), m1);
@@ -4434,10 +4467,8 @@ static inline __attribute__((always_inline)) void ggml_vec_dot_iq2_s_q8_0_multi_
         // loop, ~5 times slower for IQ3_K)
 #pragma GCC unroll 4
         for (int ib32 = 0; ib32 < QK_K/32; ib32 += 2) {
-            const uint32_t h0 = qh[ib32+0], h1 = qh[ib32+1];
-            const __m256i q2_1 = _mm256_set_epi64x(IQ2S_GRID(qs,   h0, 3), IQ2S_GRID(qs,   h0, 2), IQ2S_GRID(qs,   h0, 1), IQ2S_GRID(qs,   h0, 0));
-            const __m256i q2_2 = _mm256_set_epi64x(IQ2S_GRID(qs+4, h1, 3), IQ2S_GRID(qs+4, h1, 2), IQ2S_GRID(qs+4, h1, 1), IQ2S_GRID(qs+4, h1, 0));
-            qs += 8;
+            const __m256i q2_1 = ggml_iq2s_grid4(ix + 4*ib32);
+            const __m256i q2_2 = ggml_iq2s_grid4(ix + 4*ib32 + 4);
             __m256i aux256 = _mm256_set1_epi32(signs[0] | ((uint32_t) signs[1] << 16));
             aux256 = _mm256_and_si256(_mm256_shuffle_epi8(aux256,mask1), mask2);
             const __m256i s2_1 = _mm256_cmpeq_epi8(aux256, mask2);
@@ -4455,14 +4486,15 @@ static inline __attribute__((always_inline)) void ggml_vec_dot_iq2_s_q8_0_multi_
                 const __m256i q8s_2 = _mm256_sub_epi8(_mm256_xor_si256(s2_2, q8_2), s2_2);
                 const __m256i p1 = _mm256_madd_epi16(_mm256_maddubs_epi16(q2_1, q8s_1), sc1);
                 const __m256i p2 = _mm256_madd_epi16(_mm256_maddubs_epi16(q2_2, q8s_2), sc2);
-                accumf[c] = _mm256_fmadd_ps(_mm256_set1_ps(xd * GGML_CPU_FP16_TO_FP32(y[0].d)), _mm256_cvtepi32_ps(p1), accumf[c]);
-                accumf[c] = _mm256_fmadd_ps(_mm256_set1_ps(xd * GGML_CPU_FP16_TO_FP32(y[1].d)), _mm256_cvtepi32_ps(p2), accumf[c]);
+                const float * d = vd[c] + i*(QK_K/QK8_0) + ib32;
+                accumf[c] = _mm256_fmadd_ps(_mm256_set1_ps(xd * d[0]), _mm256_cvtepi32_ps(p1), accumf[c]);
+                accumf[c] = _mm256_fmadd_ps(_mm256_set1_ps(xd * d[1]), _mm256_cvtepi32_ps(p2), accumf[c]);
             }
         }
     }
     for (int c = 0; c < nc; c++) s[c] = 0.125f * hsum_float_8(accumf[c]);
-#undef IQ2S_GRID
 #else
+    GGML_UNUSED(vd);
     for (int c = 0; c < nc; c++) ggml_vec_dot_iq2_s_q8_0_generic(n, s + c, vx, vy[c]);
 #endif
 }
@@ -4741,9 +4773,93 @@ GGML_MULTI_DISPATCH(q2_0)
 GGML_MULTI_DISPATCH(iq3_ks)
 #undef GGML_MULTI_DISPATCH
 
+// IQ3_KS with the activation rows' block scales as floats (vd) and their scaled sums (vs[c][b] = d_b * sum of the
+// block's q8): the value table offset by +64 is unsigned, so maddubs takes the weights directly (no vpsignb), the
+// -64 * scale * sum of each block of 32 being removed once per block of 256; the weight scales and table shifts of a
+// block of 256 are built once in vectors, and the high bit takes 2 operations. Bound by the vector units of Zen 2
+// (llvm-mca: the four pipes full), so the work that needs no vector moves out of them: the table half of a block of 32
+// is a scalar address, and its scale is applied as a float with the activation scale (one product per 256, madd by
+// ones). -8 % then -15.5 % per row in cache (kb-iq3ks.c V3, V5); in RAM the experts read at ~40 GB/s either way.
+static inline __attribute__((always_inline)) void ggml_vec_dot_iq3_ks_q8_0_multi_f_n(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx,
+        const void * const * vy, const float * const * vd, const float * const * vs, const int nc) {
+#if defined __AVX2__
+    const block_iq3_ks * GGML_RESTRICT x = vx;
+    const int nb = n / QK_K;
+    // the two halves of the table (pshufb indices 0..7), the half of a block of 32 chosen by a scalar address
+    static const union { __m256i v[2]; int8_t b[64]; } kv_half = { .b = {
+        1, 24, 41, 54, 65, 77, 92, 111, 0, 0, 0, 0, 0, 0, 0, 0, 1, 24, 41, 54, 65, 77, 92, 111, 0, 0, 0, 0, 0, 0, 0, 0,
+        5, 28, 45, 58, 69, 81, 96, 115, 0, 0, 0, 0, 0, 0, 0, 0, 5, 28, 45, 58, 69, 81, 96, 115, 0, 0, 0, 0, 0, 0, 0, 0 } };
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    union { __m256 v; float f[8]; } fsb[8];   // per column: block scale * activation scale of the 8 blocks of 32
+    const __m256i m3 = _mm256_set1_epi8(3), m4 = _mm256_set1_epi8(4);
+    const __m128i bit8 = _mm_setr_epi16(1, 2, 4, 8, 16, 32, 64, 128);
+    const __m128i m15 = _mm_set1_epi16(15), m16 = _mm_set1_epi16(16);
+    __m256 accumf[8];
+    for (int c = 0; c < nc; c++) accumf[c] = _mm256_setzero_ps();
+    for (int ibl = 0; ibl < nb; ++ibl) {
+        const __m256i qh = _mm256_loadu_si256((const __m256i *) x[ibl].qh);
+        const uint16_t extra = x[ibl].extra;
+        uint32_t sc32;
+        memcpy(&sc32, x[ibl].scales, 4);
+        // the 8 scales: nibble k % 4 of the bytes (high nibbles for k >= 4), bit k of extra as bit 4, minus 16
+        const __m128i sb   = _mm_cvtepu8_epi16(_mm_cvtsi32_si128((int) sc32));
+        const __m128i nib8 = _mm_unpacklo_epi64(_mm_and_si128(sb, m15), _mm_srli_epi16(sb, 4));
+        const __m128i eb   = _mm_set1_epi16((int16_t) extra);
+        const __m128i sc8  = _mm_sub_epi16(_mm_or_si128(nib8, _mm_and_si128(_mm_cmpeq_epi16(_mm_and_si128(eb, bit8), bit8), m16)), m16);
+        // the 8 table shifts (bit 8 + k of extra: the second half of the values)
+        const __m256 scf = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(sc8));
+        __m256 accb[8];
+        for (int c = 0; c < nc; c++) {
+            accb[c] = _mm256_setzero_ps();
+            fsb[c].v = _mm256_mul_ps(scf, _mm256_loadu_ps(vd[c] + ibl*(QK_K/QK8_0)));
+        }
+#pragma GCC unroll 8
+        for (int ib32 = 0; ib32 < QK_K/32; ++ib32) {
+            const __m256i q2 = _mm256_and_si256(_mm256_srli_epi16(_mm256_loadu_si256((const __m256i *)(x[ibl].qs + 32*(ib32/4))), 2*(ib32%4)), m3);
+            const __m256i q1 = _mm256_and_si256(ib32 >= 2 ? _mm256_srli_epi16(qh, ib32 - 2) : _mm256_slli_epi16(qh, 2 - ib32), m4);
+            const __m256i w  = _mm256_shuffle_epi8(kv_half.v[(extra >> (8 + ib32)) & 1], _mm256_or_si256(q2, q1));
+            for (int c = 0; c < nc; c++) {
+                const block_q8_0 * y = (const block_q8_0 *) vy[c] + ibl*(QK_K/QK8_0) + ib32;
+                const __m256i p = _mm256_madd_epi16(_mm256_maddubs_epi16(w, _mm256_loadu_si256((const __m256i *) y->qs)), ones16);
+                accb[c] = _mm256_fmadd_ps(_mm256_broadcast_ss(fsb[c].f + ib32), _mm256_cvtepi32_ps(p), accb[c]);
+            }
+        }
+        const __m256 xd  = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(x[ibl].d));
+        for (int c = 0; c < nc; c++) {
+            // lane k: -64 * scale k * the scaled sum of block k
+            const __m256 b = _mm256_fmadd_ps(_mm256_set1_ps(-64.0f), _mm256_mul_ps(scf, _mm256_loadu_ps(vs[c] + ibl*(QK_K/QK8_0))), accb[c]);
+            accumf[c] = _mm256_fmadd_ps(xd, b, accumf[c]);
+        }
+    }
+    for (int c = 0; c < nc; c++) s[c] = hsum_float_8(accumf[c]);
+#else
+    GGML_UNUSED(vd); GGML_UNUSED(vs);
+    for (int c = 0; c < nc; c++) ggml_vec_dot_iq3_ks_q8_0_generic(n, s + c, vx, vy[c]);
+#endif
+}
+#define IQ3KS_F_CASE(k) static GGML_MULTI_CASE_ATTR void ggml_vec_dot_iq3_ks_q8_0_multi_f_c##k(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, \
+        const void * const * vy, const float * const * vd, const float * const * vs) { ggml_vec_dot_iq3_ks_q8_0_multi_f_n(n, s, vx, vy, vd, vs, k); }
+IQ3KS_F_CASE(1)
+IQ3KS_F_CASE(2)
+IQ3KS_F_CASE(3)
+IQ3KS_F_CASE(4)
+#undef IQ3KS_F_CASE
+static GGML_MULTI_CASE_ATTR void ggml_vec_dot_iq3_ks_q8_0_multi_f_cn(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx,
+        const void * const * vy, const float * const * vd, const float * const * vs, int nc) { ggml_vec_dot_iq3_ks_q8_0_multi_f_n(n, s, vx, vy, vd, vs, nc); }
+void ggml_vec_dot_iq3_ks_q8_0_multi_f(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy,
+                                      const float * const * vd, const float * const * vs, int nc) {
+    switch (nc) {
+        case 1:  ggml_vec_dot_iq3_ks_q8_0_multi_f_c1(n, s, vx, vy, vd, vs); break;
+        case 2:  ggml_vec_dot_iq3_ks_q8_0_multi_f_c2(n, s, vx, vy, vd, vs); break;
+        case 3:  ggml_vec_dot_iq3_ks_q8_0_multi_f_c3(n, s, vx, vy, vd, vs); break;
+        case 4:  ggml_vec_dot_iq3_ks_q8_0_multi_f_c4(n, s, vx, vy, vd, vs); break;
+        default: ggml_vec_dot_iq3_ks_q8_0_multi_f_cn(n, s, vx, vy, vd, vs, nc); break;
+    }
+}
+
 // one activation row (the case of the most rows: an expert used by one token), from the one-row q8_K kernels with
 // the activation scale of each block of 32
-static GGML_MULTI_CASE_ATTR void ggml_vec_dot_iq2_s_q8_0_1(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy) {
+static GGML_MULTI_CASE_ATTR void ggml_vec_dot_iq2_s_q8_0_1(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, const float * GGML_RESTRICT vd) {
 #if defined(__AVX2__)
     static const uint8_t k_mask1[32] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
                                         0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03};
@@ -4757,12 +4873,15 @@ static GGML_MULTI_CASE_ATTR void ggml_vec_dot_iq2_s_q8_0_1(int n, float * GGML_R
     const __m256i mask1 = _mm256_loadu_si256((const __m256i*)k_mask1);
     const __m256i mask2 = _mm256_loadu_si256((const __m256i*)k_mask2);
     uint64_t aux64;
-#define IQ2S_GRID(qs, h, k) iq2s_grid[ggml_iq2s_pin_index((qs)[k] | ((((uint32_t) (h)) << (8 - 2*(k))) & 0x300))]
+    union { __m256i v[2]; uint16_t u[QK_K/8]; } ixb[2]; // a union for the alignment (MSVC has no _Alignas in C)
+    ggml_iq2s_idx16(x, ixb[0].u);
     __m256 accumf = _mm256_setzero_ps();
     for (int i = 0; i < nb; ++i) {
-        const float xd = GGML_CPU_FP16_TO_FP32(x[i].d);
-        const uint8_t * GGML_RESTRICT qs = x[i].qs;
-        const uint8_t * GGML_RESTRICT qh = x[i].qh;
+        if (i + 1 < nb) ggml_iq2s_idx16(x + i + 1, ixb[(i + 1) & 1].u);
+        GGML_IQ2S_IDX_FENCE();
+        const uint16_t * ix = ixb[i & 1].u;
+        const float * GGML_RESTRICT db = vd + i*(QK_K/QK8_0);
+        __m256 accb = _mm256_setzero_ps();
         const uint16_t * GGML_RESTRICT signs = (const uint16_t *)(x[i].qs + QK_K/8);
         const block_q8_0 * GGML_RESTRICT yb = y + i*(QK_K/QK8_0);
         memcpy(&aux64, x[i].scales, 8);
@@ -4772,10 +4891,8 @@ static GGML_MULTI_CASE_ATTR void ggml_vec_dot_iq2_s_q8_0_1(int n, float * GGML_R
         for (int ib32 = 0; ib32 < QK_K/32; ib32 += 2) {
             const __m256i q8_1 = _mm256_loadu_si256((const __m256i *) yb[ib32+0].qs);
             const __m256i q8_2 = _mm256_loadu_si256((const __m256i *) yb[ib32+1].qs);
-            const uint32_t h0 = qh[ib32+0], h1 = qh[ib32+1];
-            const __m256i q2_1 = _mm256_set_epi64x(IQ2S_GRID(qs,   h0, 3), IQ2S_GRID(qs,   h0, 2), IQ2S_GRID(qs,   h0, 1), IQ2S_GRID(qs,   h0, 0));
-            const __m256i q2_2 = _mm256_set_epi64x(IQ2S_GRID(qs+4, h1, 3), IQ2S_GRID(qs+4, h1, 2), IQ2S_GRID(qs+4, h1, 1), IQ2S_GRID(qs+4, h1, 0));
-            qs += 8;
+            const __m256i q2_1 = ggml_iq2s_grid4(ix + 4*ib32);
+            const __m256i q2_2 = ggml_iq2s_grid4(ix + 4*ib32 + 4);
             __m256i aux256 = _mm256_set1_epi32(signs[0] | ((uint32_t) signs[1] << 16));
             aux256 = _mm256_and_si256(_mm256_shuffle_epi8(aux256,mask1), mask2);
             const __m256i s2_1 = _mm256_cmpeq_epi8(aux256, mask2);
@@ -4787,13 +4904,15 @@ static GGML_MULTI_CASE_ATTR void ggml_vec_dot_iq2_s_q8_0_1(int n, float * GGML_R
             signs += 4;
             const __m256i p1 = _mm256_madd_epi16(_mm256_maddubs_epi16(q2_1, q8s_1), _mm256_shuffle_epi8(scales16, get_scale_shuffle_k4(ib32+0)));
             const __m256i p2 = _mm256_madd_epi16(_mm256_maddubs_epi16(q2_2, q8s_2), _mm256_shuffle_epi8(scales16, get_scale_shuffle_k4(ib32+1)));
-            accumf = _mm256_fmadd_ps(_mm256_set1_ps(xd * GGML_CPU_FP16_TO_FP32(yb[ib32+0].d)), _mm256_cvtepi32_ps(p1), accumf);
-            accumf = _mm256_fmadd_ps(_mm256_set1_ps(xd * GGML_CPU_FP16_TO_FP32(yb[ib32+1].d)), _mm256_cvtepi32_ps(p2), accumf);
+            accb = _mm256_fmadd_ps(_mm256_broadcast_ss(db + ib32 + 0), _mm256_cvtepi32_ps(p1), accb);
+            accb = _mm256_fmadd_ps(_mm256_broadcast_ss(db + ib32 + 1), _mm256_cvtepi32_ps(p2), accb);
         }
+        // the weight scale once per block of 256 (the activation scales as floats, converted once per call: -8 % per row)
+        accumf = _mm256_fmadd_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32(x[i].d)), accb, accumf);
     }
     *s = 0.125f * hsum_float_8(accumf);
-#undef IQ2S_GRID
 #else
+    GGML_UNUSED(vd);
     ggml_vec_dot_iq2_s_q8_0_generic(n, s, vx, vy);
 #endif
 }
@@ -4835,14 +4954,20 @@ static GGML_MULTI_CASE_ATTR void ggml_vec_dot_iq3_k_q8_0_1(int n, float * GGML_R
 #endif
 }
 
-GGML_MULTI_CASES(ggml_vec_dot_iq2_s_q8_0_multi_n)
-void ggml_vec_dot_iq2_s_q8_0_multi(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int nc) {
+#define IQ2S_CASE(k) static GGML_MULTI_CASE_ATTR void ggml_vec_dot_iq2_s_q8_0_multi_n_c##k(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const float * const * vd) { ggml_vec_dot_iq2_s_q8_0_multi_n(n, s, vx, vy, vd, k); }
+IQ2S_CASE(2)
+IQ2S_CASE(3)
+IQ2S_CASE(4)
+#undef IQ2S_CASE
+static GGML_MULTI_CASE_ATTR void ggml_vec_dot_iq2_s_q8_0_multi_n_cn(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const float * const * vd, int nc) { ggml_vec_dot_iq2_s_q8_0_multi_n(n, s, vx, vy, vd, nc); }
+void ggml_vec_dot_iq2_s_q8_0_multi_f(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const float * const * vd, const float * const * vs, int nc) {
+    GGML_UNUSED(vs);
     switch (nc) {
-        case 1:  ggml_vec_dot_iq2_s_q8_0_1(n, s, vx, vy[0]); break;
-        case 2:  ggml_vec_dot_iq2_s_q8_0_multi_n_c2(n, s, vx, vy); break;
-        case 3:  ggml_vec_dot_iq2_s_q8_0_multi_n_c3(n, s, vx, vy); break;
-        case 4:  ggml_vec_dot_iq2_s_q8_0_multi_n_c4(n, s, vx, vy); break;
-        default: ggml_vec_dot_iq2_s_q8_0_multi_n_cn(n, s, vx, vy, nc); break;
+        case 1:  ggml_vec_dot_iq2_s_q8_0_1(n, s, vx, vy[0], vd[0]); break;
+        case 2:  ggml_vec_dot_iq2_s_q8_0_multi_n_c2(n, s, vx, vy, vd); break;
+        case 3:  ggml_vec_dot_iq2_s_q8_0_multi_n_c3(n, s, vx, vy, vd); break;
+        case 4:  ggml_vec_dot_iq2_s_q8_0_multi_n_c4(n, s, vx, vy, vd); break;
+        default: ggml_vec_dot_iq2_s_q8_0_multi_n_cn(n, s, vx, vy, vd, nc); break;
     }
 }
 

@@ -111,7 +111,10 @@ void ggml_vec_dot_iq2_s_q8_K_multi (int n, float * GGML_RESTRICT s, const void *
 void ggml_vec_dot_iq3_k_q8_K_multi (int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int nc);
 void ggml_vec_dot_iq4_nl_q8_0_multi(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int nc);
 // the same with q8_0 activations quantized as the GPU's q8_1 (quantize_row_q8_0_gpu)
-void ggml_vec_dot_iq2_s_q8_0_multi (int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int nc);
+// IQ2_S: with the activation rows' block scales as floats (vd[c][b] = fp32 of vy[c]'s block b scale), converted once per call
+void ggml_vec_dot_iq2_s_q8_0_multi_f(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const float * const * vd, const float * const * vs, int nc);
+// IQ3_KS: vd as IQ2_S, vs[c][b] = vd[c][b] * the sum of vy[c]'s block b
+void ggml_vec_dot_iq3_ks_q8_0_multi_f(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const float * const * vd, const float * const * vs, int nc);
 void ggml_vec_dot_iq3_k_q8_0_multi (int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int nc);
 void ggml_vec_dot_iq3_ks_q8_0_multi(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int nc);
 void ggml_vec_dot_iq3_xxs_q8_0_multi(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int nc);

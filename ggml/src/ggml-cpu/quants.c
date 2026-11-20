@@ -1509,8 +1509,13 @@ void ggml_vec_dot_iq4_xs_q8_0_multi(int n, float * GGML_RESTRICT s, const void *
 void ggml_vec_dot_q2_0_q8_0_multi(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int nc) {
     for (int c = 0; c < nc; c++) ggml_vec_dot_q8_0_dequant_generic(GGML_TYPE_Q2_0, n, s + c, vx, vy[c]);
 }
-void ggml_vec_dot_iq2_s_q8_0_multi(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int nc) {
+void ggml_vec_dot_iq2_s_q8_0_multi_f(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const float * const * vd, const float * const * vs, int nc) {
+    GGML_UNUSED(vd); GGML_UNUSED(vs);
     for (int c = 0; c < nc; c++) ggml_vec_dot_iq2_s_q8_0_generic(n, s + c, vx, vy[c]);
+}
+void ggml_vec_dot_iq3_ks_q8_0_multi_f(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const float * const * vd, const float * const * vs, int nc) {
+    GGML_UNUSED(vd); GGML_UNUSED(vs);
+    for (int c = 0; c < nc; c++) ggml_vec_dot_iq3_ks_q8_0_generic(n, s + c, vx, vy[c]);
 }
 void ggml_vec_dot_iq3_k_q8_0_multi(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int nc) {
     for (int c = 0; c < nc; c++) ggml_vec_dot_iq3_k_q8_0_generic(n, s + c, vx, vy[c]);
