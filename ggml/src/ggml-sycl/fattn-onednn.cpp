@@ -5,6 +5,7 @@
 #include <string>
 #include <optional>
 #include <unordered_map>
+#include <mutex>
 #include <vector>
 
 #include "fattn-onednn.hpp"
@@ -392,18 +393,34 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
 
     // compile once per (device, shape, KV strides), reuse across layers/calls. Stride 2 always
     // repeats stride 1 and stride 4 is always 1, so the key covers every entry that can differ.
+
     static std::unordered_map<std::string, sdpa_partition> cache;
+    static std::mutex                                      cache_mutex;
+
     char keyb[256];
+
     snprintf(keyb, sizeof(keyb), "%d:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld", ggml_sycl_get_device(),
-             (long long) H, (long long) Hkv, (long long) q, (long long) seq, (long long) d,
-             (long long) k_str[0], (long long) k_str[1], (long long) k_str[3],
-             (long long) v_str[0], (long long) v_str[1], (long long) v_str[3]);
-    ggml_sycl_sdpa_stage = "partition lookup/build";
-    auto it = cache.find(keyb);
-    if (it == cache.end()) {
-        it = cache.emplace(keyb, build_sdpa(eng, (int) H, (int) Hkv, (int) q, (int) seq, (int) d, k_str, v_str)).first;
+             (long long) H, (long long) Hkv, (long long) q, (long long) seq, (long long) d, (long long) k_str[0],
+             (long long) k_str[1], (long long) k_str[3], (long long) v_str[0], (long long) v_str[1],
+             (long long) v_str[3]);
+
+    sdpa_partition * E_ptr = nullptr;
+
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+
+        auto it = cache.find(keyb);
+
+        if (it == cache.end()) {
+            it = cache.emplace(keyb, build_sdpa(eng, (int) H, (int) Hkv, (int) q, (int) seq, (int) d, k_str, v_str))
+                     .first;
+        }
+
+        E_ptr = &it->second;
     }
-    sdpa_partition & E = it->second;
+
+    sdpa_partition & E = *E_ptr;
+
     if (!E.ok) {
         // oneDNN can decline a shape or a stride set that _supported() never sees; build_sdpa warns per key.
         ggml_sycl_flash_attn_ext_tile(ctx, dst);
