@@ -31,6 +31,9 @@ static __device__ __forceinline__ void get_rows_q_row(const get_rows_q_args & a,
     const int i11 = z / ne12;
     const int i12 = z % ne12;
     const int i01 = a.ids[i10*a.s10 + i11*a.s11 + i12*a.s12];
+    if (i01 == -2) {
+        return;   // a row past the attention's KV length (ggml_qsa_decode): never read
+    }
     half * dst_row = a.dst + i10*a.s1 + i11*a.s2 + i12*a.s3;
     const char * src0_row = (const char *) a.src0 + i01*a.nb01 + i11*a.nb02 + i12*a.nb03;
     const bool q8 = a.type == GGML_TYPE_Q8_0;

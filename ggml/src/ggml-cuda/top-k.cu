@@ -331,12 +331,21 @@ static __global__ void top_k_radix_fused(
     const int tid = threadIdx.x;
     const float * row_src = src + (size_t) row * ncols;
     const int ncols_live = top_k_ncols_live(ncols, k, n_live);
+    // top_k_qsa_tail::all_live (ggml_cuda_top_k_live): with no more live columns than k, the top-k is every column below
+    // k (the live ones first, then columns scoring -inf): written as such, no pass
+    const bool all_live = qt.all_live && n_live && *n_live <= k;
     __shared__ int histogram[NBINS];
     __shared__ int s_bin, s_above;
 
     uint32_t prefix = 0, prefix_mask = 0;
     int rank = k;
-    for (int pass = 0, shift = 32 - RADIX_BITS; shift >= 0; pass++, shift -= RADIX_BITS) {
+    if (all_live) {
+        int * row_dst = dst + (size_t) row * k;
+        for (int c = row_block * BLOCK_SIZE + tid; c < k; c += blocks_per_row * BLOCK_SIZE) {
+            row_dst[c] = c;
+        }
+    }
+    for (int pass = 0, shift = 32 - RADIX_BITS; !all_live && shift >= 0; pass++, shift -= RADIX_BITS) {
         int * hist = histograms + (pass & 1) * hist_stride;
         // top_k_radix_histogram
         histogram[tid] = 0;
@@ -381,8 +390,8 @@ static __global__ void top_k_radix_fused(
     // top_k_radix_count
     int2 * counts = (int2 *) histograms;
     const int begin = row_block * chunk;
-    const int end = min(begin + chunk, ncols_live);
-    {
+    const int end = all_live ? begin : min(begin + chunk, ncols_live);
+    if (!all_live) {
         int g = 0;
         int e = 0;
         for (int col = begin + tid; col < end; col += BLOCK_SIZE) {
@@ -411,7 +420,9 @@ static __global__ void top_k_radix_fused(
             counts[(size_t) row * blocks_per_row + row_block] = make_int2(greater, equal);
         }
     }
-    ggml_cuda_grid_barrier(&g_top_k_bar[0], &g_top_k_bar[64], gen);
+    if (!all_live) {
+        ggml_cuda_grid_barrier(&g_top_k_bar[0], &g_top_k_bar[64], gen);
+    }
 
     // top_k_radix_gather
     int * row_dst = dst + (size_t) row * k;
@@ -537,6 +548,9 @@ static size_t top_k_radix_states_bytes(int nrows) {
     return GGML_PAD(nrows * sizeof(top_k_radix_state), 256);
 }
 
+// ggml_cuda_top_k_live: the fused kernel's short-circuit with no more live columns than k (top_k_qsa_tail::all_live)
+static bool g_top_k_all_live = false;
+
 // the rows the fused kernel may take (its second histogram buffer is part of the scratch for them only)
 static constexpr int top_k_radix_fused_max_rows = 16;
 
@@ -583,8 +597,10 @@ static bool top_k_radix_fused_cuda(int * histograms, size_t hist_count, const fl
         top_k_radix_fused<BLOCK_SIZE, RADIX_BITS, true><<<blocks_per_row * nrows, BLOCK_SIZE, 0, stream>>>(
             src, dst, histograms, hist_count, ncols, k, chunk, blocks_per_row, n_live, *qt);
     } else {
+        top_k_qsa_tail none{};
+        none.all_live = g_top_k_all_live;
         top_k_radix_fused<BLOCK_SIZE, RADIX_BITS, false><<<blocks_per_row * nrows, BLOCK_SIZE, 0, stream>>>(
-            src, dst, histograms, hist_count, ncols, k, chunk, blocks_per_row, n_live, top_k_qsa_tail{});
+            src, dst, histograms, hist_count, ncols, k, chunk, blocks_per_row, n_live, none);
     }
     CUDA_CHECK(cudaGetLastError());
     return true;
@@ -991,4 +1007,11 @@ size_t ggml_cuda_top_k_scratch_size(const ggml_tensor * dst) {
 #else
     return 0;
 #endif
+}
+
+void ggml_cuda_top_k_live(ggml_cuda_pool & pool, const float * src, int * dst, int ncols, int nrows, int k, const int * n_live,
+        cudaStream_t stream) {
+    g_top_k_all_live = true;
+    top_k_radix_cuda(pool, nullptr, src, dst, ncols, nrows, k, stream, n_live);
+    g_top_k_all_live = false;
 }

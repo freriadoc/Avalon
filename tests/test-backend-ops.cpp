@@ -6160,6 +6160,81 @@ struct test_qsa_select_tiles : public test_case {
 
 // the k-pool layout of one sequence from the positions of its cells (ggml_qsa_pool_layout): positions pos_min ..
 // pos_min + n_seq - 1 spread over shuffled cells, the others empty (-1); n_seq / kpool complete blocks, padded to n_pool
+// ggml_qsa_decode: one sequence of n_used cells at positions 0 .. n_used-1 (cell i at position i), n_real complete pools,
+// the tail the incomplete pool's cells, the queries the last n_t positions; n_real <= n_top: every pool (the short-circuit)
+struct test_qsa_decode : public test_case {
+    const int64_t   n_cells, n_real, n_top, n_t;
+    const ggml_type type_idx, type_K, type_V;
+
+    std::string vars() override { return VARS_TO_STR7(n_cells, n_real, n_top, n_t, type_idx, type_K, type_V); }
+    double max_nmse_err() override { return 5e-4; }
+
+    test_qsa_decode(int64_t n_cells = 2048, int64_t n_real = 40, int64_t n_top = 64, int64_t n_t = 2,
+            ggml_type type_idx = GGML_TYPE_F32, ggml_type type_K = GGML_TYPE_Q8_0, ggml_type type_V = GGML_TYPE_Q4_0)
+        : n_cells(n_cells), n_real(n_real), n_top(n_top), n_t(n_t), type_idx(type_idx), type_K(type_K), type_V(type_V) {}
+
+    static constexpr int64_t kpool = 4, D = 256, n_head = 24, n_kvh = 2, idx_dim = 128, n_idx_h = 4, n_tail = 256;
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_pool = n_cells/kpool + 64;
+        ggml_tensor * q       = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, n_head, n_t);
+        ggml_tensor * idx_q   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, idx_dim, n_idx_h, n_t);
+        ggml_tensor * idx_k   = ggml_new_tensor_2d(ctx, type_idx, idx_dim, n_cells);
+        ggml_tensor * members = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kpool, n_pool);
+        ggml_tensor * tail    = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_tail, n_t);
+        ggml_tensor * cpos    = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_cells);
+        ggml_tensor * tpos    = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_t);
+        ggml_tensor * meta    = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4);
+        ggml_tensor * k       = ggml_new_tensor_3d(ctx, type_K, D, n_kvh, n_cells);
+        ggml_tensor * v       = ggml_new_tensor_3d(ctx, type_V, D, n_kvh, n_cells);
+        ggml_set_name(idx_q, "idx_q"); ggml_set_name(idx_k, "idx_k"); ggml_set_name(members, "members");
+        ggml_set_name(tail, "tail"); ggml_set_name(cpos, "cell_pos"); ggml_set_name(tpos, "tok_pos"); ggml_set_name(meta, "meta");
+        return ggml_qsa_decode(ctx, q, idx_q, idx_k, members, tail, cpos, tpos, meta, k, v, 1.0f/sqrtf((float) D),
+                               1.0f/sqrtf((float) idx_dim), (int32_t) n_top);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const int64_t n_tail_cells = 2;   // the incomplete pool
+        const int64_t n_used = n_real*kpool + n_tail_cells + n_t;
+        GGML_ASSERT(n_used <= n_cells);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            std::vector<int32_t> iv;
+            if (strcmp(t->name, "members") == 0) {
+                iv.resize(ggml_nelements(t));
+                for (int64_t i = 0; i < (int64_t) iv.size(); i++) {
+                    iv[i] = i < n_real*kpool ? (int32_t) i : 0;
+                }
+            } else if (strcmp(t->name, "tail") == 0) {
+                iv.assign(ggml_nelements(t), -1);
+                for (int64_t q = 0; q < n_t; q++) {
+                    for (int64_t i = 0; i < n_tail_cells + n_t; i++) {
+                        iv[q*n_tail + i] = (int32_t) (n_real*kpool + i);
+                    }
+                }
+            } else if (strcmp(t->name, "cell_pos") == 0) {
+                iv.resize(n_cells);
+                for (int64_t i = 0; i < n_cells; i++) {
+                    iv[i] = i < n_used ? (int32_t) i : -1;
+                }
+            } else if (strcmp(t->name, "tok_pos") == 0) {
+                iv.resize(n_t);
+                for (int64_t q = 0; q < n_t; q++) {
+                    iv[q] = (int32_t) (n_used - n_t + q);
+                }
+            } else if (strcmp(t->name, "meta") == 0) {
+                iv = { 0, (int32_t) n_real, 0, 0 };
+            } else if (strcmp(t->name, "idx_q") == 0 || strcmp(t->name, "idx_k") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);   // positive scores: no ties at 0 after the relu
+                continue;
+            } else {
+                init_tensor_uniform(t);
+                continue;
+            }
+            ggml_backend_tensor_set(t, iv.data(), 0, iv.size()*sizeof(int32_t));
+        }
+    }
+};
+
 struct test_qsa_pool_layout : public test_case {
     const int64_t n_kv;
     const int64_t kpool;
@@ -13625,6 +13700,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 65536, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false,  512));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 65536, 67, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 2048));
     // the tile mask of ggml_qsa_select_tiles read by the sparse kernel: f16 K/V, and q8_0 / q4_0 gathered as they are
+    for (int64_t n_t : { 1, 2, 4 }) {
+        for (int64_t n_real : { 0, 40, 300 }) {
+            test_cases.emplace_back(new test_qsa_decode(2048, n_real, 64, n_t));
+        }
+    }
+    test_cases.emplace_back(new test_qsa_decode(2048, 300, 64, 2, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
+    test_cases.emplace_back(new test_qsa_decode(2048, 300, 64, 2, GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_qsa_select_tiles(4096,  64,  4, 37, 16, true, true));
     test_cases.emplace_back(new test_qsa_select_tiles(65536, 512, 4, 64, 16, true, true));
     test_cases.emplace_back(new test_qsa_select_tiles(65536, 512, 4, 67, 16, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));

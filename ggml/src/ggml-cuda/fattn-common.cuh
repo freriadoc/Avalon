@@ -1134,7 +1134,7 @@ void launch_fattn(
     while (mask_root && mask_root->view_src) {
         mask_root = mask_root->view_src;
     }
-    const bool scan_mask = !use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1) &&
+    const bool scan_mask = !use_sparse && !ctx.fattn_kv_max && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1) &&
         mask_root->op != GGML_OP_QSA_SELECT;
     const dim3 blocks_num_KV_max(ntiles_x, Q->ne[3], 1);
     if (scan_mask) {
@@ -1265,7 +1265,7 @@ void launch_fattn(
     ggml_cuda_pool_alloc<int>    KV_max(pool);
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
     ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
-    int    * KV_max_ptr       = mask_tiles ? (int *) mask->src[4]->data :
+    int    * KV_max_ptr       = ctx.fattn_kv_max && !use_sparse ? (int *) ctx.fattn_kv_max : mask_tiles ? (int *) mask->src[4]->data :
                                 KV_max_n       == 0 ? nullptr : scratch ? (int    *) (scratch + scratch_l.KV_max)       : KV_max.alloc(KV_max_n);
     float  * dst_tmp_ptr      = dst_tmp_n      == 0 ? nullptr : scratch ? (float  *) (scratch + scratch_l.dst_tmp)      : dst_tmp.alloc(dst_tmp_n);
     float2 * dst_tmp_meta_ptr = dst_tmp_meta_n == 0 ? nullptr : scratch ? (float2 *) (scratch + scratch_l.dst_tmp_meta) : dst_tmp_meta.alloc(dst_tmp_meta_n);

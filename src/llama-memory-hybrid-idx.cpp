@@ -1250,9 +1250,14 @@ bool llama_memory_hybrid_idx_context::kpool_fixed(const llama_ubatch & ubatch) c
     static const bool enabled = !getenv("LLAMA_QSA_FIXED") || atoi(getenv("LLAMA_QSA_FIXED")) != 0;
     // past the context where the indexer selects (more complete pools than its top-k): below, every cell is attended,
     // which the plain causal attention does for a few cells (the graph changes shape once, at that point)
+    // and below it (LLAMA_QSA_FIXED_SHORT=0 restores the plain causal path there, whose graph changes shape every 64 pools,
+    // 256 cells: every shape in use rebuilt and recaptured); the fixed graph selects every live pool there (the top-k
+    // reads max(live, k) columns, the dead ones score -inf and are masked), which is the same attention
+    static const bool fixed_short = !getenv("LLAMA_QSA_FIXED_SHORT") || atoi(getenv("LLAMA_QSA_FIXED_SHORT")) != 0;
     const uint32_t kpool = mem->get_kpool();
     return enabled && ubatch.n_tokens <= LLAMA_GRAPH_SMALL_MAX_TOKENS && get_cell_pos_dev() != nullptr &&
-           kpool > 0 && kpool_cur().n_pool_real > mem->get_indexer_top_k() / kpool && kpool_layout_on_device(ubatch);
+           kpool > 0 && (fixed_short || kpool_cur().n_pool_real > mem->get_indexer_top_k() / kpool) &&
+           kpool_layout_on_device(ubatch);
 }
 
 uint32_t llama_memory_hybrid_idx_context::get_n_kpool_fixed() const {

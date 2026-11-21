@@ -1098,6 +1098,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
     "QSA_SELECT",
+    "QSA_DECODE",
 
     "UNARY",
 
@@ -1115,7 +1116,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1214,6 +1215,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
     "qsa_select(sel, top_score, kq_mask)",
+    "qsa_decode(q, idx_q, idx_k, ...)",
 
     "unary(x)",
 
@@ -1231,7 +1233,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6557,6 +6559,54 @@ void ggml_gated_delta_net_set_replay(
 }
 
 // ggml_lightning_indexer
+
+struct ggml_tensor * ggml_qsa_decode(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * idx_q,
+        struct ggml_tensor  * idx_k,
+        struct ggml_tensor  * members,
+        struct ggml_tensor  * tail,
+        struct ggml_tensor  * cell_pos,
+        struct ggml_tensor  * tok_pos,
+        struct ggml_tensor  * meta,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        float                 scale,
+        float                 idx_scale,
+        int32_t               n_top) {
+    const int64_t n_t = q->ne[2];
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && q->ne[3] == 1);
+    GGML_ASSERT(idx_q->type == GGML_TYPE_F32 && idx_q->ne[2] == n_t && idx_q->ne[3] == 1 && idx_q->ne[0] == idx_k->ne[0]);
+    GGML_ASSERT(members->type == GGML_TYPE_I32 && ggml_is_contiguous(members) && members->ne[2] == 1);
+    GGML_ASSERT(tail->type == GGML_TYPE_I32 && tail->ne[1] == n_t);
+    GGML_ASSERT(cell_pos->type == GGML_TYPE_I32 && ggml_is_contiguous(cell_pos) && ggml_nelements(cell_pos) >= k->ne[2]);
+    GGML_ASSERT(tok_pos->type == GGML_TYPE_I32 && ggml_nelements(tok_pos) == n_t && ggml_is_contiguous(tok_pos));
+    GGML_ASSERT(meta->type == GGML_TYPE_I32 && ggml_nelements(meta) >= 2);
+    GGML_ASSERT(k->ne[0] == q->ne[0] && v->ne[0] == q->ne[0] && k->ne[1] == v->ne[1] && k->ne[2] == v->ne[2]);
+    GGML_ASSERT(q->ne[1] % k->ne[1] == 0);
+    GGML_ASSERT(n_top > 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, q->ne[0], q->ne[1], 1, n_t);
+
+    ggml_set_op_params_f32(result, 0, scale);
+    ggml_set_op_params_f32(result, 1, idx_scale);
+    ggml_set_op_params_i32(result, 2, n_top);
+
+    result->op     = GGML_OP_QSA_DECODE;
+    result->src[0] = q;
+    result->src[1] = idx_q;
+    result->src[2] = idx_k;
+    result->src[3] = members;
+    result->src[4] = tail;
+    result->src[5] = cell_pos;
+    result->src[6] = tok_pos;
+    result->src[7] = meta;
+    result->src[8] = k;
+    result->src[9] = v;
+
+    return result;
+}
 
 struct ggml_tensor * ggml_qsa_select(
         struct ggml_context * ctx,

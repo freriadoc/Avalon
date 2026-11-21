@@ -1344,6 +1344,25 @@ llama_model_qwen4exp::graph::qsa_sel llama_model_qwen4exp::graph::build_qsa_sel(
         return { n_t == n_tokens ? kq_2d : ggml_view_2d(ctx0, kq_2d, n_kv, n_t, kq_2d->nb[1], t0*kq_2d->nb[1]), nullptr };
     };
 
+    // a fixed graph's selection and attention in one op (ggml_qsa_decode; LLAMA_QSA_DECODE=0: the nodes below), every
+    // size the cache's and the live counts read on the device: the indexer, top-k, gathers, mask and flash attention
+    // nodes of the selection below in one, each step working on the live pools and cells only
+    static const bool qsa_decode = !getenv("LLAMA_QSA_DECODE") || atoi(getenv("LLAMA_QSA_DECODE")) != 0;
+    if (qsa_decode && cparams.flash_attn && inp_kpool->fixed && inp_kpool->cache_safe && pos_mode) {
+        qsa_sel res_d;
+        res_d.decode    = true;
+        res_d.all_cells = true;
+        res_d.idx_q     = q;
+        res_d.idx_k     = kpool_cache.pooled_rows();
+        res_d.members   = inp_kpool->pool_idxs;
+        res_d.tail      = inp_kpool->tail_idxs;
+        res_d.cell_pos  = inp_kpool->cell_pos;
+        res_d.tok_pos   = inp_kpool->tok_pos;
+        res_d.meta      = inp_kpool->layout_meta;
+        res_d.n_top     = (int32_t) n_top_pool;
+        return res_d;
+    }
+
     // few queries (generation, drafts): the attention gathers the selected cells; a dense scan reads the
     // n_kv cells once for all queries, a gather moves n_sel cells per query (margin of 4 for its
     // scattered reads). One op gives the rows, one the mask (visibility at live slots, -inf at dead ones).
@@ -1503,6 +1522,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     // a fixed graph gathers from every cell (its rows index cells past n_kv's step as the context grows)
     ggml_tensor * k = sel.all_cells ? mctx_cur->get_k_all(ctx0, il) : mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = sel.all_cells ? mctx_cur->get_v_all(ctx0, il) : mctx_cur->get_v(ctx0, il);
+
+    if (sel.decode) {
+        ggml_tensor * cur = ggml_qsa_decode(ctx0, q, sel.idx_q, sel.idx_k, sel.members, sel.tail, sel.cell_pos, sel.tok_pos,
+                sel.meta, k, v, kq_scale, 1.0f/sqrtf((float) hparams.indexer_head_size), sel.n_top);
+        cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[3]);
+        cb(cur, "kqv_out", il);
+
+        if (inp->self_v_rot) {
+            cur = llama_mul_mat_hadamard(ctx0, cur, inp->mctx->layer_rot(inp->self_v_rot, il));
+        }
+        return cur;
+    }
 
     if (sel.rows) {
         // each query attends its gathered cells; all heads of a cell are adjacent, so a gathered row

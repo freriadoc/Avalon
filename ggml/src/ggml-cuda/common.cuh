@@ -1533,6 +1533,9 @@ struct ggml_backend_cuda_context {
     // combination of the parallel blocks applies it (fattn-common.cuh) and sets fattn_gate_done
     const fwht_gate_args * fattn_gate = nullptr;
     bool fattn_gate_done = false;
+    // the KV length of each query's flash attention, given by its caller (ggml_qsa_decode: the live cells it gathered,
+    // rounded up to FATTN_KQ_STRIDE) instead of scanned from the mask
+    const int * fattn_kv_max = nullptr;
     // the weights are read once per token (a model's large matrices while decoding, not an MTP draft's, which
     // reads its small matrices again for every piece of a prefill): Q8_0 mat-vec with non-temporal weight loads
     bool nt_weights = false;

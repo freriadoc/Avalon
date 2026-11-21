@@ -1046,6 +1046,7 @@ struct ggml_backend_sched_plan {
     const struct ggml_cgraph * key = nullptr;   // null: free
     int      key_n_nodes = 0;
     uint64_t gen         = 0;                   // the allocator's generation when it was allocated
+    ggml_gallocr_t galloc = nullptr;            // that allocator
     uint64_t used        = 0;
     bool     is_alloc    = false;
     bool     is_reset    = false;
@@ -1074,6 +1075,10 @@ struct ggml_backend_sched_plan {
 #define GGML_SCHED_MAX_PLANS 8
 
 static void ggml_backend_sched_plan_free(struct ggml_backend_sched_plan * p);
+
+struct ggml_backend_sched;
+static void ggml_backend_sched_galloc_new(struct ggml_backend_sched * sched, ggml_backend_buffer_type_t * bufts, int n_backends);
+static void ggml_backend_sched_galloc_free(struct ggml_backend_sched * sched);
 
 // the prefetch of one backend (ggml_backend_sched.pf)
 #define GGML_SCHED_PREFETCH_TABLES 128
@@ -1122,7 +1127,13 @@ struct ggml_backend_sched {
     // the buffer types given at creation; bufts replaces them with borrowed ones while a
     // MoE cache session lends the compute buffers
     ggml_backend_buffer_type_t bufts_plain[GGML_SCHED_MAX_BACKENDS];
+    // the allocator of the graph being allocated: galloc_main, or galloc_small for a small ubatch's graph
+    // (ggml_backend_sched_set_small; GGML_SCHED_SMALL_ALLOC=0: galloc_main for both): its buffers apart, never given back after a prompt
+    // nor moved by a prompt's graph, so the generation graphs keep their addresses (and their captured device graphs)
     ggml_gallocr_t galloc;
+    ggml_gallocr_t galloc_main;
+    ggml_gallocr_t galloc_small;
+    bool           want_small;
 
     // hash map of the nodes in the graph
     struct ggml_hash_set  hash_set;
@@ -1212,6 +1223,7 @@ struct ggml_backend_sched {
     const struct ggml_cgraph * plan_key;
     int      plan_key_n_nodes;
     uint64_t plan_gen;
+    ggml_gallocr_t plan_galloc;   // the allocator plan_gen is of
     uint64_t plan_clock;
 
     int debug;
@@ -2288,10 +2300,14 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     // the first graph after a reservation lends back what the worst case took beyond its own needs: a prompt shorter than
     // the ubatch fits the reserved buffers, so it would not be planned again and would keep them all (as Strata, which
     // lends each prompt what its own chunk needs)
-    const bool fit = sched->fit_next && ggml_moe_cache.borrows != nullptr;
-    sched->fit_next = false;
-
     // allocate graph
+    sched->galloc = sched->want_small && sched->galloc_small ? sched->galloc_small : sched->galloc_main;
+
+    // a small ubatch's allocator was not the one reserved for the worst case: the fit waits for the main's next graph
+    const bool fit = sched->fit_next && ggml_moe_cache.borrows != nullptr && sched->galloc == sched->galloc_main;
+    if (sched->galloc == sched->galloc_main) {
+        sched->fit_next = false;
+    }
     if (backend_ids_changed || fit || !ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: failed to allocate graph, reserving (backend_ids_changed = %d)\n", __func__, backend_ids_changed);
@@ -3430,6 +3446,40 @@ static void ggml_backend_sched_use_borrowed_compute(ggml_backend_sched_t sched) 
     }
 }
 
+static bool ggml_backend_sched_small_alloc_on() {
+    static const bool on = !getenv("GGML_SCHED_SMALL_ALLOC") || atoi(getenv("GGML_SCHED_SMALL_ALLOC")) != 0;
+    return on;
+}
+
+static void ggml_backend_sched_galloc_new(struct ggml_backend_sched * sched, ggml_backend_buffer_type_t * bufts, int n_backends) {
+    // the kept plans were of the allocators replaced (a new one may come at a freed one's address, generation 0)
+    if (sched->plans) {
+        ggml_backend_sched_plan_clear(sched);
+    }
+    sched->galloc_main  = ggml_gallocr_new_n(bufts, n_backends);
+    sched->galloc_small = ggml_backend_sched_small_alloc_on() ? ggml_gallocr_new_n(bufts, n_backends) : nullptr;
+    sched->galloc       = sched->galloc_main;
+    sched->plan_galloc  = nullptr;
+}
+
+static void ggml_backend_sched_galloc_free(struct ggml_backend_sched * sched) {
+    if (sched->plans) {
+        ggml_backend_sched_plan_clear(sched);
+    }
+    if (sched->galloc_small) {
+        ggml_gallocr_free(sched->galloc_small);
+    }
+    ggml_gallocr_free(sched->galloc_main);
+    sched->galloc_main  = nullptr;
+    sched->galloc_small = nullptr;
+    sched->galloc       = nullptr;
+    sched->plan_galloc  = nullptr;
+}
+
+void ggml_backend_sched_set_small(ggml_backend_sched_t sched, bool small) {
+    sched->want_small = small;
+}
+
 ggml_backend_sched_t ggml_backend_sched_new(
         ggml_backend_t * backends,
         ggml_backend_buffer_type_t * bufts,
@@ -3522,7 +3572,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     ggml_backend_sched_use_borrowed_compute(sched);
 
-    sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
+    ggml_backend_sched_galloc_new(sched, sched->bufts, n_backends);
     sched->op_offload = op_offload;
     sched->graph_size_max = graph_size;
     sched->plans = new std::vector<ggml_backend_sched_plan *>();
@@ -3569,13 +3619,13 @@ void ggml_backend_sched_set_moe_cache(
     // the session changes: the compute buffer types may point at it and the allocator holds
     // them, so both are rebuilt on every path below; buffers borrowed from the old session
     // go back to it before it is destroyed (this runs before any graph is reserved)
-    ggml_gallocr_free(sched->galloc);
+    ggml_backend_sched_galloc_free(sched);
     sched->galloc = NULL;
     ggml_backend_sched_drop_moe_cache(sched);
 
     auto rebuild_bufts = [sched]() {
         ggml_backend_sched_use_borrowed_compute(sched);
-        sched->galloc = ggml_gallocr_new_n(sched->bufts, sched->n_backends);
+        ggml_backend_sched_galloc_new(sched, sched->bufts, sched->n_backends);
     };
     if (mode == GGML_MOE_CACHE_MODE_OFF ||
         !ggml_moe_cache.query_config || !ggml_moe_cache.session_create) {
@@ -3661,23 +3711,23 @@ void * ggml_backend_sched_detach_moe_cache(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     ggml_backend_sched_prefetch_restore(sched);
     // borrowed compute buffers go back to the session while it is still attached
-    ggml_gallocr_free(sched->galloc);
+    ggml_backend_sched_galloc_free(sched);
     void * session = sched->moe_cache_session;
     sched->moe_cache_session = nullptr;
     sched->moe_cache_guest = false;
     ggml_backend_sched_use_borrowed_compute(sched);
-    sched->galloc = ggml_gallocr_new_n(sched->bufts, sched->n_backends);
+    ggml_backend_sched_galloc_new(sched, sched->bufts, sched->n_backends);
     return session;
 }
 
 void ggml_backend_sched_attach_moe_cache(ggml_backend_sched_t sched, void * session) {
     GGML_ASSERT(sched);
-    ggml_gallocr_free(sched->galloc);
+    ggml_backend_sched_galloc_free(sched);
     // the default session of a new scheduler gives way to the kept one
     ggml_backend_sched_drop_moe_cache(sched);
     sched->moe_cache_session = session;
     ggml_backend_sched_use_borrowed_compute(sched);
-    sched->galloc = ggml_gallocr_new_n(sched->bufts, sched->n_backends);
+    ggml_backend_sched_galloc_new(sched, sched->bufts, sched->n_backends);
 }
 
 void * ggml_backend_sched_get_moe_cache(ggml_backend_sched_t sched) {
@@ -3695,7 +3745,7 @@ void ggml_backend_sched_set_moe_guest_weights(ggml_backend_sched_t sched, const 
 void ggml_backend_sched_share_moe_cache(ggml_backend_sched_t sched, void * session) {
     GGML_ASSERT(sched);
     ggml_backend_sched_prefetch_restore(sched);
-    ggml_gallocr_free(sched->galloc);
+    ggml_backend_sched_galloc_free(sched);
     ggml_backend_sched_drop_moe_cache(sched);
     sched->moe_cache_session = session;
     sched->moe_cache_guest = session != nullptr;
@@ -3704,7 +3754,7 @@ void ggml_backend_sched_share_moe_cache(ggml_backend_sched_t sched, void * sessi
     // primed again: its expert tensors are shown to the cache, which takes them in the pools of their shapes
     sched->moe_cache_primed = false;
     ggml_backend_sched_use_borrowed_compute(sched);
-    sched->galloc = ggml_gallocr_new_n(sched->bufts, sched->n_backends);
+    ggml_backend_sched_galloc_new(sched, sched->bufts, sched->n_backends);
 }
 
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
@@ -3714,7 +3764,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     ggml_backend_sched_prefetch_restore(sched);
     // the compute buffers may be borrowed from the cache: give them back while the
     // session still exists
-    ggml_gallocr_free(sched->galloc);
+    ggml_backend_sched_galloc_free(sched);
     sched->galloc = NULL;
     ggml_backend_sched_drop_moe_cache(sched);
     for (int b = 0; b < sched->n_backends; b++) {
@@ -3804,6 +3854,7 @@ static void ggml_backend_sched_plan_swap(ggml_backend_sched_t sched, ggml_backen
     std::swap(sched->plan_key,              p->key);
     std::swap(sched->plan_key_n_nodes,      p->key_n_nodes);
     std::swap(sched->plan_gen,              p->gen);
+    std::swap(sched->plan_galloc,           p->galloc);
 }
 
 // the arrays of a plan, sized as ggml_backend_sched_new sizes the scheduler's
@@ -3856,13 +3907,14 @@ static void ggml_backend_sched_plan_free(ggml_backend_sched_plan * p) {
 }
 
 static bool ggml_backend_sched_plan_valid(ggml_backend_sched_t sched, const ggml_backend_sched_plan * p) {
-    return p->key != nullptr && p->is_alloc && p->gen == ggml_gallocr_get_generation(sched->galloc);
+    GGML_UNUSED(sched);
+    return p->key != nullptr && p->is_alloc && p->galloc != nullptr && p->gen == ggml_gallocr_get_generation(p->galloc);
 }
 
 // before the current state is reset: kept aside in a free, stale or least recently used plan if plan_set marked it
 static void ggml_backend_sched_plan_stash(ggml_backend_sched_t sched) {
-    if (sched->plan_key == nullptr || !sched->is_alloc || sched->galloc == nullptr ||
-        sched->plan_gen != ggml_gallocr_get_generation(sched->galloc)) {
+    if (sched->plan_key == nullptr || !sched->is_alloc || sched->plan_galloc == nullptr ||
+        sched->plan_gen != ggml_gallocr_get_generation(sched->plan_galloc)) {
         sched->plan_key = nullptr;
         return;
     }
@@ -3897,18 +3949,21 @@ void ggml_backend_sched_plan_set(ggml_backend_sched_t sched, const struct ggml_c
     sched->plan_key         = graph;
     sched->plan_key_n_nodes = graph->n_nodes;
     sched->plan_gen         = ggml_gallocr_get_generation(sched->galloc);
+    sched->plan_galloc      = sched->galloc;
 }
 
 bool ggml_backend_sched_plan_use(ggml_backend_sched_t sched, const struct ggml_cgraph * graph) {
-    const uint64_t gen = ggml_gallocr_get_generation(sched->galloc);
-    if (sched->is_alloc && sched->plan_key == graph && sched->plan_key_n_nodes == graph->n_nodes && sched->plan_gen == gen) {
+    const bool cur_valid = sched->plan_galloc != nullptr && sched->plan_gen == ggml_gallocr_get_generation(sched->plan_galloc);
+    if (sched->is_alloc && sched->plan_key == graph && sched->plan_key_n_nodes == graph->n_nodes && cur_valid) {
+        sched->galloc = sched->plan_galloc;
         return true;
     }
     for (auto * p : *sched->plans) {
         if (p->key == graph && p->key_n_nodes == graph->n_nodes && ggml_backend_sched_plan_valid(sched, p)) {
             // the current state takes the plan's place (kept if it is a valid plan itself)
-            const bool keep = sched->plan_key != nullptr && sched->is_alloc && sched->plan_gen == gen;
+            const bool keep = sched->plan_key != nullptr && sched->is_alloc && cur_valid;
             ggml_backend_sched_plan_swap(sched, p);
+            sched->galloc = sched->plan_galloc;
             if (!keep) {
                 p->key = nullptr;
             }
@@ -3961,17 +4016,19 @@ void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
 
     ggml_backend_sched_split_graph(sched, measure_graph);
 
+    sched->galloc = sched->galloc_main;
     ggml_gallocr_reserve_n_size(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, sizes);
 }
 
 static void ggml_backend_sched_prime_moe_cache(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
 
 bool ggml_backend_sched_compute_borrowed(ggml_backend_sched_t sched) {
-    return ggml_gallocr_borrowed(sched->galloc);
+    return ggml_gallocr_borrowed(sched->galloc_main);
 }
 
+// the main allocator's (the prompt's): the small ubatches' stay
 void ggml_backend_sched_release_borrowed(ggml_backend_sched_t sched) {
-    if (!ggml_gallocr_borrowed(sched->galloc)) {
+    if (!ggml_gallocr_borrowed(sched->galloc_main)) {
         return;
     }
     for (int i = 0; i < sched->n_backends; i++) {
@@ -3980,7 +4037,7 @@ void ggml_backend_sched_release_borrowed(ggml_backend_sched_t sched) {
     // no cache entry may still be pinned by the graph that used the buffers
     ggml_backend_sched_prefill_unpin(sched);
     ggml_backend_sched_reset(sched);
-    ggml_gallocr_release_borrowed(sched->galloc);
+    ggml_gallocr_release_borrowed(sched->galloc_main);
 }
 
 size_t ggml_backend_sched_compute_room(ggml_backend_sched_t sched) {
@@ -4000,7 +4057,7 @@ size_t ggml_backend_sched_compute_room(ggml_backend_sched_t sched) {
         }
         // this scheduler's own chunks go back before the next graph's are borrowed (ggml_gallocr_reserve_n frees, then
         // allocates)
-        const size_t r = lend + ggml_gallocr_get_buffer_size(sched->galloc, i);
+        const size_t r = lend + ggml_gallocr_get_buffer_size(sched->galloc_main, i);
         room = any ? std::min(room, r) : r;
         any = true;
     }
@@ -4020,6 +4077,7 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
 
     ggml_backend_sched_split_graph(sched, measure_graph);
 
+    sched->galloc = sched->galloc_main;
     if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
         return false;
     }
@@ -4376,6 +4434,18 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
         }
     }
 
+    // a small ubatch's graph after a prompt's: the prompt's compute buffers borrowed from the MoE cache go back to it now.
+    // On one allocator, the first generation graph shrank them (it needs a few MiB of their GiB); the main allocator no
+    // longer sees that graph, and they stayed lent until the next prompt (4 GiB after a 19k prompt: the generation's
+    // steps 1.8 - 2.4 ms longer, 21 Nov.)
+    if (sched->galloc == sched->galloc_small && ggml_gallocr_borrowed(sched->galloc_main)) {
+        for (int i = 0; i < sched->n_backends; i++) {
+            ggml_backend_synchronize(sched->backends[i]);
+        }
+        ggml_backend_sched_prefill_unpin(sched);
+        ggml_gallocr_release_borrowed(sched->galloc_main);
+    }
+
     return ggml_backend_sched_compute_splits(sched);
 }
 
@@ -4437,7 +4507,8 @@ size_t ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backe
     int backend_index = ggml_backend_sched_backend_id(sched, backend);
     GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
 
-    return ggml_gallocr_get_buffer_size(sched->galloc, backend_index);
+    return ggml_gallocr_get_buffer_size(sched->galloc_main, backend_index) +
+           (sched->galloc_small ? ggml_gallocr_get_buffer_size(sched->galloc_small, backend_index) : 0);
 }
 
 void ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend) {

@@ -56,6 +56,7 @@
 #include "ggml-cuda/softmax.cuh"
 #include "ggml-cuda/ssm-conv.cuh"
 #include "ggml-cuda/qsa-select.cuh"
+#include "ggml-cuda/qsa-decode.cuh"
 #include "ggml-cuda/ssm-scan.cuh"
 #include "ggml-cuda/sum.cuh"
 #include "ggml-cuda/sumrows.cuh"
@@ -3449,6 +3450,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_QSA_SELECT:
             ggml_cuda_op_qsa_select(ctx, dst);
             break;
+        case GGML_OP_QSA_DECODE:
+            ggml_cuda_op_qsa_decode(ctx, dst);
+            break;
         default:
             return false;
     }
@@ -5919,14 +5923,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     // the attention output rotated back and gated: by the flash attention's combination when it has one
-    if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+    if (node->op == GGML_OP_FLASH_ATTN_EXT || node->op == GGML_OP_QSA_DECODE) {
         fwht_gate_args ga;
         int64_t n_rows = 0;
         const int last = ggml_cuda_fwht_gate_after_fattn(*cuda_ctx, cgraph, i, &ga, &n_rows);
         if (last > 0) {
             cuda_ctx->fattn_gate      = &ga;
             cuda_ctx->fattn_gate_done = false;
-            ggml_cuda_flash_attn_ext(*cuda_ctx, node);
+            if (node->op == GGML_OP_QSA_DECODE) {
+                ggml_cuda_op_qsa_decode(*cuda_ctx, node);   // its flash attention combines with the gate
+            } else {
+                ggml_cuda_flash_attn_ext(*cuda_ctx, node);
+            }
             cuda_ctx->fattn_gate = nullptr;
             if (!cuda_ctx->fattn_gate_done) {
                 ggml_cuda_fwht_gate_launch((const float *) node->data, n_rows, ga, cuda_ctx->stream());
@@ -9708,6 +9716,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
         case GGML_OP_QSA_SELECT:
             return true;
+        case GGML_OP_QSA_DECODE:
+            return ggml_cuda_qsa_decode_supported(op);
 
         default:
             return false;

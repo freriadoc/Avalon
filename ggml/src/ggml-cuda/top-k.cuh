@@ -16,7 +16,13 @@ struct top_k_qsa_tail {
     int64_t s_pool, s_tail, s_sel, s_rows, n_tail, n_kv;
     int32_t kpool;
     half * mask; const int32_t * cell_pos; const int32_t * tok_pos; int64_t s_mask;
+    bool all_live = false;   // the top-k short-circuited with no more live columns than k (ggml_cuda_top_k_live)
 };
 
 // the top-k dst and its selection computed by one kernel; false if it cannot (dst untouched)
 bool ggml_cuda_top_k_qsa_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const top_k_qsa_tail & tail);
+
+// the radix top-k of rows of F32 scores whose columns past *n_live score -inf (ggml_set_live_count); with no more live columns
+// than k (few rows: the fused kernel) the columns below k are written without the passes, in order (ggml_qsa_decode)
+void ggml_cuda_top_k_live(ggml_cuda_pool & pool, const float * src, int * dst, int ncols, int nrows, int k, const int * n_live,
+        cudaStream_t stream);

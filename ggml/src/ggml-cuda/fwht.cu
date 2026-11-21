@@ -484,7 +484,7 @@ int ggml_cuda_fwht_gate_after_fattn(ggml_backend_cuda_context & ctx, ggml_cgraph
         j++;
     }
     int idx[4];
-    if (disabled || fa->op != GGML_OP_FLASH_ATTN_EXT || fa->type != GGML_TYPE_F32 || !ggml_is_contiguous(fa) ||
+    if (disabled || (fa->op != GGML_OP_FLASH_ATTN_EXT && fa->op != GGML_OP_QSA_DECODE) || fa->type != GGML_TYPE_F32 || !ggml_is_contiguous(fa) ||
             j >= cgraph->n_nodes || !fwht_gate_match(cgraph, j, idx)) {
         return 0;
     }

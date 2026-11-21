@@ -370,6 +370,9 @@ extern "C" {
     GGML_API bool                 ggml_backend_sched_plan_use(ggml_backend_sched_t sched, const struct ggml_cgraph * graph);
     GGML_API void                 ggml_backend_sched_plan_forget(ggml_backend_sched_t sched, const struct ggml_cgraph * graph);
     GGML_API void                 ggml_backend_sched_plan_clear(ggml_backend_sched_t sched);
+    // the next graph allocated is a small ubatch's: it takes an allocator of its own (GGML_SCHED_SMALL_ALLOC=0: the main
+    // one), whose buffers a prompt's graph neither moves nor gives back
+    GGML_API void                 ggml_backend_sched_set_small(ggml_backend_sched_t sched, bool small);
 
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);

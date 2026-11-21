@@ -2635,6 +2635,13 @@ struct llama_model_qwen4exp : public llama_model_base {
             // (LLAMA_QSA_ATT_SLICE): neither the mask nor the query side is ever alive for the whole batch
             std::function<ggml_tensor * (int64_t t0, int64_t n)> tiles_slice;
             int64_t n_att_slice = 0;
+            // or the whole attention of a few queries in one op (ggml_qsa_decode, LLAMA_QSA_DECODE): a fixed graph's
+            // indexer query and the pooled keys' rows, the attention built from them and the layout's inputs
+            bool          decode = false;
+            ggml_tensor * idx_q  = nullptr;
+            ggml_tensor * idx_k  = nullptr;
+            ggml_tensor * members = nullptr, * tail = nullptr, * cell_pos = nullptr, * tok_pos = nullptr, * meta = nullptr;
+            int32_t       n_top  = 0;
         };
 
         // a QSA layer of a prompt batch by slices of queries (qsa_sel::tiles_slice)

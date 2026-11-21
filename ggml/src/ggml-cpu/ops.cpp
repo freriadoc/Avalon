@@ -12796,6 +12796,121 @@ static void ggml_compute_forward_qsa_select_tiles(ggml_tensor * dst) {
     }
 }
 
+// ggml_qsa_decode: the reference (one thread)
+void ggml_compute_forward_qsa_decode(const ggml_compute_params * params, ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+    const ggml_tensor * q        = dst->src[0];
+    const ggml_tensor * idx_q    = dst->src[1];
+    const ggml_tensor * idx_k    = dst->src[2];
+    const ggml_tensor * members  = dst->src[3];
+    const ggml_tensor * tail     = dst->src[4];
+    const ggml_tensor * cell_pos = dst->src[5];
+    const ggml_tensor * tok_pos  = dst->src[6];
+    const ggml_tensor * meta     = dst->src[7];
+    const ggml_tensor * k        = dst->src[8];
+    const ggml_tensor * v        = dst->src[9];
+    const float   scale     = ggml_get_op_params_f32(dst, 0);
+    const float   idx_scale = ggml_get_op_params_f32(dst, 1);
+    const int32_t n_top     = ggml_get_op_params_i32(dst, 2);
+
+    const int64_t D = q->ne[0], n_head = q->ne[1], n_t = q->ne[2];
+    const int64_t idx_dim = idx_q->ne[0], n_idx_h = idx_q->ne[1];
+    const int64_t kpool = members->ne[0], n_pool = members->ne[1];
+    const int64_t n_tail = tail->ne[0], n_cells = k->ne[2], n_head_kv = k->ne[1];
+    const int64_t gqa = n_head / n_head_kv;
+    const int32_t * mem = (const int32_t *) members->data;
+    const int32_t * cp  = (const int32_t *) cell_pos->data;
+    const int32_t * mt  = (const int32_t *) meta->data;
+    const int32_t pos_min = mt[0];
+    const int64_t n_real  = std::min<int64_t>(n_pool, std::max(mt[1], 0));
+
+    ggml_to_float_t const idx_to_f = ggml_get_type_traits(idx_k->type)->to_float;
+    ggml_to_float_t const k_to_f   = ggml_get_type_traits(k->type)->to_float;
+    ggml_to_float_t const v_to_f   = ggml_get_type_traits(v->type)->to_float;
+    std::vector<float> krow(idx_dim), kf(D), vf(D), score(n_pool);
+    std::vector<int64_t> pools, cells;
+    std::vector<float> s, acc;
+
+    for (int64_t t = 0; t < n_t; ++t) {
+        const int32_t tp = ((const int32_t *) tok_pos->data)[t];
+        pools.clear();
+        for (int64_t p = 0; p < n_real; ++p) {
+            if (pos_min + (p + 1)*kpool - 1 > tp) {
+                continue;
+            }
+            const int32_t rep = mem[p*kpool + kpool - 1];
+            const char * kr = (const char *) idx_k->data + (int64_t) rep*idx_k->nb[1];
+            if (idx_to_f) {
+                idx_to_f(kr, krow.data(), idx_dim);
+            } else {
+                memcpy(krow.data(), kr, idx_dim*sizeof(float));
+            }
+            float sc = 0.0f;
+            for (int64_t h = 0; h < n_idx_h; ++h) {
+                const float * qh = (const float *) ((const char *) idx_q->data + h*idx_q->nb[1] + t*idx_q->nb[2]);
+                float d = 0.0f;
+                for (int64_t i = 0; i < idx_dim; ++i) {
+                    d += qh[i]*krow[i];
+                }
+                sc += idx_scale*std::max(d, 0.0f);
+            }
+            score[p] = sc;
+            pools.push_back(p);
+        }
+        if ((int64_t) pools.size() > n_top) {
+            std::partial_sort(pools.begin(), pools.begin() + n_top, pools.end(), [&](int64_t a, int64_t b) {
+                return score[a] > score[b] || (score[a] == score[b] && a < b);
+            });
+            pools.resize(n_top);
+        }
+        cells.clear();
+        const auto add = [&](int64_t c) {
+            if (c >= 0 && c < n_cells && cp[c] >= 0 && cp[c] <= tp) {
+                cells.push_back(c);
+            }
+        };
+        for (int64_t p : pools) {
+            for (int64_t r = 0; r < kpool; ++r) {
+                add(mem[p*kpool + r]);
+            }
+        }
+        for (int64_t i = 0; i < n_tail; ++i) {
+            add(((const int32_t *) ((const char *) tail->data + t*tail->nb[1]))[i]);
+        }
+        for (int64_t h = 0; h < n_head; ++h) {
+            const float * qh = (const float *) ((const char *) q->data + h*q->nb[1] + t*q->nb[2]);
+            const int64_t kh = h / gqa;
+            s.assign(cells.size(), 0.0f);
+            float mx = -INFINITY;
+            for (size_t j = 0; j < cells.size(); ++j) {
+                k_to_f((const char *) k->data + kh*k->nb[1] + cells[j]*k->nb[2], kf.data(), D);
+                float d = 0.0f;
+                for (int64_t i = 0; i < D; ++i) {
+                    d += qh[i]*kf[i];
+                }
+                s[j] = d*scale;
+                mx = std::max(mx, s[j]);
+            }
+            acc.assign(D, 0.0f);
+            float sum = 0.0f;
+            for (size_t j = 0; j < cells.size(); ++j) {
+                const float w = expf(s[j] - mx);
+                sum += w;
+                v_to_f((const char *) v->data + kh*v->nb[1] + cells[j]*v->nb[2], vf.data(), D);
+                for (int64_t i = 0; i < D; ++i) {
+                    acc[i] += w*vf[i];
+                }
+            }
+            float * out = (float *) ((char *) dst->data + h*dst->nb[1] + t*dst->nb[3]);
+            for (int64_t i = 0; i < D; ++i) {
+                out[i] = sum > 0.0f ? acc[i]/sum : 0.0f;
+            }
+        }
+    }
+}
+
 void ggml_compute_forward_qsa_select(const ggml_compute_params * params, ggml_tensor * dst) {
     if (params->ith != 0) {
         return;

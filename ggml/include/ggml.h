@@ -588,6 +588,7 @@ extern "C" {
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
         GGML_OP_QSA_SELECT,
+        GGML_OP_QSA_DECODE,
 
         GGML_OP_UNARY,
 
@@ -2758,6 +2759,39 @@ extern "C" {
             struct ggml_tensor     * tok_pos,
             int32_t                  kpool,
             enum ggml_qsa_select_mode mode);
+
+    // The QSA attention of a few queries (generation) in one op, every size the cache's and the live counts read from meta
+    // (ggml_qsa_pool_layout's, on the device): a graph captured once serves every context length. For each query t:
+    //   the indexer's score of every live pool p < meta[1] visible to it (its last position meta[0] + (p+1)*kpool - 1 <=
+    //   tok_pos[t]): sum over the indexer's heads h of idx_scale * relu(idx_q[:, h, t] . idx_k[:, members[kpool-1, p]]);
+    //   its n_top best pools (all of them when there are no more), their members and the tail's cells (tail[:, t], -1 for
+    //   none), the cells visible to it (0 <= cell_pos[c] <= tok_pos[t]); then softmax(q . k * scale) . v over those cells,
+    //   head h of q against head h / (n_head / n_head_kv) of k and v.
+    //   q            F32 [head_dim, n_head, n_t]
+    //   idx_q        F32 [idx_dim, n_idx_head, n_t]
+    //   idx_k        [idx_dim, n_cells] the pooled keys' rows (F32, F16, Q8_0)
+    //   members      I32 [kpool, n_pool]  (GGML_QSA_SELECT_POOL_MEMBERS)
+    //   tail         I32 [n_tail, n_t]
+    //   cell_pos     I32 [n_cells]
+    //   tok_pos      I32 [n_t]
+    //   meta         I32 [4]  first position, complete pools (as ggml_qsa_pool_layout's)
+    //   k, v         [head_dim, n_head_kv, n_cells] (F16, Q8_0, Q4_0)
+    // result: F32 [head_dim, n_head, 1, n_t] (flash attention's layout)
+    GGML_API struct ggml_tensor * ggml_qsa_decode(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * idx_q,
+            struct ggml_tensor  * idx_k,
+            struct ggml_tensor  * members,
+            struct ggml_tensor  * tail,
+            struct ggml_tensor  * cell_pos,
+            struct ggml_tensor  * tok_pos,
+            struct ggml_tensor  * meta,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            float                 scale,
+            float                 idx_scale,
+            int32_t               n_top);
 
     // The selection of QSA_SELECT gathered per tile of ncols queries, for a sparse flash attention that reads it as it is
     // (no dense [n_kv, n_t] mask): the result is the tile mask F16 [n_list, ncols, n_tiles], query j of tile t at

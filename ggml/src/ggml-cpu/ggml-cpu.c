@@ -2309,6 +2309,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_qsa_select(params, tensor);
             } break;
+        case GGML_OP_QSA_DECODE:
+            {
+                ggml_compute_forward_qsa_decode(params, tensor);
+            } break;
         case GGML_OP_DSV4_HC_COMB:
             {
                 ggml_compute_forward_dsv4_hc_comb(params, tensor);
@@ -2650,6 +2654,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 n_tasks = n_threads;
             } break;
         case GGML_OP_QSA_SELECT:
+        case GGML_OP_QSA_DECODE:
             {
                 n_tasks = 1;
             } break;

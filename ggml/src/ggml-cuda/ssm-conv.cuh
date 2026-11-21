@@ -5,7 +5,7 @@
 void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * bias_add_node = nullptr, ggml_tensor * silu_dst = nullptr);
 
 #define GGML_CUDA_SSM_CONV_CACHED_MAX_T     16
-#define GGML_CUDA_SSM_CONV_CACHED_MAX_SLOTS 4
+#define GGML_CUDA_SSM_CONV_CACHED_MAX_SLOTS 8   // n_rs_seq + 1: up to 7 drafts (4: the fused conv refused past 3)
 
 // rollback slots of a conv state in a recurrent cache: slot k's rows start at dst[k] (one row per
 // sequence, nb1[k] bytes apart) and take the window's columns from tail_col[k]
