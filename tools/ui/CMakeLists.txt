@@ -17,16 +17,19 @@ if(DEFINED LLAMA_WEBUI_HF_BUCKET)
     message(DEPRECATION "LLAMA_WEBUI_HF_BUCKET is deprecated, use LLAMA_UI_HF_BUCKET instead")
 endif()
 
-# Resolve HF asset version: explicit env var > derived from build number > unset
+# Resolve HF asset version: explicit env var > the pinned version.
+# llama.cpp derives it from the build number (the commit count), which in this fork names a bundle of llama.cpp's bucket
+# only by chance: without one the download falls back to "latest", whose files no longer match what
+# scripts/ui-assets.cmake requires (bundle[hash].css, workbox[hash].js missing), and the server does not build
+# (c9184e5d0, b12382). LLAMA_UI_PINNED_VERSION is a bundle known to build with this tree.
+set(LLAMA_UI_PINNED_VERSION "b12383" CACHE STRING "Prebuilt UI assets version of the Hugging Face bucket")
 if(DEFINED ENV{HF_WEBUI_VERSION})
     set(HF_UI_VERSION "$ENV{HF_WEBUI_VERSION}")
     message(DEPRECATION "HF_WEBUI_VERSION env var is deprecated, use HF_UI_VERSION instead")
 elseif(DEFINED ENV{HF_UI_VERSION})
     set(HF_UI_VERSION "$ENV{HF_UI_VERSION}")
-elseif(DEFINED LLAMA_BUILD_NUMBER)
-    set(HF_UI_VERSION "b${LLAMA_BUILD_NUMBER}")
 else()
-    set(HF_UI_VERSION "")
+    set(HF_UI_VERSION "${LLAMA_UI_PINNED_VERSION}")
 endif()
 
 if(NOT "${HF_UI_VERSION}" STREQUAL "" AND NOT HF_UI_VERSION MATCHES "^[A-Za-z0-9._-]+$")
