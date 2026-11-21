@@ -226,8 +226,18 @@ static __global__ void k_qsa_dec_compact(const qsa_dec_args a) {
     for (int i = threadIdx.x; i < a.n_sel; i += QSA_DEC_CT_THREADS) {
         mask[i] = i < total ? __float2half(0.0f) : __float2half(-INFINITY);
         if (i >= total) {
-            // past the count: cell 0 (finite, masked) up to the KV length, then nothing to gather (get_rows_q skips -2)
+            // past the count: cell 0 (finite, masked) up to the KV length, then nothing to gather (get_rows_q skips -2).
+            // Under CUDA every row past the count is cell 0: the tensor-core attention (stream-k, several blocks a tile)
+            // runs a block's first batch even past the KV length, and a NaN left in rows that were not gathered makes
+            // the output NaN (QSA_DECODE with 2 and 4 queries; a short answer made of token 0, no draft accepted).
+            // RTX 4090, a launch: the gather 6.7 us against 3.5 on a short context, 11.1 either way after 19k tokens;
+            // the attention a block a tile instead (it stops at the KV length) 8.4 us against 7.0 + 2.6, 40.8 against
+            // 11.6 after 19k tokens
+#if defined(GGML_USE_HIP)
             rows[i] = i < kv_max ? 0 : -2;
+#else
+            rows[i] = 0;
+#endif // defined(GGML_USE_HIP)
         }
     }
     if (threadIdx.x == 0) {
@@ -243,9 +253,11 @@ static __global__ void k_qsa_dec_gather(const qsa_dec_args a) {
     const int t = blockIdx.y;
     const int i = blockIdx.x*QSA_DEC_GATHER_ROWS + threadIdx.x / WARP_SIZE;
     const int lane = threadIdx.x % WARP_SIZE;
+#if defined(GGML_USE_HIP)
     if (i >= a.kv_max[t]) {
         return;
     }
+#endif // defined(GGML_USE_HIP)
     const int32_t c = i < a.cnt[t] ? a.rows[(size_t) t*a.n_sel + i] : -1;
     const size_t o = ((size_t) t*a.n_sel + i)*a.n_kvh*a.D;
     for (int h = 0; h < a.n_kvh; ++h) {
