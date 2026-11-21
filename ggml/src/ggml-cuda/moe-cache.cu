@@ -7844,7 +7844,9 @@ struct moe_hosted_layer {
     uint64_t * h_plan2k = nullptr;
     uint64_t * m_plan2k = nullptr;
     int split_pending_k[MOE_SPLIT_MAX_CARDS + 1] = {};
-    uint32_t * d_expect = nullptr;  // sequence number of the layer's last publication
+    // [0] sequence number of the layer's last publication; [1] the last one whose CPU rows the merge saw (its warm-up's
+    // stop word, GGML_CUDA_MOE_MALL_PREFETCH), [2] the warm-up's sink
+    uint32_t * d_expect = nullptr;
 };
 
 // SPLIT: the dispatcher's CPU time model (moe_split_cpu_*) was fitted on one machine; on another the CPU rows take
@@ -7969,7 +7971,7 @@ struct moe_hosted_state {
     // DIAGNOSTIC (GGML_CUDA_MOE_TIMELINE): host times per layer (seq % MOE_TL_RING): publication seen, plan flag
     // written, CPU rows' flag written (ns); sums of the derived intervals; the host's stream queries
     std::vector<int64_t> tl_host;
-    double tl_sum[28] = {0};
+    double tl_sum[36] = {0};
     double tlk_sum[8][10] = {};   // EXPERT SPLIT: per other card, its chain (moe_tl_account)
     int64_t tl_n = 0, tl_nw = 0, tl_q_n = 0, tl_q_ns = 0;
     double tl_tick_ns = 0;
@@ -7996,6 +7998,43 @@ struct moe_sgate_args {
     int ncols = 0;
 };
 
+// GGML_CUDA_MOE_MALL_PREFETCH=MiB (1: 40 MiB; HIP only, off by default): while the merge waits for the CPU rows (a first
+// poll of their flag failed: the GPU would idle), GGML_CUDA_MOE_MALL_BLOCKS more workgroups of the merge (32) read with
+// normal loads the weights in this card's memory that the nodes after the merge read first, up to the budget, so that
+// those nodes find them in the infinity cache (RDNA3's MALL, 80 MB, memory side; gfx11 has no prefetch instruction: the
+// values are consumed). They stop at the step after the CPU rows' flag (a device word the merge's polling thread writes)
+// or at the budget, and never wait for anything. The ranges are taken from the graph at each launch of the block, passed
+// by value (frozen in a captured graph). Tried on Oct 22 with a load per 128-byte line, the hc weights only (ggml-cuda.cu)
+#define MOE_WARM_MAX 12
+#define MOE_WARM_THREADS 256   // the merge's workgroup
+#define MOE_WARM_LOADS 8       // 16-byte loads per thread per step
+#define MOE_WARM_STEP (MOE_WARM_THREADS * MOE_WARM_LOADS * 16)   // 32 KB per workgroup per step
+struct moe_warm_args {
+    const char * ptr[MOE_WARM_MAX] = {};
+    uint32_t bytes[MOE_WARM_MAX] = {};     // multiples of 16
+    uint32_t c0[MOE_WARM_MAX + 1] = {};    // each range's first step (a range starts a step)
+    uint32_t * stop = nullptr;             // the layer's d_expect + 1: the last publication whose CPU rows the merge saw
+    int n = 0;
+    int nblocks = 0;                       // workgroups after the merge's own (0: none)
+    int rows = 0;
+};
+static size_t moe_mall_prefetch_bytes() {
+#if defined(GGML_USE_HIP)
+    static const size_t b = [] {
+        const char * v = getenv("GGML_CUDA_MOE_MALL_PREFETCH");
+        const long mib = v ? std::min(2048L, atol(v)) : 0;
+        return mib <= 0 ? (size_t) 0 : (size_t) (mib == 1 ? 40 : mib) << 20;
+    }();
+    return b;
+#else
+    return 0;
+#endif // defined(GGML_USE_HIP)
+}
+static int moe_mall_prefetch_blocks() {
+    static const int n = getenv("GGML_CUDA_MOE_MALL_BLOCKS") ? std::max(1, std::min(256, atoi(getenv("GGML_CUDA_MOE_MALL_BLOCKS")))) : 32;
+    return n;
+}
+
 struct moe_hosted_pending {
     moe_hosted_layer * layer = nullptr;
     const ggml_tensor * down = nullptr;
@@ -8009,6 +8048,7 @@ struct moe_hosted_pending {
     bool side = false;    // GGML_CUDA_MOE_SHEXP_STREAM: the nodes until the merge run on stream 1
     uint32_t * side4 = nullptr;   // SHEXP_STREAM: the counters
     bool side_kernels = false;    // SHEXP_STREAM: stream 1 runs only the shared expert's kernels, which wait and signal
+    moe_warm_args warm;           // GGML_CUDA_MOE_MALL_PREFETCH: the merge's warm-up, or none
 };
 static thread_local moe_hosted_pending g_hosted_pending;
 static cudaEvent_t g_side_ev[GGML_CUDA_MAX_DEVICES][2] = {};
@@ -8663,6 +8703,7 @@ static __global__ void k_moe_hosted_enter(const float * act, float * h_act, bloc
         if (tl) {
             tl[(value % MOE_TL_RING) * MOE_TL_W + 2] = 0;
             tl[(value % MOE_TL_RING) * MOE_TL_W + 3] = 0;
+            tl[(value % MOE_TL_RING) * MOE_TL_W + 10] = 0;   // the merge's warm-up (GGML_CUDA_MOE_MALL_PREFETCH)
             tl[(value % MOE_TL_RING) * MOE_TL_W + 0] = moe_tl_clock();
         }
         __threadfence_system();
@@ -8993,13 +9034,78 @@ static __global__ void k_side_done(volatile uint32_t * side) {   // SHEXP_STREAM
     side[1] = side[2];
     __threadfence();
 }
+// GGML_CUDA_MOE_MALL_PREFETCH: a warm-up workgroup of the merge (b: its index among them). Only for a layer with CPU rows
+// whose flag is not up yet (one poll); then steps of MOE_WARM_STEP bytes, the workgroups interleaved over the ranges in
+// order, the stop word read with each step. Waits for nothing: done a step after the flag, or at the budget.
+static __device__ __forceinline__ void moe_warm_body(const moe_warm_args & w, const int b, const uint32_t * d_expect,
+                                                     const volatile uint32_t * flag, const uint64_t * d_down_ids,
+                                                     const uint64_t * d_moved_down_ids, volatile unsigned long long * tl) {
+    __shared__ int up;
+    const uint32_t expect = *d_expect;
+    if (threadIdx.x == 0) {
+        up = (int32_t) (*flag - expect) >= 0;
+    }
+    // the rows read side by side (a layer without CPU rows: the merge is done at once, so are these)
+    bool cpu = false;
+    for (int r = threadIdx.x; r < w.rows; r += blockDim.x) {
+        cpu = cpu || (d_down_ids[r] == 0 && !(d_moved_down_ids && d_moved_down_ids[r] != 0));
+    }
+    if (!__syncthreads_or(cpu) || up) {
+        return;
+    }
+    const volatile uint32_t * stop = w.stop;
+    const unsigned long long t0 = tl && b == 0 && threadIdx.x == 0 ? moe_tl_clock() : 0;
+    int seg = 0;
+    uint32_t steps = 0;
+    uint32_t acc = 0;
+    for (uint32_t c = b; c < w.c0[w.n]; c += w.nblocks) {
+        const uint32_t seen = *stop;   // read with the step's loads, tested after them (no round trip of its own)
+        while (c >= w.c0[seg + 1]) {
+            seg++;
+        }
+        const uint32_t off = (c - w.c0[seg]) * MOE_WARM_STEP;
+        const char * base = w.ptr[seg] + off;
+        const uint32_t left = w.bytes[seg] - off;
+        int4 v[MOE_WARM_LOADS];
+#pragma unroll
+        for (int k = 0; k < MOE_WARM_LOADS; k++) {
+            const uint32_t o = (k * MOE_WARM_THREADS + threadIdx.x) * 16;
+            v[k] = o < left ? *(const int4 *) (base + o) : make_int4(0, 0, 0, 0);
+        }
+#pragma unroll
+        for (int k = 0; k < MOE_WARM_LOADS; k++) {
+            acc ^= (uint32_t) (v[k].x ^ v[k].y ^ v[k].z ^ v[k].w);
+        }
+        steps++;
+        if ((int32_t) (seen - expect) >= 0) {
+            break;   // the CPU rows are in
+        }
+    }
+    if (acc == 0x7fffffffu && expect == 0) {
+        w.stop[1] = acc;   // the values consumed (a store never taken: publications start at 1)
+    }
+    if (t0) {
+        volatile unsigned long long * t = tl + (expect % MOE_TL_RING) * MOE_TL_W;
+        t[11] = moe_tl_clock();   // the warm-up done (workgroup 0)
+        t[12] = t0;
+        t[10] = 1 + (unsigned long long) steps * w.nblocks * (MOE_WARM_STEP / 1024);   // 1 + KB read (from workgroup 0's)
+    }
+}
+
 static __global__ void k_moe_hosted_merge(const uint32_t * d_expect, const volatile uint32_t * flag,
                                           const uint64_t * d_down_ids, const uint64_t * d_moved_down_ids,
                                           const volatile float * m_res, float * dst, int n_embd,
                                           volatile unsigned long long * tl, const moe_sgate_args sg,
                                           const volatile int8_t * m_src, const volatile uint32_t * flags,
-                                          volatile uint32_t * diag, int n_used, int psum, const volatile uint32_t * side) {
-    if (side && blockIdx.x == gridDim.x - 1) {   // SHEXP_STREAM: the nodes stream 1 ran for this layer are done
+                                          volatile uint32_t * diag, int n_used, int psum, const volatile uint32_t * side,
+                                          const moe_warm_args warm) {
+    // the merge's workgroups (rows, the shared expert's gate, SHEXP_STREAM's wait), then the warm-up's
+    const unsigned nb = gridDim.x - (unsigned) warm.nblocks;
+    if (blockIdx.x >= nb) {
+        moe_warm_body(warm, (int) (blockIdx.x - nb), d_expect, flag, d_down_ids, d_moved_down_ids, tl);
+        return;
+    }
+    if (side && blockIdx.x == nb - 1) {   // SHEXP_STREAM: the nodes stream 1 ran for this layer are done
         if (threadIdx.x == 0) {
             while ((int32_t) (side[1] - side[0]) < 0) {
                 moe_hosted_pause();
@@ -9008,7 +9114,7 @@ static __global__ void k_moe_hosted_merge(const uint32_t * d_expect, const volat
         }
         return;
     }
-    if (sg.x && blockIdx.x == gridDim.x - 1 - (side ? 1 : 0)) {
+    if (sg.x && blockIdx.x == nb - 1 - (side ? 1 : 0)) {
         moe_sgate_body(sg);   // the last workgroup: the shared expert's gate
         return;
     }
@@ -9024,6 +9130,9 @@ static __global__ void k_moe_hosted_merge(const uint32_t * d_expect, const volat
         const unsigned long long t0 = tl ? moe_tl_clock() : 0;
         while ((int32_t) (*flag - expect) < 0) {
             moe_hosted_pause();
+        }
+        if (warm.nblocks) {
+            *(volatile uint32_t *) warm.stop = expect;   // the warm-up's workgroups stop
         }
         __threadfence_system();
         // EXPERT SPLIT: a row of another card waits for that card's flag too; its producer is read after the CPU's flag,
@@ -10386,6 +10495,18 @@ static void moe_tl_account(moe_hosted_state * st, uint32_t seq) {
         st->tl_sum[13] += copy_wait;
         st->tl_sum[16] += (double) (gp[4] - ge2) * k - copy_wait;
         st->tl_sum[17] += win_host;
+        // the GPU segment after the merge by its wait: warmed (GGML_CUDA_MOE_MALL_PREFETCH), waited > 2 us without a
+        // warm-up, no wait; the merge's wait (reached -> flag seen); the warm-up's KB and its end against the flag
+        const double waited = gp[4] && gm > gp[4] ? (double) (gm - gp[4]) * k : 0.0;
+        const int cw = gp[10] ? 0 : waited > 2e3 ? 1 : 2;
+        st->tl_sum[24 + cw] += seg_gpu;
+        st->tl_sum[27 + cw] += 1;
+        st->tl_sum[30 + cw] += waited;
+        if (gp[10]) {
+            st->tl_sum[33] += (double) (gp[10] - 1);
+            st->tl_sum[34] += ((double) gp[11] - (double) gm) * k;
+            st->tl_sum[35] += gp[11] > gp[12] ? (double) (gp[11] - gp[12]) * k : 0.0;
+        }
     }
     // EXPERT SPLIT: each other card's chain for the layer p, against the hosting card's publication and merge (two clocks:
     // %globaltimer on CUDA, assumed close; the durations within a card need no assumption)
@@ -10440,6 +10561,12 @@ static void moe_tl_account(moe_hosted_state * st, uint32_t seq) {
         GGML_LOG_INFO("moe timeline: GPU work in the window (plan seen -> merge, without the moved expert wait) %.1f us, "
                 "CPU window %.1f us; in the late layers without copy wait: GPU work %.1f us\n",
                 a[16] / nw / 1e3, a[17] / nw / 1e3, a[7] ? a[15] / a[7] / 1e3 : 0.0);
+        const double w0 = std::max(1.0, a[27]), w1 = std::max(1.0, a[28]), w2 = std::max(1.0, a[29]);
+        GGML_LOG_INFO("moe timeline: GPU segment after the merge, us: warmed %.1f (%.1f %% of the layers with CPU rows, merge "
+                "wait %.1f us, %.2f MiB read in %.1f us, warm-up end - flag seen %.1f us); waited > 2 us, not warmed %.1f "
+                "(%.1f %%, wait %.1f us); no wait %.1f (%.1f %%, wait %.1f us)\n",
+                a[24] / w0 / 1e3, 100 * a[27] / nw, a[30] / w0 / 1e3, a[33] / w0 / 1024, a[35] / w0 / 1e3, a[34] / w0 / 1e3,
+                a[25] / w1 / 1e3, 100 * a[28] / nw, a[31] / w1 / 1e3, a[26] / w2 / 1e3, 100 * a[29] / nw, a[32] / w2 / 1e3);
     }
 }
 
@@ -11384,14 +11511,14 @@ static moe_hosted_layer * moe_hosted_register(moe_hosted_state & st, moe_cache_d
     ok = ok && cudaMalloc((void **) &layer->d_fetch, (1 + 3 * MOE_SPLIT_FETCH_MAX) * sizeof(uint64_t)) == cudaSuccess &&
          cudaMemset(layer->d_fetch, 0, sizeof(uint64_t)) == cudaSuccess &&
          cudaMalloc((void **) &layer->d_act_ids, rows * sizeof(int32_t)) == cudaSuccess &&
-         cudaMalloc((void **) &layer->d_expect, sizeof(uint32_t)) == cudaSuccess;
+         cudaMalloc((void **) &layer->d_expect, 4 * sizeof(uint32_t)) == cudaSuccess;
     if (ok) {
         std::vector<int32_t> act_ids(rows);
         for (int row = 0; row < rows; row++) {
             act_ids[row] = row / n_used;
         }
         ok = cudaMemcpy(layer->d_act_ids, act_ids.data(), rows * sizeof(int32_t), cudaMemcpyHostToDevice) == cudaSuccess &&
-             cudaMemset(layer->d_expect, 0, sizeof(uint32_t)) == cudaSuccess;
+             cudaMemset(layer->d_expect, 0, 4 * sizeof(uint32_t)) == cudaSuccess;
     }
     if (!ok) {
         (void) cudaGetLastError();
@@ -12501,6 +12628,74 @@ static bool moe_shexp_launch(moe_hosted_state * st, moe_hosted_layer * layer, co
     return true;
 }
 
+// GGML_CUDA_MOE_MALL_PREFETCH: the merge's warm-up for the hosted block at node i (output `down`): the weights in this
+// card's memory (32 KB or more) that the nodes after the merge read, in their order, up to the budget; the next MoE block
+// ends the list (its experts are the cache's or the host's). Stop word: `stop` (the layer's d_expect + 1)
+static moe_warm_args moe_warm_collect(const ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i,
+                                      const ggml_tensor * down, int rows, uint32_t * stop) {
+    moe_warm_args w;
+    const size_t budget = moe_mall_prefetch_bytes();
+    ggml_backend_buffer_type_t buft = ggml_backend_cuda_buffer_type(ctx.device);
+    const auto reads_down = [down](const ggml_tensor * node) {
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            const ggml_tensor * src = node->src[s];
+            if (src && (src == down || src->view_src == down)) {
+                return true;
+            }
+        }
+        return false;
+    };
+    // the merge is queued before the first node that reads the block's output (ggml_cuda_moe_hosted_flush)
+    int j = i + 4;
+    while (j < cgraph->n_nodes && !reads_down(cgraph->nodes[j])) {
+        j++;
+    }
+    size_t total = 0;
+    const char * first = nullptr;
+    for (; j < cgraph->n_nodes && w.n < MOE_WARM_MAX && total < budget; j++) {
+        const ggml_tensor * node = cgraph->nodes[j];
+        if (node->op == GGML_OP_MUL_MAT_ID) {
+            break;
+        }
+        for (int s = 0; s < GGML_MAX_SRC && w.n < MOE_WARM_MAX && total < budget; s++) {
+            const ggml_tensor * t = node->src[s];
+            const ggml_tensor * r = t && t->view_src ? t->view_src : t;
+            if (!r || !r->buffer || ggml_backend_buffer_get_usage(r->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+                ggml_backend_buffer_get_type(r->buffer) != buft || ((uintptr_t) t->data & 15) != 0 ||
+                ggml_nbytes(t) < (size_t) MOE_WARM_STEP) {
+                continue;
+            }
+            bool seen = false;
+            for (int k = 0; k < w.n && !seen; k++) {
+                seen = w.ptr[k] == (const char *) t->data;
+            }
+            const size_t b = std::min(ggml_nbytes(t), budget - total) & ~(size_t) 15;
+            if (seen || b == 0) {
+                continue;
+            }
+            first = first ? first : t->name;
+            w.ptr[w.n] = (const char *) t->data;
+            w.bytes[w.n] = (uint32_t) b;
+            w.c0[w.n + 1] = w.c0[w.n] + (uint32_t) ((b + MOE_WARM_STEP - 1) / MOE_WARM_STEP);
+            w.n++;
+            total += b;
+        }
+    }
+    if (w.n == 0) {
+        return w;
+    }
+    w.stop = stop;
+    w.nblocks = moe_mall_prefetch_blocks();
+    w.rows = rows;
+    static int logged = 0;
+    if (logged < 4) {
+        logged++;
+        GGML_LOG_INFO("%s: the merge of %s warms %d weights, %.1f MiB (from %s), %d workgroups\n", __func__, down->name, w.n,
+                      total / 1048576.0, first, w.nblocks);
+    }
+    return w;
+}
+
 int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
     if (i + 3 >= cgraph->n_nodes) {
         return -1;
@@ -12939,6 +13134,9 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
     }
     g_hosted_pending = {layer, down, rows, split_on, sg, cards, st->m_split_diag, n_used, cards && w_src != nullptr, side,
                         side4 ? d_side : nullptr, side_kernels};
+    if (!side4 && moe_mall_prefetch_bytes() > 0) {
+        g_hosted_pending.warm = moe_warm_collect(ctx, cgraph, i, down, rows, layer->d_expect + 1);
+    }
     if (side) {
         ctx.curr_stream_no = 1;
     }
@@ -12976,12 +13174,13 @@ void ggml_cuda_moe_hosted_flush(ggml_backend_cuda_context & ctx, const ggml_tens
         CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), ev[1], 0));
     }
     ggml_cuda_q8_1_reuse_written(ctx, p.down);
-    k_moe_hosted_merge<<<p.rows + (p.sg.x ? 1 : 0) + (p.side4 ? 1 : 0), 256, 0, ctx.stream()>>>(p.layer->d_expect, p.layer->m_flags + 16,
+    static_assert(MOE_WARM_THREADS == 256, "the warm-up's steps: the merge's workgroup");
+    k_moe_hosted_merge<<<p.rows + (p.sg.x ? 1 : 0) + (p.side4 ? 1 : 0) + p.warm.nblocks, 256, 0, ctx.stream()>>>(p.layer->d_expect, p.layer->m_flags + 16,
                                                           p.layer->d_plan + 2 * p.rows, p.split ? p.layer->d_plan2 + 2 * p.rows : nullptr,
                                                           p.layer->m_res,
                                                           (float *) p.down->data, (int) p.layer->n_embd, g_tl_m, p.sg,
                                                           p.cards ? p.layer->m_src : nullptr, p.layer->m_flags,
-                                                          p.cards ? p.diag : nullptr, p.n_used, p.psum ? 1 : 0, p.side4);
+                                                          p.cards ? p.diag : nullptr, p.n_used, p.psum ? 1 : 0, p.side4, p.warm);
     CUDA_CHECK(cudaGetLastError());
     p = {};
     if (!node && g_side_open) {   // SHEXP_STREAM: the graph's end joins stream 1

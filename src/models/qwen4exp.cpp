@@ -784,10 +784,27 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
         ggml_set_name(inp->h, "mtp_h_input");
     }
 
+    // LLAMA_MTP_PF (bits, 3 by default; 0: the previous graph): the draft's prompt batches (over 8 tokens: the prompt's K/V pass, -ubd
+    // rows a graph). RX 7900 XT, 19k prompt (rocprof, -ubd 1024): 4.0 ms a 1024-row graph, of which 0.76 ms of GPU idle
+    // on the CPU split's input copy (the f32 token rows, 10 MB at PCIe 3.0 speed), and 1.43 + 0.26 + 0.07 ms for
+    // eh_proj, its concat and the repeat of e_norm.
+    //  1: the token rows gathered in their type on the host and dequantized by the GPU (llama_embd_raw_rows, as
+    //     build_inp_embd does): 2720 bytes a token cross instead of 10240. The same values
+    //  2: eh_proj = [W_e | W_h] as two products: W_e e_norm, the same for the hc streams, once a token (n_tokens
+    //     columns) instead of hc times, W_h h_norm over hc x n_tokens columns, their sum broadcast over the streams:
+    //     107 -> 67 GFLOP a 1024-row graph, no repeat and no concat (120 KB a token). The halves are views of the
+    //     weight's rows (the products take a row stride). Not bit for bit: two FP32 sums added
+    // 19k prompt (rocprof): the draft's stream 82 -> 64 ms of kernels, besides the copies
+    static const int mtp_pf = getenv("LLAMA_MTP_PF") ? atoi(getenv("LLAMA_MTP_PF")) : 3;
+
     // a shared head without its own embeddings or LM head is built alone only for --fit to measure it, before the target
     // exists (llama_model_share_mtp_io): what the target's tensors would produce stands in, as inputs of the same shape
     ggml_tensor * tok_embd;
-    if (model.tok_embd) {
+    if (model.tok_embd && (mtp_pf & 1) && n_tokens > 8 && llama_embd_raw_rows(model.tok_embd)) {
+        ggml_tensor * rows = ggml_get_rows_raw(ctx0, model.tok_embd, inp->tokens);
+        ggml_build_forward_expand(gf, rows);
+        tok_embd = ggml_cast(ctx0, rows, GGML_TYPE_F32);
+    } else if (model.tok_embd) {
         tok_embd = ggml_get_rows(ctx0, model.tok_embd, inp->tokens);
     } else {
         tok_embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
@@ -826,18 +843,34 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_tensor * h_norm = build_norm(ggml_reshape_3d(ctx0, h, n_embd, hc, n_tokens), layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
     cb(h_norm, "mtp_hnorm", il);
 
+    ggml_tensor * eh_w = layer.nextn.eh_proj;
+    const bool eh_split = (mtp_pf & 2) && n_tokens > 8 && ggml_is_matrix(eh_w) && eh_w->ne[0] == 2*n_embd &&
+        eh_w->ne[1] == n_embd && n_embd % ggml_blck_size(eh_w->type) == 0;
+
     ggml_tensor * e_norm = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
-    e_norm = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, e_norm, n_embd, 1, n_tokens), n_embd, hc, n_tokens, 1);
+    if (!eh_split) {
+        e_norm = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, e_norm, n_embd, 1, n_tokens), n_embd, hc, n_tokens, 1);
+    }
     cb(e_norm, "mtp_enorm", il);
 
-    ggml_tensor * eh_in = ggml_concat(ctx0, e_norm, h_norm, 0); // [2*n_embd, hc, n_tokens]
     ggml_tensor * res_hc;
-    if (n_tokens > 8) {
+    if (eh_split) {
+        // LLAMA_MTP_PF & 2 (above): [W_e | W_h] [e ; h_s] = W_e e + W_h h_s for each stream s
+        ggml_tensor * w_e = ggml_view_2d(ctx0, eh_w, n_embd, n_embd, eh_w->nb[1], 0);
+        ggml_tensor * w_h = ggml_view_2d(ctx0, eh_w, n_embd, n_embd, eh_w->nb[1], ggml_row_size(eh_w->type, n_embd));
+        ggml_tensor * p_e = ggml_mul_mat(ctx0, w_e, e_norm);                                              // [n_embd, n_tokens]
+        ggml_tensor * p_h = ggml_mul_mat(ctx0, w_h, ggml_reshape_2d(ctx0, h_norm, n_embd, hc*n_tokens));  // [n_embd, hc*n_tokens]
+        cb(p_e, "mtp_eh_proj_e", il);
+        cb(p_h, "mtp_eh_proj_h", il);
+        res_hc = ggml_add(ctx0, ggml_reshape_3d(ctx0, p_h, n_embd, hc, n_tokens), ggml_reshape_3d(ctx0, p_e, n_embd, 1, n_tokens));
+    } else if (n_tokens > 8) {
         // a prompt batch: one product over hc x n_tokens columns, the weights read once (as [.., hc, n_tokens] it was
         // n_tokens products of hc columns, each reading the 14 MB of eh_proj: 2.9 ms a 256-token pass on an RX 7900 XT)
+        ggml_tensor * eh_in = ggml_concat(ctx0, e_norm, h_norm, 0); // [2*n_embd, hc, n_tokens]
         res_hc = ggml_reshape_3d(ctx0, build_lora_mm(layer.nextn.eh_proj, ggml_reshape_2d(ctx0, eh_in, 2*n_embd, hc*n_tokens)),
                                  n_embd, hc, n_tokens);
     } else {
+        ggml_tensor * eh_in = ggml_concat(ctx0, e_norm, h_norm, 0); // [2*n_embd, hc, n_tokens]
         res_hc = build_lora_mm(layer.nextn.eh_proj, eh_in); // [n_embd, hc, n_tokens]
     }
     cb(res_hc, "mtp_eh_proj", il);
@@ -882,6 +915,10 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     if (model.output) {
         cur = build_lora_mm(model.output, cur, model.output_s);
+        if (model.d2t && cur->op == GGML_OP_MUL_MAT) {
+            // the cut head's product, found by this name by GGML_CUDA_DRAFT_HEAD_SCREEN (ggml-cuda, head-screen.cuh)
+            ggml_set_name(cur, "mtp_head_cut");
+        }
     } else {
         cur = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, (int64_t) model.vocab.n_tokens(), cur->ne[1]);
         ggml_set_input(cur);

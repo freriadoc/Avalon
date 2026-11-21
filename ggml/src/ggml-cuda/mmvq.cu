@@ -3,11 +3,17 @@
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
+#include "head-screen.cuh"
 
 #include <atomic>
+#include <climits>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
+#include <mutex>
 #include <type_traits>
+#include <vector>
 
 // only enabled on DGX Spark, where it is a gain on every type below. On the higher-bandwidth parts the kernel
 // has little exposed latency left to hide and the extra requests cost more than they save.
@@ -2885,6 +2891,185 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
+// ---- GGML_CUDA_DRAFT_HEAD_SCREEN (head-screen.cuh): an MTP draft's cut LM head screened through a 2-bit copy
+//
+// On by default (=0: the plain mmvq). 1: the head named mtp_head_cut by the graph (qwen4exp's MTP head with d2t), Q8_0, one column, goes
+// through the screen when its copy was built at load (ggml_cuda_head_screen_prepare, called by llama for a d2t head):
+// the output holds mmvq's exact values for the rows rescored, -inf elsewhere. 2: mmvq's output is kept and the screen
+// runs beside it, checked against it on the device (hs_check prints the mismatches and a summary every 256 calls).
+// After Basalt's head_proxy (MIT). RX 7900 XT: a head pass 266 -> 85 us warm, 544 -> 306 us cold (standalone test,
+// rescored values bit for bit mmvq's); replay-mtp, imposed text, 8 pairs: step 21.348 -> 21.019 ms (8 of 8), draft
+// 1.982 -> 1.712 ms, 162.9 -> 157.5 accepted of 600 (2 argmax of 512 missed in the check mode), t/s +0.4 % (6 of 8)
+// The copy and the candidates' scratch belong to the weight (one allocation, made before a context sizes the MoE cache
+// on the free VRAM): a head used by one stream at a time, as the MTP draft's.
+
+static int ggml_cuda_head_screen_mode() {
+    static const int mode = [] {
+        const char * env = getenv("GGML_CUDA_DRAFT_HEAD_SCREEN");
+        return env ? atoi(env) : 1;   // on by default; =0: the plain mmvq, =2: both, compared
+    }();
+    return mode;
+}
+
+struct ggml_cuda_head_screen_state {
+    int          device;
+    const void * w;        // the Q8_0 head
+    int64_t      n_rows;
+    int          n_in;
+    int          stride_row;
+    int          nwarps;   // mmvq's warps for one column (calc_nwarps): the exact rows' order
+    char *       mem;      // the copy's levels and scales, the candidates, 4 counters of the check (mode 2)
+    size_t       size;
+};
+
+static std::mutex                               g_head_screen_mutex;
+static std::vector<ggml_cuda_head_screen_state> g_head_screen_states;
+
+static bool ggml_cuda_head_screen_n_in_supported(const int64_t n_in) {
+    return n_in == 2048 || n_in == 2560 || n_in == 4096;
+}
+
+bool ggml_cuda_head_screen_prepare(const ggml_tensor * w, const int device) {
+    if (ggml_cuda_head_screen_mode() == 0) {
+        return false;
+    }
+    if (w == nullptr || w->data == nullptr || w->type != GGML_TYPE_Q8_0 || w->ne[2] != 1 || w->ne[3] != 1 ||
+            !ggml_is_contiguous(w) || !ggml_cuda_head_screen_n_in_supported(w->ne[0]) ||
+            w->ne[1] * (w->ne[0] / QK8_0) > INT_MAX) {
+        GGML_LOG_WARN("%s: %s (%s, %lld x %lld) not screened: Q8_0 rows of 2048, 2560 or 4096 only\n", __func__,
+                w ? w->name : "?", w ? ggml_type_name(w->type) : "?", w ? (long long) w->ne[0] : 0LL,
+                w ? (long long) w->ne[1] : 0LL);
+        return false;
+    }
+    const int cc        = ggml_cuda_info().devices[device].cc;
+    const int warp_size = ggml_cuda_info().devices[device].warp_size;
+    const mmvq_parameter_table_id table_id = get_device_table_id(cc);
+    const int nwarps = calc_nwarps(GGML_TYPE_Q8_0, 1, table_id);
+    // the exact rows repeat mmvq's order for one column: wave32, and not GB10's doubled block (should_halve_iters)
+    if (warp_size != 32 || table_id == MMVQ_PARAMETERS_GB10 || (nwarps != 1 && nwarps != 2 && nwarps != 4 && nwarps != 8)) {
+        GGML_LOG_WARN("%s: %s not screened: no exact path for this device\n", __func__, w->name);
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(g_head_screen_mutex);
+    for (const ggml_cuda_head_screen_state & s : g_head_screen_states) {
+        if (s.w == w->data && s.device == device) {
+            return true;
+        }
+    }
+
+    ggml_cuda_head_screen_state s;
+    s.device     = device;
+    s.w          = w->data;
+    s.n_rows     = w->ne[1];
+    s.n_in       = (int) w->ne[0];
+    s.stride_row = (int) (w->nb[1] / ggml_type_size(GGML_TYPE_Q8_0));
+    s.nwarps     = nwarps;
+    s.size       = hs_levels_bytes(s.n_rows, s.n_in) + hs_scales_bytes(s.n_rows, s.n_in) + hs_cand_bytes(s.n_rows) +
+                   4 * sizeof(unsigned long long);
+    s.mem        = nullptr;
+
+    ggml_cuda_set_device(device);
+    const cudaError_t err = cudaMalloc((void **) &s.mem, s.size);
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        GGML_LOG_WARN("%s: %s not screened: %.1f MiB for its copy not allocated (%s)\n", __func__, w->name,
+                s.size / 1048576.0, cudaGetErrorString(err));
+        return false;
+    }
+    // the stream the buffers' uploads use (ggml_backend_cuda_buffer_set_tensor): no stream of its own
+    cudaStream_t stream = cudaStreamPerThread;
+    CUDA_CHECK(cudaMemsetAsync(s.mem, 0, s.size, stream));
+    uint4    * wq = (uint4 *) s.mem;
+    uint16_t * sc = (uint16_t *) (s.mem + hs_levels_bytes(s.n_rows, s.n_in));
+    const int64_t n_groups = s.n_rows * (s.n_in / QK8_0);
+    const dim3 grid((unsigned) ((n_groups + 127) / 128));
+    switch (s.n_in) {
+        case 2048: hs_pack_q8_0<2048><<<grid, 128, 0, stream>>>((const block_q8_0 *) s.w, s.n_rows, s.stride_row, wq, sc); break;
+        case 2560: hs_pack_q8_0<2560><<<grid, 128, 0, stream>>>((const block_q8_0 *) s.w, s.n_rows, s.stride_row, wq, sc); break;
+        case 4096: hs_pack_q8_0<4096><<<grid, 128, 0, stream>>>((const block_q8_0 *) s.w, s.n_rows, s.stride_row, wq, sc); break;
+        default:   GGML_ABORT("fatal error");
+    }
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    g_head_screen_states.push_back(s);
+    GGML_LOG_INFO("%s: %s (%lld rows of %d, Q8_0) screened through a 2-bit copy: %.1f MiB on CUDA%d, exact rows as "
+            "mmvq's %d warps%s\n", __func__, w->name, (long long) s.n_rows, s.n_in, s.size / 1048576.0, device, nwarps,
+            ggml_cuda_head_screen_mode() == 2 ? " (check mode: mmvq's output kept)" : "");
+    return true;
+}
+
+void ggml_cuda_head_screen_release(const void * base, const size_t size) {
+    std::lock_guard<std::mutex> lock(g_head_screen_mutex);
+    for (size_t i = 0; i < g_head_screen_states.size();) {
+        const ggml_cuda_head_screen_state & s = g_head_screen_states[i];
+        if ((const char *) s.w >= (const char *) base && (const char *) s.w < (const char *) base + size) {
+            ggml_cuda_set_device(s.device);
+            CUDA_CHECK(cudaFree(s.mem));
+            g_head_screen_states.erase(g_head_screen_states.begin() + i);
+        } else {
+            i++;
+        }
+    }
+}
+
+// The screen's mode for this product (0: mmvq), and the state of its weight.
+static int ggml_cuda_head_screen_applies(const int device, const ggml_tensor * src0, const ggml_tensor * dst,
+        ggml_cuda_head_screen_state & state) {
+    const int mode = ggml_cuda_head_screen_mode();
+    if (mode == 0 || src0->type != GGML_TYPE_Q8_0 || dst->ne[1] != 1 || dst->ne[2] != 1 || dst->ne[3] != 1 ||
+            strcmp(dst->name, "mtp_head_cut") != 0) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(g_head_screen_mutex);
+    for (const ggml_cuda_head_screen_state & s : g_head_screen_states) {
+        if (s.w == src0->data && s.device == device && s.n_rows == src0->ne[1] && s.n_in == src0->ne[0]) {
+            state = s;
+            return mode;
+        }
+    }
+    return 0;
+}
+
+template <int N_IN>
+static void ggml_cuda_head_screen_launch(const ggml_cuda_head_screen_state & s, const block_q8_1 * y, float * out,
+        cudaStream_t stream) {
+    const int      tiles = (int) hs_tiles(s.n_rows);
+    const uint4  * wq    = (const uint4 *) s.mem;
+    const uint32_t * sc  = (const uint32_t *) (s.mem + hs_levels_bytes(s.n_rows, s.n_in));
+    float2       * cand  = (float2 *) (s.mem + hs_levels_bytes(s.n_rows, s.n_in) + hs_scales_bytes(s.n_rows, s.n_in));
+    const int      nc    = tiles * HS_PER;
+
+    hs_score<N_IN><<<tiles, HS_SCORE_THREADS, 0, stream>>>(wq, sc, y, (int) s.n_rows, cand, out);
+    switch (s.nwarps) {
+        case 1: hs_final<N_IN, 1><<<1, HS_FINAL_THREADS, 0, stream>>>(s.w, s.stride_row, y, cand, nc, out); break;
+        case 2: hs_final<N_IN, 2><<<1, HS_FINAL_THREADS, 0, stream>>>(s.w, s.stride_row, y, cand, nc, out); break;
+        case 4: hs_final<N_IN, 4><<<1, HS_FINAL_THREADS, 0, stream>>>(s.w, s.stride_row, y, cand, nc, out); break;
+        case 8: hs_final<N_IN, 8><<<1, HS_FINAL_THREADS, 0, stream>>>(s.w, s.stride_row, y, cand, nc, out); break;
+        default: GGML_ABORT("fatal error");
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+static void ggml_cuda_head_screen_run(const ggml_cuda_head_screen_state & s, const void * y_q8_1, float * out,
+        cudaStream_t stream) {
+    const block_q8_1 * y = (const block_q8_1 *) y_q8_1;
+    switch (s.n_in) {
+        case 2048: ggml_cuda_head_screen_launch<2048>(s, y, out, stream); break;
+        case 2560: ggml_cuda_head_screen_launch<2560>(s, y, out, stream); break;
+        case 4096: ggml_cuda_head_screen_launch<4096>(s, y, out, stream); break;
+        default:   GGML_ABORT("fatal error");
+    }
+}
+
+static void ggml_cuda_head_screen_check(const ggml_cuda_head_screen_state & s, const float * exact, const float * screen,
+        cudaStream_t stream) {
+    unsigned long long * stats = (unsigned long long *) (s.mem + s.size - 4 * sizeof(unsigned long long));
+    hs_check<<<1, 1024, 0, stream>>>(exact, screen, (int) s.n_rows, stats);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
@@ -3034,11 +3219,27 @@ void ggml_cuda_mul_mat_vec_q(
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
+    // GGML_CUDA_DRAFT_HEAD_SCREEN: an MTP draft's cut head through its 2-bit copy, on the same q8_1 activation
+    ggml_cuda_head_screen_state head_screen{};
+    const int head_screen_mode = !ids && !fusion ? ggml_cuda_head_screen_applies(ctx.device, src0, dst, head_screen) : 0;
+    if (head_screen_mode == 1) {
+        ggml_cuda_head_screen_run(head_screen, src1_q8_1, dst_d, stream);
+        return;
+    }
+    ggml_cuda_pool_alloc<float> head_screen_out(ctx.pool());
+    if (head_screen_mode == 2) {
+        ggml_cuda_head_screen_run(head_screen, src1_q8_1, head_screen_out.alloc(ne01), stream);
+    }
+
     mul_mat_vec_q_switch_type(
         src0->data, src0->type, src1_q8_1, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream, ctx.nt_weights);
+
+    if (head_screen_mode == 2) {
+        ggml_cuda_head_screen_check(head_screen, dst_d, head_screen_out.get(), stream);
+    }
 }
 
 void ggml_cuda_mul_mat_vec_q_multi(ggml_backend_cuda_context & ctx, const ggml_tensor * const * src0, ggml_tensor * const * dst,

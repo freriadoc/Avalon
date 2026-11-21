@@ -8,6 +8,13 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
 // based on the quantization type and GPU architecture (compute capability).
 int get_mmvq_mmid_max_batch(ggml_type type, int cc);
 
+// GGML_CUDA_DRAFT_HEAD_SCREEN (head-screen.cuh): the 2-bit copy of an MTP draft's cut LM head w (Q8_0, on device),
+// built now (when the model is loaded, before a context sizes the MoE cache); false when off or not applicable. The
+// products named mtp_head_cut by the graph then go through the screen. release: the copies of the weights in
+// [base, base + size), when their buffer is freed.
+bool ggml_cuda_head_screen_prepare(const ggml_tensor * w, int device);
+void ggml_cuda_head_screen_release(const void * base, size_t size);
+
 void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
 

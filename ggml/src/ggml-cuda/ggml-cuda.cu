@@ -1020,6 +1020,8 @@ struct ggml_backend_cuda_buffer_context {
 
 static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+    // GGML_CUDA_DRAFT_HEAD_SCREEN: the screening copy of a head in this buffer (mmvq.cu)
+    ggml_cuda_head_screen_release(ctx->dev_ptr, buffer->size);
     delete ctx;
 }
 
@@ -9869,10 +9871,22 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
-// see ggml_backend_cuda_context::nt_weights
+// GGML_CUDA_DRAFT_HEAD_SCREEN: the 2-bit screening copy of an MTP draft's cut LM head, built when the model is loaded
+// (llama, for a head with d2t); false when the variable is off or the head does not qualify (mmvq.cu)
+static bool ggml_backend_cuda_head_screen_prepare(const ggml_tensor * w) {
+    if (w == nullptr || w->buffer == nullptr || !ggml_backend_buffer_is_cuda(w->buffer)) {
+        return false;
+    }
+    const ggml_backend_cuda_buffer_context * buf_ctx = (const ggml_backend_cuda_buffer_context *) w->buffer->context;
+    return ggml_cuda_head_screen_prepare(w, buf_ctx->device);
+}
+
+// see ggml_backend_cuda_context::nt_weights; GGML_CUDA_NT_WEIGHTS=0: normal loads (with GGML_CUDA_MOE_MALL_PREFETCH: in
+// case a non-temporal load, MALL NOALLOC on gfx11, does not hit what the merge's warm-up left in the infinity cache)
 static void ggml_backend_cuda_set_weights_read_once(ggml_backend_t backend, bool read_once) {
+    static const bool nt_on = !getenv("GGML_CUDA_NT_WEIGHTS") || atoi(getenv("GGML_CUDA_NT_WEIGHTS")) != 0;
     if (backend && ggml_backend_is_cuda(backend)) {
-        ((ggml_backend_cuda_context *) backend->context)->nt_weights = read_once;
+        ((ggml_backend_cuda_context *) backend->context)->nt_weights = read_once && nt_on;
     }
 }
 
@@ -9898,6 +9912,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_set_weights_read_once") == 0) {
         return (void *)ggml_backend_cuda_set_weights_read_once;
+    }
+    if (strcmp(name, "ggml_backend_cuda_head_screen_prepare") == 0) {
+        return (void *)ggml_backend_cuda_head_screen_prepare;
     }
     if (strcmp(name, "ggml_backend_set_tensors_async") == 0) {
         return (void *)ggml_backend_cuda_set_tensors_async;

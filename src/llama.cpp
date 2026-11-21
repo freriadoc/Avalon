@@ -312,6 +312,27 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
     return true;
 }
 
+// GGML_CUDA_DRAFT_HEAD_SCREEN (ggml-cuda, head-screen.cuh): an MTP draft's cut LM head (with d2t) gets the 2-bit copy
+// that screens its rows, built once its weights are on the device: before a context sizes the MoE cache on the free
+// VRAM (the server loads the draft before the cache is sized). Nothing when the variable is off or another backend
+// holds the head.
+static void llama_model_prepare_head_screen(const llama_model & model) {
+    const ggml_tensor * w = model.output;
+    if (model.d2t == nullptr || w == nullptr || w->buffer == nullptr || w->data == nullptr ||
+            ggml_backend_buffer_is_host(w->buffer)) {
+        return;
+    }
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(w->buffer));
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (reg == nullptr) {
+        return;
+    }
+    auto * prepare = (bool (*)(const ggml_tensor *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_head_screen_prepare");
+    if (prepare != nullptr) {
+        prepare(w);
+    }
+}
+
 // Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback
 static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
@@ -369,6 +390,8 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         if (!model->load_tensors(ml)) {
             return {-2, nullptr};
         }
+
+        llama_model_prepare_head_screen(*model);
 
         return {0, model_ptr.release()};
     } catch (const std::exception & err) {

@@ -804,6 +804,20 @@ static int top_k_row_min_rows() {
     return n;
 }
 
+#if defined(GGML_USE_HIP)
+#include "top-k-reg.cuh"
+
+// The rows of top_k_radix_row with their keys in registers (top-k-reg.cuh, after Strata's block_topk_reg_kernel), on RDNA
+// and up to 65,536 columns; the same selection, another order in dst (GGML_CUDA_TOPK_REG=0: top_k_radix_row). RX 7900 XT,
+// standalone bench (the QSA prompt selection, 512 of the blocks): x1.67 at 4.8k columns, x1.80 at 8k, x1.20 at 32k,
+// x1.05 at 65k; a prompt of 19k: 52.9 -> 27.7 ms of GPU
+static bool top_k_reg_cuda(const float * src, int * dst, int ncols, int nrows, int k, cudaStream_t stream, const int * n_live) {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_TOPK_REG"); return !e || atoi(e) != 0; }();
+    return on && GGML_CUDA_CC_IS_RDNA(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) &&
+        top_k_reg_launch(src, dst, ncols, nrows, k, stream, n_live);
+}
+#endif // defined(GGML_USE_HIP)
+
 static void top_k_radix_cuda(
         ggml_cuda_pool & pool, char * scratch,
         const float * src, int * dst, int ncols, int nrows, int k, cudaStream_t stream, const int * n_live) {
@@ -815,6 +829,11 @@ static void top_k_radix_cuda(
         // GGML_CUDA_TOPK_MASKS=0: the selection reads every key twice. Alone, [32768, 4096], k = 512: 2.67 ms either way;
         // in a server reading 131k tokens, 4 alternated pairs: 0.00 to -0.79 s of 48 s with the masks
         static const bool use_masks = !getenv("GGML_CUDA_TOPK_MASKS") || atoi(getenv("GGML_CUDA_TOPK_MASKS")) != 0;
+#if defined(GGML_USE_HIP)
+        if (top_k_reg_cuda(src, dst, ncols, nrows, k, stream, n_live)) {
+            return;
+        }
+#endif // defined(GGML_USE_HIP)
         top_k_radix_row<<<nrows, TOP_K_ROW_THREADS, 0, stream>>>(src, dst, ncols, k, n_live, use_masks);
         CUDA_CHECK(cudaGetLastError());
         return;

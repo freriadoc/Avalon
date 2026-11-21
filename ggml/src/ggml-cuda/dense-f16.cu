@@ -192,7 +192,11 @@ bool ggml_cuda_dense_f16_applies(const int cc, const ggml_tensor * src0, const g
     // BF16 weights (the MoE router, the indexer's projections): any width, in place of hipBLAS, whose calls each wait
     // ~1.6 ms on the host after converting the activation to BF16 (72 a ubatch); GGML_CUDA_DENSE_F16_BF16=0: hipBLAS
     static const bool bf16 = !getenv("GGML_CUDA_DENSE_F16_BF16") || atoi(getenv("GGML_CUDA_DENSE_F16_BF16")) != 0;
-    const bool w_ok = src0->type == GGML_TYPE_Q8_0 ? src0->ne[1] >= min_rows && src0->nb[1] == ggml_row_size(GGML_TYPE_Q8_0, src0->ne[0]) :
+    // Q8_0 rows at a stride above their size too (a view of some of each row's blocks: the halves of the MTP draft's
+    // eh_proj, LLAMA_MTP_PF & 2), which the weight's conversion reads row by row
+    const bool w_ok = src0->type == GGML_TYPE_Q8_0 ? src0->ne[1] >= min_rows && src0->nb[0] == ggml_type_size(GGML_TYPE_Q8_0) &&
+                                                     src0->nb[1] >= ggml_row_size(GGML_TYPE_Q8_0, src0->ne[0]) &&
+                                                     src0->nb[1] % 2 == 0 && (uintptr_t) src0->data % 2 == 0 :
                       src0->type == GGML_TYPE_BF16 ? bf16 && src0->ne[1] >= 64 && src0->nb[1] == (size_t) src0->ne[0]*sizeof(uint16_t) &&
                                                      src0->nb[0] == sizeof(uint16_t) : false;
     static const int64_t min_tok  = getenv("GGML_CUDA_DENSE_F16_MIN_TOKENS") ? atoll(getenv("GGML_CUDA_DENSE_F16_MIN_TOKENS")) : 512;
