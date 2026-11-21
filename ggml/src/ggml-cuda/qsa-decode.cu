@@ -158,9 +158,9 @@ static __global__ void k_qsa_dec_score_q8(const qsa_dec_args a) {
                 for (int j = 0; j < 16; ++j) {
                     dp += qh[j]*kv[j];
                 }
-                dp += __shfl_xor(dp, 1, 8);
-                dp += __shfl_xor(dp, 2, 8);
-                dp += __shfl_xor(dp, 4, 8);
+                dp += __shfl_xor_sync(0xffffffff, dp, 1, 8);
+                dp += __shfl_xor_sync(0xffffffff, dp, 2, 8);
+                dp += __shfl_xor_sync(0xffffffff, dp, 4, 8);
                 sc += a.idx_scale*fmaxf(dp, 0.0f);
             }
         }
