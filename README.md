@@ -187,7 +187,7 @@ GSM8K (the first 200 problems of the test set, greedy, 4,096 tokens at most): **
 - **Sparse attention (QSA) for long contexts**: masks built on the GPU, gathered cells for generation, split kept
   across speculative steps.
 - **MTP speculative decoding** with a small draft head (cut LM head over 65k frequent tokens) that shares the main
-  model's expert cache.
+  model's expert cache, its length chosen token by token (up to 4) from the draft's confidence and the step's cost.
 - Fused GPU kernels for generation (a linear-attention layer went from 53 to 39 launches), AVX2 kernels for the experts on the CPU, IQ3_K / IQ3_KS types.
 
 ## Install (one command)
@@ -236,7 +236,7 @@ cd Qwen3.8-Flash-Next-Avalon-GGUF
 ../Avalon/build/bin/llama-server -m Qwen3.8-Flash-Next-Avalon-IQ3KS-00001-of-00033.gguf \
   -c 262144 -b 32768 -ub 32768 -fa on -ctk q8_0 -ctv q4_0 --jinja --parallel 1 \
   -md MTP/mtp-Qwen3.8-Flash-Next-shared-IQ3K-IQ4NL-FR65k.gguf --spec-type ngram-simple,draft-mtp \
-  --spec-draft-n-max 2 -ubd 256 -ctkd q8_0 -ctvd q8_0
+  -ubd 256 -ctkd q8_0 -ctvd q8_0
 ```
 
 Nothing else to set: `--fit` (on by default) places the dense weights on the GPU and the experts in RAM, the expert
@@ -245,6 +245,12 @@ cache takes the rest of the VRAM, and the cache is prefilled from `moe-cache-ran
 tokens with 4 GiB less VRAM, 4,800 with 8 GiB less). On the RX 7900 XT it gives 11 – 20% more prefill than `-ub 9536`
 (3,080 / 3,016 t/s at 32k / 131k).
 `--parallel 1` matters: other slots would keep their part of the KV cache.
+The MTP draft's length is chosen token by token, up to `--spec-draft-n-max` (4 by default): a draft token is kept while
+its chance of acceptance pays for its verification, the chance from the draft's confidence and the request's acceptance
+so far, the cost from the step's clock and the experts it runs on the CPU. Against 2 fixed drafts, on replays of ten
+kinds of text (Spec-Bench's six, essays in English and French, a code rewrite, a code edit): +5.2% on average, the worst
+−0.2%; +4 – 6% on the server's short answers. `LLAMA_MTP_ADAPT=0` drafts `--spec-draft-n-max` tokens every step, as
+before (2 was the advice).
 On NVIDIA, backend sampling is on by default: the target's argmax runs on the GPU instead of over 248k logits on the
 CPU, 6% faster per step on the RTX 4090 (neutral on the RX 7900 XT, where it stays off; `-bs` / `-no-bs` force it).
 
@@ -256,7 +262,7 @@ its environment), list the model where it is with `lemonade config set extra_mod
 are one model; `lemonade list` gives its name), and give it Avalon's settings in `recipe_options.json`: `"ctx_size":
 262144`, `"llamacpp_backend": "rocm"` and `"llamacpp_args": "-b 32768 -ub 32768 -fa on -ctk q8_0 -ctv q4_0 -md
 /path/to/models/Qwen3.8-Flash-Next-Avalon-GGUF/MTP/mtp-Qwen3.8-Flash-Next-shared-IQ3K-IQ4NL-FR65k.gguf --spec-type
-ngram-simple,draft-mtp --spec-draft-n-max 2 -ubd 256 -ctkd q8_0 -ctvd q8_0"`. Lemonade adds the model, the context, the port,
+ngram-simple,draft-mtp -ubd 256 -ctkd q8_0 -ctvd q8_0"`. Lemonade adds the model, the context, the port,
 `--jinja` and `--parallel 1` itself and no `-ngl`, so `--fit` keeps placing the model. Not tried yet: if you do, please
 open an issue with what worked or not.
 
