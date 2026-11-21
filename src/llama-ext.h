@@ -120,6 +120,11 @@ struct llama_memory_report {
 // The memory composition and the expert-cache counters of ctx. Read-only, safe between decodes.
 LLAMA_API llama_memory_report llama_get_memory_report(const struct llama_context * ctx);
 
+// The hosted MoE blocks' work on the CPU since the start, the process's every context: rows (token x expert), the
+// distinct experts of each block, and of those the ones first brought by a token past the block's first (what a longer
+// batch adds). Relaxed atomic reads: cheap enough for every step. false without an expert cache.
+LLAMA_API bool llama_moe_cpu_counts(uint64_t * rows, uint64_t * experts, uint64_t * later);
+
 // Set whether the context outputs nextn embeddings or not
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits

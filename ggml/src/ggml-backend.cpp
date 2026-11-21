@@ -3700,6 +3700,15 @@ bool ggml_backend_sched_moe_cache_rewarm_active(ggml_backend_sched_t sched) {
         ggml_moe_cache.rewarm_active(sched->moe_cache_session);
 }
 
+bool ggml_backend_moe_cache_cpu_counts(uint64_t * rows, uint64_t * experts, uint64_t * later) {
+    if (!ggml_moe_cache.cpu_counts) {
+        *rows = *experts = *later = 0;
+        return false;
+    }
+    ggml_moe_cache.cpu_counts(rows, experts, later);
+    return true;
+}
+
 bool ggml_backend_sched_moe_cache_stats(ggml_backend_sched_t sched, struct ggml_moe_cache_stats * out) {
     if (!sched || !sched->moe_cache_session || sched->moe_cache_guest || !ggml_moe_cache.stats) {
         return false;

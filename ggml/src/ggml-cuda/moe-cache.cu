@@ -10589,6 +10589,14 @@ static int moe_small_pass_max() {
 // weight; R from 1 to 9) is neither moved to the GPU nor computed: its rows are zero, the other experts keep the weights the
 // router gave them (no renormalisation). The main model's layers only, as Strata (not the MTP draft's).
 // Returns the CPU rows kept; counted as Strata reports them (missed experts skipped, rows skipped).
+static std::atomic<uint64_t> g_moe_cpu_rows{0}, g_moe_cpu_experts{0}, g_moe_cpu_later{0};
+
+static void moe_cache_cpu_counts(uint64_t * rows, uint64_t * experts, uint64_t * later) {
+    *rows    = g_moe_cpu_rows.load(std::memory_order_relaxed);
+    *experts = g_moe_cpu_experts.load(std::memory_order_relaxed);
+    *later   = g_moe_cpu_later.load(std::memory_order_relaxed);
+}
+
 static int moe_hosted_tail_skip(moe_hosted_state & st, moe_hosted_layer & layer, int rows, int32_t * cpu_rows, int n_cpu) {
     static const int rank = [] {
         const char * v = getenv("GGML_CUDA_MOE_TAIL_SKIP");
@@ -10713,6 +10721,21 @@ static void moe_hosted_serve_one(moe_hosted_state * st, uint32_t seq) {
     const int64_t t_cal = st->cal_left > 0 && n_tokens >= 2 && moe_split_enabled() ? ggml_time_us() : 0;
     int64_t t_reads = 0;   // ARENA: the CPU rows' reads of the file, out of the calibration (the model times the compute)
     n_cpu = moe_hosted_split(st, layer, rows, n_tokens, seq, cpu_rows.data(), n_cpu);
+    if (n_cpu > 0) {
+        // the distinct CPU experts, and those first brought by a token past the first (cpu_rows ascend: token-major)
+        int distinct = 0, later = 0;
+        for (int a = 0; a < n_cpu; a++) {
+            bool seen = false;
+            for (int b = 0; b < a && !seen; b++) {
+                seen = layer->h_ids[cpu_rows[b]] == layer->h_ids[cpu_rows[a]];
+            }
+            distinct += !seen;
+            later    += !seen && cpu_rows[a] >= layer->n_used;
+        }
+        g_moe_cpu_rows.fetch_add(n_cpu, std::memory_order_relaxed);
+        g_moe_cpu_experts.fetch_add(distinct, std::memory_order_relaxed);
+        g_moe_cpu_later.fetch_add(later, std::memory_order_relaxed);
+    }
     const int64_t t_plan = stats_every > 0 ? ggml_time_us() : 0;
     if (moe_pp_on()) {
         const int64_t ppc = ggml_time_us();
@@ -13243,6 +13266,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.plan_borrows = moe_cache_plan_borrows;
     ggml_moe_cache.borrows = moe_cache_borrows;
     ggml_moe_cache.stats = moe_cache_stats;
+    ggml_moe_cache.cpu_counts = moe_cache_cpu_counts;
 }
 
 #endif

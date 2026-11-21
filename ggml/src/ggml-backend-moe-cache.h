@@ -259,6 +259,10 @@ struct ggml_moe_cache_api {
     // the cache's memory, counters and miss latency per device, for the server's metrics and log; false when the
     // session reports none (no device yet, or a provider without stats)
     bool (*stats)(void * session, struct ggml_moe_cache_stats * out);
+    // the hosted MoE blocks' CPU work since the start, every session of the process: the rows (token x expert), the
+    // distinct experts per block computed on the CPU, and of those the ones a token past a block's first brings first
+    // (relaxed atomics: cheap enough for every step)
+    void (*cpu_counts)(uint64_t * rows, uint64_t * experts, uint64_t * later);
 
     // The end of the KV cache lent to the expert cache. A KV tensor whose rows are cells (one row per cell, the
     // cells in order) is registered once, before the pools are built: the rows past the first step are lent to the
@@ -346,6 +350,8 @@ GGML_API void    ggml_backend_sched_moe_cache_host_experts(ggml_backend_sched_t 
 // the cache's memory, counters and miss latency per device, for the server's metrics and log; false when the scheduler
 // has no session, is a guest, or the provider reports none
 GGML_API bool    ggml_backend_sched_moe_cache_stats(ggml_backend_sched_t sched, struct ggml_moe_cache_stats * out);
+// the hosted MoE blocks' CPU rows and distinct experts since the start (the process's every session); false without
+GGML_API bool    ggml_backend_moe_cache_cpu_counts(uint64_t * rows, uint64_t * experts, uint64_t * later);
 GGML_API void   ggml_backend_sched_attach_moe_cache(ggml_backend_sched_t sched, void * session);
 // the session of a scheduler (NULL without one), to share it with another
 GGML_API void * ggml_backend_sched_get_moe_cache(ggml_backend_sched_t sched);

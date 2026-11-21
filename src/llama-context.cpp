@@ -6303,6 +6303,10 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
     return ctx->memory_breakdown();
 }
 
+bool llama_moe_cpu_counts(uint64_t * rows, uint64_t * experts, uint64_t * later) {
+    return ggml_backend_moe_cache_cpu_counts(rows, experts, later);
+}
+
 llama_memory_report llama_get_memory_report(const struct llama_context * ctx) {
     return ctx->memory_report();
 }

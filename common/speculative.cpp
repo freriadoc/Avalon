@@ -1436,6 +1436,70 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     std::vector<bool> kv_hash_due;   // LLAMA_MTP_KV_HASH: a prompt batch was processed since the last draft
 
+    // DIAGNOSTIC LLAMA_MTP_STATS=file: one line per verified draft, "n_draft n_accepted step_ms" then each draft token's
+    // probability over the draft's top 10 and its logit lead over the runner-up
+    FILE *                           stat_f = nullptr;
+    std::vector<std::vector<float>>  stat_p;
+    int64_t                          stat_t = 0;
+    uint64_t                         stat_cpu_rows = 0, stat_cpu_experts = 0, stat_cpu_later = 0;   // at the last line
+    int64_t                          stat_draft_us = 0;   // the last draft()'s duration
+
+    // The draft's length chosen token by token (LLAMA_MTP_ADAPT=0: always n_max). Draft token j's probability over the
+    // draft's top 10 gives its chance of acceptance (mtp_chance, recorded steps), scaled by the request's acceptance
+    // against those chances (obs / exp over its last ADAPT_WIN windows, bounded to [0.5, 1.5]: code that repeats runs above
+    // 1, prose below). c_j, the product of the chances up to j, is what keeping j gains on average. Draft j, computed, is
+    // kept while c_j >= R * dT_j, dT_j = s (G[j+1] - G[j]) + c m - t_d: R the request's tokens per ms; a step with k
+    // drafts costs s G[k] + c e, G the GPU's part (a shape fitted at fixed lengths, 21 Nov., the tail skip off: steps
+    // fitted on the length and their CPU experts, R2 0.94 - 0.99), e its distinct CPU experts per MoE block
+    // (llama_moe_cpu_counts), c an expert's CPU time (49 - 66 us here); m the CPU experts a draft token adds in this
+    // passage (counted in the step itself: the experts a block's tokens past the first bring first, per draft verified;
+    // 1.5 on an English essay, 60 on a code edit: the text sets it, not the length chosen); t_d a draft pass (computed
+    // already: only its verification is at stake). The first draft is always kept (a window without one verifies nothing:
+    // a low scale would stop the drafts for good); draft j+1 is not computed when even the best chance could not pay its
+    // dT, its pass included. s and c by recursive least squares on (G[k], e) -> the step's duration (a prior of ~200
+    // steps at s 1, c 57 us; forgetting 0.995; bounded: s 0.67 - 1.5, c 20 - 150 us), each observation bounded to
+    // [0.67, 1.5] of its prediction (a slow step, a graph's capture, cannot rule a length out); t_d EMA 0.2; R, m and
+    // obs / exp over the request's last ADAPT_WIN windows. Two ggml_time_us and three atomic reads per step.
+    // 21 Nov., replays of 10 kinds of text (Spec-Bench's six, an essay in English and in French, a code rewrite and a code
+    // edit), the tail skip off, n_max 4 against 2 fixed drafts: +5.2 % on average, the worst -0.2 % (a window of 8:
+    // +4.1 / -3.1 %, 32: +4.8 / -2.8 %, an exponential decay 0.97 with a fixed cost shape: +4.0 / -6.0 %); the server
+    // (the tail skip on): +4.1 % (MTP), +5.5 % (ngram-simple with MTP) on tg-bench's short answers.
+    static constexpr int ADAPT_KMAX = 16;
+    static constexpr int ADAPT_WIN  = 16;
+    bool               adapt_on = false;
+    double             adapt_T[ADAPT_KMAX + 1];   // the GPU's part of a step with k drafts (ms, at s = 1)
+    double             adapt_scale = 1.0;          // s
+    double             adapt_c     = 0.057;        // a CPU expert (ms)
+    // the least squares' covariance of (s, c): a prior worth ~200 steps (a step's noise ~4 ms2, G ~20 ms, e ~200 experts);
+    // a weaker one (0.02, 4e-4: under a step) let the first steps, s and c rising together with the length, send them to
+    // their bounds (21 Nov., the code edit: c 143 us, s 0.69, a draft's cost 9 ms instead of 5, windows of one draft)
+    double             adapt_P[2][2] = { { 5e-5, 0.0 }, { 0.0, 5e-7 } };
+    double             adapt_td    = 0.9;          // a draft pass (ms)
+    uint64_t           adapt_ce = 0, adapt_cl = 0; // the CPU counters at the last step
+    int                adapt_passes = 0;           // the last draft()'s passes
+    struct adapt_state {
+        double c = 1.0, s = 1.0, R = 0.1;   // this window's product of chances, its scale and rate
+        std::vector<float> ch;              // the chances of its drafts (unscaled)
+        double obs = 0.0, exp = 0.0, tok = 0.0, ms = 0.0;   // sums over the last ADAPT_WIN windows
+        double m = 30.0;                    // the CPU experts a draft token adds (per MoE block summed)
+        double win[ADAPT_WIN][6] = {};      // per window: accepted, expected, tokens, ms, CPU experts brought late, drafts
+        int    win_n = 0, win_h = 0;
+        int64_t t_prev = 0;
+    };
+    std::vector<adapt_state> adapt;
+
+    static float mtp_chance(float p) {
+        // acceptance by bin of the stated probability (Basalt's bins), pooled over four positions: 1,785 steps of four
+        // drafts recorded with LLAMA_MTP_STATS (tg-bench MTP: the essay and the code rewrite after 19k, 21 Nov.)
+        static const float edge[] = { 0.3f,  0.5f,  0.7f,  0.8f,  0.9f,  0.95f, 0.99f };
+        static const float rate[] = { 0.27f, 0.33f, 0.41f, 0.51f, 0.69f, 0.73f, 0.79f, 0.96f };
+        int b = 0;
+        while (b < 7 && p >= edge[b]) {
+            ++b;
+        }
+        return rate[b];
+    }
+
     // pipeline stages: the target's batch of several ubatches taken during its decode, ubatch by ubatch, from its rows
     // on the device (llama_set_nextn_rows_cb); process() then has nothing to replay
     bool         rows_cb_ok   = false;   // the current target batch is taken by on_rows
@@ -1469,6 +1533,25 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 ctx_tgt ? "yes" : "no",
                 ctx_dft ? "yes" : "no",
                 common_speculative_get_devices_str(this->params.devices).c_str());
+
+        if (const char * sf = getenv("LLAMA_MTP_STATS")) {
+            stat_f = fopen(sf, "a");
+            stat_p.resize(n_seq);
+        }
+        {
+            const char * ad = getenv("LLAMA_MTP_ADAPT");
+            adapt_on = (!ad || atoi(ad) != 0) && this->params.n_max >= 2;
+        }
+        if (adapt_on) {
+            adapt.assign(n_seq, adapt_state{});
+            // the GPU's part fitted on 21 Nov. (RX 7900 XT, the QSA decode op, n_max 1 - 4, four texts; 0 drafts: 1 - (2 - 1)),
+            // then +2.5 ms a draft
+            static const double G0[] = { 12.70, 14.79, 16.88, 19.11, 21.58 };
+            for (int k = 0; k <= ADAPT_KMAX; ++k) {
+                adapt_T[k] = k <= 4 ? G0[k] : G0[4] + 2.5*(k - 4);
+            }
+            LOG_INF("%s: variable draft length, up to %d drafts\n", __func__, this->params.n_max);
+        }
 
         batch = common_batch(ctx_dft);
 
@@ -1690,6 +1773,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         // reset here rather than per round, or two identical requests differ
         common_sampler_reset(smpls[seq_id].get());
+        if (adapt_on) {
+            adapt[seq_id] = adapt_state{};   // a request's own acceptance and rate (the cost table stays)
+        }
 
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
@@ -1925,6 +2011,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
+        const int64_t stat_t0 = stat_f || adapt_on ? ggml_time_us() : 0;
+        struct stat_scope {
+            int64_t t0; int64_t & acc;
+            ~stat_scope() { if (t0) { acc = ggml_time_us() - t0; } }
+        } stat_sc { stat_t0, stat_draft_us };
         auto & ctx_dft = params.ctx_dft;
 
         // DIAGNOSTIC (LLAMA_MTP_KV_HASH=1): the draft's state of each drafting sequence at the first draft after a
@@ -1980,6 +2071,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             n_drafting++;
             drafting[seq_id] = true;
+            if (stat_f) {
+                stat_p[seq_id].clear();
+            }
+            if (adapt_on) {
+                auto & a = adapt[seq_id];
+                a.c = 1.0;
+                a.ch.clear();
+                a.s = a.exp >= 0.5 ? std::min(1.5, std::max(0.5, a.obs / a.exp)) : 1.0;
+                a.R = a.ms > 0.0 ? a.tok / a.ms : 0.1;
+            }
             // greedy drafting leaves no candidates behind, so the verifier falls back to sample-and-match
             if (!params.probabilistic) {
                 dp.result_q = nullptr;
@@ -2076,6 +2177,32 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
 
+                bool adapt_last = false;   // kept, but the next draft could not be: not computed
+                if (adapt_on) {
+                    auto & a = adapt[seq_id];
+                    const size_t j = dparams.at(seq_id).result->size();   // drafted so far
+                    const float  q = mtp_chance(cur_p->data[0].p);
+                    const double c = a.c * std::min(1.0, a.s*q);
+                    const int    jj = std::min<int>((int) j, ADAPT_KMAX - 2);
+                    const double verify_ms = std::max(0.1, adapt_scale*(adapt_T[jj + 1] - adapt_T[jj]) + adapt_c*a.m - adapt_td);
+                    if (j > 0 && c < a.R*verify_ms) {
+                        drafting[seq_id] = false;
+                        n_drafting--;
+
+                        continue;
+                    }
+                    a.c = c;
+                    a.ch.push_back(q);
+                    adapt_last = (int) j + 1 < params.n_max &&
+                                 c*std::min(1.0, a.s*0.96) < a.R*std::max(0.1, adapt_scale*(adapt_T[jj + 2] - adapt_T[jj + 1]) +
+                                                                                adapt_c*a.m);
+                }
+
+                if (stat_f) {
+                    stat_p[seq_id].push_back(cur_p->data[0].p);
+                    stat_p[seq_id].push_back(cur_p->size > 1 ? cur_p->data[0].logit - cur_p->data[1].logit : 99.0f);
+                }
+
                 common_sampler_accept(smpl, id, true);
 
                 auto & dp = dparams.at(seq_id);
@@ -2087,7 +2214,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
                 }
 
-                if (params.n_max <= (int) result.size()) {
+                if (params.n_max <= (int) result.size() || adapt_last) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -2123,6 +2250,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             ++i;
         }
+        adapt_passes = i + 1;
 
         if (chain_heads) {
             llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
@@ -2137,15 +2265,123 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
             }
+            if (adapt_on && dp.result->empty()) {
+                adapt[seq_id].ch.clear();
+                adapt[seq_id].t_prev = 0;   // a step without drafts: the next one's clock starts again
+            }
         }
     }
 
-    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other_mtp) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
 
         const int32_t n_rows = verify_h_rows[seq_id];
+        if (adapt_on) {
+            auto & a = adapt[seq_id];
+            const int k = (int) a.ch.size();
+            if (is_other_mtp) {
+                // another drafter's window was verified: not one of ours, its time neither
+                a.ch.clear();
+                a.t_prev = 0;
+            } else if (k > 0) {
+                double c = 1.0, e = 0.0;
+                for (float q : a.ch) {
+                    c *= q;
+                    e += c;
+                }
+                const int64_t t_now = ggml_time_us();
+                const double dt = a.t_prev > 0 ? (t_now - a.t_prev) / 1000.0 : 0.0;
+                uint64_t cr = 0, ce = 0, cl = 0;
+                const bool has_cpu = llama_moe_cpu_counts(&cr, &ce, &cl);
+                const double e_cpu = has_cpu ? (double) (ce - adapt_ce) : 0.0;
+                const double l = has_cpu ? (double) (cl - adapt_cl) : 0.0;
+                adapt_ce = ce; adapt_cl = cl;
+                double w_tok = 0.0, w_ms = 0.0, w_l = 0.0, w_k = 0.0;   // this window's entry
+                // a step's own duration only (the first of a request, or one after a step without drafts, spans more)
+                if (dt > 0.0) {
+                    const int    kk   = std::min(k, ADAPT_KMAX);
+                    const double x[2] = { adapt_T[kk], e_cpu };
+                    const double pred = adapt_scale*x[0] + adapt_c*x[1];
+                    const double obs  = std::min(1.5*pred, std::max(0.67*pred, dt));
+                    // recursive least squares on (G[k], e) -> the step: the length's cost and the text's CPU work told
+                    // apart by the experts counted, not by the lengths the rule chose (a cost per length learned from the
+                    // steps it chose lost its order, 21 Nov.: T2 < T1 on a code rewrite)
+                    const double lambda = 0.995;   // ~200 steps: a text of one length (the edit at 4) leaves s, c apart
+                    const double Px[2]  = { adapt_P[0][0]*x[0] + adapt_P[0][1]*x[1], adapt_P[1][0]*x[0] + adapt_P[1][1]*x[1] };
+                    const double den    = lambda + x[0]*Px[0] + x[1]*Px[1];
+                    const double K[2]   = { Px[0]/den, Px[1]/den };
+                    const double err    = obs - pred;
+                    adapt_scale = std::min(1.5,   std::max(0.67, adapt_scale + K[0]*err));
+                    adapt_c     = std::min(0.150, std::max(0.020, adapt_c + K[1]*err));
+                    for (int i = 0; i < 2; ++i) {
+                        for (int j = 0; j < 2; ++j) {
+                            adapt_P[i][j] = (adapt_P[i][j] - K[i]*Px[j]) / lambda;
+                        }
+                    }
+                    w_tok = n_accepted + 1; w_ms = obs;
+                    if (has_cpu) {
+                        w_l = l; w_k = k;   // the experts the k drafts brought first
+                    }
+                }
+                // the request's acceptance, rate and CPU experts per draft over its last ADAPT_WIN windows
+                double * w = a.win[a.win_h];
+                w[0] = n_accepted; w[1] = e; w[2] = w_tok; w[3] = w_ms; w[4] = w_l; w[5] = w_k;
+                a.win_h = (a.win_h + 1) % ADAPT_WIN;
+                a.win_n = std::min(a.win_n + 1, ADAPT_WIN);
+                double sum[6] = {};
+                for (int i = 0; i < a.win_n; ++i) {
+                    for (int f = 0; f < 6; ++f) {
+                        sum[f] += a.win[i][f];
+                    }
+                }
+                a.obs = sum[0]; a.exp = sum[1]; a.tok = sum[2]; a.ms = sum[3];
+                if (sum[5] > 0.0) {
+                    a.m = sum[4] / sum[5];
+                }
+                if (stat_draft_us > 0 && adapt_passes > 0) {
+                    const double td = stat_draft_us / 1000.0 / adapt_passes;
+                    adapt_td += 0.2*(std::min(3.0*adapt_td, td) - adapt_td);
+                }
+                // DIAGNOSTIC LLAMA_MTP_ADAPT_LOG=1: the learned costs, the rate and the scale every 100 steps
+                static const bool alog = getenv("LLAMA_MTP_ADAPT_LOG") && atoi(getenv("LLAMA_MTP_ADAPT_LOG")) != 0;
+                static int alog_n = 0;
+                if (alog && ++alog_n % 100 == 0) {
+                    LOG_INF("adapt %d: s %.3f c %.1f us m %.1f td %.2f | dT %.2f %.2f %.2f %.2f | R %.4f obs/exp %.3f\n", alog_n,
+                            adapt_scale, 1000*adapt_c, a.m, adapt_td,
+                            adapt_scale*(adapt_T[1] - adapt_T[0]) + adapt_c*a.m - adapt_td,
+                            adapt_scale*(adapt_T[2] - adapt_T[1]) + adapt_c*a.m - adapt_td,
+                            adapt_scale*(adapt_T[3] - adapt_T[2]) + adapt_c*a.m - adapt_td,
+                            adapt_scale*(adapt_T[4] - adapt_T[3]) + adapt_c*a.m - adapt_td,
+                            a.ms > 0 ? a.tok/a.ms : 0.0, a.exp > 0 ? a.obs/a.exp : 0.0);
+                }
+                a.t_prev = t_now;
+                a.ch.clear();
+            } else {
+                a.t_prev = 0;
+            }
+        }
+        if (stat_f && !stat_p[seq_id].empty()) {
+            // the step's duration (from the previous verified draft; the first of a request is meaningless)
+            const int64_t t_now = ggml_time_us();
+            fprintf(stat_f, "%d %d %.3f", (int) stat_p[seq_id].size()/2, (int) n_accepted, (t_now - stat_t) / 1000.0);
+            fprintf(stat_f, " d%.3f t%.3f", stat_draft_us / 1000.0, t_now / 1000.0);
+            // the step's hosted MoE work on the CPU (drafts and verification): distinct experts per block, rows
+            uint64_t cr = 0, ce = 0, cl = 0;
+            if (llama_moe_cpu_counts(&cr, &ce, &cl)) {
+                fprintf(stat_f, " e%llu r%llu l%llu", (unsigned long long) (ce - stat_cpu_experts),
+                        (unsigned long long) (cr - stat_cpu_rows), (unsigned long long) (cl - stat_cpu_later));
+                stat_cpu_rows = cr; stat_cpu_experts = ce; stat_cpu_later = cl;
+            }
+            stat_t = t_now;
+            for (float v : stat_p[seq_id]) {
+                fprintf(stat_f, " %.4f", v);
+            }
+            fputc('\n', stat_f);
+            fflush(stat_f);
+            stat_p[seq_id].clear();
+        }
         if (n_rows <= 0) {
             return;
         }
