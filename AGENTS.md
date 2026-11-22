@@ -11,6 +11,480 @@
 
 ---
 
+# Syclonith – Project Context and Engineering Guidelines
+
+## 1. Project Overview
+
+Syclonith is an independent speculative-decoding implementation built on a llama.cpp fork.
+
+The objective is to develop an adaptive speculative-decoding architecture optimised for Intel SYCL hardware, including integrated GPUs and systems without discrete GPUs.
+
+The implementation is designed to support architecture-specific speculative execution while keeping the generic speculative controller independent of individual model architectures.
+
+### Core principles
+
+- Keep Syclonith independent of llama.cpp's built-in speculative-decoding implementations.
+- Do not modify or regress the existing `draft-mtp` implementation.
+- Separate generic speculative-decoding logic from architecture-specific adapters.
+- Keep backend-specific optimisations isolated from the generic controller.
+- Prioritise correctness and measurable performance improvements over speculative optimisations.
+- Preserve upstream llama.cpp functionality wherever possible.
+
+## 2. Architecture
+
+Syclonith follows three architectural layers.
+
+### Layer 1 – Generic speculative controller
+
+Responsible for:
+- Adaptive draft length.
+- Acceptance feedback.
+- Per-sequence speculation policy.
+- Draft and verification coordination.
+- Candidate confidence handling.
+- Speculative execution statistics.
+
+This layer should not contain model-specific tensor assumptions or SYCL-specific kernel logic.
+
+### Layer 2 – Architecture adapters
+
+Responsible for:
+- Detecting model compatibility.
+- Discovering speculative/MTP tensors.
+- Hidden-state pairing and row ordering.
+- KV-cache semantics.
+- Trained prediction-head count and tensor layout.
+- Architecture-specific execution constraints.
+
+Current adapter:
+- `qwen35moe_mtp`
+
+Current model configuration tested:
+- Architecture: Qwen35MoE
+- Hidden dimension: 2048
+- Prediction layers: 1
+- Discovered MTP tensors: 4
+
+Known tensors:
+- `blk.40.nextn.eh_proj.weight`
+- `blk.40.nextn.enorm.weight`
+- `blk.40.nextn.hnorm.weight`
+- `blk.40.nextn.shared_head_norm.weight`
+
+### Layer 3 – Backend execution
+
+Responsible for:
+- GGML backend operations.
+- SYCL execution.
+- Tensor and device memory handling.
+- Synchronisation.
+- Backend graph execution.
+- SYCL command-graph recording and replay.
+
+The implementation currently uses llama.cpp's existing context scheduler and GGML backend infrastructure. It is not yet a completely independent low-level device executor.
+
+## 3. Current Development Environment
+
+Primary development environment:
+
+- OS: Rocky Linux 10
+- Hardware: Intel Core i7 with integrated Intel graphics
+- No discrete GPU
+- Backend: Intel SYCL / oneAPI
+- Compiler: Intel `icx` and `icpx`
+- Project: llama.cpp fork, Syclonith
+
+Typical build:
+
+```bash
+cmake -S . -B build-sycl \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DGGML_SYCL=ON \
+  -DGGML_SYCL_F16=ON \
+  -DCMAKE_C_COMPILER=icx \
+  -DCMAKE_CXX_COMPILER=icpx
+```
+
+Build targets:
+
+```bash
+cmake --build build-sycl --target ggml-sycl -j4
+cmake --build build-sycl --target llama-server -j4
+```
+
+## 4. Speculative Execution Implementation
+
+Syclonith uses its own speculative execution type:
+
+```text
+draft-syclonith
+```
+
+It must remain separate from:
+
+```text
+draft-mtp
+```
+
+The native Syclonith graph context is created against the target model.
+
+Current tested model:
+
+```text
+Sage-A1.5-Concise.i1-Q5_K_M.gguf
+```
+
+The current configuration uses:
+
+```text
+--spec-type draft-syclonith
+--spec-draft-n-max 1
+```
+
+The implementation has demonstrated:
+- Native draft graph execution.
+- Candidate generation.
+- Confidence gating.
+- Target verification.
+- Acceptance callbacks.
+- Rejection handling.
+- Periodic speculation statistics.
+
+Correctness indicators include:
+
+```text
+accept_without_rows=0
+accept_overflow=0
+verify_calls matching draft cycles
+```
+
+These indicators should be monitored during future changes.
+
+## 5. Important SYCL Optimisation: Small-Batch MUL_MAT_ID
+
+### Original bottleneck
+
+The original multi-token `MUL_MAT_ID` implementation used a fallback that:
+1. Copied expert IDs from device memory to host memory.
+2. Waited for the SYCL queue.
+3. Performed host-side routing and preparation.
+4. Continued with the expert computation.
+
+This introduced a substantial host synchronisation bottleneck during speculative verification.
+
+Profiling showed that target graph execution was taking approximately:
+
+```text
+322 ms per graph
+```
+
+The scheduler's input-copy and allocation overhead was comparatively small.
+
+### Implemented optimisation
+
+A new optional small-batch MoE path was added to:
+
+```text
+ggml/src/ggml-sycl/ggml-sycl.cpp
+```
+
+Configuration:
+
+```bash
+GGML_SYCL_MMID_SMALL_BATCH=2
+```
+
+For eligible multi-token operations, the implementation processes each token independently using the existing one-token fused kernel.
+
+Conceptually:
+
+```cpp
+for (int64_t t = 0; t < ne12; ++t) {
+    // Create one-token tensor views.
+    // Execute the existing fused one-token MUL_MAT_ID path.
+}
+```
+
+Eligibility includes:
+- `ne12 > 1`
+- `ne12 <= GGML_SYCL_MMID_SMALL_BATCH`
+- `ids->ne[1] == ne12`
+- Each sliced operation satisfies the existing fused-kernel requirements.
+
+The existing single-token fused path remains unchanged.
+
+The optimisation is disabled by default unless the environment variable is configured.
+
+### Confirmed execution
+
+Runtime instrumentation confirmed:
+
+```text
+[MMID-TRACE] ne12=2 ids.ne[1]=2 src1.type=f32 dst.type=f32
+[MMID-TRACE] SMALL-BATCH PATH ENTERED: ne12=2
+[MMID-TRACE] SMALL-BATCH PATH FINISHED: ne12=2 ok=1
+```
+
+This confirms that the two-token operation successfully executes through the small-batch fused path.
+
+Temporary diagnostic logging should not remain in production code.
+
+## 6. SYCL Command-Graph Compatibility
+
+### Original problem
+
+The SYCL command-graph compatibility checker rejected `MUL_MAT_ID` operations because the original multi-token implementation required host synchronisation.
+
+Relevant functions:
+
+```cpp
+ggml_sycl_mul_mat_id_needs_sync()
+check_graph_compatibility()
+ggml_backend_sycl_graph_compute()
+```
+
+The compatibility checker must reject operations that genuinely require host waits during graph recording.
+
+### Implemented change
+
+The synchronization predicate was updated to recognise eligible small-batch operations.
+
+A shared configuration accessor was introduced:
+
+```cpp
+ggml_sycl_mmid_small_batch_limit()
+```
+
+The predicate constructs one-token tensor views and validates them against the existing fused-kernel requirements.
+
+This allows graph compatibility for supported small-batch operations without globally disabling synchronisation checks.
+
+The original fallback remains protected for unsupported shapes and operations.
+
+### Confirmed command-graph execution
+
+Runtime configuration:
+
+```bash
+GGML_SYCL_MMID_SMALL_BATCH=2
+GGML_SYCL_ENABLE_GRAPH=1
+```
+
+The following messages were observed:
+
+```text
+[SYCL-GRAPH] graph id 114 reused
+[SYCL-GRAPH] warmup complete
+[SYCL-GRAPH] graph id 120 reused
+[SYCL-GRAPH] warmup complete
+```
+
+Repeated graph reuse was also observed.
+
+This confirms that Intel SYCL command-graph recording, warmup and replay are active for the tested workload.
+
+The two graph IDs indicate multiple graph instances are being maintained.
+
+## 7. Performance Results
+
+The following measurements were obtained on the current Intel integrated-graphics system using the same model family and Syclonith implementation.
+
+| Configuration | Generation throughput |
+|---|---:|
+| Initial Syclonith implementation | ~5.1 tokens/s |
+| Small-batch MUL_MAT_ID | ~14.6 tokens/s |
+| Small-batch + SYCL command graphs | ~20.21 tokens/s |
+
+Approximate improvements:
+
+- Small-batch optimisation: 2.86x over the initial implementation.
+- Command graphs: 1.38x over the small-batch-only result.
+- Combined: 3.96x over the initial implementation.
+
+Important: These are observed results from separate runs, not yet a controlled repeated benchmark. They must not be treated as final reproducible performance claims.
+
+Latest command-graph-enabled run:
+
+```text
+eval time = 49437.93 ms / 1000 tokens
+eval throughput = 20.21 tokens/s
+
+graphs reused = 552
+
+draft acceptance = 0.79354
+442 accepted / 557 generated
+mean len = 1.79
+```
+
+Acceptance remained approximately 79%.
+
+The implementation also maintained:
+
+```text
+accept_without_rows=0
+accept_overflow=0
+```
+
+## 8. Current Known Issues
+
+### oneDNN SDPA fallback
+
+The following warning still appears:
+
+```text
+oneDNN SDPA failed (could not execute sdpa primitive with sycl runtime);
+falling back to TILE kernel
+```
+
+This is a separate issue from the small-batch MoE and command-graph optimisations.
+
+Do not assume that command-graph compatibility means oneDNN SDPA is functioning.
+
+Investigate the SDPA fallback separately.
+
+### Performance validation
+
+The latest throughput results need controlled repeated testing.
+
+Benchmark requirements:
+- Same model.
+- Same prompt.
+- Same generation length.
+- Same context configuration.
+- Same CPU affinity.
+- Same compiler build.
+- Same speculative settings.
+- Alternate graph-enabled and graph-disabled runs.
+- At least three measurements per configuration.
+
+Do not use verbose SYCL debugging or profiling instrumentation during final throughput measurements.
+
+### Graph stability
+
+Further testing is required for:
+- Different prompt lengths.
+- Different verification shapes.
+- Context growth.
+- Graph property updates.
+- Repeated requests.
+- Multiple graph instances.
+- Long-running server operation.
+- Memory and graph lifecycle management.
+
+Successful graph replay on one workload does not prove correctness for all tensor shapes.
+
+## 9. Current Runtime Configuration
+
+Representative tested server configuration:
+
+```bash
+GGML_SYCL_MMID_SMALL_BATCH=2 \
+GGML_SYCL_ENABLE_GRAPH=1 \
+taskset -c 0-5 \
+build-sycl/bin/llama-server \
+  -m /home/llama/models/Sage-A1.5-Concise.i1-Q5_K_M.gguf \
+  --alias ornith-35b \
+  -b 6096 \
+  -ub 6096 \
+  -ngl 99 \
+  --host 0.0.0.0 \
+  --port 8080 \
+  --parallel 1 \
+  --cache-type-k f16 \
+  --cache-type-v f16 \
+  -c 248064 \
+  --flash-attn on \
+  -t 6 \
+  --jinja \
+  --split-mode none \
+  --main-gpu 0 \
+  --reasoning-preserve \
+  -tb 6 \
+  --no-mmproj \
+  --no-host \
+  --fit on \
+  --fit-ctx 18768 \
+  --fit-target 64 \
+  -lm mmap+mlock \
+  --spec-type draft-syclonith \
+  --spec-draft-n-max 1
+```
+
+This is a tested configuration, not a universal recommended configuration for other hardware.
+
+## 10. Engineering Rules for AI Agents
+
+All agents working on Syclonith must follow these rules.
+
+### Preserve existing functionality
+
+1. Never modify built-in `draft-mtp` unless explicitly requested.
+2. Keep Syclonith execution isolated under `draft-syclonith`.
+3. Avoid unrelated upstream llama.cpp changes.
+4. Preserve existing fallback paths.
+5. Do not globally bypass backend synchronisation checks.
+
+### SYCL kernel changes
+
+1. Verify tensor dimensions and strides before changing kernel dispatch.
+2. Preserve correct handling of sliced tensor views.
+3. Check device and host pointer semantics.
+4. Do not assume asynchronous execution implies absence of host synchronisation.
+5. Preserve correct SYCL queue ordering.
+6. Validate command-graph compatibility for every newly introduced operation.
+7. Keep unsupported operations on their existing safe fallback paths.
+
+### Command-graph changes
+
+1. Never permit graph capture for operations that require blocking host waits.
+2. Keep compatibility checks narrowly scoped.
+3. Test both graph-enabled and graph-disabled execution.
+4. Validate graph warmup, recording, replay and update behaviour.
+5. Investigate graph lifetime and pointer stability.
+6. Do not infer SYCL graph replay from llama.cpp's generic graph-reuse counter.
+
+### Development and testing
+
+1. Inspect existing source before proposing changes.
+2. Prefer complete, reviewable patches over temporary source edits.
+3. Keep instrumentation behind explicit debug or profiling switches.
+4. Remove temporary diagnostics before committing.
+5. Run `git diff --check`.
+6. Rebuild the affected targets.
+7. Provide exact file paths and commands.
+8. Clearly distinguish measured results from hypotheses.
+9. Never claim performance improvement without comparable measurements.
+10. Do not silently change architecture or public configuration interfaces.
+
+## 11. Immediate Development Priorities
+
+Recommended order:
+
+1. Preserve the current working small-batch and command-graph implementation.
+2. Run controlled graph-enabled versus graph-disabled benchmarks.
+3. Validate output correctness over longer generations.
+4. Test different prompt lengths and graph update scenarios.
+5. Investigate the oneDNN SDPA fallback.
+6. Profile remaining target execution time.
+7. Investigate further SYCL kernel optimisation only after establishing a stable baseline.
+8. Improve architecture-adapter extensibility for additional MTP-capable models.
+
+## 12. Current Project Milestone
+
+Syclonith has demonstrated the following on Intel integrated graphics:
+
+- Independent speculative-decoding controller.
+- Qwen35MoE MTP architecture adapter.
+- Native speculative graph execution.
+- Adaptive candidate acceptance.
+- Multi-token MoE small-batch fused execution.
+- Avoidance of the original host-synchronisation bottleneck.
+- Intel SYCL command-graph recording and replay.
+- Approximately 20 tokens/s generation throughput in the latest observed test.
+
+The next objective is to establish reproducible performance and correctness across changing workloads before expanding architecture support or introducing more aggressive backend optimisations.
+
+
 ## Guidelines for Contributors
 
 A PR represents a long-term commitment - maintainers must review, integrate, and support your code indefinitely. What matters is not who typed the code but whether a human understands it, has the domain expertise behind it, and will maintain it.
@@ -249,3 +723,5 @@ Chat template and parser:
 
 Testing:
 - [Slice model](skills/slice-model/SKILL.md) - build a small slice (few layers/experts) of a big HF model without downloading the full weights, to test conversion and inference
+
+
