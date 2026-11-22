@@ -291,6 +291,127 @@ __global__ void __launch_bounds__(NT) k_hc_upmix2(const mix_args a) {
 } // namespace
 #endif // defined(GGML_USE_HIP)
 
+// NVIDIA from Ampere on (GGML_CUDA_HC_UPMIX=1, off by default: not measured yet): the same kernel on the FP16 tensor
+// cores, in the place of cuBLAS's product (W_up converted to FP16 before it) and of the mix. It is k_hc_upmix2's block
+// (256 tokens x 16 values d x the 4 streams on 512 threads, the 64 rows of W_up decoded into shared memory once for all
+// K, lo read as FP16 rows from global memory); the product in one kernel with the mix, the gate rows never in memory,
+// is also Basalt's gr_up_mix (src/models/qwen4exp/prefill/kernels.cu, MIT, Jesus Gulfo). A warp: 16 tokens (the rows of
+// m16n8k16's A) x two tiles of 8 values d of each stream (B: W_up's rows as columns).
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#define HC_MIX_NV 1
+
+namespace {
+
+struct mix_args_nv {
+    const uint8_t * W; int64_t row_bytes;   // row r: W + r row_bytes, Q8_0, K values
+    const half * lo16;                      // lo as FP16 rows [T][K]
+    const float * xn; int64_t xn_tok;       // [T][4][n_embd] (floats between two tokens); lazy: the norm's scales [T][4]
+    const void * res; int64_t res_s1, res_tok;
+    const float * w;
+    float * out; int64_t out_tok;           // [T][n_embd]
+    int T, n_embd;
+    float scale;
+};
+
+// lo [T][K] F32 -> FP16 rows, a block a token
+static __global__ void k_hc_lo_f16_nv(const float * __restrict__ lo, const int64_t lo_tok, half * __restrict__ lo16, const int K) {
+    const float * row = lo + (int64_t) blockIdx.x*lo_tok;
+    half2 * dst = (half2 *) (lo16 + (int64_t) blockIdx.x*K);
+    for (int i = threadIdx.x; i < K/2; i += blockDim.x) {
+        const float2 v = ((const float2 *) row)[i];
+        dst[i] = __floats2half2_rn(fminf(fmaxf(v.x, -65504.0f), 65504.0f), fminf(fmaxf(v.y, -65504.0f), 65504.0f));
+    }
+}
+
+constexpr int NV_ULD = 328;   // halves per shared row of W_up: K = 320 + 8
+constexpr int NV_NT  = 512;
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+// c += A (16 x 16 f16, row) * B (16 x 8 f16, col)
+static __device__ __forceinline__ void hc_mma(float (& c)[4], const uint32_t (& a)[4], const uint32_t b0, const uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+#endif // defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+
+// MODE: 0 the normalized streams read, 1 lazy from F32 streams, 2 lazy from FP16 streams
+template <int MODE>
+__global__ void __launch_bounds__(NV_NT) k_hc_upmix_nv(const mix_args_nv a) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    constexpr int K = 320;
+    const int NE = a.n_embd;
+    __shared__ __align__(16) half sW[64][NV_ULD];   // row c*16 + dd: stream c, value d0 + dd
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, tig = lane & 3;
+    // the column tiles fastest: the blocks in flight share their tokens, whose streams the epilogue reads
+    const int t0 = blockIdx.y*(NV_NT/2) + 16*warp, d0 = blockIdx.x*16;
+    for (int i = tid; i < 64*(K/32); i += NV_NT) {
+        const int rr = i/(K/32), q = i%(K/32), c = rr/16, dd = rr%16;
+        const uint8_t * bp = a.W + (int64_t) (c*NE + d0 + dd)*a.row_bytes + q*34;
+        const float d = __half2float(*(const half *) bp);
+        const int8_t * qs = (const int8_t *) (bp + 2);
+        half2 * dst = (half2 *) &sW[rr][32*q];
+#pragma unroll
+        for (int k = 0; k < 16; k++) dst[k] = __floats2half2_rn(d*(float) qs[2*k], d*(float) qs[2*k + 1]);
+    }
+    __syncthreads();
+    if (t0 >= a.T) {
+        return;
+    }
+    // A: rows t0 + g and t0 + g + 8 (the tokens past the batch repeat its last one, never written)
+    const uint32_t * ar0 = (const uint32_t *) (a.lo16 + (int64_t) min(t0 + g,     a.T - 1)*K) + tig;
+    const uint32_t * ar1 = (const uint32_t *) (a.lo16 + (int64_t) min(t0 + g + 8, a.T - 1)*K) + tig;
+    float acc[4][2][4];
+#pragma unroll
+    for (int c = 0; c < 4; c++)
+#pragma unroll
+        for (int n = 0; n < 2; n++)
+#pragma unroll
+            for (int q = 0; q < 4; q++) acc[c][n][q] = 0.0f;
+#pragma unroll
+    for (int ks = 0; ks < K; ks += 16) {
+        const uint32_t A[4] = { ar0[ks/2], ar1[ks/2], ar0[ks/2 + 4], ar1[ks/2 + 4] };
+#pragma unroll
+        for (int c = 0; c < 4; c++)
+#pragma unroll
+            for (int n = 0; n < 2; n++) {
+                const uint32_t * br = (const uint32_t *) &sW[c*16 + 8*n + g][ks] + tig;
+                hc_mma(acc[c][n], A, br[0], br[4]);
+            }
+    }
+    // element q of acc[c][n]: token t0 + g + 8 (q >> 1), value d0 + 8 n + 2 tig + (q & 1), of stream c
+#pragma unroll
+    for (int n = 0; n < 2; n++)
+#pragma unroll
+        for (int q = 0; q < 4; q++) {
+            const int t = t0 + g + 8*(q >> 1), d = d0 + 8*n + 2*tig + (q & 1);
+            if (t >= a.T) {
+                continue;
+            }
+            float s = 0.0f;
+#pragma unroll
+            for (int c = 0; c < 4; c++) {
+                float x;
+                if constexpr (MODE == 2) {
+                    x = a.xn[(int64_t) t*4 + c]*__half2float(((const half *) a.res)[(int64_t) t*a.res_tok + c*a.res_s1 + d])*a.w[c*NE + d];
+                } else if constexpr (MODE == 1) {
+                    x = a.xn[(int64_t) t*4 + c]*((const float *) a.res)[(int64_t) t*a.res_tok + c*a.res_s1 + d]*a.w[c*NE + d];
+                } else {
+                    x = a.xn[(int64_t) t*a.xn_tok + c*NE + d];
+                }
+                s += x/(1.0f + __expf(-acc[c][n][q]));
+            }
+            a.out[(int64_t) t*a.out_tok + d] = a.scale*s;
+        }
+#else
+    GGML_UNUSED(a);
+    NO_DEVICE_CODE;
+#endif // defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+}
+
+} // namespace
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
 // mm: W_up (Q8_0) lo; pre: the gated mix of xn [n_embd, 4, T] by mm's output. Whether the one kernel takes both
 bool ggml_cuda_hc_upmix_supported(const int cc, const ggml_tensor * mm, const ggml_tensor * pre) {
 #if defined(HC_MIX_HIP)
@@ -304,6 +425,17 @@ bool ggml_cuda_hc_upmix_supported(const int cc, const ggml_tensor * mm, const gg
         w->nb[1] == (size_t) (K/32*34) && (uintptr_t) w->data % 2 == 0 && lo->nb[0] == sizeof(float) && lo->nb[1] % 16 == 0 && (uintptr_t) lo->data % 16 == 0 &&
         xn->nb[0] == sizeof(float) && xn->nb[1] == (size_t) n_embd*sizeof(float) && xn->nb[2] % 16 == 0 && (uintptr_t) xn->data % 16 == 0 &&
         pre->nb[0] == sizeof(float) && pre->nb[1] % 16 == 0 && (uintptr_t) pre->data % 16 == 0;
+#elif defined(HC_MIX_NV)
+    static const bool on = getenv("GGML_CUDA_HC_UPMIX") && atoi(getenv("GGML_CUDA_HC_UPMIX")) != 0;
+    const ggml_tensor * w = mm->src[0], * lo = mm->src[1], * xn = pre->src[0];
+    const int64_t K = w->ne[0], T = lo->ne[1], n_embd = xn->ne[0];
+    return on && GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_AMPERE &&
+        w->type == GGML_TYPE_Q8_0 && lo->type == GGML_TYPE_F32 && xn->type == GGML_TYPE_F32 &&
+        pre->type == GGML_TYPE_F32 && ggml_get_op_params_i32(pre, 1) != 0 && ggml_get_op_params_i32(mm, 3) == GGML_PREC_DEFAULT &&
+        K == 320 && n_embd % 16 == 0 && xn->ne[1] == 4 && w->ne[1] == 4*n_embd && w->ne[2] == 1 && w->ne[3] == 1 &&
+        lo->ne[0] == K && lo->ne[2] == 1 && T >= 256 && xn->ne[2] == T && xn->ne[3] == 1 && pre->ne[0] == n_embd && pre->ne[1] == T &&
+        w->nb[1] == (size_t) (K/32*34) && (uintptr_t) w->data % 2 == 0 && lo->nb[0] == sizeof(float) && lo->nb[1] % 8 == 0 && (uintptr_t) lo->data % 8 == 0 &&
+        xn->nb[0] == sizeof(float) && xn->nb[1] == (size_t) n_embd*sizeof(float) && pre->nb[0] == sizeof(float);
 #else
     GGML_UNUSED_VARS(cc, mm, pre);
     return false;
@@ -354,6 +486,44 @@ void ggml_cuda_hc_upmix(ggml_backend_cuda_context & ctx, const ggml_tensor * mm,
     }
     const int64_t items = (T + 127)/128*(n_embd/32);
     k_hc_upmix<<<(unsigned) std::min<int64_t>(items, 4096), 256, 0, stream>>>(a);
+    CUDA_CHECK(cudaGetLastError());
+#elif defined(HC_MIX_NV)
+    const ggml_tensor * w = mm->src[0], * lo = mm->src[1], * xn = pre->src[0];
+    const int64_t K = w->ne[0], T = lo->ne[1], n_embd = xn->ne[0];
+    cudaStream_t stream = ctx.stream();
+    mix_args_nv a;
+    a.W = (const uint8_t *) w->data; a.row_bytes = (int64_t) w->nb[1];
+    a.xn = (const float *) xn->data; a.xn_tok = (int64_t) (xn->nb[2]/sizeof(float));
+    a.res = res ? res->data : nullptr;
+    a.res_s1 = res ? (int64_t) (res->nb[1]/sizeof(float)) : 0; a.res_tok = res ? (int64_t) (res->nb[2]/sizeof(float)) : 0;
+    a.w = w_norm ? (const float *) w_norm->data : nullptr;
+    a.out = (float *) pre->data; a.out_tok = (int64_t) (pre->nb[1]/sizeof(float));
+    a.T = (int) T; a.n_embd = (int) n_embd;
+    a.scale = ggml_get_op_params_f32(pre, 0);
+    // lo as FP16 in the memory of the product's own result, which no kernel writes and which lives until the mix that
+    // reads it; from the pool when that memory is not usable
+    const auto disjoint = [](const ggml_tensor * x, const ggml_tensor * y) {
+        const char * x0 = (const char *) x->data, * y0 = (const char *) y->data;
+        return !(x0 < y0 + ggml_nbytes(y) && y0 < x0 + ggml_nbytes(x));
+    };
+    ggml_cuda_pool_alloc<half> lo16_own(ctx.pool());
+    half * lo16;
+    if (ggml_nbytes(mm) >= (size_t) T*K*sizeof(half) && (uintptr_t) mm->data % 4 == 0 &&
+            disjoint(mm, pre) && disjoint(mm, lo) && disjoint(mm, xn) && (!res || disjoint(mm, res))) {
+        lo16 = (half *) mm->data;
+    } else {
+        lo16 = lo16_own.alloc((size_t) T*K);
+    }
+    a.lo16 = lo16;
+    k_hc_lo_f16_nv<<<(unsigned) T, 160, 0, stream>>>((const float *) lo->data, (int64_t) (lo->nb[1]/sizeof(float)), lo16, (int) K);
+    const dim3 grid((unsigned) (n_embd/16), (unsigned) ((T + 255)/256));
+    if (!res) {
+        k_hc_upmix_nv<0><<<grid, NV_NT, 0, stream>>>(a);
+    } else if (!res16) {
+        k_hc_upmix_nv<1><<<grid, NV_NT, 0, stream>>>(a);
+    } else {
+        k_hc_upmix_nv<2><<<grid, NV_NT, 0, stream>>>(a);
+    }
     CUDA_CHECK(cudaGetLastError());
 #else
     GGML_UNUSED_VARS(ctx, mm, pre, res, w_norm, res16);
