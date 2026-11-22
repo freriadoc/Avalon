@@ -4869,6 +4869,13 @@ static bool ggml_cpu_moe_experts_multi(const struct ggml_tensor * gate_w, const 
 #endif
 }
 
+// ggml_moe_cache.cpu_team_passive: see ggml-backend-moe-cache.h
+static void ggml_cpu_moe_team_passive(void) {
+#if defined(GGML_USE_OPENMP) && defined(KMP_VERSION_MAJOR)
+    kmp_set_blocktime(0);
+#endif
+}
+
 // Whole experts of one token on the CPU for the MoE block the GPU hosts (ggml_moe_cache.cpu_experts):
 // a small graph gate / up / swiglu / down over the given experts only, on the model's weight
 // tensors, computed by this thread and n_threads - 1 others. The thread that calls it has no MoE
@@ -5082,6 +5089,7 @@ void ggml_cpu_init(void) {
         }
 
         ggml_moe_cache.cpu_experts = ggml_cpu_moe_experts;
+        ggml_moe_cache.cpu_team_passive = ggml_cpu_moe_team_passive;
 
         is_first_call = false;
     }

@@ -293,6 +293,10 @@ struct ggml_moe_cache_api {
                         const struct ggml_tensor * down_w, const float * act, const void * act_q8,
                         const int32_t * experts, const void * const * src, int k, int n_tokens, float * out,
                         int n_threads);
+    // the calling thread's OpenMP team waits without spinning after a parallel region (LLVM / Intel OpenMP; nothing
+    // elsewhere): for a thread that computes CPU experts now and then beside the one that computes most of them. Its
+    // workers otherwise spin for KMP_BLOCKTIME (200 ms) after each call, on the cores of the other team
+    void (*cpu_team_passive)(void);
     // before the cache sizes itself on the free memory: create the queues and scratch later work needs
     void (*prepare_queues)(void * session, const struct ggml_cgraph * graph);
     // the routed rows of the largest MoE block the backend hosts (the scheduler leaves no larger one on the GPU)

@@ -10975,6 +10975,17 @@ static std::atomic<int>        g_srv_waiters{0};
 static std::mutex              g_srv_mu;
 static std::condition_variable g_srv_cv;
 
+// The threads that serve a hosted layer only when the graph's own thread is busy (a launch, a driver call) compute a few
+// CPU rows with their own OpenMP team: its workers then spun for 200 ms (KMP_BLOCKTIME) on the cores of the team that
+// computes the others. After a 131k prompt (RX 7900 XT, 22 Nov.): 7 more threads at 70 % for 0.8 - 1.5 s, the CPU rows
+// at 105 - 150 us instead of 55. GGML_CUDA_MOE_SERVER_TEAM_ACTIVE=1: as before
+static void moe_hosted_team_passive() {
+    static const bool active = getenv("GGML_CUDA_MOE_SERVER_TEAM_ACTIVE") && atoi(getenv("GGML_CUDA_MOE_SERVER_TEAM_ACTIVE")) != 0;
+    if (!active && ggml_moe_cache.cpu_team_passive) {
+        ggml_moe_cache.cpu_team_passive();
+    }
+}
+
 static void moe_hosted_server_loop() {
     constexpr int max_states = 8;
     for (;;) {
@@ -11264,6 +11275,7 @@ static int moe_hosted_default_threads() {
 // for the stream serves it too (ggml_cuda_moe_hosted_wait): whoever holds serve_mu serves, the other one counts it
 static void moe_hosted_server(moe_hosted_state * st) {
     ggml_cuda_set_device(st->device->logical);
+    moe_hosted_team_passive();
     uint32_t seen;
     {
         std::lock_guard<std::mutex> lock(st->serve_mu);
