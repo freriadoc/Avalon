@@ -1634,27 +1634,53 @@ struct ggml_backend_cuda_context {
     std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
 
     int64_t last_graph_eviction_sweep = 0;
+    int64_t graph_use_clock = 0;
 
+    // The graphs kept: the 64 last used (GGML_CUDA_GRAPHS_MAX), the least recently used leaving when a new one comes.
+    // Before (llama.cpp#21611, GGML_CUDA_GRAPH_EVICT_TIME=1 here): every graph unused for 10 s left, on a sweep every
+    // 5 s. A prompt of more than 10 s (30k tokens on a RX 7900 XT), or a user who takes 10 s to answer, then lost the
+    // generation graphs of every batch size: each ran once kernel by kernel and was captured again, 25 - 35 ms a size,
+    // 110 - 160 ms at the start of the answer (22 Nov. 2026: 10 launches of 10 - 20 ms after a 131k prompt)
     ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
-        const int64_t time_now = ggml_time_us();
+        static const bool by_time = getenv("GGML_CUDA_GRAPH_EVICT_TIME") && atoi(getenv("GGML_CUDA_GRAPH_EVICT_TIME")) != 0;
+        static const size_t n_max = getenv("GGML_CUDA_GRAPHS_MAX") ? (size_t) std::max(1, atoi(getenv("GGML_CUDA_GRAPHS_MAX"))) : 64;
+        if (by_time) {
+            const int64_t time_now = ggml_time_us();
 
-        // sweep every 5s, evicting cuda graphs unused for >=10s
-        if (time_now - last_graph_eviction_sweep >= 5'000'000) {
-            last_graph_eviction_sweep = time_now;
-            for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
-                if (time_now - it->second->last_used_time >= 10'000'000) {
-                    it = cuda_graphs.erase(it);
-                } else {
-                    ++it;
+            // sweep every 5s, evicting cuda graphs unused for >=10s
+            if (time_now - last_graph_eviction_sweep >= 5'000'000) {
+                last_graph_eviction_sweep = time_now;
+                for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
+                    if (time_now - it->second->last_used_time >= 10'000'000) {
+                        it = cuda_graphs.erase(it);
+                    } else {
+                        ++it;
+                    }
                 }
             }
+
+            auto it = cuda_graphs.find(first_node_ptr);
+            if (it == cuda_graphs.end()) {
+                it = cuda_graphs.emplace(first_node_ptr, std::make_unique<ggml_cuda_graph>()).first;
+            }
+            it->second->last_used_time = time_now;
+            return it->second.get();
         }
 
         auto it = cuda_graphs.find(first_node_ptr);
         if (it == cuda_graphs.end()) {
+            while (cuda_graphs.size() >= n_max) {
+                auto oldest = cuda_graphs.begin();
+                for (auto jt = cuda_graphs.begin(); jt != cuda_graphs.end(); ++jt) {
+                    if (jt->second->last_used_time < oldest->second->last_used_time) {
+                        oldest = jt;
+                    }
+                }
+                cuda_graphs.erase(oldest);
+            }
             it = cuda_graphs.emplace(first_node_ptr, std::make_unique<ggml_cuda_graph>()).first;
         }
-        it->second->last_used_time = time_now;
+        it->second->last_used_time = ++graph_use_clock;   // a count of uses, not a time
         return it->second.get();
     }
 
