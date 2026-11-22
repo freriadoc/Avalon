@@ -298,6 +298,10 @@ struct server_slot {
     // speculative decoding
     common_speculative * spec;
 
+    // tokens between the checkpoint before the end of the prompt and the prompt's last 4 tokens (ckpt_tail_for), set at
+    // the request's first batch; -1: not set yet
+    int32_t n_ckpt_tail = -1;
+
     llama_tokens spec_draft;
 
     // draft candidates per token in spec_draft; only draft-simple and draft-mtp fill it
@@ -3772,6 +3776,7 @@ private:
                         slot.stats.update_prompt_start();
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
+                        slot.n_ckpt_tail = -1;
 
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                 slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
@@ -4227,11 +4232,30 @@ private:
                         !input_tokens.has_mtmd && batch.size() == 0;
                     std::vector<snapshot_req> snaps_cur;
                     int32_t n_batch_cur = n_batch;
+                    // The checkpoint "one ubatch before the end" (llama.cpp#20288: 4 + n_ubatch tokens before it) is a forced
+                    // break: with a prompt a little above n_ubatch it leaves the first tokens a ubatch of their own, which
+                    // uploads the experts as a full one does (34796 tokens at -ub 32768: 2024 then 32768, 2.1 s + 5.5 s
+                    // on an RTX 4090, 4490 t/s against ~6000 for 19k). It is placed instead on the last boundary of the
+                    // prompt cut in equal ubatches (17396 + 17396): at most one ubatch before the end as before, and no
+                    // ubatch more than the equal cut has. LLAMA_SERVER_CKPT_EQUAL=0: 4 + n_ubatch
+                    if (slot.n_ckpt_tail < 0) {
+                        static const bool ckpt_equal = !getenv("LLAMA_SERVER_CKPT_EQUAL") || atoi(getenv("LLAMA_SERVER_CKPT_EQUAL")) != 0;
+                        const int32_t g   = std::min(n_batch, n_ubatch);
+                        int32_t       rem = slot.task->n_tokens() - 4 - slot.prompt.n_tokens();
+                        slot.n_ckpt_tail = n_ubatch;
+                        if (ckpt_equal && g > 0 && rem > g) {
+                            for (int32_t k = (rem + g - 1) / g; k > 1; k--) {
+                                rem -= (rem + k - 1) / k;
+                            }
+                            slot.n_ckpt_tail = rem;
+                        }
+                    }
+                    const int32_t n_ckpt_tail = slot.n_ckpt_tail;
                     {
                         const int32_t pos   = slot.prompt.n_tokens();
                         int32_t       stop  = slot.task->n_tokens();
                         if (do_checkpoint) {
-                            for (int offset : {4 + n_ubatch, 4}) {
+                            for (int offset : {4 + n_ckpt_tail, 4}) {
                                 const int32_t s = slot.task->n_tokens() - std::min(n_batch, offset);
                                 if (s > pos && s < stop) {
                                     stop = s;
@@ -4310,11 +4334,11 @@ private:
 
                         // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
                         // create checkpoints that many tokens before the end of the prompt:
-                        //  - 4 + n_ubatch
+                        //  - 4 + n_ckpt_tail (4 + n_ubatch in llama.cpp; the last boundary of the equal cut here, see above)
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
                         if (do_checkpoint) {
-                            static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
+                            const int checkpoint_offsets[] = {4 + n_ckpt_tail, 4};
 
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {
