@@ -399,10 +399,14 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
 
     char keyb[256];
 
-    snprintf(keyb, sizeof(keyb), "%d:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld", ggml_sycl_get_device(),
-             (long long) H, (long long) Hkv, (long long) q, (long long) seq, (long long) d, (long long) k_str[0],
-             (long long) k_str[1], (long long) k_str[3], (long long) v_str[0], (long long) v_str[1],
-             (long long) v_str[3]);
+    // A compiled oneDNN partition is associated with the engine used to compile it.
+    // The cache is process-global, while engine_dnnl() is owned by each backend
+    // context. Include the native engine handle so a partition cannot be reused
+    // with a different backend context's engine on the same SYCL device.
+    snprintf(keyb, sizeof(keyb), "%p:%d:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld",
+             static_cast<void *>(eng.get()), ggml_sycl_get_device(), (long long) H, (long long) Hkv,
+             (long long) q, (long long) seq, (long long) d, (long long) k_str[0], (long long) k_str[1],
+             (long long) k_str[3], (long long) v_str[0], (long long) v_str[1], (long long) v_str[3]);
 
     sdpa_partition * E_ptr = nullptr;
 
