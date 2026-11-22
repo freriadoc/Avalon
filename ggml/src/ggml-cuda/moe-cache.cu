@@ -7743,6 +7743,16 @@ static void moe_cache_restore(void * opaque, void * backend) {
     }
     if (restored) {
         device->zone_restores++;
+        // The zones come back in a graph that does not prefetch: the first of the answer. Armed here, the restoration
+        // starts at this graph's first hosted layer; armed at the next graph's start (moe_cache_session_enter_impl, which
+        // still saw the zones out at this one's), it started a pass late: 85 ms after a 131k prompt, the coldest pass
+        // computed with nothing copying (22 Nov.). A prompt chunk that neither prefetches nor is hosted starts nothing, and
+        // the next loan disarms it. GGML_CUDA_MOE_REWARM_EARLY=0: as before
+        static const bool early = !(getenv("GGML_CUDA_MOE_REWARM_EARLY") && atoi(getenv("GGML_CUDA_MOE_REWARM_EARLY")) == 0);
+        if (early && session->lent_since_evictions && !session->lent_in_last_graph) {
+            session->lent_since_evictions = false;
+            device->rewarm_armed = true;
+        }
     }
 }
 
