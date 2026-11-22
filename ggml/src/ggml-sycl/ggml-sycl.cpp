@@ -100,7 +100,7 @@ static bool g_sycl_loaded = false;
 int g_ggml_sycl_debug = 0;
 int g_ggml_sycl_dev_debug = 0;
 int g_ggml_sycl_enable_optimize = 1;
-int g_ggml_sycl_enable_graph = 0;
+int g_ggml_sycl_enable_graph = 1;
 int g_ggml_sycl_enable_dnn = 1;
 int g_ggml_sycl_fa_onednn = 1;
 int g_ggml_sycl_fa_onednn_max_kv = 0;
@@ -431,7 +431,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_debug = ggml_sycl_get_env("GGML_SYCL_DEBUG", 0);
         g_ggml_sycl_dev_debug = ggml_sycl_get_env("GGML_SYCL_DEV_DEBUG", 0);
         g_ggml_sycl_enable_optimize = ggml_sycl_get_env("GGML_SYCL_ENABLE_OPT", 1);
-        g_ggml_sycl_enable_graph = ggml_sycl_get_env("GGML_SYCL_ENABLE_GRAPH", 0);
+        g_ggml_sycl_enable_graph = ggml_sycl_get_env("GGML_SYCL_ENABLE_GRAPH", 1);
         g_ggml_sycl_enable_dnn = ggml_sycl_get_env("GGML_SYCL_ENABLE_DNN", 1);
         g_ggml_sycl_fa_onednn = ggml_sycl_get_env("GGML_SYCL_FA_ONEDNN", 1);
         g_ggml_sycl_fa_onednn_max_kv = ggml_sycl_get_env("GGML_SYCL_FA_ONEDNN_MAX_KV", 0);
@@ -5644,7 +5644,7 @@ __dpct_inline__ static void k_zero_dst_rows(
 static int64_t ggml_sycl_mmid_small_batch_limit() {
     static const int64_t limit = [] {
         const char * e = getenv("GGML_SYCL_MMID_SMALL_BATCH");
-        return e ? (int64_t) atoi(e) : (int64_t) 0;
+        return e ? (int64_t) atoi(e) : (int64_t) 2;
     }();
 
     return limit;
