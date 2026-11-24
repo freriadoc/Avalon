@@ -37,13 +37,14 @@ done
 
 # ROCm
 if [ ! -x "$ROCM/bin/amdclang++" ] || [ ! -x "$ROCM/bin/rocminfo" ]; then
-    fail "ROCm not found in $ROCM. Install ROCm 7.x first (Ubuntu: https://rocm.docs.amd.com, amdgpu-install), or set ROCM_PATH"
+    fail "ROCm not found in $ROCM. Install ROCm 10.2 (no root: AMD's archive unpacked anywhere, see the README's Build section) or 7.x (amdgpu-install), then set ROCM_PATH"
 fi
 rocm_ver=$(cat "$ROCM/.info/version" 2>/dev/null | cut -d- -f1 || true)
 case "$rocm_ver" in
-    7.*) echo "ROCm $rocm_ver" ;;
-    "")  warn "ROCm version unknown (tested: 7.2.4)" ;;
-    *)   fail "ROCm $rocm_ver found; Avalon is tested with ROCm 7.2.4 only" ;;
+    10.*) echo "ROCm $rocm_ver" ;;
+    7.*) echo "ROCm $rocm_ver (10.2 recommended)" ;;
+    "")  warn "ROCm version unknown (tested: 10.2.0, 7.2.4)" ;;
+    *)   fail "ROCm $rocm_ver found; Avalon is tested with ROCm 10.2.0 and 7.2.4" ;;
 esac
 
 # GPU: RDNA3 (gfx1100 measured; gfx1101 / gfx1102 should work) or RDNA4 (gfx1200 / gfx1201: reported working by a user,
@@ -108,6 +109,7 @@ say "Building llama-server for $AMDGPU_TARGETS (10 – 30 minutes)"
 
 cmake -S "$AVALON_DIR" -B "$AVALON_DIR/build" -DGGML_HIP=ON -DAMDGPU_TARGETS="$AMDGPU_TARGETS" \
     -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER="$ROCM/bin/amdclang" -DCMAKE_CXX_COMPILER="$ROCM/bin/amdclang++" \
+    -DCMAKE_PREFIX_PATH="$ROCM" -DCMAKE_HIP_COMPILER="$ROCM/lib/llvm/bin/clang++" -DCMAKE_HIP_FLAGS="-isystem $ROCM/include" \
     > "$AVALON_DIR/build-configure.log" 2>&1 || { tail -20 "$AVALON_DIR/build-configure.log"; fail "cmake failed (log: $AVALON_DIR/build-configure.log)"; }
 cmake --build "$AVALON_DIR/build" -j"$JOBS" --target llama-server > "$AVALON_DIR/build.log" 2>&1 \
     || { tail -30 "$AVALON_DIR/build.log"; fail "build failed (log: $AVALON_DIR/build.log)"; }

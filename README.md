@@ -44,7 +44,7 @@ driver; the AI is the engine, and the rest of the car.
 
 [IQ3_KS hybrid](https://huggingface.co/freriadoc/Qwen3.8-Flash-Next-Avalon-GGUF) (2 – 4-bit experts, perplexity close
 to Unsloth's UD-IQ4_XS), greedy decoding, 512 tokens, MTP speculative decoding with 2 draft tokens; best case: mean of 3
-answers, the other rows: median of 2 runs (Nov 1):
+answers, the other rows: median of 2 runs (Nov 1, ROCm 7.2.4):
 
 | case | generation, no MTP | generation, MTP | prefill, no MTP / MTP |
 |---|---|---|---|
@@ -196,7 +196,7 @@ GSM8K (the first 200 problems of the test set, greedy, 4,096 tokens at most): **
 curl -fsSL https://raw.githubusercontent.com/freriadoc/Avalon/main/install.sh | bash
 ```
 
-The installer checks the machine (Linux, AVX2, ROCm 7.x, an RDNA3 GPU, or RDNA4: reported working on a Radeon AI PRO
+The installer checks the machine (Linux, AVX2, ROCm 10.x or 7.x, an RDNA3 GPU, or RDNA4: reported working on a Radeon AI PRO
 R9700, not measured here; 16 GB of RAM or more, ~98 GiB of disk), builds
 `llama-server` for the detected GPU, downloads the model and its MTP head (~89 GiB, resumable), verifies every file
 against its SHA-256 on Hugging Face and installs an `avalon-server` launcher in `~/.local/bin` with the command of
@@ -209,14 +209,30 @@ avalon-server          # OpenAI-compatible API on http://127.0.0.1:8080; extra a
 
 ## Build (Linux, ROCm)
 
-By hand, without the installer. Tested with ROCm 7.2.4 on gfx1100 (RX 7900 XT / XTX).
+By hand, without the installer. Tested on gfx1100 (RX 7900 XT / XTX) with **ROCm 10.2.0** (recommended) and 7.2.4.
+On the RX 7900 XT (Nov 24, 256k context, MTP): prefill at 32k / 131k 3,225 / 3,330 t/s against 2,888 / 3,112 with
+7.2.4 (the first servers, alternated, the card cool; over an hour of servers in a row the card heats and 131k drops to
+2,740 – 3,290 t/s); the same generation (replay at a fixed text: step 19.61 against 19.60 ms, 8 runs each); no crash
+or hang in 14 servers and 24 replays.
+
+ROCm 10.2 needs no root: AMD's archive unpacked anywhere (gfx110X is RDNA3; RDNA4 takes `gfx120X-all`), the Linux
+kernel's own `amdgpu` driver is enough.
 
 ```bash
+mkdir -p ~/rocm-10.2 && curl -fL https://stable.repo.amd.com/rocm/core/tarball/therock-dist-linux-gfx110X-all-10.2.0.tar.gz \
+  | tar -xz -C ~/rocm-10.2
+export ROCM_PATH=~/rocm-10.2      # or /opt/rocm for a ROCm 7.x installed with amdgpu-install
+
 git clone https://github.com/freriadoc/Avalon && cd Avalon
-cmake -B build -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1100 -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_C_COMPILER=/opt/rocm/bin/amdclang -DCMAKE_CXX_COMPILER=/opt/rocm/bin/amdclang++
+cmake -B build -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1100 -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=$ROCM_PATH \
+  -DCMAKE_C_COMPILER=$ROCM_PATH/bin/amdclang -DCMAKE_CXX_COMPILER=$ROCM_PATH/bin/amdclang++ \
+  -DCMAKE_HIP_COMPILER=$ROCM_PATH/lib/llvm/bin/clang++ -DCMAKE_HIP_FLAGS="-isystem $ROCM_PATH/include"
 cmake --build build -j$(nproc) --target llama-server
 ```
+
+`-isystem` puts this ROCm's HIP headers first: where a distribution also ships HIP's headers in `/usr/include/hip`
+(Ubuntu 26.04), the compiler would otherwise take those and fail (`__ocml_exp10_f32` undeclared). The binary finds
+ROCm's libraries by its own path, nothing to set when running it.
 
 ### Build (Linux, CUDA)
 
@@ -243,7 +259,7 @@ Nothing else to set: `--fit` (on by default) places the dense weights on the GPU
 cache takes the rest of the VRAM, and the cache is prefilled from `moe-cache-ranking.bin` next to the model.
 `-ub 32768` is a ceiling: each prompt runs in the largest ubatch the expert cache can lend VRAM for (about 20,500
 tokens with 4 GiB less VRAM, 4,800 with 8 GiB less). On the RX 7900 XT it gives 11 – 20% more prefill than `-ub 9536`
-(3,080 / 3,016 t/s at 32k / 131k).
+(3,080 / 3,016 t/s at 32k / 131k, ROCm 7.2.4).
 `--parallel 1` matters: other slots would keep their part of the KV cache.
 The MTP draft's length is chosen token by token, up to `--spec-draft-n-max` (4 by default): a draft token is kept while
 its chance of acceptance pays for its verification, the chance from the draft's confidence and the request's acceptance
@@ -306,7 +322,7 @@ More than two GPUs is untested.
   does not have. Other models run as in llama.cpp, without the expert cache work.
 - **GPUs measured.** One AMD GPU (RDNA3, RDNA4 by users) and pairs of NVIDIA GPUs with the pipeline stages (see
   above). Two AMD GPUs and more than two GPUs: untested.
-- **Tuned on RDNA3 with ROCm 7.2.** CUDA builds and was measured on rented RTX 4090s (see
+- **Tuned on RDNA3 with ROCm 7.2 and 10.2.** CUDA builds and was measured on rented RTX 4090s (see
   [NVIDIA](#nvidia-cuda-one-rented-rtx-4090)); its kernels are not tuned for NVIDIA yet, and the installer is ROCm only.
   RDNA4 runs ([reported](#reported-by-users-not-verified-here) on an R9700), not measured here; the chunked prompt GDN
   kernel is RDNA3-only.
