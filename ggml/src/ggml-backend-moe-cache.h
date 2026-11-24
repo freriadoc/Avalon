@@ -311,8 +311,14 @@ struct ggml_moe_cache_api {
     // the graph builder keeps the dense slices otherwise (RDNA2 has none: the node ran on the CPU, #46); null: not known
     bool (*qsa_tiles)(void);
     // the cells of the KV cache from which the backend's attention of a list per query (ggml_qsa_select_tiles of 1) is
-    // faster than its tiles of 16 queries; null or 0: not known (the graph builder's own limit)
+    // faster than its tiles of 16 queries (RDNA2, which has no tiles: than the dense slices); null or 0: not known (the
+    // graph builder's own limit)
     int64_t (*qsa_query_min_kv)(void);
+    // whether every GPU of the backend, without a kernel for the tiles (qsa_tiles false), has the attention of a list
+    // per query (ggml_qsa_select_tiles of 1) for a K and a V of these types (ggml_type), heads of d_head values, n_head_q
+    // heads of queries in all and n_head_kv of the cache: RDNA2, a q8_0 K and a q4_0 V of 256 values, 12 heads of queries
+    // a head of the cache. null or false: none, the graph builder keeps the dense slices
+    bool (*qsa_list)(int type_k, int type_v, int d_head, int n_head_q, int n_head_kv);
     // whether the prefill ring (GGML_CUDA_MOE_RING_PREFILL) can be used: false when only a part of the experts is in
     // registered RAM (the arena of a machine with less RAM than the experts take), where the ring would copy the others
     // through the page cache; the scheduler then keeps the prefetch and the graph builds no summed down. null: not known
