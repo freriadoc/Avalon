@@ -3188,16 +3188,21 @@ static bool moe_cache_pin_tensor(const moe_cache_session & session, moe_cache_de
     return true;
 }
 
-// The experts' anonymous host memory (the direct load's ranges, the arena) in 2 MiB pages where the kernel allows them
-// (transparent huge pages, "madvise" on common distributions): the CPU computes the experts the cache misses from it,
-// rows spread over ~2 MiB per expert; with 4 KiB pages the address translation cost ~6 % of their time (moe-cpu-bench
-// HUGE=1, cold experts). On the server (18 Nov., ABBA): the CPU time per expert row -2.0 % (59.4 -> 58.2 us, ~0.5 % of
-// a step); the first prompt after a start can be slower when the kernel had to compact memory for the 2 MiB pages and
-// evicted part of the page cache (the PLE table: ~4 GiB, read back by that prompt; one start in two here), the
-// following prompts as fast as with 4 KiB pages. GGML_CUDA_MOE_HUGE=0: 4 KiB pages.
+// GGML_CUDA_MOE_HUGE=1: the experts' anonymous host memory (the direct load's ranges, the arena) in 2 MiB pages where
+// the kernel allows them (transparent huge pages, "madvise" on common distributions): the CPU computes the experts the
+// cache misses from it, rows spread over ~2 MiB per expert; with 4 KiB pages the address translation cost ~6 % of their
+// time (moe-cpu-bench HUGE=1, cold experts). On the server (18 Nov., ABBA): the CPU time per expert row -2.0 % (59.4 ->
+// 58.2 us, ~0.5 % of a step).
+// Off by default: the kernel compacts memory to build those pages, and it moves pages of the memory registered for the
+// GPU's copies; each move invalidates a registered range, and KFD suspends the GPU's queues while it restores it
+// (svm_range_restore_work, amdgpu_amdkfd_restore_userptr_worker: "hogged CPU" in the kernel log). RX 7900 XT, Ubuntu
+// 26.04, kernel 7.0.0-44, 24 Nov., replay after 19k: with 2 MiB pages 250 000 - 794 000 pages moved per run, 4 runs
+// in 6 hung (steps of 0.4 s to minutes); with 4 KiB pages 17 000 - 79 000, 3 runs in 3 to their end (one copy of
+// 151 ms). The same workers stalled the GPU on kernel 7.0.0-34 (0.2 s to minutes, 23 Nov.), not measured there with
+// 4 KiB pages.
 static void moe_cache_host_huge_pages(void * p, size_t bytes) {
 #if defined(__linux__) && defined(MADV_HUGEPAGE)
-    static const bool huge = !getenv("GGML_CUDA_MOE_HUGE") || atoi(getenv("GGML_CUDA_MOE_HUGE")) != 0;
+    static const bool huge = getenv("GGML_CUDA_MOE_HUGE") && atoi(getenv("GGML_CUDA_MOE_HUGE")) != 0;
     if (huge && madvise(p, bytes, MADV_HUGEPAGE) != 0) {
         MOE_CACHE_LOG("[moe-cache] madvise(MADV_HUGEPAGE) of %zu MiB failed: %s\n", bytes >> 20, strerror(errno));
     }
