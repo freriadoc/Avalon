@@ -3325,6 +3325,51 @@ static size_t moe_cache_pin_load_direct(moe_cache_device & device, const std::ve
 #endif
 }
 
+// GGML_CUDA_MOE_LATE_DIRECT (on, =0 turns it off): a tensor registered late (the MTP draft's experts, blk.48 here, 1136 MiB)
+// first goes through the direct load like the others (anonymous memory at the same address, filled with O_DIRECT),
+// instead of being registered in place on the file's mapping. Registered file pages stay in the page cache: under RAM
+// pressure (MemFree ~430 MB in the replay, 24 Nov.) the kernel drops them and KFD's restore reads them again from the
+// disk (kworker events_freezable at 168 MiB/s, refault_file 43 000/s), the GPU idle, the run hung. Only the pages no
+// registered range holds yet (a page shared with a neighbour tensor already registered stays as it is).
+// Measured 24 Nov. (replay after a short prompt, compaction sysctl set): in place 3 runs in 3 hung at start; direct 3 in
+// 3 to their end (step median 19.57 / 19.34 / 19.35 ms), KFD still suspending the queues 1.9 - 3.5 s per run (pages
+// moved by compaction: 63 000 - 183 000)
+static void moe_cache_pin_late_direct(moe_cache_device & device, const void * base, size_t size) {
+    static const bool on = !getenv("GGML_CUDA_MOE_LATE_DIRECT") || atoi(getenv("GGML_CUDA_MOE_LATE_DIRECT")) != 0;
+    if (!on || !device.pin_direct) {
+        return;
+    }
+    uintptr_t ib = (uintptr_t) base & ~(uintptr_t) 4095;
+    uintptr_t ie = GGML_PAD((uintptr_t) base + size, 4096);
+    for (const auto & r : device.pinned) {
+        if (ib >= r.first && ib < r.second) {
+            ib = r.second;
+        }
+        if (ie > r.first && ie <= r.second) {
+            ie = r.first;
+        }
+    }
+    if (ib >= ie) {
+        return;
+    }
+    const std::vector<std::pair<uintptr_t, uintptr_t>> merged = { { ib, ie } };
+    std::vector<std::atomic<int>> left(1);
+    std::vector<char> loaded(1, 1);
+    std::vector<std::thread> readers;
+    std::mutex mu;
+    std::condition_variable cv;
+    const int64_t t0 = ggml_time_us();
+    const size_t got = moe_cache_pin_load_direct(device, merged, left, loaded, readers, mu, cv);
+    for (auto & t : readers) {
+        t.join();
+    }
+    if (got && !loaded[0]) {
+        (void) moe_cache_remap_any(device, ib, ie);   // a failed read: the file's pages again
+    }
+    MOE_CACHE_LOG("[moe-cache] CUDA%d pin: late tensor, %zu MiB read with O_DIRECT in %.2f s%s\n", device.physical,
+            got >> 20, (ggml_time_us() - t0) / 1e6, got && !loaded[0] ? " (read failed, file pages kept)" : "");
+}
+
 static void moe_cache_pin_experts(const moe_cache_session & session, moe_cache_device & device) {
     if (!moe_cache_pin_enabled() || !device.pinned.empty()) {
         return;
@@ -4253,6 +4298,7 @@ static int moe_cache_discover_pool(
             // like the others, still before its first graph (registering synchronizes every stream)
             size_t bytes = 0;
             ggml_cuda_set_device(device.logical);
+            moe_cache_pin_late_direct(device, host_base, tensor_size);
             if (moe_cache_pin_tensor(session, device, host_base, device.seen_tensors.at(host_base), bytes)) {
                 std::sort(device.pinned.begin(), device.pinned.end());
                 MOE_CACHE_LOG("[moe-cache] CUDA%d pin: %s registered late (%zu MiB)\n", device.physical, name, bytes >> 20);
