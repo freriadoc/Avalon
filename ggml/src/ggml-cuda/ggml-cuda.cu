@@ -304,6 +304,13 @@ static int ggml_cuda_parse_id(const char * devName) {
 // one is sized on its dispatch; ggml_cuda_prime_queues repeats the largest dispatch before the MoE cache is sized. An
 // explicit HSA_SCRATCH_SINGLE_LIMIT is kept.
 //
+// A scratch sized on its dispatch is released by ROCr once the dispatch ends (scratch reclaim) and allocated again by the
+// next one that spills. On an RX 7800 XT (gfx1101, ROCm 7.2.4) that path never finished: the first dispatch over the
+// limit (ggml_cuda_prime_queues' k_scratch_prime, 192 x 256 threads, 480 B each) kept the GPU busy forever, and the
+// context was never created (HSA_ENABLE_SCRATCH_ASYNC_RECLAIM=0 did not help). Without the reclaim the scratch grows to
+// the largest dispatch and stays, which is the size ggml_cuda_prime_queues reserves anyway. An explicit
+// HSA_NO_SCRATCH_RECLAIM is kept.
+//
 // ROCclr pins the host pages of a copy from pageable memory larger than GPU_PINNED_MIN_XFER_SIZE (128 MiB: the prefetch
 // of an expert tensor not registered in place) for the time of the copy, against KFD's system memory limit; when that
 // limit is full (a 32 or 48 GB machine, or another process), the pin waits forever (ROCm/legacy-rocm-build#6582).
@@ -322,11 +329,13 @@ __attribute__((constructor)) static void ggml_hip_set_hw_queues() {
     set_default("GPU_MAX_HW_QUEUES", hw_queues);
     set_default("ROCBLAS_DEVICE_MEMORY_SIZE", "65536");
     set_default("HSA_SCRATCH_SINGLE_LIMIT", "1048576");
+    set_default("HSA_NO_SCRATCH_RECLAIM", "1");
     set_default("GPU_PINNED_MIN_XFER_SIZE", "1048576");
 #else
     setenv("GPU_MAX_HW_QUEUES", hw_queues, /*overwrite =*/ 0);
     setenv("ROCBLAS_DEVICE_MEMORY_SIZE", "65536", /*overwrite =*/ 0);
     setenv("HSA_SCRATCH_SINGLE_LIMIT", "1048576", /*overwrite =*/ 0);
+    setenv("HSA_NO_SCRATCH_RECLAIM", "1", /*overwrite =*/ 0);
     setenv("GPU_PINNED_MIN_XFER_SIZE", "1048576", /*overwrite =*/ 0);
     // the prompt's expert ring (GGML_CUDA_MOE_RING_PREFILL, as on NVIDIA below): RX 7900 XT, 262k context with MTP, ABBA,
     // prefill and steps as with the prefetch's 4 slots, 900 MiB lent by the cache during a prefill instead of 1 800 and
