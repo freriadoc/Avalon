@@ -6033,20 +6033,32 @@ struct test_qsa_select_tiles : public test_case {
     // > 0: the selections of 16 consecutive queries drawn from tile_union selections' worth of pools, all live (a deep
     // prompt of qwen4exp: 4.3 from 57k cells on); 0: half from a few hot pools, half anywhere, some dead
     const float     tile_union;
+    // 1: the odd queries chose nothing (empty lists); 2: every cell of the odd queries masked (by_pos = false);
+    // 3: the queries in the middle of the context, the cells after them masked (by_pos = true);
+    // 4: the first half of the cache masked for the odd queries (by_pos = false): their lists, in the cells' order,
+    //    start with blocks of 32 cells all masked (the online softmax's first maximum is -inf there)
+    const int       variant;
 
     std::string vars() override {
-        return VARS_TO_STR13(n_kv, n_top, kpool, n_t, ncols, by_pos, flash, type_K, type_V, n_head_kv, kv_perm, q_scale, tile_union);
+        return VARS_TO_STR14(n_kv, n_top, kpool, n_t, ncols, by_pos, flash, type_K, type_V, n_head_kv, kv_perm, q_scale, tile_union, variant);
     }
 
     std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return flash ? "FLASH_ATTN_QSA_TILES" : "QSA_SELECT_TILES"; }
 
-    double max_nmse_err() override { return 2e-2; }
+    // GGML_TEST_QSA_LIST_NMSE: a tighter bound for a list per query of up to 64 queries. RDNA2's kernel is at 4e-9 of
+    // the CPU on an RX 6800 XT (q in int8 as the CPU's q8_0 dot product; 1.6e-6 with FP32 scores): at 4e-6 one cell
+    // dropped or one block of V off by 25 % in one cell fails
+    double max_nmse_err() override {
+        static const double tight = [] { const char * e = getenv("GGML_TEST_QSA_LIST_NMSE"); return e ? atof(e) : 0.0; }();
+        return tight > 0.0 && flash && ncols == 1 && n_t <= 64 ? tight : 2e-2;
+    }
 
     test_qsa_select_tiles(int64_t n_kv = 4096, int64_t n_top = 64, int64_t kpool = 4, int64_t n_t = 37, int64_t ncols = 16,
             bool by_pos = true, bool flash = false, ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16,
-            int64_t n_head_kv = 1, bool kv_perm = false, float q_scale = 1.0f, float tile_union = 0.0f)
+            int64_t n_head_kv = 1, bool kv_perm = false, float q_scale = 1.0f, float tile_union = 0.0f, int variant = 0)
         : n_kv(n_kv), n_top(n_top), kpool(kpool), n_t(n_t), ncols(ncols), by_pos(by_pos), flash(flash),
-          type_K(type_K), type_V(type_V), n_head_kv(n_head_kv), kv_perm(kv_perm), q_scale(q_scale), tile_union(tile_union) {}
+          type_K(type_K), type_V(type_V), n_head_kv(n_head_kv), kv_perm(kv_perm), q_scale(q_scale), tile_union(tile_union),
+          variant(variant) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t n_sel = n_top*kpool + kpool - 1;
@@ -6123,6 +6135,9 @@ struct test_qsa_select_tiles : public test_case {
                     for (int64_t j = n_top*kpool; j < n_sel; j++) {   // the tail: the last cells, one missing
                         v[q*n_sel + j] = j == n_sel - 1 ? -1 : (int32_t) (n_kv - 1 - (j - n_top*kpool));
                     }
+                    if (variant == 1 && q % 2 == 1) {
+                        std::fill(v.begin() + q*n_sel, v.begin() + (q + 1)*n_sel, -1);
+                    }
                 }
                 ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
             } else if (strcmp(t->name, "score") == 0) {
@@ -6136,6 +6151,12 @@ struct test_qsa_select_tiles : public test_case {
                 for (auto & x : v) {
                     x = ggml_fp32_to_fp16(rng() % 3 == 0 ? -INFINITY : 0.0f);
                 }
+                for (int64_t q = 1; variant == 2 && q < t->ne[1]; q += 2) {
+                    std::fill(v.begin() + q*t->ne[0], v.begin() + (q + 1)*t->ne[0], ggml_fp32_to_fp16(-INFINITY));
+                }
+                for (int64_t q = 1; variant == 4 && q < t->ne[1]; q += 2) {
+                    std::fill(v.begin() + q*t->ne[0], v.begin() + q*t->ne[0] + t->ne[0]/2, ggml_fp32_to_fp16(-INFINITY));
+                }
                 ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
             } else if (strcmp(t->name, "cell_pos") == 0) {
                 std::vector<int32_t> v(ggml_nelements(t));
@@ -6146,7 +6167,7 @@ struct test_qsa_select_tiles : public test_case {
             } else if (strcmp(t->name, "tok_pos") == 0) {
                 std::vector<int32_t> v(ggml_nelements(t));
                 for (int64_t i = 0; i < n_t; i++) {
-                    v[i] = (int32_t) (n_kv - n_t + i);   // the last queries: most cells visible, the tail causal
+                    v[i] = (int32_t) ((variant == 3 ? n_kv/2 : n_kv - n_t) + i);   // the last queries: most cells visible, the tail causal
                 }
                 ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
             } else if (strcmp(t->name, "q") == 0) {
@@ -13738,6 +13759,34 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_qsa_select_tiles(150016, 512, 4, 333, 1, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, true));
     test_cases.emplace_back(new test_qsa_select_tiles(262144, 512, 4, 2048, 1, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, true, 8.0f));
     test_cases.emplace_back(new test_qsa_select_tiles(49152, 512, 4, 8192, 1, true, false));
+    // a list per query on a GPU without a tile kernel (RDNA2): lists of 1, 2, 3 cells (one cell more or less shows),
+    // of 100 (not a multiple of 32), the cache's layout or not, 1 to 64 queries, caches of any size, empty and fully
+    // masked lists, queries in the middle of the context
+    test_cases.emplace_back(new test_qsa_select_tiles(4096, 1, 1, 37, 1, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, true));
+    test_cases.emplace_back(new test_qsa_select_tiles(4096, 1, 1, 37, 1, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, false));
+    test_cases.emplace_back(new test_qsa_select_tiles(4096, 2, 1, 37, 1, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, true));
+    test_cases.emplace_back(new test_qsa_select_tiles(4096, 2, 1, 37, 1, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, false));
+    test_cases.emplace_back(new test_qsa_select_tiles(4096, 3, 1, 37, 1, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, true));
+    test_cases.emplace_back(new test_qsa_select_tiles(4096, 3, 1, 37, 1, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, false));
+    test_cases.emplace_back(new test_qsa_select_tiles(4096, 25, 4, 37, 1, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, true));
+    test_cases.emplace_back(new test_qsa_select_tiles(4096, 25, 4, 37, 1, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, false));
+    test_cases.emplace_back(new test_qsa_select_tiles(40960, 512, 4, 1, 1, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, true));
+    test_cases.emplace_back(new test_qsa_select_tiles(40960, 512, 4, 2, 1, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, true));
+    test_cases.emplace_back(new test_qsa_select_tiles(40960, 512, 4, 3, 1, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, true));
+    test_cases.emplace_back(new test_qsa_select_tiles(40960, 512, 4, 7, 1, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, true));
+    test_cases.emplace_back(new test_qsa_select_tiles(40960, 512, 4, 9, 1, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, true));
+    test_cases.emplace_back(new test_qsa_select_tiles(40960, 512, 4, 13, 1, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, true));
+    test_cases.emplace_back(new test_qsa_select_tiles(40960, 512, 4, 17, 1, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, true));
+    test_cases.emplace_back(new test_qsa_select_tiles(40960, 512, 4, 37, 1, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, true));
+    test_cases.emplace_back(new test_qsa_select_tiles(40960, 512, 4, 64, 1, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, true));
+    test_cases.emplace_back(new test_qsa_select_tiles(2048, 64, 4, 17, 1, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, true));
+    test_cases.emplace_back(new test_qsa_select_tiles(4096, 64, 4, 17, 1, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, true));
+    test_cases.emplace_back(new test_qsa_select_tiles(4100, 64, 4, 17, 1, true, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, true));
+    test_cases.emplace_back(new test_qsa_select_tiles(40960, 512, 4, 37, 1, true,  true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, true, 1.0f, 0.0f, 1));
+    test_cases.emplace_back(new test_qsa_select_tiles(40960, 512, 4, 37, 1, false, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, true, 1.0f, 0.0f, 2));
+    test_cases.emplace_back(new test_qsa_select_tiles(40960, 512, 4, 37, 1, true,  true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, true, 1.0f, 0.0f, 3));
+    test_cases.emplace_back(new test_qsa_select_tiles(40960, 512, 4, 37, 1, false, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, true, 1.0f, 0.0f, 4));
+    test_cases.emplace_back(new test_qsa_select_tiles(40960, 512, 4, 37, 1, false, true, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, true));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {12, 1}, 65536, 200, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 2048));
 
     // sparse mask + quantized cache

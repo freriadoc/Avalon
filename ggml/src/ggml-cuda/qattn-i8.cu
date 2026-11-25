@@ -20,6 +20,7 @@
 // GGML_CUDA_QATTN_BENCH="n_kv[,n_queries[,runs[,skip]]]" runs the bench at the backend's creation and exits.
 // GGML_CUDA_QATTN_I8=0: off (the f16 kernel of one query instead). On by default for NVIDIA from Ampere on and for RDNA3 /
 // RDNA4 (7900 XT, 262k cells, 9536 queries, the node: 45.4 ms with the f16 kernel of one query, 37.1 with this one).
+// RDNA2 (no WMMA): k_qattn_rdna2, the same list per query by dp4a, GGML_CUDA_QATTN_RDNA2=0: off (the dense slices).
 
 #include "common.cuh"
 #include "cp-async.cuh"
@@ -670,6 +671,237 @@ static __global__ void __launch_bounds__(128) k_qattn_f16(const qattn_args a) {
 #endif // defined(GGML_USE_HIP)
 }
 
+// RDNA2 (k_qattn_rdna2): no WMMA and no kernel for a tile mask there, the prompt's attention read every cell of the
+// cache (RX 6800 XT: 1.7 ns a query and cell, 75 % of a 250k prefill). The same attention of a list per query, without
+// WMMA: q is quantized to int8 once a block (as k_qattn_i8), a thread scores its cell for the heads of its wave by dp4a
+// (K's q8_0 row read once a wave), the online softmax is k_qattn_f16's, a thread then owns 2 values of the output (a
+// byte of V's q4_0 blocks: its 2 codes) for the 12 heads in FP32, V decoded once a cell. 12 heads a KV head only
+// (qattn_rdna2_shapes, asserted at the launch); rows 12 to 15 of the shared arrays are padding. GGML_CUDA_QATTN_RDNA2=0:
+// off (the dense slices). A build with -DGGML_CUDA_QATTN_RDNA2_FAULT (the tests' negative controls, never a release)
+// reads the variable of that name: 1 drops each list's first cell, 2 scales V's first block of it
+struct qattn_rdna2_smem {
+    int32_t qc[16][64];             // q's int8 codes [head][block*8 + word]
+    float   qs[16][8];              // their scales [head][block], times the attention's scale
+    float   x[16][32];              // the scores [head][cell], mask added
+    alignas(16) float p[32][16];    // the weights [cell][head]: a cell's heads in 3 reads of 16 bytes
+    float alpha[16];
+    float lsum[16];
+    float mrow[16];
+};
+
+static __global__ void __launch_bounds__(128) k_qattn_rdna2(const qattn_args a) {
+#if defined(GGML_USE_HIP)
+    __shared__ __align__(16) qattn_rdna2_smem S;
+    const int iq = blockIdx.x, kvh = blockIdx.y;
+    const int lane = threadIdx.x, warp = threadIdx.y, t = warp*32 + lane;
+    const int n_list = a.n_list, n_head = a.n_head;
+
+    const char    * Qq = a.Q + iq*a.sQ1 + (int64_t) kvh*n_head*a.sQ2;
+    float         * oq = a.out + ((int64_t) iq*n_head*a.n_head_kv + (int64_t) kvh*n_head)*256;
+    const char    * Kg = a.K + kvh*a.sK2;
+    const char    * Vg = a.V + kvh*a.sV2;
+    const int32_t * lq = a.lists + (int64_t) iq*n_list;
+    const half    * mq = a.mask + (int64_t) iq*n_list;
+    const int n_chunks = (a.lists[(int64_t) n_list*a.n_q + iq] + 31)/32;
+
+    constexpr int NH = 12;               // the heads of a KV head (qattn_rdna2_shapes)
+    const int bo = t >> 4, io = t & 15;  // the thread's part of the output: values bo*32 + io and + 16, every head
+    float acc[NH][2];
+#pragma unroll
+    for (int h = 0; h < NH; ++h) {
+        acc[h][0] = acc[h][1] = 0.0f;
+    }
+    if (t < 16) {
+        S.mrow[t] = -INFINITY;
+        S.lsum[t] = 0.0f;
+    }
+    // q: int8 per (head, block of 32 values), as k_qattn_i8
+    {
+        const int h = t & 15, g = t >> 4;
+        float v[32];
+        float amax = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 32; ++j) {
+            v[j] = h < NH ? ((const float *) (Qq + h*a.sQ2))[g*32 + j] : 0.0f;   // not past Q's last KV head
+            amax = fmaxf(amax, fabsf(v[j]));
+        }
+        const float inv = amax > 0.0f ? 127.0f/amax : 0.0f;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            S.qc[h][g*8 + w] = (int32_t) qattn_pack(v[4*w], v[4*w + 1], v[4*w + 2], v[4*w + 3], inv);
+        }
+        S.qs[h][g] = amax/127.0f*a.scale;
+    }
+    __syncthreads();
+
+    for (int ci = 0; ci < n_chunks; ++ci) {
+        // the scores of the thread's cell for the heads warp, warp + 4, warp + 8: int8 products (dp4a); row warp + 12
+        // of x is padding, written with the mask alone so that the softmax reads no uninitialized memory
+        {
+            const int32_t index = lq[ci*32 + lane];
+            const char * kp = Kg + (int64_t) (index ^ (index >> 31))*a.sK1;   // a padded entry: ~cell, masked
+            float s[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            // rolled: unrolled, the compiler keeps q's codes in registers (RX 6800 XT: 221 registers, 24.2 ms on the
+            // bench against 82 and 19.2)
+#pragma unroll 1
+            for (int b = 0; b < 8; ++b) {
+                half d;
+                int32_t codes[8];
+                memcpy(&d, kp + b*34, sizeof(half));
+                memcpy(codes, kp + b*34 + 2, sizeof(codes));
+                const float kd = __half2float(d);
+#pragma unroll
+                for (int j = 0; j < NH/4; ++j) {
+                    const int h = warp + 4*j;
+                    int32_t sumi = 0;
+#pragma unroll
+                    for (int w = 0; w < 8; ++w) {
+                        sumi = ggml_cuda_dp4a(codes[w], S.qc[h][b*8 + w], sumi);
+                    }
+                    s[j] = fmaf((float) sumi*kd, S.qs[h][b], s[j]);
+                }
+            }
+            float m = __half2float(mq[ci*32 + lane]);
+#ifdef GGML_CUDA_QATTN_RDNA2_FAULT
+            if (a.skip == 1 && ci == 0 && lane == 0) {
+                m = -INFINITY;
+            }
+#endif
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                S.x[warp + 4*j][lane] = s[j] + m;
+            }
+        }
+        __syncthreads();
+        // the online softmax: 8 threads a head, 4 cells each
+        {
+            const int r = t >> 3, sub = t & 7;
+            float x[4], mx = -INFINITY;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                x[j] = S.x[r][sub*4 + j];
+                mx = fmaxf(mx, x[j]);
+            }
+#pragma unroll
+            for (int o = 1; o < 8; o <<= 1) {
+                mx = fmaxf(mx, __shfl_xor_sync(0xFFFFFFFFu, mx, o, 32));
+            }
+            const float m_old = S.mrow[r];
+            const float m_new = fmaxf(m_old, mx);
+            float sum = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float e = x[j] == -INFINITY ? 0.0f : expf(x[j] - m_new);
+                S.p[sub*4 + j][r] = e;
+                sum += e;
+            }
+#pragma unroll
+            for (int o = 1; o < 8; o <<= 1) {
+                sum += __shfl_xor_sync(0xFFFFFFFFu, sum, o, 32);
+            }
+            if (sub == 0) {
+                const float al = m_old == -INFINITY ? 0.0f : expf(m_old - m_new);
+                S.alpha[r] = al;
+                S.lsum[r]  = fmaf(S.lsum[r], al, sum);
+                S.mrow[r]  = m_new;
+            }
+        }
+        __syncthreads();
+        // the output: the running sums rescaled, then each cell's 2 values of V times its weight of every head
+#pragma unroll
+        for (int h = 0; h < NH; ++h) {
+            acc[h][0] *= S.alpha[h];
+            acc[h][1] *= S.alpha[h];
+        }
+        for (int c = 0; c < 32; ++c) {
+            const int32_t index = lq[ci*32 + c];
+            const char * vp = Vg + (int64_t) (index ^ (index >> 31))*a.sV1 + bo*18;
+            half d;
+            memcpy(&d, vp, sizeof(half));
+            const uint8_t q = (uint8_t) vp[2 + io];
+            const float vd = __half2float(d);
+            float v0 = vd*(float) ((q & 0x0F) - 8);
+            float v1 = vd*(float) ((q >> 4) - 8);
+#ifdef GGML_CUDA_QATTN_RDNA2_FAULT
+            if (a.skip == 2 && ci == 0 && c == 0 && bo == 0) {
+                v0 *= 1.25f;
+                v1 *= 1.25f;
+            }
+#endif
+            const float4 * pc = (const float4 *) S.p[c];
+#pragma unroll
+            for (int h4 = 0; h4 < NH/4; ++h4) {
+                const float4 w = pc[h4];
+                acc[4*h4 + 0][0] = fmaf(w.x, v0, acc[4*h4 + 0][0]);
+                acc[4*h4 + 0][1] = fmaf(w.x, v1, acc[4*h4 + 0][1]);
+                acc[4*h4 + 1][0] = fmaf(w.y, v0, acc[4*h4 + 1][0]);
+                acc[4*h4 + 1][1] = fmaf(w.y, v1, acc[4*h4 + 1][1]);
+                acc[4*h4 + 2][0] = fmaf(w.z, v0, acc[4*h4 + 2][0]);
+                acc[4*h4 + 2][1] = fmaf(w.z, v1, acc[4*h4 + 2][1]);
+                acc[4*h4 + 3][0] = fmaf(w.w, v0, acc[4*h4 + 3][0]);
+                acc[4*h4 + 3][1] = fmaf(w.w, v1, acc[4*h4 + 3][1]);
+            }
+        }
+        // no barrier: the next chunk's scores write x only and read neither p nor alpha, which are written again only
+        // after the next chunk's first barrier, which every thread reaches after its reads here
+    }
+#pragma unroll
+    for (int h = 0; h < NH; ++h) {
+        const float l = S.lsum[h];
+        oq[h*256 + bo*32 + io]      = l > 0.0f ? acc[h][0]/l : 0.0f;
+        oq[h*256 + bo*32 + io + 16] = l > 0.0f ? acc[h][1]/l : 0.0f;
+    }
+#else
+    GGML_UNUSED(a);
+    NO_DEVICE_CODE;
+#endif // defined(GGML_USE_HIP)
+}
+
+// the only place that decides RDNA2's list per query: the device, and the switch
+static bool qattn_rdna2_arch(const int cc) {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_QATTN_RDNA2"); return !e || atoi(e) != 0; }();
+    return on && GGML_CUDA_CC_IS_RDNA2(cc);
+}
+
+// the shapes k_qattn_rdna2 takes, as the tests cover them: f32 queries, a q8_0 K and a q4_0 V of 256 values, 12 heads
+// a KV head (what the graph builder knows before it builds the node: ggml_cuda_qsa_list)
+static bool qattn_rdna2_shapes(const int cc, const ggml_type type_q, const ggml_type type_k, const ggml_type type_v,
+        const int64_t d_q, const int64_t d_k, const int64_t d_v, const int64_t n_head_q, const int64_t n_head_kv) {
+    return qattn_rdna2_arch(cc) && type_q == GGML_TYPE_F32 && type_k == GGML_TYPE_Q8_0 && type_v == GGML_TYPE_Q4_0 &&
+        d_q == 256 && d_k == 256 && d_v == 256 && n_head_kv > 0 && n_head_q == 12*n_head_kv;
+}
+
+// whether k_qattn_rdna2 takes this attention: a list per query (ggml_qsa_select_tiles of 1) of any number of queries
+// over a cache of any size
+bool ggml_cuda_qattn_rdna2_applies(const int cc, const ggml_tensor * dst) {
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    if (!qattn_rdna2_arch(cc) || !mask || mask->op != GGML_OP_QSA_SELECT ||
+            ggml_get_op_params_i32(mask, 1) != GGML_QSA_SELECT_TILE_MASK || mask->ne[1] != 1) {
+        return false;
+    }
+    float max_bias = 0.0f, logit_softcap = 0.0f;
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    return max_bias == 0.0f && logit_softcap == 0.0f && dst->src[4] == nullptr && mask->src[4] != nullptr &&
+        qattn_rdna2_shapes(cc, Q->type, K->type, V->type, Q->ne[0], K->ne[0], V->ne[0], Q->ne[2], K->ne[2]) &&
+        V->ne[1] == K->ne[1] && V->ne[2] == K->ne[2] && K->nb[0] == ggml_type_size(K->type) && V->nb[0] == ggml_type_size(V->type) &&
+        Q->ne[3] == 1 && Q->nb[0] == sizeof(float) && mask->ne[0] % 32 == 0 && mask->ne[2] == Q->ne[1];
+}
+
+// ggml_moe_cache.qsa_list: every device takes a list per query of these shapes (closed when there is no device)
+bool ggml_cuda_qsa_list(const int type_k, const int type_v, const int d_head, const int n_head_q, const int n_head_kv) {
+    const ggml_cuda_device_info & info = ggml_cuda_info();
+    for (int i = 0; i < info.device_count; i++) {
+        if (!qattn_rdna2_shapes(info.devices[i].cc, GGML_TYPE_F32, (ggml_type) type_k, (ggml_type) type_v, d_head, d_head, d_head, n_head_q, n_head_kv)) {
+            return false;
+        }
+    }
+    return info.device_count > 0;
+}
+
 // RDNA3: k_qattn_f16, unless GGML_CUDA_QATTN_F16=0 (k_qattn_i8). RX 7900 XT, the node, 9536 queries of 2048 cells,
 // tiles of 16 / int8 / FP16 a query: 16.3 / 32.9 / 28.5 ms at 4.9k cells, 21.4 / 33.5 / 29.0 at 9.7k, 26.8 / 34.0 / 29.3
 // at 16k, 31.4 / 34.3 / 29.5 at 25k, 35.0 / 34.5 / 29.6 at 33k, 50.7 / 35.0 / 30.0 at 66k, 54.3 / 35.9 / 30.8 at 262k;
@@ -705,15 +937,17 @@ static bool qattn_f16_on(const int cc) {
 }
 
 // the cells from which a list per query replaces the tiles of 16 (ggml_moe_cache.qsa_query_min_kv): 16384 when every
-// device runs k_qattn_f16 (the tiles are still 9 % faster there, the list 6 % at 25k), else the graph builder's limit
+// device runs k_qattn_f16 (the tiles are still 9 % faster there, the list 6 % at 25k), else the graph builder's limit.
+// RDNA2: the cells from which the list replaces the dense slices, 8192: on an RX 6800 XT a batch of 4096 tokens is as
+// fast either way between 4096 and 8192 cells, 0.4 s faster with the list from 8192 and 0.7 s from 12288
 int64_t ggml_cuda_qattn_query_min_kv() {
     const ggml_cuda_device_info & info = ggml_cuda_info();
+    bool f16 = info.device_count > 0, rdna2 = info.device_count > 0;   // every device
     for (int i = 0; i < info.device_count; i++) {
-        if (!qattn_f16_on(info.devices[i].cc)) {
-            return 0;
-        }
+        f16   = f16   && qattn_f16_on(info.devices[i].cc);
+        rdna2 = rdna2 && qattn_rdna2_arch(info.devices[i].cc);
     }
-    return info.device_count > 0 ? 16384 : 0;
+    return f16 ? 16384 : rdna2 ? 8192 : 0;
 }
 
 struct qattn_nv_smem {
@@ -1047,6 +1281,8 @@ void ggml_cuda_qattn_i8(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * V    = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
     GGML_ASSERT(mask->ne[2] == Q->ne[1] && ggml_is_contiguous(dst) && ggml_is_contiguous(mask));
+    // every kernel here, k_qattn_rdna2 too although it copies the rows byte by byte and needs no alignment: the KV
+    // cache's buffers are aligned, an unaligned view of them would be a caller's error on any device
     GGML_ASSERT((uintptr_t) K->data % 16 == 0 && (uintptr_t) V->data % 16 == 0);
 
     qattn_args a;
@@ -1076,6 +1312,13 @@ void ggml_cuda_qattn_i8(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         k_qattn_i8_nv<<<grid, block, 0, ctx.stream()>>>(a);
     } else if (qattn_f16_on(cc)) {
         qattn_f16_launch(a, grid, block, ctx.stream());
+    } else if (qattn_rdna2_arch(cc)) {
+        GGML_ASSERT(a.n_head == 12);   // k_qattn_rdna2 is written for 12 heads a KV head (qattn_rdna2_shapes)
+#ifdef GGML_CUDA_QATTN_RDNA2_FAULT
+        static const int fault = [] { const char * e = getenv("GGML_CUDA_QATTN_RDNA2_FAULT"); return e ? atoi(e) : 0; }();
+        a.skip = fault;
+#endif
+        k_qattn_rdna2<<<grid, block, 0, ctx.stream()>>>(a);
     } else {
         k_qattn_i8<<<grid, block, 0, ctx.stream()>>>(a);
     }
@@ -1184,11 +1427,14 @@ void ggml_cuda_qattn_i8_bench(int device) {
     const bool nv = GGML_CUDA_CC_IS_NVIDIA(cc);
     const dim3 grid((unsigned) n_q, (unsigned) n_head_kv, 1), block(32, 4, 1);
     const bool f16 = qattn_f16_on(ggml_cuda_info().devices[device].cc);
+    const bool rdna2 = qattn_rdna2_arch(ggml_cuda_info().devices[device].cc);
     const auto run = [&]() {
         if (nv) {
             k_qattn_i8_nv<<<grid, block>>>(a);
         } else if (f16) {
             qattn_f16_launch(a, grid, block, 0);
+        } else if (rdna2) {
+            k_qattn_rdna2<<<grid, block>>>(a);
         } else {
             k_qattn_i8<<<grid, block>>>(a);
         }
@@ -1200,8 +1446,8 @@ void ggml_cuda_qattn_i8_bench(int device) {
     }
     {
         cudaFuncAttributes attr = {};
-        if (cudaFuncGetAttributes(&attr, nv ? (const void *) k_qattn_i8_nv : f16 ? (qattn_ksc() ? (const void *) k_qattn_f16<true, true> : (const void *) k_qattn_f16<false, true>) : (const void *) k_qattn_i8) == cudaSuccess) {
-            printf("qattn %s kernel:", f16 ? "f16" : "i8");
+        if (cudaFuncGetAttributes(&attr, nv ? (const void *) k_qattn_i8_nv : f16 ? (qattn_ksc() ? (const void *) k_qattn_f16<true, true> : (const void *) k_qattn_f16<false, true>) : rdna2 ? (const void *) k_qattn_rdna2 : (const void *) k_qattn_i8) == cudaSuccess) {
+            printf("qattn %s kernel:", f16 ? "f16" : rdna2 ? "rdna2" : "i8");
             printf(" %d registers, %zu bytes of scratch a thread, %zu bytes of shared memory\n",
                 (int) attr.numRegs, (size_t) attr.localSizeBytes, (size_t) attr.sharedSizeBytes);
         }

@@ -167,6 +167,7 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
 }
 
 bool ggml_cuda_qattn_i8_applies(const int cc, const ggml_tensor * dst);
+bool ggml_cuda_qattn_rdna2_applies(const int cc, const ggml_tensor * dst);
 void ggml_cuda_qattn_i8(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 bool ggml_cuda_flash_attn_ext_mma_f16_kv_quant_sparse(const int cc, const ggml_tensor * dst) {
@@ -606,6 +607,7 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_TILE    = 200,
     BEST_FATTN_KERNEL_VEC     = 100,
     BEST_FATTN_KERNEL_MMA_F16 = 400,
+    BEST_FATTN_KERNEL_QLIST   = 500,   // RDNA2: a list per query (qattn-i8.cu, k_qattn_rdna2)
 };
 
 // K/V types for which there is a vector kernel template instance, other kernels convert these to f16:
@@ -679,6 +681,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     const int cc = ggml_cuda_info().devices[device].cc;
+
+    // RDNA2's list per query, before the conditions of the other kernels (a padded cache, more than 8 queries)
+    if (ggml_cuda_qattn_rdna2_applies(cc, dst)) {
+        return BEST_FATTN_KERNEL_QLIST;
+    }
 
     switch (K->ne[0]) {
         case  40:
@@ -866,6 +873,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_K = K->type == GGML_TYPE_F32 || f16_fallback;
             need_f16_V = V->type == GGML_TYPE_F32 || f16_fallback;
         } break;
+        case BEST_FATTN_KERNEL_QLIST:   // the rows as they are stored
         case BEST_FATTN_KERNEL_NONE:
             break;
     }
@@ -940,9 +948,26 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
             break;
+        case BEST_FATTN_KERNEL_QLIST:
+            if (!g_fattn_scratch_query) {   // no scratch to report
+                ggml_cuda_qattn_i8(ctx, dst);
+            }
+            break;
     }
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
-    return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
+    const bool ok = ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
+    // RDNA2 reads a tile mask only as a list per query of its shapes: any other one runs on the CPU (#46), said once
+    const ggml_tensor * mask = dst->src[3];
+    if (!ok && GGML_CUDA_CC_IS_RDNA2(ggml_cuda_info().devices[device].cc) && mask && mask->op == GGML_OP_QSA_SELECT &&
+            ggml_get_op_params_i32(mask, 1) == GGML_QSA_SELECT_TILE_MASK) {
+        static bool said = false;   // not atomic, as the file's other one-time flags: a race only says it twice
+        if (!said) {
+            GGML_LOG_WARN("%s: a QSA tile mask of %d columns (K %s, V %s) that no kernel of this GPU reads: the attention runs on the CPU\n",
+                __func__, (int) mask->ne[1], ggml_type_name(dst->src[1]->type), ggml_type_name(dst->src[2]->type));
+            said = true;
+        }
+    }
+    return ok;
 }
